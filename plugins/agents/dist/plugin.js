@@ -14,10 +14,126 @@ function optionalService(ctx, name) {
     return void 0;
   }
 }
+var schema = {
+  object(properties, required = []) {
+    return { type: "object", properties, required, additionalProperties: false };
+  },
+  string(description, extra = {}) {
+    return { type: "string", description, ...extra };
+  },
+  integer(description, extra = {}) {
+    return { type: "integer", description, ...extra };
+  },
+  boolean(description) {
+    return { type: "boolean", description };
+  }
+};
+function stringArg(args, name, required = true) {
+  const value = args[name];
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (required) throw new Error(`${name} is required.`);
+  return "";
+}
+function numberArg(args, name, fallback, min, max) {
+  const value = args[name];
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
 
 // packages/core/src/cli.ts
 var EXPIRY_MARGIN_MS = 3 * 6e4;
 var DEFAULT_LIFETIME_MS = 30 * 6e4;
+
+// packages/core/src/sse.ts
+var SseParser = class {
+  constructor(onEvent) {
+    this.onEvent = onEvent;
+  }
+  buffer = "";
+  data = [];
+  event = "";
+  id;
+  push(chunk) {
+    this.buffer += chunk;
+    let index = this.buffer.search(/\r\n|\r|\n/);
+    while (index !== -1) {
+      const line = this.buffer.slice(0, index);
+      const newline = this.buffer.startsWith("\r\n", index) ? 2 : 1;
+      this.buffer = this.buffer.slice(index + newline);
+      this.line(line);
+      index = this.buffer.search(/\r\n|\r|\n/);
+    }
+  }
+  /** Dispatches a final event that was not followed by a blank line. */
+  end() {
+    if (this.buffer) this.line(this.buffer);
+    this.buffer = "";
+    this.line("");
+  }
+  line(line) {
+    if (line === "") {
+      if (this.data.length) {
+        this.onEvent({
+          event: this.event || "message",
+          data: this.data.join("\n"),
+          ...this.id !== void 0 && { id: this.id }
+        });
+      }
+      this.data = [];
+      this.event = "";
+      return;
+    }
+    if (line.startsWith(":")) return;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "data") this.data.push(value);
+    else if (field === "event") this.event = value;
+    else if (field === "id") this.id = value;
+  }
+};
+function parseSse(body) {
+  const events = [];
+  const parser = new SseParser((event) => events.push(event));
+  parser.push(body);
+  parser.end();
+  return events;
+}
+
+// packages/core/src/client.ts
+var DatabricksApiError = class extends Error {
+  constructor(status, errorCode, message, body) {
+    super(message);
+    this.status = status;
+    this.errorCode = errorCode;
+    this.body = body;
+    this.name = "DatabricksApiError";
+  }
+  get isPermission() {
+    return this.status === 403 || this.errorCode === "PERMISSION_DENIED";
+  }
+  get isNotFound() {
+    return this.status === 404 || this.errorCode === "RESOURCE_DOES_NOT_EXIST" || this.errorCode === "NOT_FOUND";
+  }
+  get isFeatureDisabled() {
+    return this.errorCode === "FEATURE_DISABLED" || this.errorCode === "NOT_IMPLEMENTED" || /not enabled|feature.*disabled|preview/i.test(this.message);
+  }
+};
+function apiError(response) {
+  let code;
+  let message = `Databricks returned HTTP ${response.status}`;
+  try {
+    const parsed = JSON.parse(response.body);
+    code = parsed.error_code ?? (typeof parsed.error === "object" ? parsed.error?.code : void 0);
+    message = parsed.message ?? (typeof parsed.error === "object" ? parsed.error?.message : parsed.error) ?? parsed.error_description ?? message;
+  } catch {
+    const text = response.body.trim();
+    if (text && text.length < 400 && !text.startsWith("<")) message = text;
+  }
+  return new DatabricksApiError(response.status, code, message, response.body);
+}
 
 // packages/core/src/service.ts
 var SERVICE_NAME = "databricks";
@@ -321,6 +437,37 @@ function EmptyState(props) {
     /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "lg", weight: 500 }, props.title),
     props.children && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", as: "div" }, props.children),
     props.action
+  );
+}
+function Badge(props) {
+  const tone = props.tone ?? "neutral";
+  const color = {
+    neutral: "var(--dbx-subtle)",
+    brand: "var(--dbx-lava-text)",
+    success: "var(--dbx-success)",
+    warning: "var(--dbx-warning)",
+    danger: "var(--dbx-danger)"
+  }[tone];
+  return /* @__PURE__ */ React.createElement(
+    "span",
+    {
+      title: props.title,
+      style: {
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+        padding: "1px 7px",
+        borderRadius: 999,
+        fontSize: "0.6875rem",
+        fontWeight: 500,
+        lineHeight: 1.6,
+        color,
+        background: tone === "brand" ? "var(--dbx-brand-tint)" : "var(--dbx-inset)",
+        border: "1px solid var(--dbx-border)",
+        whiteSpace: "nowrap"
+      }
+    },
+    props.children
   );
 }
 function Field(props) {
@@ -684,6 +831,791 @@ var Genie = class {
   }
 };
 
+// packages/core/src/api/mcp.ts
+var PROTOCOL_VERSION = "2025-06-18";
+var McpError = class extends Error {
+  constructor(message, code, data) {
+    super(message);
+    this.code = code;
+    this.data = data;
+    this.name = "McpError";
+  }
+};
+var gatewayMcpPath = (fullName) => `/ai-gateway/mcp-services/${fullName}`;
+var McpClient = class {
+  constructor(client, path, query = {}) {
+    this.client = client;
+    this.path = path;
+    this.query = query;
+  }
+  session;
+  initializing;
+  nextId = 1;
+  toolsCache;
+  serverInfo;
+  instructions;
+  async listTools(signal) {
+    if (this.toolsCache && Date.now() - this.toolsCache.at < 5 * 6e4) return this.toolsCache.tools;
+    const tools = [];
+    let cursor;
+    do {
+      const page = await this.call("tools/list", cursor ? { cursor } : {}, signal);
+      tools.push(...page.tools ?? []);
+      cursor = page.nextCursor;
+    } while (cursor);
+    this.toolsCache = { at: Date.now(), tools };
+    return tools;
+  }
+  callTool(name, args, options = {}) {
+    return this.call(
+      "tools/call",
+      { name, arguments: args, ...options.meta && { _meta: options.meta } },
+      options.signal,
+      options.timeoutMs
+    );
+  }
+  async readResource(uri, signal) {
+    return await this.call("resources/read", { uri }, signal);
+  }
+  async ensureSession(signal) {
+    if (this.session) return;
+    this.initializing ??= (async () => {
+      const result = await this.send(
+        {
+          jsonrpc: "2.0",
+          id: this.nextId++,
+          method: "initialize",
+          params: {
+            protocolVersion: PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "databricks-buzz-plugins", version: "0.1.0" }
+          }
+        },
+        signal,
+        true
+      );
+      this.serverInfo = result?.serverInfo;
+      this.instructions = result?.instructions;
+      await this.send({ jsonrpc: "2.0", method: "notifications/initialized" }, signal).catch(() => {
+      });
+    })().finally(() => {
+      this.initializing = void 0;
+    });
+    await this.initializing;
+  }
+  async call(method, params, signal, timeoutMs) {
+    await this.ensureSession(signal);
+    try {
+      return await this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+    } catch (error) {
+      if (error.status === 404 && this.session) {
+        this.session = void 0;
+        await this.ensureSession(signal);
+        return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+      }
+      throw error;
+    }
+  }
+  async send(message, signal, initializing = false, timeoutMs = 12e4) {
+    const response = await this.client.request(this.path, {
+      method: "POST",
+      query: this.query,
+      body: message,
+      timeoutMs,
+      ...signal && { signal },
+      headers: {
+        Accept: "application/json, text/event-stream",
+        ...!initializing && { "MCP-Protocol-Version": PROTOCOL_VERSION },
+        ...this.session && { "Mcp-Session-Id": this.session }
+      }
+    });
+    const session = response.headers["mcp-session-id"];
+    if (session) this.session = session;
+    if (message.id === void 0) return void 0;
+    if (response.status === 202) return void 0;
+    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    const type = response.headers["content-type"] ?? "";
+    const payloads = type.includes("text/event-stream") ? parseSse(response.body).map((event) => event.data) : [response.body];
+    for (const payload of payloads) {
+      let parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (parsed.id !== message.id) continue;
+      if (parsed.error)
+        throw new McpError(parsed.error.message ?? "MCP error", parsed.error.code, parsed.error.data);
+      return parsed.result;
+    }
+    throw new McpError(`No response to ${message.method}`);
+  }
+};
+function resultText(result) {
+  return (result.content ?? []).map((item) => item.type === "text" ? String(item.text) : "").filter(Boolean).join("\n\n");
+}
+function resultJson(result) {
+  if (result.structuredContent !== void 0) return result.structuredContent;
+  for (const item of result.content ?? []) {
+    if (item.type !== "text") continue;
+    const text = String(item.text).trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) continue;
+    try {
+      return JSON.parse(text);
+    } catch {
+    }
+  }
+  return void 0;
+}
+
+// plugins/genie/src/genie-one.ts
+var GENIE_ONE = "system.ai.genie_one_mcp";
+var POLL_MS = 3e3;
+var MAX_RESULTS = 3;
+var cell = (value) => value === null || value === void 0 ? null : typeof value === "object" ? JSON.stringify(value) : String(value);
+function toResultSet(result) {
+  if (!result.ready || !result.columns?.length) return void 0;
+  const rows = (result.rows ?? []).map((row) => row.map(cell));
+  const total = result.total_row_count ?? void 0;
+  return resultSet(
+    result.columns.map((column) => ({ name: column.name, ...column.type_text && { type: column.type_text } })),
+    rows,
+    {
+      ...total !== void 0 && { totalRows: total },
+      truncated: Boolean(result.truncated) || total !== void 0 && total > rows.length
+    }
+  );
+}
+var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+function cleanAnswer(text) {
+  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
+}
+function trimTables(markdown, maxRows = 12) {
+  const lines = markdown.split("\n");
+  const out = [];
+  const row = /^\s*\|.*\|\s*$/;
+  for (let i = 0; i < lines.length; i++) {
+    if (row.test(lines[i] ?? "") && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
+      out.push(lines[i] ?? "", lines[i + 1] ?? "");
+      let body = 0;
+      i += 2;
+      for (; i < lines.length && row.test(lines[i] ?? ""); i++, body++) if (body < maxRows) out.push(lines[i] ?? "");
+      if (body > maxRows) out.push("", `_${body - maxRows} more rows in Databricks._`);
+      i--;
+      continue;
+    }
+    out.push(lines[i] ?? "");
+  }
+  return out.join("\n");
+}
+var sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener(
+    "abort",
+    () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    },
+    { once: true }
+  );
+});
+var GenieOne = class {
+  constructor(service) {
+    this.service = service;
+  }
+  clients = /* @__PURE__ */ new Map();
+  availability = /* @__PURE__ */ new Map();
+  async mcp() {
+    const client = await this.service.ready();
+    const snapshot = this.service.snapshot();
+    const workspaceId = snapshot.status === "connected" ? snapshot.workspaceId ?? snapshot.profile.workspaceId : void 0;
+    const key = `${client.host}|${workspaceId ?? ""}`;
+    let mcp = this.clients.get(key);
+    if (!mcp) {
+      mcp = new McpClient(client, gatewayMcpPath(GENIE_ONE), workspaceId ? { o: workspaceId } : {});
+      this.clients.set(key, mcp);
+    }
+    return mcp;
+  }
+  /** Whether Genie One answers in this workspace for this user. */
+  available() {
+    const snapshot = this.service.snapshot();
+    const key = snapshot.status === "connected" ? snapshot.profile.host : "none";
+    let check = this.availability.get(key);
+    if (!check) {
+      check = this.mcp().then((mcp) => mcp.listTools()).then((tools) => tools.some((tool) => tool.name === "genie_ask")).catch(() => false).then((ok) => {
+        if (!ok) this.availability.delete(key);
+        return ok;
+      });
+      this.availability.set(key, check);
+    }
+    return check;
+  }
+  async ask(question, options = {}) {
+    const { signal } = options;
+    const mcp = await this.mcp();
+    const asked = await mcp.callTool(
+      "genie_ask",
+      { question, ...options.conversationId && { conversation_id: options.conversationId } },
+      { ...signal && { signal }, timeoutMs: 17e4 }
+    );
+    if (asked.isError) throw new Error(resultText(asked) || "Genie One couldn't take the question.");
+    const started = resultJson(asked) ?? {};
+    const conversationId = started.conversation_id ?? options.conversationId ?? "";
+    const responseId = started.response_id ?? "";
+    if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
+    let state = started;
+    let markdown = resultText(asked);
+    let unknowns = 0;
+    let steps = [];
+    const deadline = Date.now() + 10 * 6e4;
+    try {
+      while (!state.status || state.status === "in_progress" || state.status === "unknown" && unknowns < 5) {
+        if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
+        await sleep(POLL_MS, signal);
+        const polled = await mcp.callTool(
+          "genie_poll_response",
+          { conversation_id: conversationId, response_id: responseId },
+          { ...signal && { signal }, timeoutMs: 6e4 }
+        );
+        if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
+        state = resultJson(polled) ?? { status: "unknown" };
+        markdown = resultText(polled);
+        unknowns = state.status === "unknown" ? unknowns + 1 : 0;
+        if (state.progress_steps?.length) {
+          steps = state.progress_steps;
+          options.onProgress?.(steps);
+        }
+      }
+    } catch (error) {
+      if (signal?.aborted)
+        void mcp.callTool("genie_cancel_response", { conversation_id: conversationId }).catch(() => void 0);
+      throw error;
+    }
+    if (state.status === "failed") throw new Error(markdown.trim() || "Genie One couldn't answer that.");
+    const items = (state.query_items ?? []).slice(0, MAX_RESULTS);
+    const results = (await Promise.all(
+      items.map(
+        (item) => mcp.callTool(
+          "genie_get_query_result",
+          { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
+          { ...signal && { signal }, timeoutMs: 6e4 }
+        ).then((fetched) => fetched.isError ? void 0 : toResultSet(resultJson(fetched) ?? {})).catch(() => void 0)
+      )
+    )).filter((result) => result !== void 0);
+    return {
+      conversationId,
+      responseId,
+      status: state.status ?? "completed",
+      text: (state.final_answer ?? "").trim(),
+      markdown: markdown.trim(),
+      steps,
+      results,
+      sql: items.flatMap((item) => item.sql ? [item.sql] : []),
+      ...state.deep_link && { deepLink: state.deep_link }
+    };
+  }
+  /** Plain text for agents: the answer (with its tables and links), the SQL and the deep link. */
+  format(answer) {
+    const lines = ["Genie One", `conversation_id: ${answer.conversationId}`];
+    if (answer.status === "incomplete") lines.push("(Genie One stopped before finishing; the answer may be partial.)");
+    const text = cleanAnswer(answer.text);
+    if (text) lines.push("", text);
+    else for (const result of answer.results) lines.push("", toMarkdown(result, 20));
+    for (const statement of answer.sql.slice(0, 2)) lines.push("", "SQL Genie One ran:", "```sql", statement.trim(), "```");
+    if (answer.deepLink) lines.push("", `[Explore in Databricks](${answer.deepLink})`);
+    return lines.join("\n");
+  }
+};
+
+// packages/core/src/api/mcp-catalog.ts
+var NATIVE = /* @__PURE__ */ new Set(["system.ai.genie_one_mcp", "system.ai.sandbox"]);
+var plain = (text = "") => text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
+function serviceLabel(fullName) {
+  const leaf = fullName.split(".").pop() ?? fullName;
+  const known = { dbsql: "Databricks SQL", github: "GitHub", gmail: "Gmail", microsoft_365: "Microsoft 365" };
+  if (known[leaf]) return known[leaf];
+  const words = leaf.replace(/[_-]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+function functionsServer(catalog, schema2) {
+  return {
+    id: `functions:${catalog}.${schema2}`,
+    kind: "functions",
+    label: `${catalog}.${schema2} functions`,
+    description: `Unity Catalog functions in ${catalog}.${schema2}`,
+    path: `/api/2.0/mcp/functions/${encodeURIComponent(catalog)}/${encodeURIComponent(schema2)}`
+  };
+}
+var McpCatalog = class {
+  constructor(client) {
+    this.client = client;
+  }
+  async services(signal) {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 10; page++) {
+      const response = await this.client.get("/api/2.1/unity-catalog/mcp-services", {
+        query: { view: "FULL", page_size: 100, page_token: pageToken },
+        ...signal && { signal }
+      });
+      for (const service of response.mcp_services ?? []) {
+        const fullName = service.name.replace(/^mcp-services\//, "");
+        if (NATIVE.has(fullName)) continue;
+        const kind = service.config?.source_connection?.securable_kind ?? "";
+        out.push({
+          id: `service:${fullName}`,
+          kind: "service",
+          label: serviceLabel(fullName),
+          description: plain(service.comment).replace(/ Verify that the provider's service.*$/, ""),
+          path: gatewayMcpPath(fullName),
+          .../U2M/.test(kind) && { needsLogin: true },
+          ...fullName.startsWith("system.ai.") && { builtIn: true }
+        });
+      }
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return out;
+  }
+  async connections(signal) {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 10; page++) {
+      const response = await this.client.get("/api/2.1/unity-catalog/connections", {
+        query: { max_results: 500, page_token: pageToken },
+        ...signal && { signal }
+      });
+      for (const connection of response.connections ?? []) {
+        if (connection.options?.is_mcp_connection !== "true") continue;
+        const host = connection.options.host?.replace(/^https?:\/\//, "");
+        out.push({
+          id: `connection:${connection.name}`,
+          kind: "connection",
+          label: connection.name,
+          ...(connection.comment || host) && { description: plain(connection.comment) || host },
+          path: `/api/2.0/mcp/external/${encodeURIComponent(connection.name)}`
+        });
+      }
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return out.sort((a, b) => a.label.localeCompare(b.label));
+  }
+  /** Everything the person can see, built-ins first; a failing source is skipped. */
+  async list(signal) {
+    const errors = [];
+    const [services, connections] = await Promise.all([
+      this.services(signal).catch((error) => (errors.push(`MCP services: ${error.message}`), [])),
+      this.connections(signal).catch((error) => (errors.push(`connections: ${error.message}`), []))
+    ]);
+    const builtIn = services.filter((server) => server.builtIn).sort((a, b) => a.label.localeCompare(b.label));
+    const registered = services.filter((server) => !server.builtIn).sort((a, b) => a.label.localeCompare(b.label));
+    return { servers: [...builtIn, ...registered, ...connections], errors };
+  }
+};
+function toolPrefix(server) {
+  const base2 = (server.label || server.id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return (base2 || "mcp").slice(0, 20).replace(/_+$/, "");
+}
+
+// plugins/genie/src/tools.ts
+var AUDIENCE = "Note: these results came from the owner's Databricks access. Everyone in this conversation can read what you post, so share only what this audience should see.";
+function formatAnswer(space, answer, link, maxRows) {
+  const lines = [`Genie agent: ${space.title} (${space.space_id})`, `conversation_id: ${answer.message.conversation_id}`, `status: ${answer.message.status}`];
+  if (answer.error) lines.push(`error: ${answer.error}`);
+  if (answer.text) lines.push("", answer.text);
+  if (answer.result) lines.push("", toMarkdown(answer.result, maxRows));
+  else if (answer.rowCount !== void 0) lines.push("", `(The query returned ${answer.rowCount} rows; the result could not be fetched.)`);
+  if (answer.sql) lines.push("", "SQL:", "```sql", answer.sql.trim(), "```");
+  if (answer.suggestions.length) lines.push("", `Follow-ups Genie suggests: ${answer.suggestions.slice(0, 3).join(" | ")}`);
+  if (link) lines.push("", `Open in Genie: ${link}`);
+  lines.push("", AUDIENCE);
+  return lines.join("\n");
+}
+
+// plugins/agents/src/capabilities.ts
+var GENIE_ONE_CHOICE = { id: "genie-one", kind: "genie-one", label: "Genie One" };
+var NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+function normalizeChoices(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const choice = item;
+    if (typeof choice?.id !== "string" || typeof choice.label !== "string" || typeof choice.kind !== "string") return [];
+    if (["service", "connection", "functions"].includes(choice.kind) && !(typeof choice.path === "string" && choice.path.startsWith("/"))) return [];
+    return [{ id: choice.id, kind: choice.kind, label: choice.label, ...choice.path && { path: choice.path } }];
+  });
+}
+var slug = (text, max) => (text.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "x").slice(0, max).replace(/_+$/, "");
+var workspaceIdOf = (service) => {
+  const snapshot = service.snapshot();
+  return snapshot.status === "connected" ? snapshot.workspaceId ?? snapshot.profile.workspaceId : void 0;
+};
+function withTimeout(signal, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`No answer within ${ms / 1e3} seconds`)), ms);
+  const stop = () => controller.abort(signal.reason);
+  if (signal.aborted) stop();
+  else signal.addEventListener("abort", stop, { once: true });
+  controller.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+  return controller.signal;
+}
+function replyText(reply) {
+  if (typeof reply === "string") return reply;
+  const content = reply?.content;
+  if (Array.isArray(content)) return content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
+  return JSON.stringify(reply);
+}
+function fromAgentTool(tool) {
+  return {
+    name: tool.name,
+    description: tool.description ?? "",
+    parameters: tool.inputSchema ?? { type: "object", properties: {} },
+    run: async (args) => replyText(await tool.call({}, {}, args))
+  };
+}
+function genieLocalTools(service, choices) {
+  const tools = [];
+  const used = /* @__PURE__ */ new Set();
+  for (const choice of choices) {
+    if (choice.kind === "genie-one") {
+      const genieOne = new GenieOne(service);
+      tools.push({
+        name: "genie_one_ask",
+        description: "Asks Genie One, Databricks' assistant for questions about any data the owner can access in this agent's workspace. It finds the tables, writes and runs the SQL, and answers with numbers, a table and a link. Pass conversation_id from an earlier answer to follow up. Answers can take a minute.",
+        parameters: {
+          type: "object",
+          properties: { question: { type: "string", description: "The question, in plain language." }, conversation_id: { type: "string" } },
+          required: ["question"]
+        },
+        run: async (args, signal) => {
+          const conversationId = typeof args.conversation_id === "string" && args.conversation_id ? args.conversation_id : void 0;
+          return genieOne.format(await genieOne.ask(String(args.question ?? ""), { signal, ...conversationId && { conversationId } }));
+        }
+      });
+    } else if (choice.kind === "genie") {
+      const spaceId = choice.id.replace(/^genie:/, "");
+      let name = `genie_${slug(choice.label, 40)}_ask`;
+      for (let n = 2; used.has(name); n++) name = `genie_${slug(choice.label, 36)}_${n}_ask`;
+      used.add(name);
+      tools.push({
+        name,
+        description: `Asks the "${choice.label}" Genie agent, curated by the owner's data team, a question about its data. It answers with an explanation, a table and the SQL. Pass conversation_id to follow up.`,
+        parameters: {
+          type: "object",
+          properties: { question: { type: "string", description: "The question, in plain language." }, conversation_id: { type: "string" } },
+          required: ["question"]
+        },
+        run: async (args, signal) => {
+          const client = await service.ready(signal);
+          const conversationId = typeof args.conversation_id === "string" && args.conversation_id ? args.conversation_id : void 0;
+          const answer = await new Genie(client).answer(spaceId, String(args.question ?? ""), { signal, ...conversationId && { conversationId } });
+          return formatAnswer({ title: choice.label, space_id: spaceId }, answer, service.workspaceUrl(Genie.webPath(spaceId, answer.message.conversation_id)), 30);
+        }
+      });
+    }
+  }
+  return tools;
+}
+async function mcpLocalTools(service, choices, signal) {
+  const servers = choices.filter((choice) => choice.path);
+  if (!servers.length) return { tools: [], problems: [] };
+  const client = await service.ready(signal);
+  const workspaceId = workspaceIdOf(service);
+  const problems = [];
+  const lists = await Promise.all(
+    servers.map(async (server) => {
+      const query = server.path.startsWith("/ai-gateway/") && workspaceId ? { o: workspaceId } : {};
+      const mcp = new McpClient(client, server.path, query);
+      try {
+        const tools2 = await mcp.listTools(withTimeout(signal, 3e4));
+        return { server, mcp, tools: tools2 };
+      } catch (error) {
+        problems.push(`${server.label}: ${error.message ?? error}`);
+        return { server, mcp, tools: [] };
+      }
+    })
+  );
+  const tools = [];
+  const names = /* @__PURE__ */ new Set();
+  for (const { server, mcp, tools: listed } of lists) {
+    const prefix = toolPrefix(server);
+    for (const tool of listed) {
+      let name = `${prefix}__${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+      for (let n = 2; names.has(name); n++) name = `${name.slice(0, 60)}_${n}`;
+      if (!NAME.test(name)) continue;
+      names.add(name);
+      tools.push({
+        name,
+        description: `[${server.label}] ${tool.description ?? tool.title ?? tool.name}`.slice(0, 4e3),
+        parameters: tool.inputSchema ?? { type: "object", properties: {} },
+        run: async (args, runSignal) => {
+          const result = await mcp.callTool(tool.name, args, { signal: runSignal, timeoutMs: 17e4 });
+          const text = resultText(result);
+          const body = text || (result.structuredContent !== void 0 ? JSON.stringify(resultJson(result)) : "OK");
+          return result.isError ? `Error from ${server.label}: ${body}` : body;
+        }
+      });
+    }
+  }
+  return { tools, problems };
+}
+
+// plugins/agents/src/ui.tsx
+var GENIE_ONE_ID = "genie-one";
+function NeedsConnection(props) {
+  const snapshot = useConnection(props.service);
+  if (snapshot.status === "connected") return null;
+  return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks isn't connected", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => props.service.openSettings() }, "Connect") }, "These agents run on Databricks with your sign-in.");
+}
+function DatabricksForm(props) {
+  const { config, onChange } = props;
+  const workspace = useAgentService(props.service, config.profile);
+  const status = useConnection(workspace).status;
+  const endpoints = useAsync(async (signal) => (await new Ai(await workspace.ready(signal)).endpoints(signal)).filter((e) => /chat/.test(e.task) && !e.isAgent), [workspace, status]);
+  const known = new Set(DEFAULT_MODELS.map((model) => model.id));
+  const options = [
+    ...DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label })),
+    ...(endpoints.data ?? []).filter((endpoint) => !known.has(endpoint.name)).map((endpoint) => ({ id: endpoint.name, label: `${endpoint.label} (endpoint)` }))
+  ];
+  if (!options.some((option) => option.id === config.model)) options.unshift({ id: config.model, label: config.model });
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
+    WorkspaceField,
+    {
+      service: props.service,
+      ...config.profile && { profile: config.profile },
+      disabled: props.disabled,
+      onChange: (profile) => {
+        const { profile: _old, ...rest } = config;
+        onChange({ ...rest, ...profile && { profile }, tools: config.tools.filter((tool) => tool.kind === "genie-one") });
+      }
+    }
+  ), /* @__PURE__ */ React.createElement(Field, { label: "Model", hint: "Served by Databricks AI Gateway, billed to your workspace." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.model, onChange: (event) => onChange({ ...config, model: event.target.value }) }, options.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.id, value: option.id }, option.label)))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 10, alignItems: "flex-start", fontSize: "0.8125rem" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", disabled: props.disabled, checked: config.sandbox, onChange: (event) => onChange({ ...config, sandbox: event.target.checked }), style: { marginTop: 3 } }), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement(Text, { weight: 500, as: "div" }, "Give it a Databricks Sandbox"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, "Its own Linux machine in Databricks to run code, with a persistent home folder, internet access and the Databricks CLI signed in as you. Created on first use."))), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, disabled: props.disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) }))));
+}
+function GenieForm(props) {
+  const { config, onChange } = props;
+  const workspace = useAgentService(props.service, config.profile);
+  const status = useConnection(workspace).status;
+  const spaces = useAsync(async (signal) => new Genie(await workspace.ready(signal)).listSpaces(signal), [workspace, status]);
+  React.useEffect(() => {
+    if (!config.spaceId) onChange({ ...config, spaceId: GENIE_ONE_ID, spaceTitle: "Genie One" });
+  }, [config, onChange]);
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
+    WorkspaceField,
+    {
+      service: props.service,
+      ...config.profile && { profile: config.profile },
+      disabled: props.disabled,
+      onChange: (profile) => onChange({ spaceId: GENIE_ONE_ID, spaceTitle: "Genie One", ...profile && { profile } })
+    }
+  ), /* @__PURE__ */ React.createElement(Field, { label: "Answers with", hint: "Mention this Buzz agent with a data question; it answers with an explanation, a table, the SQL and a link. Genie One finds the right data across the workspace; a Genie agent sticks to the data your team curated. Each thread keeps its own Genie conversation for follow-ups." }, spaces.loading ? /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading Genie agents\u2026")) : spaces.error ? /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, describeError(spaces.error)) : /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: config.spaceId,
+      onChange: (event) => {
+        const keep = config.profile ? { profile: config.profile } : {};
+        if (event.target.value === GENIE_ONE_ID) return onChange({ spaceId: GENIE_ONE_ID, spaceTitle: "Genie One", ...keep });
+        const space = spaces.data?.find((candidate) => candidate.space_id === event.target.value);
+        onChange({ spaceId: event.target.value, spaceTitle: space?.title ?? "", ...keep });
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: GENIE_ONE_ID }, "Genie One \xB7 all your data"),
+    (spaces.data ?? []).map((space) => /* @__PURE__ */ React.createElement("option", { key: space.space_id, value: space.space_id }, space.title))
+  ))));
+}
+function EndpointForm(props) {
+  const { config, onChange } = props;
+  const workspace = useAgentService(props.service, config.profile);
+  const status = useConnection(workspace).status;
+  const endpoints = useAsync(async (signal) => (await new Ai(await workspace.ready(signal)).endpoints(signal)).filter((e) => e.isAgent || /responses|chat/.test(e.task)), [workspace, status]);
+  const isApp = /^https:\/\//.test(config.target);
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
+    WorkspaceField,
+    {
+      service: props.service,
+      ...config.profile && { profile: config.profile },
+      disabled: props.disabled,
+      onChange: (profile) => {
+        const { profile: _old, ...rest } = config;
+        onChange({ ...rest, target: "", task: "", label: "", ...profile && { profile } });
+      }
+    }
+  ), /* @__PURE__ */ React.createElement(Field, { label: "Agent endpoint", hint: "Agent Bricks agents, Knowledge Assistants, supervisors and custom agents you deployed to Model Serving." }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled || endpoints.loading,
+      value: isApp ? "" : config.target,
+      onChange: (event) => {
+        const endpoint = endpoints.data?.find((candidate) => candidate.name === event.target.value);
+        onChange({ ...config, target: event.target.value, task: endpoint?.task ?? "", label: endpoint?.label ?? event.target.value });
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, endpoints.loading ? "Loading\u2026" : "Choose an endpoint"),
+    (endpoints.data ?? []).map((endpoint) => /* @__PURE__ */ React.createElement("option", { key: endpoint.name, value: endpoint.name }, endpoint.name, endpoint.task ? ` \xB7 ${endpoint.task}` : "", endpoint.ready ? "" : " \xB7 not ready"))
+  )), /* @__PURE__ */ React.createElement(Field, { label: "Or a Databricks App URL", hint: "For agents deployed on Databricks Apps (Agent Runtime), e.g. https://my-agent-123.aws.databricksapps.com" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      className: "dbx-input",
+      disabled: props.disabled,
+      value: isApp ? config.target : "",
+      placeholder: "https://\u2026databricksapps.com",
+      onChange: (event) => onChange({ ...config, target: event.target.value.trim(), task: "app", label: "Databricks App" })
+    }
+  ))));
+}
+function SettingsTab(props) {
+  const [draft, setDraft] = React.useState(props.config);
+  const [state, setState] = React.useState({});
+  const dirty = JSON.stringify(draft) !== JSON.stringify(props.config);
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(props.Form, { service: props.service, config: draft, onChange: setDraft, disabled: state.saving }), props.note, state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, justify: "flex-end", align: "center" }, state.saved && !dirty && /* @__PURE__ */ React.createElement(Text, { tone: "success", size: "sm" }, "Saved"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", disabled: !dirty || state.saving, onClick: () => setDraft(props.config) }, "Revert"), /* @__PURE__ */ React.createElement(
+    Button,
+    {
+      variant: "primary",
+      disabled: !dirty || state.saving,
+      onClick: () => {
+        setState({ saving: true });
+        props.save(draft).then(
+          () => setState({ saved: true }),
+          (error) => setState({ error: describeError(error) })
+        );
+      }
+    },
+    state.saving ? "Saving\u2026" : "Save"
+  ))));
+}
+function useAgentService(service, profile) {
+  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+var ADD = "__add__";
+function WorkspaceField(props) {
+  const main = useConnection(props.service);
+  const workspace = useAgentService(props.service, props.profile);
+  const current = useConnection(workspace);
+  const [adding, setAdding] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [state, setState] = React.useState({});
+  if (!props.service.forProfile) return null;
+  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
+  const profiles = props.service.profiles();
+  const mainName = main.status === "connected" ? main.profile.name : void 0;
+  const signIn = async () => {
+    setState({ busy: true });
+    try {
+      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
+      props.onChange(profile === mainName ? void 0 : profile);
+      setAdding(false);
+      setUrl("");
+      setState({});
+    } catch (error) {
+      setState({ error: describeError(error) });
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Where this agent's Databricks work runs: models, Genie, SQL, MCP servers and its Sandbox. Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: adding ? ADD : props.profile ?? "",
+      onChange: (event) => {
+        const value = event.target.value;
+        if (value === ADD) return setAdding(true);
+        setAdding(false);
+        props.onChange(value && value !== mainName ? value : void 0);
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
+    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
+    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
+  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && current.status === "connecting" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026")), props.profile && current.status === "connected" && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", host(current), " as ", current.user.userName, "."), props.profile && current.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, current.message)));
+}
+function Check(props) {
+  return /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 10, alignItems: "flex-start", fontSize: "0.8125rem", cursor: props.disabled ? "default" : "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", disabled: props.disabled, checked: props.checked, onChange: (event) => props.onChange(event.target.checked), style: { marginTop: 3 } }), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, props.title), props.badge), props.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.detail)));
+}
+function ToolsField(props) {
+  const { service } = props;
+  const status = useConnection(service).status;
+  const spaces = useAsync(async (signal) => new Genie(await service.ready(signal)).listSpaces(signal), [service, status]);
+  const catalog = useAsync(async (signal) => new McpCatalog(await service.ready(signal)).list(signal), [service, status]);
+  const [query, setQuery] = React.useState("");
+  const [schemaName, setSchemaName] = React.useState("");
+  const chosen = new Set(props.tools.map((tool) => tool.id));
+  const toggle = (choice, on) => props.onChange(on ? [...props.tools.filter((tool) => tool.id !== choice.id), choice] : props.tools.filter((tool) => tool.id !== choice.id));
+  const servers = catalog.data?.servers ?? [];
+  const needle = query.trim().toLowerCase();
+  const visible = servers.filter((server) => chosen.has(server.id) || !needle || `${server.label} ${server.description ?? ""} ${server.id}`.toLowerCase().includes(needle));
+  const builtIn = visible.filter((server) => server.builtIn);
+  const others = visible.filter((server) => !server.builtIn);
+  const functions = props.tools.filter((tool) => tool.kind === "functions");
+  const asChoice = (server) => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Field, { label: "Genie", hint: "Genie One finds the right data on its own; a Genie agent answers from data your team curated." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    Check,
+    {
+      checked: chosen.has(GENIE_ONE_CHOICE.id),
+      disabled: props.disabled,
+      onChange: (on) => toggle(GENIE_ONE_CHOICE, on),
+      title: "Genie One",
+      detail: "Questions about any data you can access in this workspace."
+    }
+  ), spaces.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), (spaces.data ?? []).map((space) => /* @__PURE__ */ React.createElement(
+    Check,
+    {
+      key: space.space_id,
+      checked: chosen.has(`genie:${space.space_id}`),
+      disabled: props.disabled,
+      onChange: (on) => toggle({ id: `genie:${space.space_id}`, kind: "genie", label: space.title }, on),
+      title: space.title,
+      ...space.description && { detail: space.description }
+    }
+  )))), /* @__PURE__ */ React.createElement(Field, { label: "MCP servers", hint: "Tools from MCP servers in this workspace: Databricks-provided services, ones your team registered in Unity Catalog, and external MCP connections. They run with your access." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, catalog.loading && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finding MCP servers\u2026")), catalog.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, describeError(catalog.error)), (catalog.data?.errors ?? []).map((error) => /* @__PURE__ */ React.createElement(Text, { key: error, tone: "tertiary", size: "xs" }, "Couldn't list ", error)), servers.length > 8 && /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: `Search ${servers.length} servers`, value: query, onChange: (event) => setQuery(event.target.value) }), builtIn.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 500 }, "Databricks"), builtIn.map((server) => /* @__PURE__ */ React.createElement(
+    Check,
+    {
+      key: server.id,
+      checked: chosen.has(server.id),
+      disabled: props.disabled,
+      onChange: (on) => toggle(asChoice(server), on),
+      title: server.label,
+      ...server.description && { detail: server.description },
+      ...server.needsLogin ? { badge: /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") } : server.id === "service:system.ai.dbsql" && { badge: /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") }
+    }
+  )), others.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 500 }, "Your workspace"), /* @__PURE__ */ React.createElement("div", { style: { maxHeight: 260, overflow: "auto", display: "flex", flexDirection: "column", gap: 8 } }, others.slice(0, needle ? 200 : 40).map((server) => /* @__PURE__ */ React.createElement(
+    Check,
+    {
+      key: server.id,
+      checked: chosen.has(server.id),
+      disabled: props.disabled,
+      onChange: (on) => toggle(asChoice(server), on),
+      title: server.label,
+      detail: `${server.kind === "connection" ? "External MCP connection" : "MCP service"}${server.description ? ` \xB7 ${server.description}` : ""}`,
+      ...server.needsLogin && { badge: /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") }
+    }
+  )), !needle && others.length > 40 && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, others.length - 40, " more. Search to find them.")), functions.map((tool) => /* @__PURE__ */ React.createElement(Check, { key: tool.id, checked: true, disabled: props.disabled, onChange: () => toggle(tool, false), title: tool.label, detail: "Unity Catalog functions" })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      className: "dbx-input",
+      placeholder: "catalog.schema with Unity Catalog functions",
+      value: schemaName,
+      onChange: (event) => setSchemaName(event.target.value.trim()),
+      style: { flex: 1 }
+    }
+  ), /* @__PURE__ */ React.createElement(
+    Button,
+    {
+      size: "sm",
+      disabled: props.disabled || !/^[\w-]+\.[\w-]+$/.test(schemaName),
+      onClick: () => {
+        const [catalogName = "", schemaPart = ""] = schemaName.split(".");
+        const server = functionsServer(catalogName, schemaPart);
+        toggle(asChoice(server), true);
+        setSchemaName("");
+      }
+    },
+    "Add functions"
+  )))));
+}
+
 // packages/core/src/api/sandbox.ts
 var SANDBOX_HOME = "/home/sandbox-agent";
 function sandboxId(seed) {
@@ -897,7 +1829,7 @@ function fromBase64(encoded) {
 // plugins/agents/src/loop.ts
 var MESSAGE_TOOLS = /* @__PURE__ */ new Set(["send", "reply_in_subthread"]);
 var MAX_RESULT = 24e3;
-var NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+var NAME2 = /^[a-zA-Z0-9_-]{1,64}$/;
 var rpcId = 0;
 async function rpc(handler, method, params) {
   const response = await handler({ jsonrpc: "2.0", id: ++rpcId, method, ...params !== void 0 && { params } });
@@ -906,7 +1838,7 @@ async function rpc(handler, method, params) {
 }
 async function buzzTools(handler) {
   const listed = await rpc(handler, "tools/list");
-  return (listed.tools ?? []).filter((tool) => NAME.test(tool.name));
+  return (listed.tools ?? []).filter((tool) => NAME2.test(tool.name));
 }
 function toFunction(tool) {
   const parameters = tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object", properties: {} };
@@ -944,7 +1876,7 @@ function target(args) {
   return void 0;
 }
 async function runLoop(input) {
-  const listed = input.buzz ? await buzzTools(input.buzz) : [];
+  const listed = (input.buzz ? await buzzTools(input.buzz) : []).filter((tool) => input.buzzFilter?.(tool.name) ?? true);
   const local = new Map((input.local ?? []).map((tool) => [tool.name, tool]));
   const buzzNames = new Set(listed.map((tool) => tool.name));
   const tools = [
@@ -1016,6 +1948,230 @@ function trimHistory(messages, maxChars = 12e4, maxMessages = 120) {
     start = next;
   }
   return messages.slice(start);
+}
+
+// packages/core/src/api/sql.ts
+var StatementError = class extends Error {
+  constructor(message, statementId, state) {
+    super(message);
+    this.statementId = statementId;
+    this.state = state;
+    this.name = "StatementError";
+  }
+};
+var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
+var Sql = class {
+  constructor(client) {
+    this.client = client;
+  }
+  async warehouses(signal) {
+    const response = await this.client.get("/api/2.0/sql/warehouses", signal ? { signal } : {});
+    return response.warehouses ?? [];
+  }
+  /** The best default: running serverless, any serverless, running, first. */
+  static pick(warehouses) {
+    const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
+    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+  }
+  /** Runs a statement and waits for its first result chunk. */
+  async execute(statement, options) {
+    const signal = options.signal;
+    let response = await this.client.post(
+      "/api/2.0/sql/statements",
+      {
+        statement,
+        warehouse_id: options.warehouseId,
+        wait_timeout: "30s",
+        on_wait_timeout: "CONTINUE",
+        disposition: "INLINE",
+        format: "JSON_ARRAY",
+        row_limit: options.rowLimit ?? 1e3,
+        ...options.catalog && { catalog: options.catalog },
+        ...options.schema && { schema: options.schema }
+      },
+      { timeoutMs: 45e3, ...signal && { signal } }
+    );
+    options.onStatement?.(response.statement_id);
+    const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
+    const cancel = () => void this.cancel(response.statement_id).catch(() => {
+    });
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      let delay = 750;
+      while (RUNNING.has(response.status?.state ?? "")) {
+        if (Date.now() > deadline) {
+          cancel();
+          throw new StatementError("The query took too long and was cancelled.", response.statement_id, "CANCELED");
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        signal?.throwIfAborted();
+        delay = Math.min(3e3, delay * 1.5);
+        response = await this.client.get(
+          `/api/2.0/sql/statements/${encodeURIComponent(response.statement_id)}`,
+          signal ? { signal } : {}
+        );
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+    }
+    const state = response.status?.state;
+    if (state !== "SUCCEEDED")
+      throw new StatementError(
+        response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
+        response.statement_id,
+        state
+      );
+    return { statementId: response.statement_id, result: fromStatement(response) };
+  }
+  cancel(statementId) {
+    return this.client.post(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}/cancel`, {});
+  }
+  catalogs(signal) {
+    return this.client.get("/api/2.1/unity-catalog/catalogs", signal ? { signal } : {}).then((response) => response.catalogs ?? []);
+  }
+  schemas(catalog, signal) {
+    return this.client.get("/api/2.1/unity-catalog/schemas", {
+      query: { catalog_name: catalog },
+      ...signal && { signal }
+    }).then((response) => response.schemas ?? []);
+  }
+  tables(catalog, schema2, signal) {
+    return this.client.get(
+      "/api/2.1/unity-catalog/tables",
+      { query: { catalog_name: catalog, schema_name: schema2, max_results: 200 }, ...signal && { signal } }
+    ).then((response) => response.tables ?? []);
+  }
+  table(fullName, signal) {
+    return this.client.get(`/api/2.1/unity-catalog/tables/${encodeURIComponent(fullName)}`, signal ? { signal } : {});
+  }
+};
+function isReadOnlySql(statement) {
+  const stripped = statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ").replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/`[^`]*`/g, "``").trim();
+  const statements = stripped.split(";").map((part) => part.trim()).filter(Boolean);
+  if (!statements.length) return false;
+  return statements.every((part) => {
+    const first = /^\(*\s*(\w+)/.exec(part)?.[1]?.toUpperCase();
+    if (!first || !["SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "VALUES", "TABLE", "LIST"].includes(first))
+      return false;
+    return !/\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|COPY|OPTIMIZE|VACUUM|REFRESH|RESTORE|CALL)\b/i.test(
+      part.replace(/^WITH[\s\S]*?\bSELECT\b/i, "SELECT")
+    );
+  });
+}
+
+// plugins/sql/src/runs.ts
+async function resolveWarehouse(service, explicit) {
+  const client = await service.ready();
+  const sql = new Sql(client);
+  const warehouses = await sql.warehouses();
+  const preferred = explicit || service.preferences.get("warehouseId");
+  const chosen = preferred && warehouses.find((w) => w.id === preferred || w.name === preferred) || Sql.pick(warehouses);
+  if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
+  return { id: chosen.id, name: chosen.name };
+}
+
+// plugins/sql/src/tools.ts
+var ALLOW_WRITES = "sqlAgentWrites";
+var AUDIENCE2 = "These rows came from the owner's Databricks access; everyone in this conversation can read what you post. To let readers re-run it with their own access, post the SQL in a ```sql block.";
+function sqlTools(service) {
+  return [
+    {
+      name: "databricks_sql_query",
+      description: "Runs a Databricks SQL statement on a SQL warehouse and returns the result as a Markdown table (Spark SQL / Databricks SQL dialect; use three-part names catalog.schema.table). Read-only statements (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN) are always allowed; statements that change data are refused unless the owner allowed them. Use databricks_catalog_list and databricks_table_describe to find tables and columns first.",
+      inputSchema: schema.object(
+        {
+          statement: schema.string("One SQL statement."),
+          warehouse: schema.string("Warehouse id or name; defaults to the owner's default warehouse."),
+          catalog: schema.string("Default catalog for unqualified names."),
+          schema: schema.string("Default schema for unqualified names."),
+          max_rows: schema.integer("Rows to include in the reply (default 50, max 200).")
+        },
+        ["statement"]
+      ),
+      async call(_client, _context, args) {
+        const statement = stringArg(args, "statement");
+        if (!isReadOnlySql(statement) && !service.preferences.get(ALLOW_WRITES))
+          throw new Error(
+            "That statement could change data, and the owner only allows read-only SQL from agents. Ask the owner to run it, or to allow it in Settings \u2192 Databricks SQL."
+          );
+        const warehouse = await resolveWarehouse(service, stringArg(args, "warehouse", false) || void 0);
+        const client = await service.ready();
+        const catalog = stringArg(args, "catalog", false);
+        const schemaName = stringArg(args, "schema", false);
+        const started = Date.now();
+        const { statementId, result } = await new Sql(client).execute(statement, {
+          warehouseId: warehouse.id,
+          rowLimit: 1e3,
+          ...catalog && { catalog },
+          ...schemaName && { schema: schemaName }
+        });
+        const total = result.totalRows ?? result.rows.length;
+        return [
+          `Ran on ${warehouse.name} in ${((Date.now() - started) / 1e3).toFixed(1)}s (statement ${statementId}); ${total} row${total === 1 ? "" : "s"}.`,
+          "",
+          toMarkdown(result, numberArg(args, "max_rows", 50, 1, 200)),
+          "",
+          AUDIENCE2
+        ].join("\n");
+      }
+    },
+    {
+      name: "databricks_sql_warehouses",
+      description: "Lists the SQL warehouses the owner can use, with their state and size.",
+      inputSchema: schema.object({}),
+      async call() {
+        const client = await service.ready();
+        const warehouses = await new Sql(client).warehouses();
+        const preferred = service.preferences.get("warehouseId");
+        if (!warehouses.length) return "No SQL warehouses are available to the owner.";
+        return warehouses.map(
+          (w) => `- ${w.name} (id ${w.id}): ${w.state ?? "unknown"}, ${w.cluster_size ?? "?"}${w.enable_serverless_compute ? ", serverless" : ""}${w.id === preferred ? " \u2014 default" : ""}`
+        ).join("\n");
+      }
+    },
+    {
+      name: "databricks_catalog_list",
+      description: "Browses Unity Catalog: with no arguments lists catalogs; with catalog lists its schemas; with catalog and schema lists its tables and views (with comments).",
+      inputSchema: schema.object({
+        catalog: schema.string("Catalog name."),
+        schema: schema.string("Schema name within the catalog.")
+      }),
+      async call(_client, _context, args) {
+        const client = await service.ready();
+        const sql = new Sql(client);
+        const catalog = stringArg(args, "catalog", false);
+        const schemaName = stringArg(args, "schema", false);
+        if (!catalog) {
+          const catalogs = await sql.catalogs();
+          return catalogs.map((c) => `- ${c.name}${c.comment ? `: ${c.comment}` : ""}`).join("\n") || "No catalogs visible.";
+        }
+        if (!schemaName) {
+          const schemas = await sql.schemas(catalog);
+          return schemas.map((s) => `- ${s.full_name}${s.comment ? `: ${s.comment}` : ""}`).join("\n") || `No schemas visible in ${catalog}.`;
+        }
+        const tables = await sql.tables(catalog, schemaName);
+        return tables.map((t) => `- ${t.full_name} (${(t.table_type ?? "TABLE").toLowerCase()})${t.comment ? `: ${t.comment.replace(/\s+/g, " ").slice(0, 160)}` : ""}`).join("\n") || `No tables visible in ${catalog}.${schemaName}.`;
+      }
+    },
+    {
+      name: "databricks_table_describe",
+      description: "Describes a Unity Catalog table or view: its columns with types and comments, owner, type and description.",
+      inputSchema: schema.object({ table: schema.string("Three-part name, catalog.schema.table.") }, ["table"]),
+      async call(_client, _context, args) {
+        const name = stringArg(args, "table");
+        if (!/^[^.\s]+\.[^.\s]+\.[^.\s]+$/.test(name)) throw new Error("Use a three-part name: catalog.schema.table.");
+        const client = await service.ready();
+        const table = await new Sql(client).table(name);
+        return [
+          `${table.full_name} (${(table.table_type ?? "TABLE").toLowerCase()})${table.owner ? `, owned by ${table.owner}` : ""}`,
+          table.comment ? `
+${table.comment}` : "",
+          "",
+          ...(table.columns ?? []).map((c) => `- ${c.name} ${c.type_text ?? ""}${c.nullable === false ? " not null" : ""}${c.comment ? ` \u2014 ${c.comment}` : ""}`)
+        ].join("\n");
+      }
+    }
+  ];
 }
 
 // plugins/agents/src/sandbox.ts
@@ -1155,94 +2311,6 @@ function plainText(content) {
   return content.replace(/\[([^\]]*)\]\(nostr:[^)]+\)/g, "").replace(/nostr:(npub|nprofile|note|nevent)1[0-9a-z]+/g, "").replace(/^\s*@\S+\s*/, "").replace(/[ \t]+/g, " ").trim();
 }
 
-// plugins/agents/src/ui.tsx
-function NeedsConnection(props) {
-  const snapshot = useConnection(props.service);
-  if (snapshot.status === "connected") return null;
-  return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks isn't connected", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => props.service.openSettings() }, "Connect") }, "These agents run on Databricks with your sign-in.");
-}
-function DatabricksForm(props) {
-  const { config, onChange } = props;
-  const endpoints = useAsync(async (signal) => (await new Ai(await props.service.ready(signal)).endpoints(signal)).filter((e) => /chat/.test(e.task) && !e.isAgent), [props.service.snapshot().status]);
-  const known = new Set(DEFAULT_MODELS.map((model) => model.id));
-  const options = [
-    ...DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label })),
-    ...(endpoints.data ?? []).filter((endpoint) => !known.has(endpoint.name)).map((endpoint) => ({ id: endpoint.name, label: `${endpoint.label} (endpoint)` }))
-  ];
-  if (!options.some((option) => option.id === config.model)) options.unshift({ id: config.model, label: config.model });
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(Field, { label: "Model", hint: "Served by Databricks AI Gateway, billed to your workspace." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.model, onChange: (event) => onChange({ ...config, model: event.target.value }) }, options.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.id, value: option.id }, option.label)))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 10, alignItems: "flex-start", fontSize: "0.8125rem" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", disabled: props.disabled, checked: config.sandbox, onChange: (event) => onChange({ ...config, sandbox: event.target.checked }), style: { marginTop: 3 } }), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement(Text, { weight: 500, as: "div" }, "Give it a Databricks Sandbox"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, "Its own Linux machine in Databricks to run code, with a persistent home folder, internet access and the Databricks CLI signed in as you. Created on first use."))), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) }))));
-}
-function GenieForm(props) {
-  const { config, onChange } = props;
-  const spaces = useAsync(async (signal) => new Genie(await props.service.ready(signal)).listSpaces(signal), [props.service.snapshot().status]);
-  React.useEffect(() => {
-    const first = spaces.data?.[0];
-    if (!config.spaceId && first) onChange({ spaceId: first.space_id, spaceTitle: first.title });
-  }, [spaces.data, config.spaceId, onChange]);
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(Field, { label: "Genie agent", hint: "Mention this Buzz agent with a data question; it answers with Genie's explanation, a table and the SQL. Each thread keeps its own Genie conversation for follow-ups." }, spaces.loading ? /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading Genie agents\u2026")) : spaces.error ? /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, describeError(spaces.error)) : /* @__PURE__ */ React.createElement(
-    "select",
-    {
-      className: "dbx-select",
-      disabled: props.disabled,
-      value: config.spaceId,
-      onChange: (event) => {
-        const space = spaces.data?.find((candidate) => candidate.space_id === event.target.value);
-        onChange({ spaceId: event.target.value, spaceTitle: space?.title ?? "" });
-      }
-    },
-    !config.spaceId && /* @__PURE__ */ React.createElement("option", { value: "" }, "Choose a Genie agent"),
-    (spaces.data ?? []).map((space) => /* @__PURE__ */ React.createElement("option", { key: space.space_id, value: space.space_id }, space.title))
-  ))));
-}
-function EndpointForm(props) {
-  const { config, onChange } = props;
-  const endpoints = useAsync(async (signal) => (await new Ai(await props.service.ready(signal)).endpoints(signal)).filter((e) => e.isAgent || /responses|chat/.test(e.task)), [props.service.snapshot().status]);
-  const isApp = /^https:\/\//.test(config.target);
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(Field, { label: "Agent endpoint", hint: "Agent Bricks agents, Knowledge Assistants, supervisors and custom agents you deployed to Model Serving." }, /* @__PURE__ */ React.createElement(
-    "select",
-    {
-      className: "dbx-select",
-      disabled: props.disabled || endpoints.loading,
-      value: isApp ? "" : config.target,
-      onChange: (event) => {
-        const endpoint = endpoints.data?.find((candidate) => candidate.name === event.target.value);
-        onChange({ ...config, target: event.target.value, task: endpoint?.task ?? "", label: endpoint?.label ?? event.target.value });
-      }
-    },
-    /* @__PURE__ */ React.createElement("option", { value: "" }, endpoints.loading ? "Loading\u2026" : "Choose an endpoint"),
-    (endpoints.data ?? []).map((endpoint) => /* @__PURE__ */ React.createElement("option", { key: endpoint.name, value: endpoint.name }, endpoint.name, endpoint.task ? ` \xB7 ${endpoint.task}` : "", endpoint.ready ? "" : " \xB7 not ready"))
-  )), /* @__PURE__ */ React.createElement(Field, { label: "Or a Databricks App URL", hint: "For agents deployed on Databricks Apps (Agent Runtime), e.g. https://my-agent-123.aws.databricksapps.com" }, /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      className: "dbx-input",
-      disabled: props.disabled,
-      value: isApp ? config.target : "",
-      placeholder: "https://\u2026databricksapps.com",
-      onChange: (event) => onChange({ ...config, target: event.target.value.trim(), task: "app", label: "Databricks App" })
-    }
-  ))));
-}
-function SettingsTab(props) {
-  const [draft, setDraft] = React.useState(props.config);
-  const [state, setState] = React.useState({});
-  const dirty = JSON.stringify(draft) !== JSON.stringify(props.config);
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(props.Form, { service: props.service, config: draft, onChange: setDraft, disabled: state.saving }), props.note, state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, justify: "flex-end", align: "center" }, state.saved && !dirty && /* @__PURE__ */ React.createElement(Text, { tone: "success", size: "sm" }, "Saved"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", disabled: !dirty || state.saving, onClick: () => setDraft(props.config) }, "Revert"), /* @__PURE__ */ React.createElement(
-    Button,
-    {
-      variant: "primary",
-      disabled: !dirty || state.saving,
-      onClick: () => {
-        setState({ saving: true });
-        props.save(draft).then(
-          () => setState({ saved: true }),
-          (error) => setState({ error: describeError(error) })
-        );
-      }
-    },
-    state.saving ? "Saving\u2026" : "Save"
-  ))));
-}
-
 // plugins/agents/src/types.tsx
 var TURN_TIMEOUT_MS = 30 * 6e4;
 var Queue = class {
@@ -1306,10 +2374,47 @@ function normalizeDatabricks(config) {
     model: typeof value.model === "string" && value.model ? value.model : DEFAULT_MODEL,
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
-    sandbox: value.sandbox === true
+    sandbox: value.sandbox === true,
+    tools: normalizeChoices(value.tools),
+    ...typeof value.profile === "string" && value.profile && { profile: value.profile }
   };
 }
+function agentService(service, profile) {
+  return profile && service.forProfile ? service.forProfile(profile) : service;
+}
+async function databricksTools(service, workspace, config, sandbox, signal) {
+  const same = workspace === service;
+  const choices = config.tools;
+  const genieOne = choices.some((choice) => choice.kind === "genie-one");
+  const mcp = await mcpLocalTools(workspace, choices, signal);
+  const local = [...sandbox, ...genieLocalTools(workspace, choices), ...mcp.tools, ...same ? [] : sqlTools(workspace).map(fromAgentTool)];
+  return {
+    local,
+    problems: mcp.problems,
+    buzzFilter: (name) => {
+      if (genieOne && name === "databricks_genie_one_ask") return false;
+      if (!same && name.startsWith("databricks_") && !name.startsWith("databricks_memory_")) return false;
+      return true;
+    }
+  };
+}
+function toolsNote(workspace, service, problems) {
+  const lines = [];
+  if (workspace !== service) {
+    const snapshot = workspace.snapshot();
+    const host = snapshot.status === "connected" ? snapshot.profile.host : "another workspace";
+    lines.push(`Your Databricks tools (SQL, Genie, MCP servers, Sandbox) work in ${host}, not the workspace Buzz is connected to.`);
+  }
+  if (problems.length) lines.push(`These tool servers didn't answer this turn, so their tools are missing: ${problems.join("; ")}.`);
+  return lines.join("\n");
+}
 function registerTypes(agents, kit, service) {
+  const genieOnes = /* @__PURE__ */ new WeakMap();
+  const genieOneFor = (workspace) => {
+    let found = genieOnes.get(workspace);
+    if (!found) genieOnes.set(workspace, found = new GenieOne(workspace));
+    return found;
+  };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
   function turn(delivery, conversation, work) {
@@ -1338,11 +2443,13 @@ function registerTypes(agents, kit, service) {
     title: "Databricks",
     description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
     provider: provider(service),
-    defaults: () => ({ config: normalizeDatabricks({}) }),
+    // Genie One is on by default: data questions work with no setup.
+    defaults: () => ({ config: normalizeDatabricks({ tools: [GENIE_ONE_CHOICE] }) }),
     summary: (agent) => {
       const config = normalizeDatabricks(agent.config);
       const label = DEFAULT_MODELS.find((model) => model.id === config.model)?.label ?? config.model;
-      return config.sandbox ? `${label} \xB7 Sandbox` : label;
+      const extras = [config.sandbox ? "Sandbox" : "", config.tools.length ? `${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}` : "", config.profile ?? ""].filter(Boolean);
+      return [label, ...extras].join(" \xB7 ");
     },
     adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
     carry: (config) => config.instructions.trim() ? { instructions: config.instructions } : {},
@@ -1389,9 +2496,12 @@ function registerTypes(agents, kit, service) {
         return;
       }
       turn(delivery, conversation, async (signal) => {
-        const client = await service.ready(signal);
+        const workspace = agentService(service, config.profile);
+        const client = await workspace.ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const sandbox = config.sandbox ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [];
+        const tools = await databricksTools(service, workspace, config, sandbox, signal);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
         const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: config.sandbox ? `${SANDBOX_HOME}/work` : "~", instructions, tools: true });
         const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
         const ai = new Ai(client);
@@ -1403,7 +2513,8 @@ function registerTypes(agents, kit, service) {
             history: session.messages,
             prompt: prompt.text,
             buzz: kit.tools(delivery.agent, conversation),
-            local: config.sandbox ? sandboxTools(service, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [],
+            buzzFilter: tools.buzzFilter,
+            local: tools.local,
             chat: async (request) => {
               const completion = await ai.chat(request);
               answered = true;
@@ -1429,8 +2540,11 @@ function registerTypes(agents, kit, service) {
       try {
         const prompt = await standalone.prompt();
         if (!prompt) return { ok: true };
-        const client = await service.ready(standalone.signal);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const workspace = agentService(service, config.profile);
+        const client = await workspace.ready(standalone.signal);
+        const sandbox = config.sandbox ? sandboxTools(workspace, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [];
+        const tools = await databricksTools(service, workspace, config, sandbox, standalone.signal);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({
@@ -1439,7 +2553,8 @@ function registerTypes(agents, kit, service) {
           history: [],
           prompt,
           buzz: kit.tools(standalone.delivery.agent),
-          local: config.sandbox ? sandboxTools(service, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [],
+          buzzFilter: tools.buzzFilter,
+          local: tools.local,
           chat: (request) => ai.chat(request),
           signal: standalone.signal,
           onStep: (tool, target2) => standalone.delivery.step?.(tool, target2)
@@ -1453,9 +2568,10 @@ function registerTypes(agents, kit, service) {
   const genieType = {
     id: "genie",
     title: "Genie",
-    description: "Answers data questions with one of your Databricks Genie agents: an explanation, a table and the SQL, in the thread.",
+    description: "Answers data questions in the thread with Databricks Genie: Genie One across all your data, or one of your Genie agents. Explanation, table, SQL and a link.",
     provider: provider(service),
-    defaults: () => ({ config: { spaceId: "", spaceTitle: "" } }),
+    // Genie One needs no setup: it finds the right data across the workspace.
+    defaults: () => ({ config: { spaceId: GENIE_ONE_ID, spaceTitle: "Genie One" } }),
     summary: (agent) => `Genie \xB7 ${agent.config.spaceTitle || "no agent chosen"}`,
     Create: (props) => /* @__PURE__ */ React.createElement(GenieForm, { service, config: props.config, onChange: props.onChange, disabled: props.disabled }),
     tabs: [
@@ -1477,15 +2593,40 @@ function registerTypes(agents, kit, service) {
       turn(delivery, conversation, async (signal) => {
         if (!config.spaceId) throw new Error("No Genie agent is chosen yet. My owner can pick one in my Settings.");
         const question = deliveredText(delivery) || "What can I ask you about?";
-        const client = await service.ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
+        const workspace = agentService(service, config.profile);
+        if (config.spaceId === GENIE_ONE_ID) {
+          delivery.step?.("genie", "Genie One");
+          const answer2 = await genieOneFor(workspace).ask(question, {
+            ...session.genieOneConversationId && { conversationId: session.genieOneConversationId },
+            signal,
+            onProgress: (steps) => {
+              const last = steps[steps.length - 1] ?? "";
+              delivery.step?.("genie", /^Running SQL/.test(last) ? "running SQL" : /^Query result/.test(last) ? "reading the result" : "thinking");
+            }
+          });
+          const parts2 = [];
+          const text = trimTables(cleanAnswer(answer2.text));
+          if (text) parts2.push(text);
+          else for (const result of answer2.results.slice(-1)) parts2.push(toMarkdown(result, 15));
+          if (answer2.status === "incomplete") parts2.push("_Genie One stopped early; this may be partial._");
+          const sql = answer2.sql[answer2.sql.length - 1];
+          if (sql) parts2.push(`\`\`\`sql
+${sql.trim()}
+\`\`\``);
+          if (answer2.deepLink) parts2.push(`[Explore in Databricks](${answer2.deepLink})`);
+          await kit.reply(delivery.agent, conversation, parts2.join("\n\n") || "Genie One had no answer.");
+          await sessions.set(delivery.agent.key, conversation.key, { ...session, genieOneConversationId: answer2.conversationId });
+          return;
+        }
+        const client = await workspace.ready(signal);
         delivery.step?.("genie", config.spaceTitle || "Genie");
         const answer = await new Genie(client).answer(config.spaceId, question, {
           ...session.genieConversationId && { conversationId: session.genieConversationId },
           signal,
           onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " "))
         });
-        const link = service.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
+        const link = workspace.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
         const parts = [];
         if (answer.text) parts.push(answer.text);
         if (answer.result?.columns.length) parts.push(toMarkdown(answer.result, 15));
@@ -1536,7 +2677,7 @@ ${answer.sql.trim()}
       }
       turn(delivery, conversation, async (signal) => {
         if (!config.target) throw new Error("No agent endpoint is chosen yet. My owner can pick one in my Settings.");
-        const client = await service.ready(signal);
+        const client = await agentService(service, config.profile).ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
         const question = deliveredText(delivery);
         const history = session.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");

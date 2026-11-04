@@ -211,6 +211,13 @@ export class Connection {
     }
   }
 
+  /** Rereads CLI profiles (for example after another connection added one). */
+  async refreshProfiles(): Promise<void> {
+    await this.reloadProfiles();
+    const state = this.state;
+    if ("profiles" in state) this.set({ ...state, profiles: this.workspaceProfiles() });
+  }
+
   cancelSignIn(): void {
     this.login?.abort();
   }

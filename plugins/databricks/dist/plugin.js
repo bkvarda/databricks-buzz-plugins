@@ -805,6 +805,12 @@ var Connection = class {
       if (this.login === controller) this.login = void 0;
     }
   }
+  /** Rereads CLI profiles (for example after another connection added one). */
+  async refreshProfiles() {
+    await this.reloadProfiles();
+    const state = this.state;
+    if ("profiles" in state) this.set({ ...state, profiles: this.workspaceProfiles() });
+  }
   cancelSignIn() {
     this.login?.abort();
   }
@@ -1041,12 +1047,30 @@ function describeError(error) {
 }
 
 // packages/core/src/provider.ts
-function createService(connection, openSettings) {
+var memoryStorage = () => {
+  const values = /* @__PURE__ */ new Map();
+  return { get: (key) => values.get(key) ?? null, set: (key, value) => value === null ? values.delete(key) : values.set(key, value) };
+};
+function createService(connection, openSettings, spawn) {
   const scope = () => {
     const snapshot = connection.snapshot();
     return snapshot.status === "connected" ? snapshot.profile.host : "none";
   };
   const preferences = createPreferences(scope);
+  const byProfile = /* @__PURE__ */ new Map();
+  const profileService = (profile) => {
+    const current = connection.snapshot();
+    if (current.status === "connected" && current.profile.name === profile) return service;
+    let found = byProfile.get(profile);
+    if (!found && spawn) {
+      const derived = spawn(memoryStorage());
+      void derived.useProfile(profile).catch(() => {
+      });
+      found = createService(derived, openSettings);
+      byProfile.set(profile, found);
+    }
+    return found ?? service;
+  };
   connection.subscribe(preferences.notify);
   const members = /* @__PURE__ */ new Map();
   const memberListeners = /* @__PURE__ */ new Set();
@@ -1055,7 +1079,7 @@ function createService(connection, openSettings) {
     memberList = [...members.values()].sort((a, b) => a.name.localeCompare(b.name));
     for (const listener of [...memberListeners]) listener();
   };
-  return {
+  const service = {
     version: 1,
     snapshot: connection.snapshot,
     subscribe: connection.subscribe,
@@ -1069,6 +1093,19 @@ function createService(connection, openSettings) {
     openSettings,
     signIn: () => connection.signIn(),
     preferences,
+    ...spawn && {
+      forProfile: (profile) => profileService(profile),
+      async addWorkspace(options = {}) {
+        const fresh = spawn(memoryStorage());
+        await fresh.signIn(options);
+        const snapshot = fresh.snapshot();
+        if (snapshot.status !== "connected")
+          throw new Error("error" in snapshot && snapshot.error || "message" in snapshot && snapshot.message || "Sign-in didn't finish.");
+        byProfile.set(snapshot.profile.name, createService(fresh, openSettings));
+        void connection.refreshProfiles();
+        return snapshot.profile.name;
+      }
+    },
     announce(member) {
       members.set(member.id, member);
       notifyMembers();
@@ -1085,6 +1122,7 @@ function createService(connection, openSettings) {
       return () => memberListeners.delete(listener);
     }
   };
+  return service;
 }
 
 // packages/core/src/result.ts
@@ -2029,7 +2067,7 @@ function apply(ctx) {
     const navigation = optionalService(ctx, "navigation");
     void navigation?.open({ version: 1, kind: "settings", section: SETTINGS_SECTION });
   };
-  const service = createService(connection, openSettings);
+  const service = createService(connection, openSettings, (storage) => new Connection(ctx.host, storage, connection.transport));
   ctx.provide(SERVICE_NAME, service);
   void connection.start();
   const recheck = () => {

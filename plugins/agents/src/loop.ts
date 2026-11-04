@@ -21,6 +21,8 @@ export type LoopInput = Readonly<{
   prompt: string;
   /** Buzz tools for this conversation (from the harness kit). */
   buzz?: McpHandler;
+  /** Which Buzz tools to offer (default: all). */
+  buzzFilter?(name: string): boolean;
   local?: readonly LocalTool[];
   chat(request: { model: string; messages: readonly ChatMessage[]; tools: readonly FunctionTool[]; signal: AbortSignal }): Promise<ChatCompletion>;
   signal: AbortSignal;
@@ -105,7 +107,7 @@ function target(args: Record<string, unknown>): string | undefined {
 }
 
 export async function runLoop(input: LoopInput): Promise<LoopResult> {
-  const listed = input.buzz ? await buzzTools(input.buzz) : [];
+  const listed = (input.buzz ? await buzzTools(input.buzz) : []).filter((tool) => input.buzzFilter?.(tool.name) ?? true);
   const local = new Map((input.local ?? []).map((tool) => [tool.name, tool]));
   const buzzNames = new Set(listed.map((tool) => tool.name));
   const tools: FunctionTool[] = [

@@ -7,9 +7,11 @@ import { React } from "@dbx/core/react";
 import { type DatabricksService, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { Button, DatabricksMark, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GenieChat, turnMarkdown } from "./chat";
-import { type SpacesStore, useSpaces } from "./page";
+import type { GenieOne } from "./genie-one";
+import { GenieOneChat, oneTurnMarkdown } from "./genie-one-chat";
+import { GENIE_ONE_ENTRY, type SpacesStore, useGenieOneAvailable, useSelection, useSpaces } from "./page";
 
-export function composerTool(service: DatabricksService, store: SpacesStore) {
+export function composerTool(service: DatabricksService, store: SpacesStore, genieOne: GenieOne) {
   return function AskGenie(props: ComposerToolProps) {
     const [open, setOpen] = React.useState(false);
     const root = React.useRef<HTMLDivElement>(null);
@@ -35,7 +37,14 @@ export function composerTool(service: DatabricksService, store: SpacesStore) {
     return (
       <DbxRoot style={{ position: "relative", display: "inline-flex" }}>
         <div ref={root} style={{ display: "contents" }}>
-          <Button icon variant="ghost" aria-label="Ask Genie" title="Ask Genie about your data" disabled={props.disabled} onClick={() => setOpen(!open)}>
+          <Button
+            icon
+            variant="ghost"
+            aria-label="Ask Genie"
+            title="Ask Genie about your data. Only you see the answer until you insert it."
+            disabled={props.disabled}
+            onClick={() => setOpen(!open)}
+          >
             <DatabricksMark size={14} />
           </Button>
           {open && (
@@ -60,6 +69,7 @@ export function composerTool(service: DatabricksService, store: SpacesStore) {
               <GeniePicker
                 service={service}
                 store={store}
+                genieOne={genieOne}
                 onInsert={(markdown) => {
                   if (props.insertText(`${markdown}\n`)) {
                     setOpen(false);
@@ -75,18 +85,21 @@ export function composerTool(service: DatabricksService, store: SpacesStore) {
   };
 }
 
-function GeniePicker(props: { service: DatabricksService; store: SpacesStore; onInsert(markdown: string): void }) {
-  const { service, store } = props;
+function GeniePicker(props: { service: DatabricksService; store: SpacesStore; genieOne: GenieOne; onInsert(markdown: string): void }) {
+  const { service, store, genieOne } = props;
   const snapshot = useConnection(service);
   const spaces = useSpaces(store);
-  const [selected, setSelected] = usePreference<string>(service, "genieSpaceId");
+  const oneAvailable = useGenieOneAvailable(service, genieOne);
+  const [selected, setSelected] = useSelection(service, oneAvailable);
   if (snapshot.status !== "connected")
     return (
       <EmptyState title="Connect Databricks" action={<Button variant="brand" onClick={() => service.openSettings()}>Connect</Button>}>
         Sign in once to ask Genie from any conversation.
       </EmptyState>
     );
-  const space = spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
+  const useOne = oneAvailable && (selected === GENIE_ONE_ENTRY || !spaces.spaces.length);
+  const space = useOne ? undefined : (spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0]);
+  const value = useOne ? GENIE_ONE_ENTRY : (space?.space_id ?? "");
   return (
     <Stack gap={12}>
       <Stack direction="row" gap={8} align="center">
@@ -94,9 +107,10 @@ function GeniePicker(props: { service: DatabricksService; store: SpacesStore; on
         <Text weight={500}>Ask Genie</Text>
         {spaces.status === "loading" && <Spinner size={12} />}
       </Stack>
-      {spaces.status === "error" && <Notice tone="danger">{spaces.error}</Notice>}
-      {spaces.spaces.length > 0 && (
-        <select className="dbx-select" value={space?.space_id ?? ""} onChange={(event) => setSelected(event.target.value)} aria-label="Genie agent">
+      {spaces.status === "error" && !oneAvailable && <Notice tone="danger">{spaces.error}</Notice>}
+      {(oneAvailable || spaces.spaces.length > 0) && (
+        <select className="dbx-select" value={value} onChange={(event) => setSelected(event.target.value)} aria-label="Ask">
+          {oneAvailable && <option value={GENIE_ONE_ENTRY}>Genie One · all your data</option>}
           {spaces.spaces.map((candidate) => (
             <option key={candidate.space_id} value={candidate.space_id}>
               {candidate.title}
@@ -104,7 +118,19 @@ function GeniePicker(props: { service: DatabricksService; store: SpacesStore; on
           ))}
         </select>
       )}
-      {spaces.status === "ready" && !spaces.spaces.length && <Text tone="subtle">No Genie agents are shared with you yet.</Text>}
+      {!oneAvailable && spaces.status === "ready" && !spaces.spaces.length && <Text tone="subtle">No Genie agents are shared with you yet.</Text>}
+      {useOne && (
+        <GenieOneChat
+          service={service}
+          genieOne={genieOne}
+          compact
+          answerActions={(turn) => (
+            <Button size="sm" variant="primary" onClick={() => props.onInsert(oneTurnMarkdown(turn))}>
+              Insert into message
+            </Button>
+          )}
+        />
+      )}
       {space && (
         <GenieChat
           key={space.space_id}
@@ -121,7 +147,7 @@ function GeniePicker(props: { service: DatabricksService; store: SpacesStore; on
         />
       )}
       <Text tone="tertiary" size="xs">
-        Answers use your access. Inserting shares the answer with everyone in this conversation.
+        Only you see this until you insert it. Answers use your access; inserting shares the answer with everyone in this conversation.
       </Text>
     </Stack>
   );

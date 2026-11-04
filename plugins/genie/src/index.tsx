@@ -18,7 +18,7 @@ export function apply(ctx: Context) {
   const live = attach(ctx, { id: "bkvarda.databricks-genie", name: "Databricks Genie" }, (scope, databricks) => {
     const store = new SpacesStore(databricks);
     const genieOne = new GenieOne(databricks);
-    scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store) });
+    scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store, genieOne) });
     scope.conversation.registerLink({
       id: "genie-link",
       title: "Genie links",

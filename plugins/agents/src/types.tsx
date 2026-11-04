@@ -6,11 +6,15 @@ import type { AgentType, Agents, Delivery, HarnessConversation, HarnessKit } fro
 import type { ComponentType } from "react";
 import { Ai, DEFAULT_MODEL, DEFAULT_MODELS } from "@dbx/core/api/ai";
 import { Genie } from "@dbx/core/api/genie";
+import { cleanAnswer, GenieOne, trimTables } from "../../genie/src/genie-one";
+import { GENIE_ONE_ID } from "./ui";
 import { SANDBOX_HOME } from "@dbx/core/api/sandbox";
 import { React } from "@dbx/core/react";
 import { toMarkdown } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
-import { runLoop, trimHistory } from "./loop";
+import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
+import { type LocalTool, runLoop, trimHistory } from "./loop";
+import { sqlTools } from "../../sql/src/tools";
 import { SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
 import { plainText, Sessions } from "./state";
 import { type DatabricksConfig, DatabricksForm, type EndpointConfig, EndpointForm, type GenieConfig, GenieForm, SettingsTab } from "./ui";
@@ -90,10 +94,63 @@ export function normalizeDatabricks(config: unknown): DatabricksConfig {
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
     sandbox: value.sandbox === true,
+    tools: normalizeChoices(value.tools),
+    ...(typeof value.profile === "string" && value.profile && { profile: value.profile }),
   };
 }
 
+/** The service for an agent: its own workspace profile, or Buzz's connection. */
+export function agentService(service: DatabricksService, profile: string | undefined): DatabricksService {
+  return profile && service.forProfile ? service.forProfile(profile) : service;
+}
+
+/**
+ * Local tools for a Databricks agent and which Buzz tools to hide: an agent
+ * on another workspace gets SQL, Genie and MCP bound to that workspace and
+ * doesn't see the Buzz workspace's Databricks tools (memory still follows the
+ * owner).
+ */
+async function databricksTools(
+  service: DatabricksService,
+  workspace: DatabricksService,
+  config: DatabricksConfig,
+  sandbox: LocalTool[],
+  signal: AbortSignal,
+): Promise<{ local: LocalTool[]; buzzFilter(name: string): boolean; problems: string[] }> {
+  const same = workspace === service;
+  const choices: readonly ToolChoice[] = config.tools;
+  const genieOne = choices.some((choice) => choice.kind === "genie-one");
+  const mcp = await mcpLocalTools(workspace, choices, signal);
+  const local = [...sandbox, ...genieLocalTools(workspace, choices), ...mcp.tools, ...(same ? [] : sqlTools(workspace).map(fromAgentTool))];
+  return {
+    local,
+    problems: mcp.problems,
+    buzzFilter: (name) => {
+      if (genieOne && name === "databricks_genie_one_ask") return false;
+      if (!same && name.startsWith("databricks_") && !name.startsWith("databricks_memory_")) return false;
+      return true;
+    },
+  };
+}
+
+function toolsNote(workspace: DatabricksService, service: DatabricksService, problems: readonly string[]): string {
+  const lines: string[] = [];
+  if (workspace !== service) {
+    const snapshot = workspace.snapshot();
+    const host = snapshot.status === "connected" ? snapshot.profile.host : "another workspace";
+    lines.push(`Your Databricks tools (SQL, Genie, MCP servers, Sandbox) work in ${host}, not the workspace Buzz is connected to.`);
+  }
+  if (problems.length) lines.push(`These tool servers didn't answer this turn, so their tools are missing: ${problems.join("; ")}.`);
+  return lines.join("\n");
+}
+
 export function registerTypes(agents: Agents, kit: HarnessKit, service: DatabricksService) {
+  const genieOnes = new WeakMap<DatabricksService, GenieOne>();
+  const genieOneFor = (workspace: DatabricksService) => {
+    let found = genieOnes.get(workspace);
+    if (!found) genieOnes.set(workspace, (found = new GenieOne(workspace)));
+    return found;
+  };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
 
@@ -127,11 +184,13 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     title: "Databricks",
     description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
     provider: provider(service),
-    defaults: () => ({ config: normalizeDatabricks({}) }),
+    // Genie One is on by default: data questions work with no setup.
+    defaults: () => ({ config: normalizeDatabricks({ tools: [GENIE_ONE_CHOICE] }) }),
     summary: (agent) => {
       const config = normalizeDatabricks(agent.config);
       const label = DEFAULT_MODELS.find((model) => model.id === config.model)?.label ?? config.model;
-      return config.sandbox ? `${label} · Sandbox` : label;
+      const extras = [config.sandbox ? "Sandbox" : "", config.tools.length ? `${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}` : "", config.profile ?? ""].filter(Boolean);
+      return [label, ...extras].join(" · ");
     },
     adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
     carry: (config) => (config.instructions.trim() ? { instructions: config.instructions } : {}),
@@ -183,9 +242,12 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         return;
       }
       turn(delivery, conversation, async (signal) => {
-        const client = await service.ready(signal);
+        const workspace = agentService(service, config.profile);
+        const client = await workspace.ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const sandbox = config.sandbox ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [];
+        const tools = await databricksTools(service, workspace, config, sandbox, signal);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
         const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: config.sandbox ? `${SANDBOX_HOME}/work` : "~", instructions, tools: true });
         const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
         const ai = new Ai(client);
@@ -197,7 +259,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
             history: session.messages,
             prompt: prompt.text,
             buzz: kit.tools(delivery.agent, conversation),
-            local: config.sandbox ? sandboxTools(service, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [],
+            buzzFilter: tools.buzzFilter,
+            local: tools.local,
             chat: async (request) => {
               const completion = await ai.chat(request);
               answered = true;
@@ -223,8 +286,11 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       try {
         const prompt = await standalone.prompt();
         if (!prompt) return { ok: true };
-        const client = await service.ready(standalone.signal);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const workspace = agentService(service, config.profile);
+        const client = await workspace.ready(standalone.signal);
+        const sandbox = config.sandbox ? sandboxTools(workspace, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [];
+        const tools = await databricksTools(service, workspace, config, sandbox, standalone.signal);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({
@@ -233,7 +299,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           history: [],
           prompt,
           buzz: kit.tools(standalone.delivery.agent),
-          local: config.sandbox ? sandboxTools(service, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [],
+          buzzFilter: tools.buzzFilter,
+          local: tools.local,
           chat: (request) => ai.chat(request),
           signal: standalone.signal,
           onStep: (tool, target) => standalone.delivery.step?.(tool, target),
@@ -249,9 +316,10 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   const genieType: AgentType<GenieConfig> = {
     id: "genie",
     title: "Genie",
-    description: "Answers data questions with one of your Databricks Genie agents: an explanation, a table and the SQL, in the thread.",
+    description: "Answers data questions in the thread with Databricks Genie: Genie One across all your data, or one of your Genie agents. Explanation, table, SQL and a link.",
     provider: provider(service),
-    defaults: () => ({ config: { spaceId: "", spaceTitle: "" } }),
+    // Genie One needs no setup: it finds the right data across the workspace.
+    defaults: () => ({ config: { spaceId: GENIE_ONE_ID, spaceTitle: "Genie One" } }),
     summary: (agent) => `Genie · ${(agent.config as GenieConfig).spaceTitle || "no agent chosen"}`,
     Create: (props: CreateProps<GenieConfig>) => <GenieForm service={service} config={props.config} onChange={props.onChange} disabled={props.disabled} />,
     tabs: [
@@ -273,15 +341,38 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       turn(delivery, conversation, async (signal) => {
         if (!config.spaceId) throw new Error("No Genie agent is chosen yet. My owner can pick one in my Settings.");
         const question = deliveredText(delivery) || "What can I ask you about?";
-        const client = await service.ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
+        const workspace = agentService(service, config.profile);
+        if (config.spaceId === GENIE_ONE_ID) {
+          delivery.step?.("genie", "Genie One");
+          const answer = await genieOneFor(workspace).ask(question, {
+            ...(session.genieOneConversationId && { conversationId: session.genieOneConversationId }),
+            signal,
+            onProgress: (steps) => {
+              const last = steps[steps.length - 1] ?? "";
+              delivery.step?.("genie", /^Running SQL/.test(last) ? "running SQL" : /^Query result/.test(last) ? "reading the result" : "thinking");
+            },
+          });
+          const parts: string[] = [];
+          const text = trimTables(cleanAnswer(answer.text));
+          if (text) parts.push(text);
+          else for (const result of answer.results.slice(-1)) parts.push(toMarkdown(result, 15));
+          if (answer.status === "incomplete") parts.push("_Genie One stopped early; this may be partial._");
+          const sql = answer.sql[answer.sql.length - 1];
+          if (sql) parts.push(`\`\`\`sql\n${sql.trim()}\n\`\`\``);
+          if (answer.deepLink) parts.push(`[Explore in Databricks](${answer.deepLink})`);
+          await kit.reply(delivery.agent, conversation, parts.join("\n\n") || "Genie One had no answer.");
+          await sessions.set(delivery.agent.key, conversation.key, { ...session, genieOneConversationId: answer.conversationId });
+          return;
+        }
+        const client = await workspace.ready(signal);
         delivery.step?.("genie", config.spaceTitle || "Genie");
         const answer = await new Genie(client).answer(config.spaceId, question, {
           ...(session.genieConversationId && { conversationId: session.genieConversationId }),
           signal,
           onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " ")),
         });
-        const link = service.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
+        const link = workspace.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
         const parts: string[] = [];
         if (answer.text) parts.push(answer.text);
         if (answer.result?.columns.length) parts.push(toMarkdown(answer.result, 15));
@@ -332,7 +423,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       }
       turn(delivery, conversation, async (signal) => {
         if (!config.target) throw new Error("No agent endpoint is chosen yet. My owner can pick one in my Settings.");
-        const client = await service.ready(signal);
+        const client = await agentService(service, config.profile).ready(signal);
         const session = sessions.get(delivery.agent.key, conversation.key);
         const question = deliveredText(delivery);
         const history = session.messages.filter((m): m is { role: "user" | "assistant"; content: string } => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");

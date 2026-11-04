@@ -8,6 +8,7 @@ export type Session = {
   messages: ChatMessage[];
   /** Genie agents keep Genie's own conversation per Buzz conversation. */
   genieConversationId?: string;
+  genieOneConversationId?: string;
   updatedAt: number;
 };
 

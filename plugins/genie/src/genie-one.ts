@@ -95,6 +95,26 @@ export function cleanAnswer(text: string): string {
     .trim();
 }
 
+/** Shortens Markdown tables to `maxRows` body rows, for chat messages. */
+export function trimTables(markdown: string, maxRows = 12): string {
+  const lines = markdown.split("\n");
+  const out: string[] = [];
+  const row = /^\s*\|.*\|\s*$/;
+  for (let i = 0; i < lines.length; i++) {
+    if (row.test(lines[i] ?? "") && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
+      out.push(lines[i] ?? "", lines[i + 1] ?? "");
+      let body = 0;
+      i += 2;
+      for (; i < lines.length && row.test(lines[i] ?? ""); i++, body++) if (body < maxRows) out.push(lines[i] ?? "");
+      if (body > maxRows) out.push("", `_${body - maxRows} more rows in Databricks._`);
+      i--;
+      continue;
+    }
+    out.push(lines[i] ?? "");
+  }
+  return out.join("\n");
+}
+
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const timer = setTimeout(resolve, ms);

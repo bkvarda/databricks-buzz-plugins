@@ -23,7 +23,7 @@ export function apply(ctx: Context) {
     const navigation = optionalService<Navigation>(ctx, "navigation");
     void navigation?.open({ version: 1, kind: "settings", section: SETTINGS_SECTION });
   };
-  const service = createService(connection, openSettings);
+  const service = createService(connection, openSettings, (storage) => new Connection(ctx.host, storage, connection.transport));
   ctx.provide(SERVICE_NAME, service);
   void connection.start();
 

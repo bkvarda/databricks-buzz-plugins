@@ -15,6 +15,8 @@ import { gatewayMcpPath, McpClient } from "@dbx/core/api/mcp";
 import { createService } from "@dbx/core/provider";
 import { GenieOne } from "../plugins/genie/src/genie-one";
 import { runLoop } from "../plugins/agents/src/loop";
+import { mcpLocalTools } from "../plugins/agents/src/capabilities";
+import { McpCatalog } from "@dbx/core/api/mcp-catalog";
 import { SANDBOX_PROMPT, sandboxFor, sandboxTools } from "../plugins/agents/src/sandbox";
 import { Memory, entryId } from "@dbx/core/api/memory";
 import { Sandboxes } from "@dbx/core/api/sandbox";
@@ -224,6 +226,42 @@ describe.skipIf(!PROFILE)(`live workspace (${PROFILE})`, () => {
       await new Sandboxes(client).delete(sandboxFor(pubkey)).catch((error) => record("agent.deleteError", String(error)));
     }
   }, 600_000);
+
+  it("discovers MCP servers and calls one through an agent tool", async () => {
+    const service = createService(connection, () => {});
+    const { servers, errors } = await new McpCatalog(client).list();
+    record("mcp.servers", servers.slice(0, 40).map((server) => ({ id: server.id, label: server.label, needsLogin: server.needsLogin, path: server.path })));
+    record("mcp.count", { servers: servers.length, errors });
+    const dbsql = servers.find((server) => server.id === "service:system.ai.dbsql");
+    expect(dbsql?.label).toBe("Databricks SQL");
+    const { tools, problems } = await mcpLocalTools(service, [{ id: dbsql!.id, kind: dbsql!.kind, label: dbsql!.label, path: dbsql!.path }], new AbortController().signal);
+    record("mcp.dbsql.tools", tools.map((tool) => ({ name: tool.name, parameters: tool.parameters })));
+    expect(problems).toEqual([]);
+    const query = tools.find((tool) => /sql|query|statement/i.test(tool.name) && /statement|query|sql/i.test(JSON.stringify(tool.parameters)));
+    expect(query).toBeDefined();
+    const properties = Object.keys((query!.parameters as { properties?: Record<string, unknown> }).properties ?? {});
+    const argument = properties.find((name) => /statement|query|sql/i.test(name))!;
+    const output = await query!.run({ [argument]: "SELECT 41 + 1 AS answer" }, new AbortController().signal);
+    record("mcp.dbsql.output", output.slice(0, 1500));
+    expect(output).toContain("42");
+  }, 300_000);
+
+  it("connects a second, per-profile service without touching the main one", async () => {
+    // A fresh main connection that never starts stands in for "Buzz is
+    // connected elsewhere"; the derived service signs in on its own.
+    const host = nodeHost(new URL("../plugins/databricks/manifest.json", import.meta.url).pathname);
+    const values = new Map<string, string>();
+    const idle = new Connection(host, { get: (key) => values.get(key) ?? null, set: (key, value) => (value === null ? values.delete(key) : values.set(key, value)) });
+    const main = createService(idle, () => {}, (storage) => new Connection(host, storage, idle.transport));
+    const derived = main.forProfile!(PROFILE!);
+    expect(derived).not.toBe(main);
+    const derivedClient = await derived.ready();
+    expect(derivedClient.host).toBe(client.host);
+    expect(derived.snapshot().status).toBe("connected");
+    expect(idle.snapshot().status).toBe("checking");
+    expect(values.size).toBe(0);
+    expect(main.forProfile!(PROFILE!)).toBe(derived);
+  }, 120_000);
 
   it("writes, searches and deletes managed memory", async () => {
     const memory = new Memory(client);

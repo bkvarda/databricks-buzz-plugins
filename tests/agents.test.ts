@@ -97,7 +97,7 @@ describe("agent helpers", () => {
 });
 
 import { answerParts, answerText, cleanAnswer, parseStep } from "../plugins/genie/src/genie-one-chat";
-import { stripComments, toResultSet } from "../plugins/genie/src/genie-one";
+import { stripComments, toResultSet, trimTables } from "../plugins/genie/src/genie-one";
 
 describe("Genie One rendering", () => {
   it("parses progress steps, dropping embedded tables and comment markers", () => {
@@ -149,5 +149,16 @@ describe("Genie One display helpers", () => {
   it("unescapes Markdown backslash escapes", () => {
     expect(renderInline("about \\~$14.80 and 2\\*3")).toEqual(["about ", "~", "$14.80 and 2", "*", "3"]);
     expect(parseBlocks("a \\~b")[0]).toEqual({ type: "p", text: "a \\~b" });
+  });
+});
+
+describe("chat replies", () => {
+  it("trims long Markdown tables and says how many rows were left out", () => {
+    const table = ["| h | n |", "| --- | --- |", ...Array.from({ length: 15 }, (_, i) => `| ${i} | ${i * 10} |`)].join("\n");
+    const trimmed = trimTables(`Intro\n\n${table}\n\nOutro`, 12).split("\n");
+    expect(trimmed.filter((line) => /^\| \d/.test(line))).toHaveLength(12);
+    expect(trimmed).toContain("_3 more rows in Databricks._");
+    expect(trimmed[trimmed.length - 1]).toBe("Outro");
+    expect(trimTables("| a |\n| --- |\n| 1 |")).toBe("| a |\n| --- |\n| 1 |");
   });
 });

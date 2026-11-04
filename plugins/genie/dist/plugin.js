@@ -1875,7 +1875,7 @@ function geniePage(service, store, genieOne) {
 }
 
 // plugins/genie/src/conversation.tsx
-function composerTool(service, store) {
+function composerTool(service, store, genieOne) {
   return function AskGenie(props) {
     const [open, setOpen] = React.useState(false);
     const root = React.useRef(null);
@@ -1898,7 +1898,18 @@ function composerTool(service, store) {
         document.removeEventListener("pointerdown", onPointer, true);
       };
     }, [open, props]);
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { position: "relative", display: "inline-flex" } }, /* @__PURE__ */ React.createElement("div", { ref: root, style: { display: "contents" } }, /* @__PURE__ */ React.createElement(Button, { icon: true, variant: "ghost", "aria-label": "Ask Genie", title: "Ask Genie about your data", disabled: props.disabled, onClick: () => setOpen(!open) }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 })), open && /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { position: "relative", display: "inline-flex" } }, /* @__PURE__ */ React.createElement("div", { ref: root, style: { display: "contents" } }, /* @__PURE__ */ React.createElement(
+      Button,
+      {
+        icon: true,
+        variant: "ghost",
+        "aria-label": "Ask Genie",
+        title: "Ask Genie about your data. Only you see the answer until you insert it.",
+        disabled: props.disabled,
+        onClick: () => setOpen(!open)
+      },
+      /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 })
+    ), open && /* @__PURE__ */ React.createElement(
       "div",
       {
         role: "dialog",
@@ -1923,6 +1934,7 @@ function composerTool(service, store) {
         {
           service,
           store,
+          genieOne,
           onInsert: (markdown) => {
             if (props.insertText(`${markdown}
 `)) {
@@ -1936,14 +1948,25 @@ function composerTool(service, store) {
   };
 }
 function GeniePicker(props) {
-  const { service, store } = props;
+  const { service, store, genieOne } = props;
   const snapshot = useConnection(service);
   const spaces = useSpaces(store);
-  const [selected, setSelected] = usePreference(service, "genieSpaceId");
+  const oneAvailable = useGenieOneAvailable(service, genieOne);
+  const [selected, setSelected] = useSelection(service, oneAvailable);
   if (snapshot.status !== "connected")
     return /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Sign in once to ask Genie from any conversation.");
-  const space = spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Ask Genie"), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), spaces.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, spaces.error), spaces.spaces.length > 0 && /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: space?.space_id ?? "", onChange: (event) => setSelected(event.target.value), "aria-label": "Genie agent" }, spaces.spaces.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.space_id, value: candidate.space_id }, candidate.title))), spaces.status === "ready" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "No Genie agents are shared with you yet."), space && /* @__PURE__ */ React.createElement(
+  const useOne = oneAvailable && (selected === GENIE_ONE_ENTRY || !spaces.spaces.length);
+  const space = useOne ? void 0 : spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
+  const value = useOne ? GENIE_ONE_ENTRY : space?.space_id ?? "";
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Ask Genie"), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), spaces.status === "error" && !oneAvailable && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, spaces.error), (oneAvailable || spaces.spaces.length > 0) && /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value, onChange: (event) => setSelected(event.target.value), "aria-label": "Ask" }, oneAvailable && /* @__PURE__ */ React.createElement("option", { value: GENIE_ONE_ENTRY }, "Genie One \xB7 all your data"), spaces.spaces.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.space_id, value: candidate.space_id }, candidate.title))), !oneAvailable && spaces.status === "ready" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "No Genie agents are shared with you yet."), useOne && /* @__PURE__ */ React.createElement(
+    GenieOneChat,
+    {
+      service,
+      genieOne,
+      compact: true,
+      answerActions: (turn) => /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => props.onInsert(oneTurnMarkdown(turn)) }, "Insert into message")
+    }
+  ), space && /* @__PURE__ */ React.createElement(
     GenieChat,
     {
       key: space.space_id,
@@ -1952,7 +1975,7 @@ function GeniePicker(props) {
       compact: true,
       answerActions: (turn) => turn.text || turn.result ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => props.onInsert(turnMarkdown(space, turn, service.workspaceUrl(Genie.webPath(space.space_id, turn.message?.conversation_id)))) }, "Insert into message") : null
     }
-  ), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Answers use your access. Inserting shares the answer with everyone in this conversation."));
+  ), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Only you see this until you insert it. Answers use your access; inserting shares the answer with everyone in this conversation."));
 }
 function genieLinkChip(service, store) {
   return function GenieLink(props) {
@@ -2067,7 +2090,7 @@ function apply(ctx) {
   const live = attach(ctx, { id: "bkvarda.databricks-genie", name: "Databricks Genie" }, (scope, databricks) => {
     const store = new SpacesStore(databricks);
     const genieOne = new GenieOne(databricks);
-    scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store) });
+    scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store, genieOne) });
     scope.conversation.registerLink({
       id: "genie-link",
       title: "Genie links",

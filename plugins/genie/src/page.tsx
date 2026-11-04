@@ -85,14 +85,14 @@ const SELECTED = "genieSpaceId";
 export const GENIE_ONE_ENTRY = "genie-one";
 
 /** Whether Genie One answers here; rechecked when the workspace changes. */
-function useGenieOneAvailable(service: DatabricksService, genieOne: GenieOne) {
+export function useGenieOneAvailable(service: DatabricksService, genieOne: GenieOne) {
   const snapshot = useConnection(service);
   const host = snapshot.status === "connected" ? snapshot.profile.host : undefined;
   return useAsync(async () => (host ? genieOne.available() : false), [host]).data === true;
 }
 
 /** The selected entry, defaulting to Genie One when nothing is chosen. */
-function useSelection(service: DatabricksService, oneAvailable: boolean) {
+export function useSelection(service: DatabricksService, oneAvailable: boolean) {
   const [selected, setSelected] = usePreference<string>(service, SELECTED);
   return [selected ?? (oneAvailable ? GENIE_ONE_ENTRY : undefined), setSelected] as const;
 }

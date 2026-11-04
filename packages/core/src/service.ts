@@ -39,6 +39,17 @@ export type DatabricksService = Readonly<{
   preferences: Preferences;
   /** Lists a feature plugin in Settings → Databricks while it is active. */
   announce?(member: Readonly<{ id: string; name: string }>): () => void;
+  /**
+   * A service bound to another CLI profile, for an agent that works in a
+   * different workspace. Same sign-in, token refresh and transport as the main
+   * connection; the main connection is untouched.
+   */
+  forProfile?(profile: string): DatabricksService;
+  /**
+   * Browser sign-in to another workspace without switching the main
+   * connection. Resolves with the new (or reused) CLI profile name.
+   */
+  addWorkspace?(options?: Readonly<{ host?: string }>): Promise<string>;
 }>;
 
 declare module "@deepseek-ai/cordis" {
