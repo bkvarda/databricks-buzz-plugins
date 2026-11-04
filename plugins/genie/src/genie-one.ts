@@ -11,7 +11,7 @@
 // Results come back in `structuredContent`; the text content carries the same
 // answer as Markdown for models.
 import { gatewayMcpPath, McpClient, resultJson, resultText } from "@dbx/core/api/mcp";
-import { resultSet, type ResultSet, toMarkdown } from "@dbx/core/result";
+import { resultBlock, resultSet, type ResultSet, toMarkdown } from "@dbx/core/result";
 import type { DatabricksService } from "@dbx/core/service";
 
 export const GENIE_ONE = "system.ai.genie_one_mcp";
@@ -89,6 +89,9 @@ export function cleanAnswer(text: string): string {
   return stripComments(text)
     .replace(/\s*:citation\[[^\]]*\]/g, "")
     .replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "")
+    // Citations of the space's instructions point nowhere a reader can open.
+    .replace(/\s*\[Knowledge snippets?\]\([^)]*\)/gi, "")
+    .replace(/([.!?)])[ \t]+Knowledge snippets?(?=[ \t]*(\n|$))/gi, "$1")
     // "`samples.nyctaxi.trips` [samples.nyctaxi.trips](…)" reads as one link.
     .replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](")
     .replace(/[ \t]+$/gm, "")
@@ -113,6 +116,73 @@ export function trimTables(markdown: string, maxRows = 12): string {
     out.push(lines[i] ?? "");
   }
   return out.join("\n");
+}
+
+/**
+ * Genie One can't draw charts over MCP and says so; Buzz draws them, so those
+ * sentences go when a chart is shown.
+ */
+export function withoutChartCaveats(markdown: string): string {
+  const visual = String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`;
+  // A match runs from the previous sentence's end; keep the space before it.
+  const lead = (match: string) => /^[ \t]*/.exec(match)?.[0] ?? "";
+  return markdown
+    .replace(new RegExp(String.raw`[^.!?\n]*\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\b[^.!?\n]*\b${visual}\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead)
+    .replace(new RegExp(String.raw`[^.!?\n]*\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${visual}|you can (?:chart|plot|graph) (?:this|it|them|directly))\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead)
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+const cells = (line: string) =>
+  line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.replace(/\*\*|__|`/g, "").trim());
+
+const key = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/**
+ * The answer as a chat message: each Markdown table becomes a result block in
+ * place (Genie One's typed rows when they match), so Buzz draws it as a chart.
+ * With no table in the text, the last result with more than one row follows it.
+ */
+export function answerMarkdown(answer: Pick<GenieOneAnswer, "text" | "results">, maxRows = 200): string {
+  const lines = cleanAnswer(answer.text).split("\n");
+  const unused = [...answer.results];
+  const take = (header: readonly string[], rowCount: number) => {
+    const names = header.map(key).join("|");
+    let index = unused.findIndex((result) => result.columns.map((column) => key(column.name)).join("|") === names);
+    if (index < 0) index = unused.findIndex((result) => result.columns.length === header.length && result.rows.length === rowCount);
+    return index < 0 ? undefined : unused.splice(index, 1)[0];
+  };
+  const out: string[] = [];
+  let blocks = 0;
+  const row = /^\s*\|.*\|\s*$/;
+  for (let i = 0; i < lines.length; i++) {
+    if (row.test(lines[i] ?? "") && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
+      const header = cells(lines[i] ?? "");
+      const body: (string | null)[][] = [];
+      for (i += 2; i < lines.length && row.test(lines[i] ?? ""); i++) body.push(cells(lines[i] ?? "").map((cell) => cell || null));
+      i--;
+      const result = take(header, body.length) ?? resultSet(header.map((name) => ({ name })), body);
+      out.push("", resultBlock(result, maxRows), "");
+      blocks++;
+      continue;
+    }
+    out.push(lines[i] ?? "");
+  }
+  let text = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!blocks) {
+    const last = answer.results[answer.results.length - 1];
+    if (last?.columns.length && (last.rows.length > 1 || !text)) {
+      text = [text, resultBlock(last, maxRows)].filter(Boolean).join("\n\n");
+      blocks++;
+    }
+  }
+  return blocks ? withoutChartCaveats(text) : text;
 }
 
 const sleep = (ms: number, signal?: AbortSignal) =>

@@ -1194,102 +1194,79 @@ function toCsv(result) {
     ...result.rows.map((row) => row.map(quote).join(","))
   ].join("\n");
 }
-
-// packages/core/src/api/sql.ts
-var StatementError = class extends Error {
-  constructor(message, statementId, state) {
-    super(message);
-    this.statementId = statementId;
-    this.state = state;
-    this.name = "StatementError";
+function comparable(rows, indices) {
+  const peak = (index) => Math.max(0, ...rows.map((row) => Math.abs(Number(row[index]) || 0)));
+  const base = indices[0] === void 0 ? 0 : peak(indices[0]);
+  return indices.filter((index, n) => n === 0 || base === 0 || peak(index) / base <= 10 && peak(index) / base >= 0.1);
+}
+function planChart(result) {
+  const { columns, rows } = result;
+  if (!rows.length) return { type: "none" };
+  const numeric = columns.flatMap((column, index) => column.kind === "number" ? [index] : []);
+  if (rows.length === 1 && columns.length === 1 && numeric.length === 1) {
+    const value = Number(rows[0]?.[0]);
+    if (Number.isFinite(value)) return { type: "kpi", value, label: columns[0]?.name ?? "" };
   }
-};
-var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
-var Sql = class {
-  constructor(client) {
-    this.client = client;
+  if (rows.length < 2 || !numeric.length) return { type: "none" };
+  const time = columns.findIndex((column) => column.kind === "time");
+  if (time !== -1) {
+    const series = comparable(rows, numeric.filter((index) => index !== time)).slice(0, 4);
+    return series.length ? { type: "line", x: time, series } : { type: "none" };
   }
-  async warehouses(signal) {
-    const response = await this.client.get("/api/2.0/sql/warehouses", signal ? { signal } : {});
-    return response.warehouses ?? [];
+  const label = columns.findIndex((column) => column.kind === "text");
+  if (label !== -1 && rows.length <= 40) {
+    const series = comparable(rows, numeric).slice(0, 3);
+    const longest = Math.max(...rows.map((row) => (row[label] ?? "").length));
+    return { type: "bar", x: label, series, horizontal: longest > 10 || rows.length > 12 };
   }
-  /** The best default: running serverless, any serverless, running, first. */
-  static pick(warehouses) {
-    const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
-    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+  const yearLike = numeric.find(
+    (index) => /(^|_)(year|yr|quarter|month|week|day|hour|minute|period)(_|s?$)/i.test(columns[index]?.name ?? "")
+  );
+  if (yearLike !== void 0) {
+    const series = comparable(rows, numeric.filter((index) => index !== yearLike)).slice(0, 4);
+    if (series.length) return { type: "line", x: yearLike, series };
   }
-  /** Runs a statement and waits for its first result chunk. */
-  async execute(statement, options) {
-    const signal = options.signal;
-    let response = await this.client.post(
-      "/api/2.0/sql/statements",
-      {
-        statement,
-        warehouse_id: options.warehouseId,
-        wait_timeout: "30s",
-        on_wait_timeout: "CONTINUE",
-        disposition: "INLINE",
-        format: "JSON_ARRAY",
-        row_limit: options.rowLimit ?? 1e3,
-        ...options.catalog && { catalog: options.catalog },
-        ...options.schema && { schema: options.schema }
-      },
-      { timeoutMs: 45e3, ...signal && { signal } }
-    );
-    options.onStatement?.(response.statement_id);
-    const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
-    const cancel = () => void this.cancel(response.statement_id).catch(() => {
-    });
-    signal?.addEventListener("abort", cancel, { once: true });
-    try {
-      let delay = 750;
-      while (RUNNING.has(response.status?.state ?? "")) {
-        if (Date.now() > deadline) {
-          cancel();
-          throw new StatementError("The query took too long and was cancelled.", response.statement_id, "CANCELED");
-        }
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        signal?.throwIfAborted();
-        delay = Math.min(3e3, delay * 1.5);
-        response = await this.client.get(
-          `/api/2.0/sql/statements/${encodeURIComponent(response.statement_id)}`,
-          signal ? { signal } : {}
-        );
-      }
-    } finally {
-      signal?.removeEventListener("abort", cancel);
-    }
-    const state = response.status?.state;
-    if (state !== "SUCCEEDED")
-      throw new StatementError(
-        response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
-        response.statement_id,
-        state
-      );
-    return { statementId: response.statement_id, result: fromStatement(response) };
+  return { type: "none" };
+}
+var RESULT_LANGUAGE = "databricks-result";
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  let wasQuoted = false;
+  const endField = () => {
+    row.push(field === "" && !wasQuoted ? null : field);
+    field = "";
+    wasQuoted = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quoted) {
+      if (char === '"' && text[i + 1] === '"') field += '"', i++;
+      else if (char === '"') quoted = false;
+      else field += char;
+    } else if (char === '"' && field === "") quoted = true, wasQuoted = true;
+    else if (char === ",") endField();
+    else if (char === "\n" || char === "\r") {
+      if (char === "\r" && text[i + 1] === "\n") i++;
+      endField();
+      rows.push(row);
+      row = [];
+    } else field += char;
   }
-  cancel(statementId) {
-    return this.client.post(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}/cancel`, {});
+  if (field !== "" || wasQuoted || row.length) {
+    endField();
+    rows.push(row);
   }
-  catalogs(signal) {
-    return this.client.get("/api/2.1/unity-catalog/catalogs", signal ? { signal } : {}).then((response) => response.catalogs ?? []);
-  }
-  schemas(catalog, signal) {
-    return this.client.get("/api/2.1/unity-catalog/schemas", {
-      query: { catalog_name: catalog },
-      ...signal && { signal }
-    }).then((response) => response.schemas ?? []);
-  }
-  tables(catalog, schema2, signal) {
-    return this.client.get(
-      "/api/2.1/unity-catalog/tables",
-      { query: { catalog_name: catalog, schema_name: schema2, max_results: 200 }, ...signal && { signal } }
-    ).then((response) => response.tables ?? []);
-  }
-  table(fullName, signal) {
-    return this.client.get(`/api/2.1/unity-catalog/tables/${encodeURIComponent(fullName)}`, signal ? { signal } : {});
-  }
-};
+  return rows.filter((cells) => cells.some((cell) => cell !== null));
+}
+function fromCsv(text) {
+  const [header, ...rows] = parseCsv(text.trim());
+  if (!header?.length || header.some((name) => !name)) return void 0;
+  if (rows.some((row) => row.length !== header.length)) return void 0;
+  return resultSet(header.map((name) => ({ name: name ?? "" })), rows);
+}
 
 // packages/core/src/ui/theme.ts
 var BRAND = {
@@ -1303,6 +1280,16 @@ var BRAND = {
   blue: "#4462C9",
   teal: "#1B5162"
 };
+var CHART_COLORS = [
+  "var(--dbx-chart-1)",
+  "var(--dbx-chart-2)",
+  "var(--dbx-chart-3)",
+  "var(--dbx-chart-4)",
+  "var(--dbx-chart-5)",
+  "var(--dbx-chart-6)",
+  "var(--dbx-chart-7)",
+  "var(--dbx-chart-8)"
+];
 var STYLE_ID = "dbx-buzz-plugins-style-v1";
 var STYLESHEET = `
 [data-dbx] {
@@ -1394,7 +1381,8 @@ function ensureStyles(doc = globalThis.document) {
   style.textContent = STYLESHEET;
   doc.head.appendChild(style);
 }
-var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z"/></svg>`;
+var DATABRICKS_MARK_PATH = "M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z";
+var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="${DATABRICKS_MARK_PATH}"/></svg>`;
 var DATABRICKS_MARK_MONO_SVG = DATABRICKS_MARK_SVG.replace(
   'fill="#FF3621"',
   'fill="currentColor"'
@@ -1673,6 +1661,203 @@ function DataTable(props) {
     ))))
   ), /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 8 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, rows.length === total ? `${total} ${total === 1 ? "row" : "rows"}` : `Showing ${rows.length} of ${total.toLocaleString()} rows`, result.truncated && rows.length === total ? " (truncated)" : ""), /* @__PURE__ */ React.createElement(CopyButton, { text: toCsv(result), label: "Copy CSV" })));
 }
+var W = 560;
+var H = 220;
+var PAD = { top: 12, right: 12, bottom: 28, left: 52 };
+function ticks(min, max, count = 4) {
+  if (min === max) return [min];
+  const span = max - min;
+  const step = 10 ** Math.floor(Math.log10(span / count));
+  const nice = [1, 2, 2.5, 5, 10].map((m) => m * step).find((s) => span / s <= count) ?? step * 10;
+  const start = Math.ceil(min / nice) * nice;
+  const out = [];
+  for (let value = start; value <= max + nice / 1e3; value += nice) out.push(Number(value.toPrecision(12)));
+  return out;
+}
+function Legend(props) {
+  if (props.names.length < 2) return null;
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 12, wrap: true }, props.names.map((name, index) => /* @__PURE__ */ React.createElement("span", { key: name, style: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: "0.6875rem", color: "var(--dbx-subtle)" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 8, height: 8, borderRadius: 2, background: CHART_COLORS[index % CHART_COLORS.length] } }), name)));
+}
+function LineChart(props) {
+  const { result, plan } = props;
+  const isTime = result.columns[plan.x]?.kind === "time";
+  const points = result.rows.map((row) => ({
+    x: isTime ? Date.parse(String(row[plan.x])) : Number(row[plan.x]),
+    raw: String(row[plan.x] ?? ""),
+    ys: plan.series.map((index) => Number(row[index]))
+  })).filter((point) => Number.isFinite(point.x)).sort((a, b) => a.x - b.x);
+  if (points.length < 2) return null;
+  const xs = points.map((point) => point.x);
+  const ys = points.flatMap((point) => point.ys.filter(Number.isFinite));
+  const [x0, x1] = [Math.min(...xs), Math.max(...xs)];
+  const [y0, y1] = [Math.min(0, ...ys), Math.max(...ys)];
+  const sx = (x) => PAD.left + (x - x0) / (x1 - x0 || 1) * (W - PAD.left - PAD.right);
+  const sy = (y) => H - PAD.bottom - (y - y0) / (y1 - y0 || 1) * (H - PAD.top - PAD.bottom);
+  const xTicks = [points[0], points[Math.floor(points.length / 2)], points[points.length - 1]].filter(Boolean);
+  return /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Line chart of ${plan.series.map((i) => result.columns[i]?.name).join(", ")}`, style: { width: "100%", height: "auto" } }, ticks(y0, y1).map((tick) => /* @__PURE__ */ React.createElement("g", { key: tick }, /* @__PURE__ */ React.createElement("line", { x1: PAD.left, x2: W - PAD.right, y1: sy(tick), y2: sy(tick), stroke: "var(--dbx-border)" }), /* @__PURE__ */ React.createElement("text", { x: PAD.left - 6, y: sy(tick) + 3, textAnchor: "end", fontSize: "10", fill: "var(--dbx-subtle)" }, formatNumber(tick, "compact")))), xTicks.map((point, index) => /* @__PURE__ */ React.createElement("text", { key: point.raw, x: sx(point.x), y: H - 8, fontSize: "10", fill: "var(--dbx-subtle)", textAnchor: index === 0 ? "start" : index === xTicks.length - 1 ? "end" : "middle" }, isTime ? point.raw.slice(0, 10) : point.raw)), plan.series.map((_, s) => /* @__PURE__ */ React.createElement(
+    "polyline",
+    {
+      key: plan.series[s],
+      fill: "none",
+      stroke: CHART_COLORS[s % CHART_COLORS.length],
+      strokeWidth: "2",
+      strokeLinejoin: "round",
+      points: points.filter((p) => Number.isFinite(p.ys[s])).map((p) => `${sx(p.x)},${sy(p.ys[s])}`).join(" ")
+    }
+  )));
+}
+function BarChart(props) {
+  const { result, plan } = props;
+  const rows = result.rows.slice(0, 40);
+  const values = rows.flatMap((row) => plan.series.map((index) => Number(row[index])).filter(Number.isFinite));
+  const max = Math.max(0, ...values);
+  const min = Math.min(0, ...values);
+  if (plan.horizontal) {
+    const rowH = 22;
+    const labelW = 150;
+    const height = rows.length * rowH * Math.max(1, plan.series.length * 0.6) + 8;
+    const band2 = (height - 8) / rows.length;
+    const scale = (v) => (v - min) / (max - min || 1) * (W - labelW - 60);
+    return /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${W} ${height}`, role: "img", "aria-label": "Bar chart", style: { width: "100%", height: "auto" } }, rows.map((row, r) => {
+      const y = 4 + r * band2;
+      const label = String(row[plan.x] ?? "null");
+      return /* @__PURE__ */ React.createElement("g", { key: `${label}-${r}` }, /* @__PURE__ */ React.createElement("text", { x: labelW - 8, y: y + band2 / 2 + 3, textAnchor: "end", fontSize: "10", fill: "var(--dbx-ink)" }, label.length > 24 ? `${label.slice(0, 23)}\u2026` : label), plan.series.map((index, s) => {
+        const value = Number(row[index]);
+        const barH = (band2 - 4) / plan.series.length;
+        const w = Number.isFinite(value) ? scale(value) - scale(0) : 0;
+        return /* @__PURE__ */ React.createElement("g", { key: index }, /* @__PURE__ */ React.createElement("rect", { x: labelW + Math.min(scale(0), scale(0) + w), y: y + s * barH, width: Math.abs(w), height: Math.max(2, barH - 1), rx: "2", fill: CHART_COLORS[s % CHART_COLORS.length] }, /* @__PURE__ */ React.createElement("title", null, `${label}: ${formatNumber(value)}`)), plan.series.length === 1 && /* @__PURE__ */ React.createElement("text", { x: labelW + scale(0) + Math.max(0, w) + 4, y: y + barH / 2 + 3, fontSize: "10", fill: "var(--dbx-subtle)" }, formatNumber(value, "compact")));
+      }));
+    }));
+  }
+  const band = (W - PAD.left - PAD.right) / rows.length;
+  const sy = (y) => H - PAD.bottom - (y - min) / (max - min || 1) * (H - PAD.top - PAD.bottom);
+  return /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Bar chart", style: { width: "100%", height: "auto" } }, ticks(min, max).map((tick) => /* @__PURE__ */ React.createElement("g", { key: tick }, /* @__PURE__ */ React.createElement("line", { x1: PAD.left, x2: W - PAD.right, y1: sy(tick), y2: sy(tick), stroke: "var(--dbx-border)" }), /* @__PURE__ */ React.createElement("text", { x: PAD.left - 6, y: sy(tick) + 3, textAnchor: "end", fontSize: "10", fill: "var(--dbx-subtle)" }, formatNumber(tick, "compact")))), rows.map((row, r) => {
+    const label = String(row[plan.x] ?? "null");
+    const barW = band * 0.75 / plan.series.length;
+    return /* @__PURE__ */ React.createElement("g", { key: `${label}-${r}` }, plan.series.map((index, s) => {
+      const value = Number(row[index]);
+      const top = sy(Math.max(0, value));
+      const h = Math.abs(sy(value) - sy(0));
+      return /* @__PURE__ */ React.createElement("rect", { key: index, x: PAD.left + r * band + band * 0.125 + s * barW, y: top, width: Math.max(1, barW - 1), height: Math.max(1, h), rx: "2", fill: CHART_COLORS[s % CHART_COLORS.length] }, /* @__PURE__ */ React.createElement("title", null, `${label}: ${formatNumber(value)}`));
+    }), /* @__PURE__ */ React.createElement("text", { x: PAD.left + r * band + band / 2, y: H - 10, fontSize: "10", textAnchor: "middle", fill: "var(--dbx-subtle)" }, label.length > 10 ? `${label.slice(0, 9)}\u2026` : label));
+  }));
+}
+function ResultChart(props) {
+  const plan = props.plan ?? planChart(props.result);
+  if (plan.type === "none") return null;
+  if (plan.type === "kpi")
+    return /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { padding: "8px 2px" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, plan.label), /* @__PURE__ */ React.createElement(Text, { size: "xl", weight: 600, style: { fontSize: "1.75rem", fontVariantNumeric: "tabular-nums" } }, formatNumber(plan.value)));
+  const names = plan.series.map((index) => props.result.columns[index]?.name ?? "");
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Legend, { names }), plan.type === "line" ? /* @__PURE__ */ React.createElement(LineChart, { result: props.result, plan }) : /* @__PURE__ */ React.createElement(BarChart, { result: props.result, plan }));
+}
+function ResultView(props) {
+  const plan = React.useMemo(() => planChart(props.result), [props.result]);
+  const [view, setView] = React.useState(plan.type === "none" ? "table" : "chart");
+  if (!props.result.columns.length) return /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "The query returned no columns.");
+  const canChart = plan.type !== "none";
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, canChart && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: view === "chart" ? "default" : "ghost", onClick: () => setView("chart") }, "Chart"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: view === "table" ? "default" : "ghost", onClick: () => setView("table") }, "Table"), props.result.truncated && /* @__PURE__ */ React.createElement(Badge, { tone: "warning" }, "Partial")), view === "chart" && canChart ? /* @__PURE__ */ React.createElement(ResultChart, { result: props.result, plan }) : /* @__PURE__ */ React.createElement(DataTable, { result: props.result, ...props.maxHeight !== void 0 && { maxHeight: props.maxHeight } }));
+}
+function ResultBlock(props) {
+  const result = React.useMemo(() => fromCsv(props.code), [props.code]);
+  if (!result) throw new Error("Not a result table");
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "10px 44px 10px 12px" } }, /* @__PURE__ */ React.createElement(ResultView, { result, maxHeight: 320, compact: true }));
+}
+
+// packages/core/src/api/sql.ts
+var StatementError = class extends Error {
+  constructor(message, statementId, state) {
+    super(message);
+    this.statementId = statementId;
+    this.state = state;
+    this.name = "StatementError";
+  }
+};
+var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
+var Sql = class {
+  constructor(client) {
+    this.client = client;
+  }
+  async warehouses(signal) {
+    const response = await this.client.get("/api/2.0/sql/warehouses", signal ? { signal } : {});
+    return response.warehouses ?? [];
+  }
+  /** The best default: running serverless, any serverless, running, first. */
+  static pick(warehouses) {
+    const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
+    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+  }
+  /** Runs a statement and waits for its first result chunk. */
+  async execute(statement, options) {
+    const signal = options.signal;
+    let response = await this.client.post(
+      "/api/2.0/sql/statements",
+      {
+        statement,
+        warehouse_id: options.warehouseId,
+        wait_timeout: "30s",
+        on_wait_timeout: "CONTINUE",
+        disposition: "INLINE",
+        format: "JSON_ARRAY",
+        row_limit: options.rowLimit ?? 1e3,
+        ...options.catalog && { catalog: options.catalog },
+        ...options.schema && { schema: options.schema }
+      },
+      { timeoutMs: 45e3, ...signal && { signal } }
+    );
+    options.onStatement?.(response.statement_id);
+    const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
+    const cancel = () => void this.cancel(response.statement_id).catch(() => {
+    });
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      let delay = 750;
+      while (RUNNING.has(response.status?.state ?? "")) {
+        if (Date.now() > deadline) {
+          cancel();
+          throw new StatementError("The query took too long and was cancelled.", response.statement_id, "CANCELED");
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        signal?.throwIfAborted();
+        delay = Math.min(3e3, delay * 1.5);
+        response = await this.client.get(
+          `/api/2.0/sql/statements/${encodeURIComponent(response.statement_id)}`,
+          signal ? { signal } : {}
+        );
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+    }
+    const state = response.status?.state;
+    if (state !== "SUCCEEDED")
+      throw new StatementError(
+        response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
+        response.statement_id,
+        state
+      );
+    return { statementId: response.statement_id, result: fromStatement(response) };
+  }
+  cancel(statementId) {
+    return this.client.post(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}/cancel`, {});
+  }
+  catalogs(signal) {
+    return this.client.get("/api/2.1/unity-catalog/catalogs", signal ? { signal } : {}).then((response) => response.catalogs ?? []);
+  }
+  schemas(catalog, signal) {
+    return this.client.get("/api/2.1/unity-catalog/schemas", {
+      query: { catalog_name: catalog },
+      ...signal && { signal }
+    }).then((response) => response.schemas ?? []);
+  }
+  tables(catalog, schema2, signal) {
+    return this.client.get(
+      "/api/2.1/unity-catalog/tables",
+      { query: { catalog_name: catalog, schema_name: schema2, max_results: 200 }, ...signal && { signal } }
+    ).then((response) => response.tables ?? []);
+  }
+  table(fullName, signal) {
+    return this.client.get(`/api/2.1/unity-catalog/tables/${encodeURIComponent(fullName)}`, signal ? { signal } : {});
+  }
+};
 
 // plugins/databricks/src/links.tsx
 var statusCache = /* @__PURE__ */ new Map();
@@ -2089,6 +2274,12 @@ function apply(ctx) {
         installer: () => optionalService(ctx, "pluginInstaller")
       }
     )
+  });
+  ctx.conversation.registerCodeBlock({
+    id: "result",
+    title: "Databricks results",
+    matches: (language) => language === RESULT_LANGUAGE,
+    component: ResultBlock
   });
   ctx.conversation.registerLink({
     id: "workspace",

@@ -3,6 +3,7 @@ import type { ChatCompletion, ChatMessage } from "@dbx/core/api/ai";
 import { runLoop, trimHistory } from "../plugins/agents/src/loop";
 import { plainText } from "../plugins/agents/src/state";
 import { normalizeDatabricks } from "../plugins/agents/src/types";
+import { fromCsv, parseCsv, RESULT_LANGUAGE, resultBlock, resultSet } from "@dbx/core/result";
 
 function fakeBuzz(log: unknown[]) {
   return async (message: unknown) => {
@@ -97,7 +98,7 @@ describe("agent helpers", () => {
 });
 
 import { answerParts, answerText, cleanAnswer, parseStep } from "../plugins/genie/src/genie-one-chat";
-import { stripComments, toResultSet, trimTables } from "../plugins/genie/src/genie-one";
+import { stripComments, toResultSet, trimTables, answerMarkdown, withoutChartCaveats } from "../plugins/genie/src/genie-one";
 
 describe("Genie One rendering", () => {
   it("parses progress steps, dropping embedded tables and comment markers", () => {
@@ -160,5 +161,59 @@ describe("chat replies", () => {
     expect(trimmed).toContain("_3 more rows in Databricks._");
     expect(trimmed[trimmed.length - 1]).toBe("Outro");
     expect(trimTables("| a |\n| --- |\n| 1 |")).toBe("| a |\n| --- |\n| 1 |");
+  });
+});
+
+describe("result blocks", () => {
+  const orders = [
+    "I can't draw charts here, so I've split the orders out by day in a table you can chart directly.",
+    "",
+    "| date | web_orders | store_orders |",
+    "| --- | --- | --- |",
+    "| 2026-11-01 | 120.5 | 410.25 |",
+    "| 2026-11-02 | 98.75 | 415.5 |",
+    "",
+    "- **Store orders are steady.**",
+    "",
+    "To turn this into a chart, you can open the result in a SQL editor or a dashboard and add a stacked bar chart: put the date on the x-axis. Daily figures use the same definition. [Knowledge snippet](#k1)",
+  ].join("\n");
+
+  it("round-trips CSV, quoting and nulls", () => {
+    const result = resultSet([{ name: "city" }, { name: "trips" }], [["New York, NY", "3"], ['Say "hi"', null]]);
+    const block = resultBlock(result);
+    expect(block.startsWith(`\`\`\`${RESULT_LANGUAGE}\n`)).toBe(true);
+    const parsed = fromCsv(block.split("\n").slice(1, -1).join("\n"));
+    expect(parsed?.rows).toEqual([["New York, NY", "3"], ['Say "hi"', null]]);
+    expect(parsed?.columns.map((column) => column.kind)).toEqual(["text", "number"]);
+    expect(parseCsv('a,b\r\n"x\ny",2\r\n')).toEqual([["a", "b"], ["x\ny", "2"]]);
+    expect(fromCsv("a,b\n1")).toBeUndefined();
+    expect(fromCsv("")).toBeUndefined();
+  });
+
+  it("notes rows left out", () => {
+    const result = resultSet([{ name: "n" }], [["1"], ["2"], ["3"]], { totalRows: 10 });
+    expect(resultBlock(result, 2)).toContain("_Showing 2 of 10 rows._");
+  });
+
+  it("turns Genie One tables into result blocks in place and drops chart caveats", () => {
+    const typed = resultSet([{ name: "date", type: "DATE" }, { name: "web_orders", type: "DOUBLE" }, { name: "store_orders", type: "DOUBLE" }], [
+      ["2026-11-01", "120.5", "410.25"],
+      ["2026-11-02", "98.75", "415.5"],
+    ]);
+    const text = answerMarkdown({ text: orders, results: [typed] });
+    expect(text).not.toMatch(/can't draw|turn this into a chart|Knowledge snippet|\| --- \|/);
+    expect(text.startsWith(`\`\`\`${RESULT_LANGUAGE}\ndate,web_orders,store_orders\n2026-11-01,120.5,410.25`)).toBe(true);
+    expect(text).toContain("- **Store orders are steady.**");
+    expect(text).toContain("Daily figures use the same definition.");
+    // Without typed rows, the table's own cells become the block.
+    expect(answerMarkdown({ text: orders, results: [] })).toContain("2026-11-02,98.75,415.5");
+  });
+
+  it("adds the last result after plain text, and leaves single values alone", () => {
+    const rows = resultSet([{ name: "hour" }, { name: "trips" }], [["17", "1200"], ["18", "1455"]]);
+    expect(answerMarkdown({ text: "6 PM is busiest.", results: [rows] })).toBe(`6 PM is busiest.\n\n${resultBlock(rows)}`);
+    const one = resultSet([{ name: "trips" }], [["21932"]]);
+    expect(answerMarkdown({ text: "**21,932** trips.", results: [one] })).toBe("**21,932** trips.");
+    expect(withoutChartCaveats("Revenue grew 4%. I can't render a graph in chat. Ask for more.")).toBe("Revenue grew 4%. Ask for more.");
   });
 });

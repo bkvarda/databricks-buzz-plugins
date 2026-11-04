@@ -173,3 +173,62 @@ export function planChart(result: ResultSet): ChartPlan {
   }
   return { type: "none" };
 }
+
+// ── Result blocks in messages ──
+// An agent reply carries a result as a fenced code block of CSV, language
+// `databricks-result`. With these plugins installed, Buzz draws it as a chart
+// with a table toggle; without them it stays readable CSV, and Copy gives CSV.
+
+export const RESULT_LANGUAGE = "databricks-result";
+
+/** Parses CSV (RFC 4180 quoting). Empty unquoted fields become null. */
+export function parseCsv(text: string): (string | null)[][] {
+  const rows: (string | null)[][] = [];
+  let row: (string | null)[] = [];
+  let field = "";
+  let quoted = false;
+  let wasQuoted = false;
+  const endField = () => {
+    row.push(field === "" && !wasQuoted ? null : field);
+    field = "";
+    wasQuoted = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quoted) {
+      if (char === '"' && text[i + 1] === '"') (field += '"'), i++;
+      else if (char === '"') quoted = false;
+      else field += char;
+    } else if (char === '"' && field === "") (quoted = true), (wasQuoted = true);
+    else if (char === ",") endField();
+    else if (char === "\n" || char === "\r") {
+      if (char === "\r" && text[i + 1] === "\n") i++;
+      endField();
+      rows.push(row);
+      row = [];
+    } else field += char;
+  }
+  if (field !== "" || wasQuoted || row.length) {
+    endField();
+    rows.push(row);
+  }
+  return rows.filter((cells) => cells.some((cell) => cell !== null));
+}
+
+/** A result block's ResultSet, or undefined when it isn't a header plus rows. */
+export function fromCsv(text: string): ResultSet | undefined {
+  const [header, ...rows] = parseCsv(text.trim());
+  if (!header?.length || header.some((name) => !name)) return undefined;
+  if (rows.some((row) => row.length !== header.length)) return undefined;
+  return resultSet(header.map((name) => ({ name: name ?? "" })), rows);
+}
+
+/** A fenced result block for a message, with at most `maxRows` rows. */
+export function resultBlock(result: ResultSet, maxRows = 200): string {
+  const shown = { ...result, rows: result.rows.slice(0, maxRows) };
+  const csv = toCsv(shown);
+  const fence = csv.includes("```") ? "````" : "```";
+  const total = result.totalRows ?? result.rows.length;
+  const note = total > shown.rows.length ? `\n\n_Showing ${shown.rows.length} of ${total} rows._` : "";
+  return `${fence}${RESULT_LANGUAGE}\n${csv}\n${fence}${note}`;
+}

@@ -151,7 +151,7 @@ function withDatabricks(ctx, member, apply2) {
 function useConnection(service) {
   return React.useSyncExternalStore(service.subscribe, service.snapshot);
 }
-function useAsync(load, key) {
+function useAsync(load, key2) {
   const [state, setState] = React.useState({ loading: true });
   const [nonce, setNonce] = React.useState(0);
   React.useEffect(() => {
@@ -167,7 +167,7 @@ function useAsync(load, key) {
       }
     );
     return () => controller.abort();
-  }, [...key, nonce]);
+  }, [...key2, nonce]);
   return { ...state, reload: () => setNonce((n) => n + 1) };
 }
 function isApiError(error) {
@@ -286,7 +286,8 @@ function ensureStyles(doc = globalThis.document) {
   style.textContent = STYLESHEET;
   doc.head.appendChild(style);
 }
-var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z"/></svg>`;
+var DATABRICKS_MARK_PATH = "M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z";
+var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="${DATABRICKS_MARK_PATH}"/></svg>`;
 var DATABRICKS_MARK_MONO_SVG = DATABRICKS_MARK_SVG.replace(
   'fill="#FF3621"',
   'fill="currentColor"'
@@ -299,6 +300,11 @@ var DATABRICKS_ICON_MONO = svgDataUri(DATABRICKS_MARK_MONO_SVG);
 function DbxRoot(props) {
   ensureStyles();
   return /* @__PURE__ */ React.createElement("div", { "data-dbx": "", className: props.className, style: props.style }, props.children);
+}
+function databricksIcon() {
+  return React.forwardRef(function DatabricksIcon({ size = "1em", title, color: _color, ...props }, ref) {
+    return /* @__PURE__ */ React.createElement("svg", { ref, viewBox: "-15.5 0 331 331", width: size, height: size, fill: "none", role: title ? "img" : void 0, "aria-hidden": title ? void 0 : true, ...props }, title && /* @__PURE__ */ React.createElement("title", null, title), /* @__PURE__ */ React.createElement("path", { fill: "#FF3621", d: DATABRICKS_MARK_PATH }));
+  });
 }
 function DatabricksMark(props) {
   const size = props.size ?? 16;
@@ -713,6 +719,26 @@ function toMarkdown(result, maxRows = 20) {
 _Showing ${Math.min(maxRows, result.rows.length)} of ${total} rows._` : "";
   return [head, rule, ...body].join("\n") + note;
 }
+function toCsv(result) {
+  const quote = (value) => value === null ? "" : /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  return [
+    result.columns.map((column) => quote(column.name)).join(","),
+    ...result.rows.map((row) => row.map(quote).join(","))
+  ].join("\n");
+}
+var RESULT_LANGUAGE = "databricks-result";
+function resultBlock(result, maxRows = 200) {
+  const shown = { ...result, rows: result.rows.slice(0, maxRows) };
+  const csv = toCsv(shown);
+  const fence = csv.includes("```") ? "````" : "```";
+  const total = result.totalRows ?? result.rows.length;
+  const note = total > shown.rows.length ? `
+
+_Showing ${shown.rows.length} of ${total} rows._` : "";
+  return `${fence}${RESULT_LANGUAGE}
+${csv}
+${fence}${note}`;
+}
 
 // packages/core/src/api/genie.ts
 var TERMINAL = /* @__PURE__ */ new Set(["COMPLETED", "FAILED", "QUERY_RESULT_EXPIRED", "CANCELLED"]);
@@ -988,25 +1014,49 @@ function toResultSet(result) {
 }
 var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
 function cleanAnswer(text) {
-  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
+  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/\s*\[Knowledge snippets?\]\([^)]*\)/gi, "").replace(/([.!?)])[ \t]+Knowledge snippets?(?=[ \t]*(\n|$))/gi, "$1").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
 }
-function trimTables(markdown, maxRows = 12) {
-  const lines = markdown.split("\n");
+function withoutChartCaveats(markdown) {
+  const visual = String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`;
+  const lead = (match) => /^[ \t]*/.exec(match)?.[0] ?? "";
+  return markdown.replace(new RegExp(String.raw`[^.!?\n]*\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\b[^.!?\n]*\b${visual}\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(new RegExp(String.raw`[^.!?\n]*\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${visual}|you can (?:chart|plot|graph) (?:this|it|them|directly))\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+var cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell2) => cell2.replace(/\*\*|__|`/g, "").trim());
+var key = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
+function answerMarkdown(answer, maxRows = 200) {
+  const lines = cleanAnswer(answer.text).split("\n");
+  const unused = [...answer.results];
+  const take = (header, rowCount) => {
+    const names = header.map(key).join("|");
+    let index = unused.findIndex((result) => result.columns.map((column) => key(column.name)).join("|") === names);
+    if (index < 0) index = unused.findIndex((result) => result.columns.length === header.length && result.rows.length === rowCount);
+    return index < 0 ? void 0 : unused.splice(index, 1)[0];
+  };
   const out = [];
+  let blocks = 0;
   const row = /^\s*\|.*\|\s*$/;
   for (let i = 0; i < lines.length; i++) {
     if (row.test(lines[i] ?? "") && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
-      out.push(lines[i] ?? "", lines[i + 1] ?? "");
-      let body = 0;
-      i += 2;
-      for (; i < lines.length && row.test(lines[i] ?? ""); i++, body++) if (body < maxRows) out.push(lines[i] ?? "");
-      if (body > maxRows) out.push("", `_${body - maxRows} more rows in Databricks._`);
+      const header = cells(lines[i] ?? "");
+      const body = [];
+      for (i += 2; i < lines.length && row.test(lines[i] ?? ""); i++) body.push(cells(lines[i] ?? "").map((cell2) => cell2 || null));
       i--;
+      const result = take(header, body.length) ?? resultSet(header.map((name) => ({ name })), body);
+      out.push("", resultBlock(result, maxRows), "");
+      blocks++;
       continue;
     }
     out.push(lines[i] ?? "");
   }
-  return out.join("\n");
+  let text = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!blocks) {
+    const last = answer.results[answer.results.length - 1];
+    if (last?.columns.length && (last.rows.length > 1 || !text)) {
+      text = [text, resultBlock(last, maxRows)].filter(Boolean).join("\n\n");
+      blocks++;
+    }
+  }
+  return blocks ? withoutChartCaveats(text) : text;
 }
 var sleep = (ms, signal) => new Promise((resolve, reject) => {
   const timer = setTimeout(resolve, ms);
@@ -1029,25 +1079,25 @@ var GenieOne = class {
     const client = await this.service.ready();
     const snapshot = this.service.snapshot();
     const workspaceId = snapshot.status === "connected" ? snapshot.workspaceId ?? snapshot.profile.workspaceId : void 0;
-    const key = `${client.host}|${workspaceId ?? ""}`;
-    let mcp = this.clients.get(key);
+    const key2 = `${client.host}|${workspaceId ?? ""}`;
+    let mcp = this.clients.get(key2);
     if (!mcp) {
       mcp = new McpClient(client, gatewayMcpPath(GENIE_ONE), workspaceId ? { o: workspaceId } : {});
-      this.clients.set(key, mcp);
+      this.clients.set(key2, mcp);
     }
     return mcp;
   }
   /** Whether Genie One answers in this workspace for this user. */
   available() {
     const snapshot = this.service.snapshot();
-    const key = snapshot.status === "connected" ? snapshot.profile.host : "none";
-    let check = this.availability.get(key);
+    const key2 = snapshot.status === "connected" ? snapshot.profile.host : "none";
+    let check = this.availability.get(key2);
     if (!check) {
       check = this.mcp().then((mcp) => mcp.listTools()).then((tools) => tools.some((tool) => tool.name === "genie_ask")).catch(() => false).then((ok) => {
-        if (!ok) this.availability.delete(key);
+        if (!ok) this.availability.delete(key2);
         return ok;
       });
-      this.availability.set(key, check);
+      this.availability.set(key2, check);
     }
     return check;
   }
@@ -1869,8 +1919,8 @@ async function callBuzz(handler, name, args) {
   return { text: text || (result.isError ? "Error" : "OK"), error: Boolean(result.isError) };
 }
 function target(args) {
-  for (const key of ["channel", "path", "command", "agent", "statement", "question", "query", "url"]) {
-    const value = args[key];
+  for (const key2 of ["channel", "path", "command", "agent", "statement", "question", "query", "url"]) {
+    const value = args[key2];
     if (typeof value === "string" && value) return value.length > 60 ? `${value.slice(0, 57)}\u2026` : value;
   }
   return void 0;
@@ -2304,7 +2354,7 @@ var Sessions = class {
   /** Every conversation key saved for an agent, newest first. */
   list(agent) {
     const prefix = `${PREFIX}:${agent}:`;
-    return this.storage.keys().filter((key) => key.startsWith(prefix)).map((key) => ({ conversation: key.slice(prefix.length), session: this.get(agent, key.slice(prefix.length)) })).sort((a, b) => b.session.updatedAt - a.session.updatedAt);
+    return this.storage.keys().filter((key2) => key2.startsWith(prefix)).map((key2) => ({ conversation: key2.slice(prefix.length), session: this.get(agent, key2.slice(prefix.length)) })).sort((a, b) => b.session.updatedAt - a.session.updatedAt);
   }
 };
 function plainText(content) {
@@ -2317,28 +2367,28 @@ var Queue = class {
   tails = /* @__PURE__ */ new Map();
   running = /* @__PURE__ */ new Map();
   listeners = /* @__PURE__ */ new Set();
-  run(key, work) {
-    const previous = this.tails.get(key) ?? Promise.resolve();
+  run(key2, work) {
+    const previous = this.tails.get(key2) ?? Promise.resolve();
     const next = previous.catch(() => {
     }).then(async () => {
       const controller = new AbortController();
-      this.running.set(key, controller);
+      this.running.set(key2, controller);
       this.notify();
       try {
         return await work(controller.signal);
       } finally {
-        if (this.running.get(key) === controller) this.running.delete(key);
+        if (this.running.get(key2) === controller) this.running.delete(key2);
         this.notify();
       }
     });
-    this.tails.set(key, next);
+    this.tails.set(key2, next);
     return next;
   }
-  active(key) {
-    return this.running.has(key);
+  active(key2) {
+    return this.running.has(key2);
   }
-  interrupt(key) {
-    this.running.get(key)?.abort();
+  interrupt(key2) {
+    this.running.get(key2)?.abort();
   }
   subscribe(listener) {
     this.listeners.add(listener);
@@ -2398,8 +2448,14 @@ async function databricksTools(service, workspace, config, sandbox, signal) {
     }
   };
 }
+var RESULT_PROMPT = [
+  "To show a query result or other table, put it in a fenced code block with the language",
+  `\`${RESULT_LANGUAGE}\` whose body is CSV with a header row (up to 200 rows; quote values that contain commas).`,
+  "Buzz draws it as an interactive chart with a table view, so you can chart data; don't say you can't.",
+  "Put the label column (such as a date or category) first and the numeric columns after it, unformatted (no $ or thousands separators)."
+].join(" ");
 function toolsNote(workspace, service, problems) {
-  const lines = [];
+  const lines = [RESULT_PROMPT];
   if (workspace !== service) {
     const snapshot = workspace.snapshot();
     const host = snapshot.status === "connected" ? snapshot.profile.host : "another workspace";
@@ -2409,6 +2465,7 @@ function toolsNote(workspace, service, problems) {
   return lines.join("\n");
 }
 function registerTypes(agents, kit, service) {
+  const icon = databricksIcon();
   const genieOnes = /* @__PURE__ */ new WeakMap();
   const genieOneFor = (workspace) => {
     let found = genieOnes.get(workspace);
@@ -2419,9 +2476,9 @@ function registerTypes(agents, kit, service) {
   const queue = new Queue();
   function turn(delivery, conversation, work) {
     delivery.acknowledged?.();
-    const key = `${delivery.agent.key}|${conversation.key}`;
-    const done = queue.run(key, (signal) => {
-      const stop = () => queue.interrupt(key);
+    const key2 = `${delivery.agent.key}|${conversation.key}`;
+    const done = queue.run(key2, (signal) => {
+      const stop = () => queue.interrupt(key2);
       delivery.signal.addEventListener("abort", stop, { once: true });
       delivery.interruptible?.(async () => stop());
       return work(signal).finally(() => delivery.signal.removeEventListener("abort", stop));
@@ -2440,6 +2497,7 @@ function registerTypes(agents, kit, service) {
   }
   const databricksType = {
     id: "databricks",
+    icon,
     title: "Databricks",
     description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
     provider: provider(service),
@@ -2479,11 +2537,11 @@ function registerTypes(agents, kit, service) {
       scope: (agent) => normalizeDatabricks(agent.config).scope,
       state: (agent, place) => queue.active(`${agent.key}|${conversationKey(normalizeDatabricks(agent.config).scope, place)}`) ? "active" : "idle",
       async run(agent, place, action) {
-        const key = conversationKey(normalizeDatabricks(agent.config).scope, place);
-        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
-        if (action === "new") return sessions.clear(agent.key, key);
-        const session = sessions.get(agent.key, key);
-        await sessions.set(agent.key, key, { ...session, messages: trimHistory(session.messages, 2e4, 12) });
+        const key2 = conversationKey(normalizeDatabricks(agent.config).scope, place);
+        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
+        if (action === "new") return sessions.clear(agent.key, key2);
+        const session = sessions.get(agent.key, key2);
+        await sessions.set(agent.key, key2, { ...session, messages: trimHistory(session.messages, 2e4, 12) });
       },
       subscribe: (listener) => queue.subscribe(listener)
     },
@@ -2567,6 +2625,7 @@ function registerTypes(agents, kit, service) {
   };
   const genieType = {
     id: "genie",
+    icon,
     title: "Genie",
     description: "Answers data questions in the thread with Databricks Genie: Genie One across all your data, or one of your Genie agents. Explanation, table, SQL and a link.",
     provider: provider(service),
@@ -2606,9 +2665,8 @@ function registerTypes(agents, kit, service) {
             }
           });
           const parts2 = [];
-          const text = trimTables(cleanAnswer(answer2.text));
+          const text = answerMarkdown(answer2);
           if (text) parts2.push(text);
-          else for (const result of answer2.results.slice(-1)) parts2.push(toMarkdown(result, 15));
           if (answer2.status === "incomplete") parts2.push("_Genie One stopped early; this may be partial._");
           const sql = answer2.sql[answer2.sql.length - 1];
           if (sql) parts2.push(`\`\`\`sql
@@ -2629,7 +2687,7 @@ ${sql.trim()}
         const link = workspace.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
         const parts = [];
         if (answer.text) parts.push(answer.text);
-        if (answer.result?.columns.length) parts.push(toMarkdown(answer.result, 15));
+        if (answer.result?.columns.length) parts.push(resultBlock(answer.result));
         if (answer.sql) parts.push(`\`\`\`sql
 ${answer.sql.trim()}
 \`\`\``);
@@ -2643,6 +2701,7 @@ ${answer.sql.trim()}
   };
   const endpointType = {
     id: "endpoint",
+    icon,
     title: "Databricks custom agent",
     description: "Brings an agent you built on Databricks (Agent Bricks, Model Serving or Databricks Apps) into Buzz conversations.",
     provider: provider(service),
@@ -2661,9 +2720,9 @@ ${answer.sql.trim()}
       scope: () => "thread",
       state: (agent, place) => queue.active(`${agent.key}|${conversationKey("thread", place)}`) ? "active" : "idle",
       async run(agent, place, action) {
-        const key = conversationKey("thread", place);
-        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
-        return sessions.clear(agent.key, key);
+        const key2 = conversationKey("thread", place);
+        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
+        return sessions.clear(agent.key, key2);
       },
       subscribe: (listener) => queue.subscribe(listener)
     },

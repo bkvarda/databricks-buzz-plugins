@@ -284,10 +284,9 @@ function renderLinks(text: string) {
   });
 }
 
-function ConversationDemo() {
-  const [text, setText] = React.useState(CONVERSATION_SAMPLE);
-  const [draft, setDraft] = React.useState("");
-  const blocks = text.split(/```(\w*)\n([\s\S]*?)```/g);
+/** Message text with fenced blocks drawn by registered code block renderers. */
+function messageParts(text: string): React.ReactNode[] {
+  const blocks = text.split(/```([\w-]*)\n([\s\S]*?)\n?```/g);
   const parts: React.ReactNode[] = [];
   for (let i = 0; i < blocks.length; i += 3) {
     if (blocks[i]) parts.push(<p key={`t${i}`} style={{ whiteSpace: "pre-wrap", margin: "0 0 8px" }}>{renderLinks(blocks[i] ?? "")}</p>);
@@ -306,6 +305,13 @@ function ConversationDemo() {
       );
     }
   }
+  return parts;
+}
+
+function ConversationDemo() {
+  const [text, setText] = React.useState(CONVERSATION_SAMPLE);
+  const [draft, setDraft] = React.useState("");
+  const parts = messageParts(text);
   return (
     <div style={{ maxWidth: 820, margin: "0 auto", padding: 24 }}>
       <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
@@ -431,7 +437,8 @@ function AgentsDemo() {
     <div style={{ padding: 24, maxWidth: 900, display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "flex", gap: 6 }}>
         {registry.agentTypes.map((candidate, n) => (
-          <button key={candidate.id} type="button" onClick={() => setSelected(n)} style={{ fontWeight: n === selected ? 600 : 400 }}>
+          <button key={candidate.id} type="button" onClick={() => setSelected(n)} style={{ fontWeight: n === selected ? 600 : 400, display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {candidate.icon && <candidate.icon size={16} aria-hidden="true" />}
             {candidate.title}
           </button>
         ))}
@@ -446,7 +453,7 @@ function AgentsDemo() {
         {posted.map((message) => (
           <div key={message.at} style={{ border: "1px solid var(--border-standard)", borderRadius: 10, padding: 12, marginBottom: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
             <div style={{ fontSize: 11, color: "var(--text-subtle)" }}>posted via {message.via}</div>
-            {message.text}
+            <div style={{ whiteSpace: "normal" }}>{messageParts(message.text)}</div>
           </div>
         ))}
       </div>

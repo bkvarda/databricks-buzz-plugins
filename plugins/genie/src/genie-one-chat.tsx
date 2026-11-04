@@ -9,7 +9,7 @@ import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice
 import { ResultView } from "@dbx/core/ui/data";
 import { Markdown, parseBlocks } from "@dbx/core/ui/markdown";
 import { Composer } from "./chat";
-import { cleanAnswer, type GenieOne, type GenieOneAnswer, stripComments } from "./genie-one";
+import { cleanAnswer, type GenieOne, type GenieOneAnswer, stripComments, withoutChartCaveats } from "./genie-one";
 
 export { cleanAnswer };
 
@@ -60,7 +60,7 @@ export function answerParts(answer: GenieOneAnswer): { text: string; results: re
     }
     kept.push(lines[i] ?? "");
   }
-  if (!tables.length) return { text, results: answer.results };
+  if (!tables.length) return { text: answer.results.length ? withoutChartCaveats(text) : text, results: answer.results };
   const parsed = answer.results.length
     ? answer.results
     : tables.flatMap((table) => {
@@ -68,7 +68,8 @@ export function answerParts(answer: GenieOneAnswer): { text: string; results: re
         if (!block || block.type !== "table") return [];
         return [resultSet(block.header.map((name) => ({ name: plain(name) })), block.rows.map((cells) => cells.map((cell) => plain(cell) || null)))];
       });
-  return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), results: parsed };
+  const rest = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text: parsed.length ? withoutChartCaveats(rest) : rest, results: parsed };
 }
 
 /** The answer text alone (tables removed when they render natively). */

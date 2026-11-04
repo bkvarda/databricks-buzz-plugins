@@ -1,7 +1,7 @@
 // Result tables and charts for Databricks query results.
 import { React } from "../react";
-import { formatCell, formatNumber, planChart, type ChartPlan, type ResultSet, type SeriesPlan, toCsv } from "../result";
-import { Badge, Button, CopyButton, Stack, Text } from "./components";
+import { formatCell, formatNumber, fromCsv, planChart, type ChartPlan, type ResultSet, type SeriesPlan, toCsv } from "../result";
+import { Badge, Button, CopyButton, DbxRoot, Stack, Text } from "./components";
 import { CHART_COLORS } from "./theme";
 
 export function DataTable(props: { result: ResultSet; maxRows?: number; maxHeight?: number }) {
@@ -270,5 +270,20 @@ export function ResultView(props: { result: ResultSet; maxHeight?: number; compa
         <DataTable result={props.result} {...(props.maxHeight !== undefined && { maxHeight: props.maxHeight })} />
       )}
     </Stack>
+  );
+}
+
+/**
+ * A `databricks-result` code block in a message: its CSV drawn as a chart with
+ * a table toggle. Throws on CSV it can't read, so Buzz shows the plain block.
+ */
+export function ResultBlock(props: { code: string }) {
+  const result = React.useMemo(() => fromCsv(props.code), [props.code]);
+  if (!result) throw new Error("Not a result table");
+  // Room on the right for the host's Copy button.
+  return (
+    <DbxRoot style={{ padding: "10px 44px 10px 12px" }}>
+      <ResultView result={result} maxHeight={320} compact />
+    </DbxRoot>
   );
 }

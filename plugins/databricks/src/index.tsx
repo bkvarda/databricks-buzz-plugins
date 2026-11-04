@@ -9,6 +9,8 @@ import { Connection } from "@dbx/core/connection";
 import { optionalService } from "@dbx/core/host-types";
 import { createService } from "@dbx/core/provider";
 import { bindReact, React } from "@dbx/core/react";
+import { RESULT_LANGUAGE } from "@dbx/core/result";
+import { ResultBlock } from "@dbx/core/ui/data";
 import { SERVICE_NAME, SETTINGS_SECTION } from "@dbx/core/service";
 import { linkChip, panelMatches, workspacePanel } from "./links";
 import { ConnectionSettings } from "./settings";
@@ -48,6 +50,14 @@ export function apply(ctx: Context) {
         installer={() => optionalService<PluginInstaller>(ctx, "pluginInstaller")}
       />
     ),
+  });
+
+  // Query results agents post as `databricks-result` CSV blocks draw as charts.
+  ctx.conversation.registerCodeBlock({
+    id: "result",
+    title: "Databricks results",
+    matches: (language) => language === RESULT_LANGUAGE,
+    component: ResultBlock,
   });
 
   ctx.conversation.registerLink({

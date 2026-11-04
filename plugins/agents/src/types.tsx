@@ -6,11 +6,12 @@ import type { AgentType, Agents, Delivery, HarnessConversation, HarnessKit } fro
 import type { ComponentType } from "react";
 import { Ai, DEFAULT_MODEL, DEFAULT_MODELS } from "@dbx/core/api/ai";
 import { Genie } from "@dbx/core/api/genie";
-import { cleanAnswer, GenieOne, trimTables } from "../../genie/src/genie-one";
+import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { GENIE_ONE_ID } from "./ui";
 import { SANDBOX_HOME } from "@dbx/core/api/sandbox";
 import { React } from "@dbx/core/react";
-import { toMarkdown } from "@dbx/core/result";
+import { databricksIcon } from "@dbx/core/ui/components";
+import { RESULT_LANGUAGE, resultBlock } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
@@ -133,8 +134,16 @@ async function databricksTools(
   };
 }
 
+/** How a Databricks agent shows data: Buzz draws result blocks as charts. */
+export const RESULT_PROMPT = [
+  "To show a query result or other table, put it in a fenced code block with the language",
+  `\`${RESULT_LANGUAGE}\` whose body is CSV with a header row (up to 200 rows; quote values that contain commas).`,
+  "Buzz draws it as an interactive chart with a table view, so you can chart data; don't say you can't.",
+  "Put the label column (such as a date or category) first and the numeric columns after it, unformatted (no $ or thousands separators).",
+].join(" ");
+
 function toolsNote(workspace: DatabricksService, service: DatabricksService, problems: readonly string[]): string {
-  const lines: string[] = [];
+  const lines: string[] = [RESULT_PROMPT];
   if (workspace !== service) {
     const snapshot = workspace.snapshot();
     const host = snapshot.status === "connected" ? snapshot.profile.host : "another workspace";
@@ -145,6 +154,8 @@ function toolsNote(workspace: DatabricksService, service: DatabricksService, pro
 }
 
 export function registerTypes(agents: Agents, kit: HarnessKit, service: DatabricksService) {
+  // Buzz draws a type's icon in its harness choices; any SVG component works.
+  const icon = databricksIcon() as unknown as AgentType["icon"];
   const genieOnes = new WeakMap<DatabricksService, GenieOne>();
   const genieOneFor = (workspace: DatabricksService) => {
     let found = genieOnes.get(workspace);
@@ -181,6 +192,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   // ── Databricks agent: a Databricks model with Buzz's tools (+ Sandbox) ──
   const databricksType: AgentType<DatabricksConfig> = {
     id: "databricks",
+    icon,
     title: "Databricks",
     description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
     provider: provider(service),
@@ -315,6 +327,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   // ── Genie agent: a Buzz agent that is a Genie agent ──
   const genieType: AgentType<GenieConfig> = {
     id: "genie",
+    icon,
     title: "Genie",
     description: "Answers data questions in the thread with Databricks Genie: Genie One across all your data, or one of your Genie agents. Explanation, table, SQL and a link.",
     provider: provider(service),
@@ -354,9 +367,9 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
             },
           });
           const parts: string[] = [];
-          const text = trimTables(cleanAnswer(answer.text));
+          // Tables go out as result blocks, which Buzz draws as charts.
+          const text = answerMarkdown(answer);
           if (text) parts.push(text);
-          else for (const result of answer.results.slice(-1)) parts.push(toMarkdown(result, 15));
           if (answer.status === "incomplete") parts.push("_Genie One stopped early; this may be partial._");
           const sql = answer.sql[answer.sql.length - 1];
           if (sql) parts.push(`\`\`\`sql\n${sql.trim()}\n\`\`\``);
@@ -375,7 +388,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         const link = workspace.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
         const parts: string[] = [];
         if (answer.text) parts.push(answer.text);
-        if (answer.result?.columns.length) parts.push(toMarkdown(answer.result, 15));
+        if (answer.result?.columns.length) parts.push(resultBlock(answer.result));
         if (answer.sql) parts.push(`\`\`\`sql\n${answer.sql.trim()}\n\`\`\``);
         if (answer.message.status !== "COMPLETED") parts.push(`Genie stopped with status ${answer.message.status}${answer.error ? `: ${answer.error}` : ""}.`);
         if (answer.suggestions.length) parts.push(`_You could also ask:_ ${answer.suggestions.slice(0, 3).map((q) => `“${q}”`).join(" · ")}`);
@@ -389,6 +402,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   // ── Custom agent: your agent on Model Serving or Databricks Apps ──
   const endpointType: AgentType<EndpointConfig> = {
     id: "endpoint",
+    icon,
     title: "Databricks custom agent",
     description: "Brings an agent you built on Databricks (Agent Bricks, Model Serving or Databricks Apps) into Buzz conversations.",
     provider: provider(service),

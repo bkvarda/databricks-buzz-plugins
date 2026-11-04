@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { React } from "../react";
-import { DATABRICKS_MARK_SVG, ensureStyles } from "./theme";
+import { DATABRICKS_MARK_PATH, DATABRICKS_MARK_SVG, ensureStyles } from "./theme";
 
 export function DbxRoot(props: {
   children: ReactNode;
@@ -13,6 +13,24 @@ export function DbxRoot(props: {
       {props.children}
     </div>
   );
+}
+
+type IconProps = Omit<React.SVGProps<SVGSVGElement>, "ref"> & { size?: string | number; title?: string };
+
+/**
+ * The Databricks mark as a Buzz design-system icon component (for agent types
+ * and other host-owned choices): an SVG sized by `size`, centered in a square.
+ * Call after `bindReact`.
+ */
+export function databricksIcon() {
+  return React.forwardRef<SVGSVGElement, IconProps>(function DatabricksIcon({ size = "1em", title, color: _color, ...props }, ref) {
+    return (
+      <svg ref={ref} viewBox="-15.5 0 331 331" width={size} height={size} fill="none" role={title ? "img" : undefined} aria-hidden={title ? undefined : true} {...props}>
+        {title && <title>{title}</title>}
+        <path fill="#FF3621" d={DATABRICKS_MARK_PATH} />
+      </svg>
+    );
+  });
 }
 
 export function DatabricksMark(props: { size?: number; title?: string; /** "current" paints with the text color, e.g. on a Lava button. */ color?: "brand" | "current" }) {

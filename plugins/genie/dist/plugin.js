@@ -562,7 +562,8 @@ function ensureStyles(doc = globalThis.document) {
   style.textContent = STYLESHEET;
   doc.head.appendChild(style);
 }
-var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z"/></svg>`;
+var DATABRICKS_MARK_PATH = "M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z";
+var DATABRICKS_MARK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 331" fill="none"><path fill="#FF3621" d="${DATABRICKS_MARK_PATH}"/></svg>`;
 var DATABRICKS_MARK_MONO_SVG = DATABRICKS_MARK_SVG.replace(
   'fill="#FF3621"',
   'fill="currentColor"'
@@ -1466,7 +1467,12 @@ function toResultSet(result) {
 }
 var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
 function cleanAnswer(text) {
-  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
+  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/\s*\[Knowledge snippets?\]\([^)]*\)/gi, "").replace(/([.!?)])[ \t]+Knowledge snippets?(?=[ \t]*(\n|$))/gi, "$1").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
+}
+function withoutChartCaveats(markdown) {
+  const visual = String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`;
+  const lead = (match) => /^[ \t]*/.exec(match)?.[0] ?? "";
+  return markdown.replace(new RegExp(String.raw`[^.!?\n]*\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\b[^.!?\n]*\b${visual}\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(new RegExp(String.raw`[^.!?\n]*\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${visual}|you can (?:chart|plot|graph) (?:this|it|them|directly))\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 var sleep = (ms, signal) => new Promise((resolve, reject) => {
   const timer = setTimeout(resolve, ms);
@@ -1616,13 +1622,14 @@ function answerParts(answer) {
     }
     kept.push(lines[i] ?? "");
   }
-  if (!tables.length) return { text, results: answer.results };
+  if (!tables.length) return { text: answer.results.length ? withoutChartCaveats(text) : text, results: answer.results };
   const parsed = answer.results.length ? answer.results : tables.flatMap((table) => {
     const block = parseBlocks(table.join("\n")).find((candidate) => candidate.type === "table");
     if (!block || block.type !== "table") return [];
     return [resultSet(block.header.map((name) => ({ name: plain(name) })), block.rows.map((cells2) => cells2.map((cell2) => plain(cell2) || null)))];
   });
-  return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), results: parsed };
+  const rest = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text: parsed.length ? withoutChartCaveats(rest) : rest, results: parsed };
 }
 function formatSql(sql) {
   if (sql.includes("\n")) return sql.trim();
