@@ -285,3 +285,40 @@ describe("AI Gateway chat", () => {
     expect(bodies[3]?.reasoning_effort).toBeUndefined();
   });
 });
+
+import { isLoginRejection, McpCatalog, mcpLoginPath, serviceName } from "@dbx/core/api/mcp-catalog";
+import { DatabricksApiError } from "@dbx/core/client";
+
+describe("MCP service logins", () => {
+  const catalogAnswering = (answer: () => unknown) => {
+    const paths: string[] = [];
+    const client = {
+      get: async (path: string) => {
+        paths.push(path);
+        return answer();
+      },
+    };
+    return { catalog: new McpCatalog(client as never), paths };
+  };
+  it("reads the caller's credential: ACTIVE is logged in, NOT_FOUND is not yet", async () => {
+    const active = catalogAnswering(() => ({ provisioning_info: { state: "ACTIVE" } }));
+    expect(await active.catalog.loginState("system.ai.github")).toBe("signed-in");
+    expect(active.paths).toEqual(["/api/2.1/unity-catalog/mcp-services/system.ai.github/user-credentials"]);
+    expect(await catalogAnswering(() => ({ provisioning_info: { state: "PROVISIONING" } })).catalog.loginState("system.ai.github")).toBe("needed");
+    const missing = catalogAnswering(() => {
+      throw new DatabricksApiError(404, "NOT_FOUND", "Credential for user identity('1') is not found for the connection 'github'.", "");
+    });
+    expect(await missing.catalog.loginState("system.ai.github")).toBe("needed");
+    const noApi = catalogAnswering(() => {
+      throw new DatabricksApiError(404, "ENDPOINT_NOT_FOUND", "No API found", "");
+    });
+    expect(await noApi.catalog.loginState("system.ai.github")).toBe("unknown");
+  });
+  it("links to the login page and spots the gateway's 401 rejection", () => {
+    expect(mcpLoginPath("system.ai.github")).toBe("/mcp-service-login?name=system.ai.github");
+    expect(serviceName({ id: "service:system.ai.github", kind: "service" })).toBe("system.ai.github");
+    expect(serviceName({ id: "connection:x", kind: "connection" })).toBeUndefined();
+    expect(isLoginRejection(new Error("The MCP service request was rejected (HTTP 401). Check the service authentication"))).toBe(true);
+    expect(isLoginRejection(new Error("Timed out"))).toBe(false);
+  });
+});

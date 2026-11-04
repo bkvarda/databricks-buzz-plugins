@@ -1511,6 +1511,9 @@ function serviceLabel(fullName) {
   const words = leaf.replace(/[_-]+/g, " ").trim();
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
+var serviceName = (server) => server.kind === "service" ? server.id.replace(/^service:/, "") : void 0;
+var mcpLoginPath = (fullName) => `/mcp-service-login?name=${encodeURIComponent(fullName)}`;
+var isLoginRejection = (error) => /HTTP 401|requires authentication|not logged in|login first|Credential for user identity/i.test(error?.message ?? String(error));
 function functionsServer(catalog, schema2) {
   return {
     id: `functions:${catalog}.${schema2}`,
@@ -1550,6 +1553,22 @@ var McpCatalog = class {
       if (!pageToken) break;
     }
     return out;
+  }
+  /**
+   * The caller's own login to a per-user OAuth MCP service (Beta API): a
+   * credential in state ACTIVE means logged in; NOT_FOUND means not yet.
+   */
+  async loginState(fullName, signal) {
+    try {
+      const response = await this.client.get(
+        `/api/2.1/unity-catalog/mcp-services/${fullName}/user-credentials`,
+        signal ? { signal } : {}
+      );
+      const state = response.provisioning_info?.state ?? response.state;
+      return !state || state === "ACTIVE" ? "signed-in" : "needed";
+    } catch (error) {
+      return error.errorCode === "NOT_FOUND" ? "needed" : "unknown";
+    }
   }
   async connections(signal) {
     const out = [];
@@ -1704,7 +1723,10 @@ async function mcpLocalTools(service, choices, signal) {
         const tools2 = await mcp.listTools(withTimeout(signal, 3e4));
         return { server, mcp, tools: tools2 };
       } catch (error) {
-        problems.push(`${server.label}: ${error.message ?? error}`);
+        const login = server.kind === "service" && isLoginRejection(error) ? service.workspaceUrl(mcpLoginPath(server.id.replace(/^service:/, ""))) : void 0;
+        problems.push(
+          login ? `${server.label}: your owner isn't logged in to ${server.label} yet. Ask them to log in at ${login}, then try again` : `${server.label}: ${error.message ?? error}`
+        );
         return { server, mcp, tools: [] };
       }
     })
@@ -2498,6 +2520,7 @@ function MultiPicker(props) {
       aside: /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs" }, props.selected.length, " selected")
     },
     props.selected.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, props.selected.map((option) => /* @__PURE__ */ React.createElement("span", { key: option.id, className: "dbx-chip", title: option.detail ?? option.label }, /* @__PURE__ */ React.createElement("span", null, option.label), /* @__PURE__ */ React.createElement("button", { type: "button", "aria-label": `Remove ${option.label}`, disabled: props.disabled, onClick: () => props.onToggle(option, false) }, "\xD7")))),
+    props.alerts,
     /* @__PURE__ */ React.createElement("div", { className: "dbx-picker" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: props.searchPlaceholder ?? `Search ${props.options.length}`, "aria-label": `Search ${props.label.toLowerCase()}`, value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(
       OptionList,
       {
@@ -2554,8 +2577,8 @@ function ModelField(props) {
 }
 var genieSpaces = (service) => cachedList(service, "genie-spaces", async () => new Genie(await service.ready()).listSpaces());
 var asChoice = (server) => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
-function serverOption(server) {
-  const badge = server.needsLogin ? /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") : server.id === "service:system.ai.dbsql" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") : void 0;
+function serverOption(server, login) {
+  const badge = server.needsLogin ? login === "signed-in" ? void 0 : login === "needed" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: `Log in to ${server.label} to use it` }, "Not logged in") : /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") : server.id === "service:system.ai.dbsql" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") : void 0;
   return {
     id: server.id,
     label: server.label,
@@ -2565,6 +2588,59 @@ function serverOption(server) {
     ...badge && { badge }
   };
 }
+var loginStates = /* @__PURE__ */ new WeakMap();
+function useMcpLogins(service, connected, servers) {
+  const names = servers.filter((server) => server.needsLogin).map(serviceName).filter((name) => Boolean(name)).join(" ");
+  const [states, setStates] = React.useState(() => loginStates.get(service) ?? {});
+  const [waiting, setWaiting] = React.useState();
+  const deadline = React.useRef(0);
+  const check = React.useCallback(
+    async (only) => {
+      const client = service.client();
+      const list = only ?? (names ? names.split(" ") : []);
+      if (!client || !list.length) return;
+      const catalog = new McpCatalog(client);
+      const found = Object.fromEntries(await Promise.all(list.map(async (name) => [name, await catalog.loginState(name)])));
+      const next = { ...loginStates.get(service), ...found };
+      loginStates.set(service, next);
+      setStates(next);
+    },
+    [service, names]
+  );
+  React.useEffect(() => {
+    if (connected) void check();
+  }, [check, connected]);
+  React.useEffect(() => {
+    const again = () => void check();
+    globalThis.addEventListener?.("focus", again);
+    return () => globalThis.removeEventListener?.("focus", again);
+  }, [check]);
+  React.useEffect(() => {
+    if (!waiting) return;
+    if (states[waiting] === "signed-in") return setWaiting(void 0);
+    const timer = setInterval(() => Date.now() > deadline.current ? setWaiting(void 0) : void check([waiting]), 3e3);
+    return () => clearInterval(timer);
+  }, [waiting, states, check]);
+  const logIn = (name) => {
+    const url = service.workspaceUrl(mcpLoginPath(name));
+    if (!url) return;
+    window.open(url, "_blank", "noopener");
+    deadline.current = Date.now() + 5 * 6e4;
+    setWaiting(name);
+  };
+  return { states, waiting, logIn, check };
+}
+function McpLoginNotice(props) {
+  const { label } = props.server;
+  return /* @__PURE__ */ React.createElement(
+    Notice,
+    {
+      tone: "warning",
+      action: props.waiting ? /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: props.disabled, onClick: props.onCheck }, "Check again") : /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: props.disabled, onClick: props.onLogIn }, "Log in to ", label)
+    },
+    props.waiting ? /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement("span", null, "Finish logging in to ", label, " in your browser.")) : `Log in so this agent can use ${label} as you.`
+  );
+}
 function ToolsField(props) {
   const { service } = props;
   const status = useConnection(service).status;
@@ -2573,10 +2649,12 @@ function ToolsField(props) {
   const [schemaName, setSchemaName] = React.useState("");
   const choices = /* @__PURE__ */ new Map([[GENIE_ONE_CHOICE.id, GENIE_ONE_CHOICE]]);
   const servers = catalog.data?.servers ?? [];
+  const logins = useMcpLogins(service, status === "connected", servers);
   const options = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Databricks", detail: "Questions about any data you can access" }];
+  const loginOf = (server) => logins.states[serviceName(server) ?? ""];
   for (const server of servers.filter((candidate) => candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
-    options.push(serverOption(server));
+    options.push(serverOption(server, loginOf(server)));
   }
   for (const space of spaces.data ?? []) {
     const choice = { id: `genie:${space.space_id}`, kind: "genie", label: space.title };
@@ -2585,7 +2663,7 @@ function ToolsField(props) {
   }
   for (const server of servers.filter((candidate) => !candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
-    options.push(serverOption(server));
+    options.push(serverOption(server, loginOf(server)));
   }
   for (const tool of props.tools)
     if (!choices.has(tool.id)) {
@@ -2598,6 +2676,10 @@ function ToolsField(props) {
     if (!choice) return;
     props.onChange(on ? [...props.tools.filter((tool) => tool.id !== id), choice] : props.tools.filter((tool) => tool.id !== id));
   };
+  const toLogIn = servers.filter((server) => {
+    const name = serviceName(server);
+    return name && props.tools.some((tool) => tool.id === server.id) && (logins.states[name] === "needed" || logins.waiting === name);
+  });
   const loading = !loads(status) ? false : spaces.loading ? "Loading Genie agents\u2026" : catalog.loading ? "Finding MCP servers\u2026" : false;
   const notes = status !== "connected" ? [] : [
     ...spaces.error ? [`Couldn't list Genie agents: ${describeError(spaces.error)}`] : [],
@@ -2614,6 +2696,20 @@ function ToolsField(props) {
       options,
       loading,
       notes,
+      alerts: toLogIn.map((server) => {
+        const name = serviceName(server);
+        return /* @__PURE__ */ React.createElement(
+          McpLoginNotice,
+          {
+            key: server.id,
+            server,
+            waiting: logins.waiting === name,
+            onLogIn: () => logins.logIn(name),
+            onCheck: () => void logins.check([name]),
+            ...props.disabled !== void 0 && { disabled: props.disabled }
+          }
+        );
+      }),
       ...props.disabled !== void 0 && { disabled: props.disabled },
       onToggle: (option, on) => toggle(option.id, on),
       footer: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(

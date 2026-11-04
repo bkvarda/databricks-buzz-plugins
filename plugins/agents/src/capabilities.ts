@@ -4,7 +4,7 @@
 // agent's workspace (which may differ from the one Buzz is connected to).
 import { Genie } from "@dbx/core/api/genie";
 import { McpClient, resultJson, resultText } from "@dbx/core/api/mcp";
-import { type McpServerKind, toolPrefix } from "@dbx/core/api/mcp-catalog";
+import { isLoginRejection, mcpLoginPath, type McpServerKind, toolPrefix } from "@dbx/core/api/mcp-catalog";
 import type { AgentTool } from "@dbx/core/host-types";
 import type { DatabricksService } from "@dbx/core/service";
 import { formatAnswer } from "../../genie/src/tools";
@@ -139,7 +139,13 @@ export async function mcpLocalTools(
         const tools = await mcp.listTools(withTimeout(signal, 30_000));
         return { server, mcp, tools };
       } catch (error) {
-        problems.push(`${server.label}: ${(error as Error).message ?? error}`);
+        // A per-user OAuth service the owner hasn't logged in to: give the model the link.
+        const login = server.kind === "service" && isLoginRejection(error) ? service.workspaceUrl(mcpLoginPath(server.id.replace(/^service:/, ""))) : undefined;
+        problems.push(
+          login
+            ? `${server.label}: your owner isn't logged in to ${server.label} yet. Ask them to log in at ${login}, then try again`
+            : `${server.label}: ${(error as Error).message ?? error}`,
+        );
         return { server, mcp, tools: [] };
       }
     }),

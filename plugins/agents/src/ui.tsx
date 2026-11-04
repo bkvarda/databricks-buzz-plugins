@@ -4,7 +4,7 @@
 // Databricks. Every kind can work in its own workspace.
 import { Ai, type ChatModel, DEFAULT_MODELS } from "@dbx/core/api/ai";
 import { Genie } from "@dbx/core/api/genie";
-import { functionsServer, McpCatalog, type McpServer } from "@dbx/core/api/mcp-catalog";
+import { functionsServer, McpCatalog, type McpLoginState, mcpLoginPath, type McpServer, serviceName } from "@dbx/core/api/mcp-catalog";
 import { Sandboxes } from "@dbx/core/api/sandbox";
 import type { ConnectionSnapshot } from "@dbx/core/connection";
 import { React } from "@dbx/core/react";
@@ -581,6 +581,8 @@ export function MultiPicker(props: {
   options: readonly PickOption[];
   loading?: string | false;
   notes?: readonly string[];
+  /** Shown under the chips, for things the chosen options need. */
+  alerts?: React.ReactNode;
   disabled?: boolean;
   onToggle(option: PickOption, on: boolean): void;
   footer?: React.ReactNode;
@@ -610,6 +612,7 @@ export function MultiPicker(props: {
           ))}
         </div>
       )}
+      {props.alerts}
       <div className="dbx-picker">
         <input className="dbx-input" placeholder={props.searchPlaceholder ?? `Search ${props.options.length}`} aria-label={`Search ${props.label.toLowerCase()}`} value={query} onChange={(event) => setQuery(event.target.value)} />
         <OptionList
@@ -688,9 +691,13 @@ const genieSpaces = (service: DatabricksService) => cachedList(service, "genie-s
 
 const asChoice = (server: McpServer): ToolChoice => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
 
-function serverOption(server: McpServer): PickOption {
+function serverOption(server: McpServer, login?: McpLoginState): PickOption {
   const badge = server.needsLogin ? (
-    <Badge>Needs your account</Badge>
+    login === "signed-in" ? undefined : login === "needed" ? (
+      <Badge tone="warning" title={`Log in to ${server.label} to use it`}>Not logged in</Badge>
+    ) : (
+      <Badge>Needs your account</Badge>
+    )
   ) : server.id === "service:system.ai.dbsql" ? (
     <Badge tone="warning" title="Unlike the suite's own SQL tool, this server isn't read-only">
       Can change data
@@ -708,6 +715,89 @@ function serverOption(server: McpServer): PickOption {
   };
 }
 
+const loginStates = new WeakMap<DatabricksService, Record<string, McpLoginState>>();
+
+/**
+ * The person's logins to per-user OAuth MCP services (GitHub, Slack, …):
+ * checked when the form opens, when Buzz is focused again, and every few
+ * seconds while a login page is open.
+ */
+function useMcpLogins(service: DatabricksService, connected: boolean, servers: readonly McpServer[]) {
+  const names = servers
+    .filter((server) => server.needsLogin)
+    .map(serviceName)
+    .filter((name): name is string => Boolean(name))
+    .join(" ");
+  const [states, setStates] = React.useState<Readonly<Record<string, McpLoginState>>>(() => loginStates.get(service) ?? {});
+  const [waiting, setWaiting] = React.useState<string>();
+  const deadline = React.useRef(0);
+  const check = React.useCallback(
+    async (only?: readonly string[]) => {
+      const client = service.client();
+      const list = only ?? (names ? names.split(" ") : []);
+      if (!client || !list.length) return;
+      const catalog = new McpCatalog(client);
+      const found = Object.fromEntries(await Promise.all(list.map(async (name) => [name, await catalog.loginState(name)] as const)));
+      const next = { ...loginStates.get(service), ...found };
+      loginStates.set(service, next);
+      setStates(next);
+    },
+    [service, names],
+  );
+  React.useEffect(() => {
+    if (connected) void check();
+  }, [check, connected]);
+  React.useEffect(() => {
+    const again = () => void check();
+    globalThis.addEventListener?.("focus", again);
+    return () => globalThis.removeEventListener?.("focus", again);
+  }, [check]);
+  React.useEffect(() => {
+    if (!waiting) return;
+    if (states[waiting] === "signed-in") return setWaiting(undefined);
+    const timer = setInterval(() => (Date.now() > deadline.current ? setWaiting(undefined) : void check([waiting])), 3000);
+    return () => clearInterval(timer);
+  }, [waiting, states, check]);
+  const logIn = (name: string) => {
+    const url = service.workspaceUrl(mcpLoginPath(name));
+    if (!url) return;
+    window.open(url, "_blank", "noopener");
+    deadline.current = Date.now() + 5 * 60_000;
+    setWaiting(name);
+  };
+  return { states, waiting, logIn, check };
+}
+
+/** A chosen MCP service that needs the person's own login, with a button to the login page. */
+function McpLoginNotice(props: { server: McpServer; waiting: boolean; onLogIn(): void; onCheck(): void; disabled?: boolean }) {
+  const { label } = props.server;
+  return (
+    <Notice
+      tone="warning"
+      action={
+        props.waiting ? (
+          <Button size="sm" disabled={props.disabled} onClick={props.onCheck}>
+            Check again
+          </Button>
+        ) : (
+          <Button size="sm" variant="brand" disabled={props.disabled} onClick={props.onLogIn}>
+            Log in to {label}
+          </Button>
+        )
+      }
+    >
+      {props.waiting ? (
+        <Stack direction="row" gap={6} align="center">
+          <Spinner size={11} />
+          <span>Finish logging in to {label} in your browser.</span>
+        </Stack>
+      ) : (
+        `Log in so this agent can use ${label} as you.`
+      )}
+    </Notice>
+  );
+}
+
 /** Genie One, Genie agents and MCP servers from the agent's workspace. */
 export function ToolsField(props: { service: DatabricksService; tools: readonly ToolChoice[]; onChange(tools: ToolChoice[]): void; disabled?: boolean }) {
   const { service } = props;
@@ -717,12 +807,14 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
   const [schemaName, setSchemaName] = React.useState("");
   const choices = new Map<string, ToolChoice>([[GENIE_ONE_CHOICE.id, GENIE_ONE_CHOICE]]);
   const servers = catalog.data?.servers ?? [];
+  const logins = useMcpLogins(service, status === "connected", servers);
   // Databricks' own first (Genie One and the system.ai servers), then the
   // workspace's Genie agents and MCP servers, which can number hundreds.
   const options: PickOption[] = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Databricks", detail: "Questions about any data you can access" }];
+  const loginOf = (server: McpServer) => logins.states[serviceName(server) ?? ""];
   for (const server of servers.filter((candidate) => candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
-    options.push(serverOption(server));
+    options.push(serverOption(server, loginOf(server)));
   }
   for (const space of spaces.data ?? []) {
     const choice: ToolChoice = { id: `genie:${space.space_id}`, kind: "genie", label: space.title };
@@ -731,7 +823,7 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
   }
   for (const server of servers.filter((candidate) => !candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
-    options.push(serverOption(server));
+    options.push(serverOption(server, loginOf(server)));
   }
   // Chosen things the lists don't show (functions, or ones still loading).
   for (const tool of props.tools)
@@ -745,6 +837,11 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
     if (!choice) return;
     props.onChange(on ? [...props.tools.filter((tool) => tool.id !== id), choice] : props.tools.filter((tool) => tool.id !== id));
   };
+  // Chosen services still waiting for the person's login.
+  const toLogIn = servers.filter((server) => {
+    const name = serviceName(server);
+    return name && props.tools.some((tool) => tool.id === server.id) && (logins.states[name] === "needed" || logins.waiting === name);
+  });
   const loading = !loads(status) ? false : spaces.loading ? "Loading Genie agents…" : catalog.loading ? "Finding MCP servers…" : false;
   const notes = status !== "connected" ? [] : [
     ...(spaces.error ? [`Couldn't list Genie agents: ${describeError(spaces.error)}`] : []),
@@ -760,6 +857,19 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
       options={options}
       loading={loading}
       notes={notes}
+      alerts={toLogIn.map((server) => {
+        const name = serviceName(server)!;
+        return (
+          <McpLoginNotice
+            key={server.id}
+            server={server}
+            waiting={logins.waiting === name}
+            onLogIn={() => logins.logIn(name)}
+            onCheck={() => void logins.check([name])}
+            {...(props.disabled !== undefined && { disabled: props.disabled })}
+          />
+        );
+      })}
       {...(props.disabled !== undefined && { disabled: props.disabled })}
       onToggle={(option, on) => toggle(option.id, on)}
       footer={

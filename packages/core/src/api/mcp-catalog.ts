@@ -55,6 +55,20 @@ export function serviceLabel(fullName: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/** Whether the person has logged in to a per-user OAuth MCP service. */
+export type McpLoginState = "signed-in" | "needed" | "unknown";
+
+/** "service:system.ai.github" → "system.ai.github"; undefined for other kinds. */
+export const serviceName = (server: Pick<McpServer, "id" | "kind">) =>
+  server.kind === "service" ? server.id.replace(/^service:/, "") : undefined;
+
+/** Databricks' page where a person logs in to an MCP service's provider (and can log out). */
+export const mcpLoginPath = (fullName: string) => `/mcp-service-login?name=${encodeURIComponent(fullName)}`;
+
+/** An MCP rejection that means the person hasn't logged in to the provider. */
+export const isLoginRejection = (error: unknown) =>
+  /HTTP 401|requires authentication|not logged in|login first|Credential for user identity/i.test((error as Error)?.message ?? String(error));
+
 export function functionsServer(catalog: string, schema: string): McpServer {
   return {
     id: `functions:${catalog}.${schema}`,
@@ -94,6 +108,24 @@ export class McpCatalog {
       if (!pageToken) break;
     }
     return out;
+  }
+
+  /**
+   * The caller's own login to a per-user OAuth MCP service (Beta API): a
+   * credential in state ACTIVE means logged in; NOT_FOUND means not yet.
+   */
+  async loginState(fullName: string, signal?: AbortSignal): Promise<McpLoginState> {
+    try {
+      const response = await this.client.get<{ provisioning_info?: { state?: string }; state?: string }>(
+        `/api/2.1/unity-catalog/mcp-services/${fullName}/user-credentials`,
+        signal ? { signal } : {},
+      );
+      const state = response.provisioning_info?.state ?? response.state;
+      return !state || state === "ACTIVE" ? "signed-in" : "needed";
+    } catch (error) {
+      // ENDPOINT_NOT_FOUND (API not in this workspace) and the rest stay unknown.
+      return (error as { errorCode?: string }).errorCode === "NOT_FOUND" ? "needed" : "unknown";
+    }
   }
 
   async connections(signal?: AbortSignal): Promise<McpServer[]> {
