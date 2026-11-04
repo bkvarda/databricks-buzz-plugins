@@ -568,6 +568,7 @@ function DbxRoot(props) {
 }
 function DatabricksMark(props) {
   const size = props.size ?? 16;
+  const svg = props.color === "current" ? DATABRICKS_MARK_SVG.replace('fill="#FF3621"', 'fill="currentColor"') : DATABRICKS_MARK_SVG;
   return /* @__PURE__ */ React.createElement(
     "span",
     {
@@ -575,7 +576,7 @@ function DatabricksMark(props) {
       "aria-label": props.title,
       "aria-hidden": props.title ? void 0 : true,
       style: { display: "inline-flex", width: size, height: size * 1.1, flex: "none" },
-      dangerouslySetInnerHTML: { __html: DATABRICKS_MARK_SVG.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
+      dangerouslySetInnerHTML: { __html: svg.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
     }
   );
 }

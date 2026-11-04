@@ -15,8 +15,9 @@ export function DbxRoot(props: {
   );
 }
 
-export function DatabricksMark(props: { size?: number; title?: string }) {
+export function DatabricksMark(props: { size?: number; title?: string; /** "current" paints with the text color, e.g. on a Lava button. */ color?: "brand" | "current" }) {
   const size = props.size ?? 16;
+  const svg = props.color === "current" ? DATABRICKS_MARK_SVG.replace('fill="#FF3621"', 'fill="currentColor"') : DATABRICKS_MARK_SVG;
   return (
     <span
       role={props.title ? "img" : undefined}
@@ -24,7 +25,7 @@ export function DatabricksMark(props: { size?: number; title?: string }) {
       aria-hidden={props.title ? undefined : true}
       style={{ display: "inline-flex", width: size, height: size * 1.1, flex: "none" }}
       // Static, trusted SVG constant; no user content.
-      dangerouslySetInnerHTML={{ __html: DATABRICKS_MARK_SVG.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }}
+      dangerouslySetInnerHTML={{ __html: svg.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }}
     />
   );
 }

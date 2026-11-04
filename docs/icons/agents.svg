@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF7033"/><stop offset="1" stop-color="#E5301D"/></linearGradient></defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#g)"/>
+  
+    <rect x="144" y="176" width="224" height="176" rx="56" fill="#FFFFFF"/>
+    <circle cx="214" cy="262" r="20" fill="#0B2026"/><circle cx="298" cy="262" r="20" fill="#0B2026"/>
+    <path d="M226 310h60" stroke="#0B2026" stroke-width="14" stroke-linecap="round"/>
+    <path d="M256 176v-40" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round"/><circle cx="256" cy="124" r="16" fill="#FFFFFF"/>
+    <path d="M144 250h-28M396 250h-28" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round"/>
+    <g transform="translate(372 356) scale(0.2175226586102719)"><path d="M283.923 136.449L150.144 213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144 313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11 181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536 81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828 72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z" fill="#0B2026"/></g>
+</svg>

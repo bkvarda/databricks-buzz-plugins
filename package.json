@@ -9,13 +9,19 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "playground": "node scripts/build.mjs && node playground/server.mjs",
+    "icons": "node scripts/icons.mjs"
   },
   "devDependencies": {
     "@buzz/author": "file:vendor/buzz-author-0.0.0-preview.1.tgz",
+    "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^22.10.0",
     "@types/react": "19.2.18",
+    "@types/react-dom": "^19.2.0",
     "esbuild": "^0.25.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   }

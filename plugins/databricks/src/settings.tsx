@@ -196,7 +196,7 @@ function SignedOut(props: {
             </Text>
           </Stack>
           <Button variant="brand" onClick={() => run(() => connection.signIn())}>
-            <DatabricksMark size={13} />
+            <DatabricksMark size={13} color="current" />
             Sign in with Databricks
           </Button>
         </Stack>

@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "source": "Example Org",
+  "plugins": [
+    {
+      "id": "bkvarda.databricks-agents",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/agents/dist"
+    },
+    {
+      "id": "bkvarda.databricks",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/databricks/dist"
+    },
+    {
+      "id": "bkvarda.databricks-genie",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/genie/dist"
+    },
+    {
+      "id": "bkvarda.databricks-lakebase",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/lakebase/dist"
+    },
+    {
+      "id": "bkvarda.databricks-memory",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/memory/dist"
+    },
+    {
+      "id": "bkvarda.databricks-sql",
+      "repository": "https://github.com/bkvarda/databricks-buzz-plugins",
+      "reference": "main",
+      "commit": "1eb097a04818f0e0cdfdc6eae511d055db1c6411",
+      "path": "plugins/sql/dist"
+    }
+  ]
+}

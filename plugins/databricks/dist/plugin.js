@@ -1321,6 +1321,7 @@ function DbxRoot(props) {
 }
 function DatabricksMark(props) {
   const size = props.size ?? 16;
+  const svg = props.color === "current" ? DATABRICKS_MARK_SVG.replace('fill="#FF3621"', 'fill="currentColor"') : DATABRICKS_MARK_SVG;
   return /* @__PURE__ */ React.createElement(
     "span",
     {
@@ -1328,7 +1329,7 @@ function DatabricksMark(props) {
       "aria-label": props.title,
       "aria-hidden": props.title ? void 0 : true,
       style: { display: "inline-flex", width: size, height: size * 1.1, flex: "none" },
-      dangerouslySetInnerHTML: { __html: DATABRICKS_MARK_SVG.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
+      dangerouslySetInnerHTML: { __html: svg.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
     }
   );
 }
@@ -1779,7 +1780,7 @@ function SignedOut(props) {
   const { connection, profiles, run } = props;
   const [url, setUrl] = React.useState("");
   const [profile, setProfile] = React.useState(profiles[0]?.name ?? "");
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Card, { padding: 18 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 14, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Stack, { gap: 3, style: { flex: "1 1 260px" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Sign in with Databricks"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Opens your browser for single sign-on. You'll pick your workspace there.")), /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => run(() => connection.signIn()) }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), "Sign in with Databricks"))), props.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Sign-in didn't finish" }, props.error), profiles.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "Or use a profile you already signed in with"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: profile, onChange: (event) => setProfile(event.target.value), style: { maxWidth: 420 }, "aria-label": "Databricks CLI profile" }, profiles.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.name, value: candidate.name }, candidate.name, " \u2014 ", hostLabel(candidate.host)))), /* @__PURE__ */ React.createElement(Button, { disabled: !profile, onClick: () => run(() => connection.useProfile(profile)) }, "Use profile"))), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Card, { padding: 18 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 14, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Stack, { gap: 3, style: { flex: "1 1 260px" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Sign in with Databricks"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Opens your browser for single sign-on. You'll pick your workspace there.")), /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => run(() => connection.signIn()) }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13, color: "current" }), "Sign in with Databricks"))), props.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Sign-in didn't finish" }, props.error), profiles.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "Or use a profile you already signed in with"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: profile, onChange: (event) => setProfile(event.target.value), style: { maxWidth: 420 }, "aria-label": "Databricks CLI profile" }, profiles.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.name, value: candidate.name }, candidate.name, " \u2014 ", hostLabel(candidate.host)))), /* @__PURE__ */ React.createElement(Button, { disabled: !profile, onClick: () => run(() => connection.useProfile(profile)) }, "Use profile"))), /* @__PURE__ */ React.createElement(
     "form",
     {
       onSubmit: (event) => {
