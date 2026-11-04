@@ -68,6 +68,8 @@ export function createService(
     },
     openSettings,
     signIn: () => connection.signIn(),
+    reauthenticate: () => connection.reauthenticate(),
+    cancelSignIn: () => connection.cancelSignIn(),
     preferences,
     ...(spawn && {
       forProfile: (profile: string) => profileService(profile),

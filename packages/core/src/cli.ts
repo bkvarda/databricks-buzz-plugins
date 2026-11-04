@@ -54,9 +54,34 @@ const DEFAULT_LIFETIME_MS = 30 * 60_000;
 const missingProgram = (error: unknown) =>
   /no such file|not found|cannot find|os error 2|enoent/i.test(String(error));
 
-function signInNeeded(stderr: string) {
-  return /refresh token|invalid_grant|re-?auth|auth login|no token|cache|expired|not found in cache|cannot find/i.test(
-    stderr,
+/**
+ * What a failed CLI run said. With `--output json`, CLI 1.x prints its error
+ * as JSON on stdout (`{"error_code": "UNAUTHENTICATED", "message": …}`) and
+ * leaves stderr empty; older versions write plain text to stderr.
+ */
+export function cliFailure(
+  result: Readonly<{ stdout: string; stderr: string }>,
+): { message: string; code?: string } {
+  const stderr = result.stderr.trim().replace(/^Error:\s*/, "");
+  try {
+    const parsed = JSON.parse(result.stdout) as { error_code?: unknown; message?: unknown } | null;
+    if (parsed && typeof parsed.message === "string" && parsed.message.trim())
+      return {
+        message: parsed.message.trim(),
+        ...(typeof parsed.error_code === "string" && { code: parsed.error_code }),
+      };
+  } catch {
+    // Not JSON: the text is on stderr.
+  }
+  return { message: stderr };
+}
+
+function signInNeeded(failure: Readonly<{ message: string; code?: string }>) {
+  return (
+    failure.code === "UNAUTHENTICATED" ||
+    /refresh token|invalid_grant|re-?auth|auth login|no token|cache|expired|not found in cache|cannot find/i.test(
+      failure.message,
+    )
   );
 }
 
@@ -139,7 +164,7 @@ export class DatabricksCli {
   async profiles(): Promise<CliProfile[]> {
     const result = await this.run(CLI_PROCESSES.profiles, [], 20_000);
     if (result.code !== 0)
-      throw new Error(result.stderr.trim() || "Could not read profiles.");
+      throw new Error(cliFailure(result).message || "Could not read profiles.");
     return parseProfiles(result.stdout || '{"profiles":[]}');
   }
 
@@ -164,9 +189,9 @@ export class DatabricksCli {
       const result = await this.run(CLI_PROCESSES.token, args, 60_000);
       if (result.code !== 0) {
         this.tokens.delete(key);
-        const message = result.stderr.trim();
-        if (signInNeeded(message)) throw new SignInRequiredError();
-        throw new Error(message || "Could not get a Databricks token.");
+        const failure = cliFailure(result);
+        if (signInNeeded(failure)) throw new SignInRequiredError();
+        throw new Error(failure.message || "Could not get a Databricks token.");
       }
       const token = parseToken(result.stdout);
       this.tokens.set(key, token);
@@ -196,7 +221,7 @@ export class DatabricksCli {
     this.tokens.delete(target.profile);
     if (result.code !== 0) {
       throw new Error(
-        result.stderr.trim().split("\n").pop() || "Sign-in did not finish.",
+        cliFailure(result).message.split("\n").pop() || "Sign-in did not finish.",
       );
     }
   }

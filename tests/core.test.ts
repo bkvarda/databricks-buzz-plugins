@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { parseProfiles, parseToken, normalizeHost, isWorkspaceProfile } from "@dbx/core/cli";
+import { describe, expect, it, vi } from "vitest";
+import type { Host } from "@buzz/author";
+import { cliFailure, DatabricksCli, parseProfiles, parseToken, normalizeHost, isWorkspaceProfile, SignInRequiredError } from "@dbx/core/cli";
+import { Connection } from "@dbx/core/connection";
 import { bodyAndTrailers, curlConfig, curlQuote, endMarker, splitHead } from "@dbx/core/curl";
 import { parseSse, SseParser } from "@dbx/core/sse";
 import { fromStatement, planChart, resultSet, toMarkdown } from "@dbx/core/result";
@@ -86,6 +88,75 @@ describe("CLI parsing", () => {
     expect(parseToken('{"access_token":"t","expiry":"2030-01-01T00:00:00Z"}').expiresAt).toBe(Date.parse("2030-01-01T00:00:00Z"));
     expect(parseToken('{"access_token":"t","expires_in":60}', 1000).expiresAt).toBe(61_000);
     expect(() => parseToken('{"token_type":"Bearer"}')).toThrow();
+  });
+});
+
+type Run = { code: number | null; stdout?: string; stderr?: string };
+
+/** A Host whose processes answer from a script; `killed` settles when the plugin kills one. */
+function scriptedHost(script: Record<string, (args: readonly string[], killed: Promise<void>) => Run | Promise<Run>>) {
+  const calls: { id: string; args: readonly string[] }[] = [];
+  const host = {
+    async spawn(id: string, options: { args?: readonly string[]; onStdout?(data: string): void; onStderr?(data: string): void } = {}) {
+      const args = options.args ?? [];
+      calls.push({ id, args });
+      let kill!: () => void;
+      const killed = new Promise<void>((resolve) => (kill = resolve));
+      const exited = (async () => {
+        const missing = (): Run => ({ code: 127, stderr: "not found" });
+        const result: Run = await (script[id] ?? missing)(args, killed);
+        if (result.stdout) options.onStdout?.(result.stdout);
+        if (result.stderr) options.onStderr?.(result.stderr);
+        return result.code;
+      })();
+      return { write: async () => {}, end: async () => {}, kill: async () => kill(), exited };
+    },
+  } as unknown as Host;
+  return { host, calls };
+}
+
+// What CLI 1.x prints for `auth token --output json` when the refresh token is gone.
+const EXPIRED = {
+  code: 1,
+  stdout: JSON.stringify({
+    error_code: "UNAUTHENTICATED",
+    message: "A new access token could not be retrieved because the refresh token is invalid. To reauthenticate, run the following command:\n  $ databricks auth login --profile ws",
+  }),
+  stderr: "",
+};
+const PROFILES = { code: 0, stdout: JSON.stringify({ profiles: [{ name: "ws", host: "https://ws.cloud.databricks.com", auth_type: "databricks-cli" }] }) };
+
+describe("CLI sign-in errors", () => {
+  it("reads the error from JSON on stdout or from text on stderr", () => {
+    expect(cliFailure(EXPIRED)).toMatchObject({ code: "UNAUTHENTICATED", message: expect.stringMatching(/refresh token is invalid/) });
+    expect(cliFailure({ stdout: "", stderr: "Error: cannot find profile\n" })).toEqual({ message: "cannot find profile" });
+    expect(cliFailure({ stdout: "not json", stderr: "" })).toEqual({ message: "" });
+  });
+  it("asks for sign-in when the token can't be refreshed", async () => {
+    const { host } = scriptedHost({ "cli-token": () => EXPIRED });
+    await expect(new DatabricksCli(host).token({ profile: "ws" })).rejects.toBeInstanceOf(SignInRequiredError);
+  });
+  it("offers sign-in again to the same profile, and a cancel goes back to the message", async () => {
+    const { host, calls } = scriptedHost({
+      "cli-profiles": () => PROFILES,
+      "cli-token": () => EXPIRED,
+      "cli-login": async (_args, killed) => {
+        await killed;
+        return { code: null };
+      },
+    });
+    const storage = new Map<string, string>();
+    const connection = new Connection(host, { get: (key) => storage.get(key) ?? null, set: (key, value) => (value === null ? storage.delete(key) : storage.set(key, value)) }, async () => {
+      throw new Error("no requests expected");
+    });
+    await connection.useProfile("ws");
+    expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true, profile: { name: "ws" } });
+    const signing = connection.reauthenticate();
+    await vi.waitFor(() => expect(connection.snapshot().status).toBe("signing-in"));
+    expect(calls.find((call) => call.id === "cli-login")?.args).toEqual(["--profile", "ws", "--host", "https://ws.cloud.databricks.com"]);
+    connection.cancelSignIn();
+    await signing;
+    expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true });
   });
 });
 

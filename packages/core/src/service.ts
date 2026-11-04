@@ -35,6 +35,13 @@ export type DatabricksService = Readonly<{
   profiles(): readonly CliProfile[];
   openSettings(): void;
   signIn(): Promise<void>;
+  /**
+   * Browser sign-in to this service's own workspace and CLI profile, for an
+   * expired or missing sign-in (`databricks auth login --profile …`).
+   */
+  reauthenticate?(): Promise<void>;
+  /** Stops a browser sign-in that is still waiting. */
+  cancelSignIn?(): void;
   /** Per-workspace preferences shared by the suite on this device. */
   preferences: Preferences;
   /** Lists a feature plugin in Settings → Databricks while it is active. */

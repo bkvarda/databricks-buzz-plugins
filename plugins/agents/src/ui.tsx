@@ -6,6 +6,7 @@ import { Ai, type ChatModel, DEFAULT_MODELS } from "@dbx/core/api/ai";
 import { Genie } from "@dbx/core/api/genie";
 import { functionsServer, McpCatalog, type McpServer } from "@dbx/core/api/mcp-catalog";
 import { Sandboxes } from "@dbx/core/api/sandbox";
+import type { ConnectionSnapshot } from "@dbx/core/connection";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { Badge, Button, DbxRoot, Field, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
@@ -61,14 +62,100 @@ const settling = (status: string) => status === "checking" || status === "connec
 /** Lists load while connected, or will once a starting connection finishes. */
 const loads = (status: string) => status === "connected" || settling(status);
 
-function NeedsConnection(props: { service: DatabricksService }) {
-  const snapshot = useConnection(props.service);
-  if (snapshot.status === "connected" || settling(snapshot.status)) return null;
+const hostname = (host: string) => new URL(host).hostname;
+
+/** The browser is open for sign-in; the form waits, as Settings → Databricks does. */
+function BrowserWait(props: { service: DatabricksService; host?: string }) {
+  const { cancelSignIn } = props.service;
   return (
-    <Notice tone="warning" title="Databricks isn't connected" action={<Button size="sm" variant="brand" onClick={() => props.service.openSettings()}>Connect</Button>}>
-      These agents run on Databricks with your sign-in.
+    <Stack direction="row" gap={8} align="center" justify="space-between">
+      <Stack direction="row" gap={6} align="center">
+        <Spinner size={11} />
+        <Text tone="subtle" size="sm">
+          Finish signing in in your browser{props.host ? ` (${hostname(props.host)})` : ""}.
+        </Text>
+      </Stack>
+      {cancelSignIn && (
+        <Button size="sm" variant="ghost" onClick={() => cancelSignIn()}>
+          Cancel
+        </Button>
+      )}
+    </Stack>
+  );
+}
+
+/** Buzz's own Databricks connection, with the same sign-in Settings offers. */
+function NeedsConnection(props: { service: DatabricksService }) {
+  const { service } = props;
+  const snapshot = useConnection(service);
+  if (snapshot.status === "signing-in") return <BrowserWait service={service} {...(snapshot.host && { host: snapshot.host })} />;
+  if (snapshot.status === "connected" || settling(snapshot.status)) return null;
+  const expired = snapshot.status === "error" && snapshot.needsSignIn && service.reauthenticate;
+  const action = expired ? (
+    <Button size="sm" variant="brand" onClick={() => void service.reauthenticate!()}>
+      Sign in again
+    </Button>
+  ) : snapshot.status === "signed-out" ? (
+    <Button size="sm" variant="brand" onClick={() => void service.signIn()}>
+      Sign in with Databricks
+    </Button>
+  ) : (
+    <Button size="sm" variant="brand" onClick={() => service.openSettings()}>
+      Connect
+    </Button>
+  );
+  return (
+    <Notice tone="warning" title={expired ? "Your Databricks sign-in has expired" : "Databricks isn't connected"} action={action}>
+      {snapshot.status === "signed-out" && snapshot.error ? snapshot.error : "These agents run on Databricks with your sign-in."}
     </Notice>
   );
+}
+
+/**
+ * How the agent's own workspace connection is doing. An expired or missing
+ * sign-in gets a button that runs the CLI's browser sign-in for that profile
+ * (`databricks auth login --profile …`), the same flow as Settings.
+ */
+function WorkspaceStatus(props: { service: DatabricksService; snapshot: ConnectionSnapshot }) {
+  const { service, snapshot } = props;
+  const signIn = (label: string) =>
+    service.reauthenticate ? (
+      <Button size="sm" variant="brand" onClick={() => void service.reauthenticate!()}>
+        {label}
+      </Button>
+    ) : undefined;
+  switch (snapshot.status) {
+    case "checking":
+    case "connecting":
+      return (
+        <Stack direction="row" gap={6} align="center">
+          <Spinner size={11} />
+          <Text tone="subtle" size="sm">Connecting…</Text>
+        </Stack>
+      );
+    case "signing-in":
+      return <BrowserWait service={service} {...(snapshot.host && { host: snapshot.host })} />;
+    case "connected":
+      return (
+        <Text tone="subtle" size="sm">
+          Signed in to {hostname(snapshot.profile.host)} as {snapshot.user.userName}.
+        </Text>
+      );
+    case "error":
+      return (
+        <Notice tone="warning" action={signIn(snapshot.needsSignIn ? "Sign in again" : "Sign in")}>
+          {snapshot.needsSignIn ? "Your sign-in to this workspace has expired." : snapshot.message}
+        </Notice>
+      );
+    case "signed-out":
+      return (
+        <Notice tone="warning" action={signIn("Sign in")}>
+          {snapshot.error ?? "You're not signed in to this workspace."}
+        </Notice>
+      );
+    default:
+      return null;
+  }
 }
 
 export function AgentForm(props: FormProps<DatabricksConfig> & { service: DatabricksService }) {
@@ -271,17 +358,9 @@ export function WorkspaceField(props: { service: DatabricksService; profile?: st
             </Button>
           </Stack>
         )}
+        {state.busy && <Text tone="subtle" size="sm">Finish signing in in your browser.</Text>}
         {state.error && <Text tone="danger" size="sm">{state.error}</Text>}
-        {props.profile && current.status === "connecting" && (
-          <Stack direction="row" gap={6} align="center">
-            <Spinner size={11} />
-            <Text tone="subtle" size="sm">Connecting…</Text>
-          </Stack>
-        )}
-        {props.profile && current.status === "connected" && (
-          <Text tone="subtle" size="sm">Signed in to {host(current)} as {current.user.userName}.</Text>
-        )}
-        {props.profile && current.status === "error" && <Text tone="danger" size="sm">{current.message}</Text>}
+        {props.profile && !adding && <WorkspaceStatus service={workspace} snapshot={current} />}
       </Stack>
     </Field>
   );

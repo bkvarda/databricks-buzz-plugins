@@ -79,6 +79,8 @@ export class Connection {
   private profiles: readonly CliProfile[] = [];
   private current: { profile: CliProfile; client: DatabricksClient } | undefined;
   private login: AbortController | undefined;
+  /** The profile this connection last tried, so it can sign in to it again. */
+  private target: CliProfile | undefined;
   private generation = 0;
   readonly cli: DatabricksCli;
   readonly transport: Transport;
@@ -183,6 +185,7 @@ export class Connection {
     this.login?.abort();
     const controller = new AbortController();
     this.login = controller;
+    const before = this.state;
     const host = options.host ? normalizeHost(options.host) : undefined;
     const name =
       options.profile ??
@@ -198,7 +201,8 @@ export class Connection {
       await this.connect(profile, { silent: false });
     } catch (error) {
       if (controller.signal.aborted) {
-        this.set({ status: "signed-out", profiles: this.workspaceProfiles() });
+        // A cancelled "Sign in again" goes back to the message that asked for it.
+        this.set(before.status === "error" ? before : { status: "signed-out", profiles: this.workspaceProfiles() });
         return;
       }
       this.set({
@@ -222,9 +226,9 @@ export class Connection {
     this.login?.abort();
   }
 
-  /** Signs in again to the current profile's workspace. */
+  /** Signs in again to the current (or last tried) profile's workspace. */
   async reauthenticate(): Promise<void> {
-    const profile = this.state.status === "connected" || this.state.status === "error" ? this.state.profile : undefined;
+    const profile = "profile" in this.state ? this.state.profile : this.target;
     if (!profile) return this.signIn();
     return this.signIn({ host: profile.host, profile: profile.name });
   }
@@ -258,6 +262,7 @@ export class Connection {
 
   private async connect(profile: CliProfile, options: Readonly<{ silent: boolean }>): Promise<void> {
     const generation = ++this.generation;
+    this.target = profile;
     this.set({ status: "connecting", profile });
     const client = new DatabricksClient({
       host: profile.host,

@@ -193,9 +193,22 @@ var SignInRequiredError = class extends Error {
 var EXPIRY_MARGIN_MS = 3 * 6e4;
 var DEFAULT_LIFETIME_MS = 30 * 6e4;
 var missingProgram = (error) => /no such file|not found|cannot find|os error 2|enoent/i.test(String(error));
-function signInNeeded(stderr) {
-  return /refresh token|invalid_grant|re-?auth|auth login|no token|cache|expired|not found in cache|cannot find/i.test(
-    stderr
+function cliFailure(result) {
+  const stderr = result.stderr.trim().replace(/^Error:\s*/, "");
+  try {
+    const parsed = JSON.parse(result.stdout);
+    if (parsed && typeof parsed.message === "string" && parsed.message.trim())
+      return {
+        message: parsed.message.trim(),
+        ...typeof parsed.error_code === "string" && { code: parsed.error_code }
+      };
+  } catch {
+  }
+  return { message: stderr };
+}
+function signInNeeded(failure) {
+  return failure.code === "UNAUTHENTICATED" || /refresh token|invalid_grant|re-?auth|auth login|no token|cache|expired|not found in cache|cannot find/i.test(
+    failure.message
   );
 }
 function parseProfiles(stdout) {
@@ -256,7 +269,7 @@ var DatabricksCli = class {
   async profiles() {
     const result = await this.run(CLI_PROCESSES.profiles, [], 2e4);
     if (result.code !== 0)
-      throw new Error(result.stderr.trim() || "Could not read profiles.");
+      throw new Error(cliFailure(result).message || "Could not read profiles.");
     return parseProfiles(result.stdout || '{"profiles":[]}');
   }
   /** A current access token; refreshes it through the CLI when needed. */
@@ -273,9 +286,9 @@ var DatabricksCli = class {
       const result = await this.run(CLI_PROCESSES.token, args, 6e4);
       if (result.code !== 0) {
         this.tokens.delete(key);
-        const message = result.stderr.trim();
-        if (signInNeeded(message)) throw new SignInRequiredError();
-        throw new Error(message || "Could not get a Databricks token.");
+        const failure = cliFailure(result);
+        if (signInNeeded(failure)) throw new SignInRequiredError();
+        throw new Error(failure.message || "Could not get a Databricks token.");
       }
       const token = parseToken(result.stdout);
       this.tokens.set(key, token);
@@ -300,7 +313,7 @@ var DatabricksCli = class {
     this.tokens.delete(target.profile);
     if (result.code !== 0) {
       throw new Error(
-        result.stderr.trim().split("\n").pop() || "Sign-in did not finish."
+        cliFailure(result).message.split("\n").pop() || "Sign-in did not finish."
       );
     }
   }
@@ -696,6 +709,8 @@ var Connection = class {
   profiles = [];
   current;
   login;
+  /** The profile this connection last tried, so it can sign in to it again. */
+  target;
   generation = 0;
   cli;
   transport;
@@ -782,6 +797,7 @@ var Connection = class {
     this.login?.abort();
     const controller = new AbortController();
     this.login = controller;
+    const before = this.state;
     const host = options.host ? normalizeHost(options.host) : void 0;
     const name = options.profile ?? (host ? this.profiles.find((profile) => profile.host === host)?.name ?? this.freshProfileName(host) : this.freshProfileName());
     this.set({ status: "signing-in", profiles: this.workspaceProfiles(), ...host && { host } });
@@ -793,7 +809,7 @@ var Connection = class {
       await this.connect(profile, { silent: false });
     } catch (error) {
       if (controller.signal.aborted) {
-        this.set({ status: "signed-out", profiles: this.workspaceProfiles() });
+        this.set(before.status === "error" ? before : { status: "signed-out", profiles: this.workspaceProfiles() });
         return;
       }
       this.set({
@@ -814,9 +830,9 @@ var Connection = class {
   cancelSignIn() {
     this.login?.abort();
   }
-  /** Signs in again to the current profile's workspace. */
+  /** Signs in again to the current (or last tried) profile's workspace. */
   async reauthenticate() {
-    const profile = this.state.status === "connected" || this.state.status === "error" ? this.state.profile : void 0;
+    const profile = "profile" in this.state ? this.state.profile : this.target;
     if (!profile) return this.signIn();
     return this.signIn({ host: profile.host, profile: profile.name });
   }
@@ -846,6 +862,7 @@ var Connection = class {
   }
   async connect(profile, options) {
     const generation = ++this.generation;
+    this.target = profile;
     this.set({ status: "connecting", profile });
     const client = new DatabricksClient({
       host: profile.host,
@@ -1092,6 +1109,8 @@ function createService(connection, openSettings, spawn) {
     },
     openSettings,
     signIn: () => connection.signIn(),
+    reauthenticate: () => connection.reauthenticate(),
+    cancelSignIn: () => connection.cancelSignIn(),
     preferences,
     ...spawn && {
       forProfile: (profile) => profileService(profile),
