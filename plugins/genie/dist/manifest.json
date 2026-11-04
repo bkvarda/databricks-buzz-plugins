@@ -1,0 +1,16 @@
+{
+  "id": "bkvarda.databricks-genie",
+  "name": "Databricks Genie",
+  "apiVersion": 1,
+  "description": "Ask Databricks Genie agents and Genie One about your data, with charts, from a page, the composer or any agent.",
+  "discovery": {
+    "category": "agent-tools",
+    "tags": [
+      "Databricks",
+      "Genie",
+      "Analytics",
+      "Text to SQL",
+      "Charts"
+    ]
+  }
+}

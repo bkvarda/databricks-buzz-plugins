@@ -1,0 +1,15 @@
+{
+  "id": "bkvarda.databricks-sql",
+  "name": "Databricks SQL",
+  "apiVersion": 1,
+  "description": "Run SQL blocks from conversations with your own Databricks access, browse Unity Catalog, and give agents governed SQL tools.",
+  "discovery": {
+    "category": "developer-tools-and-integrations",
+    "tags": [
+      "Databricks",
+      "SQL",
+      "Unity Catalog",
+      "Data warehouse"
+    ]
+  }
+}

@@ -1,8 +1,9 @@
 // Host contract types the author entry does not export by name.
-import type { AddedTool, Agents, Context, Panel } from "@buzz/author";
+import type { AddedTool, Agents, Context, Page, Panel } from "@buzz/author";
 import type { ComponentType } from "react";
 
 export type PanelProps = Panel["component"] extends ComponentType<infer P> ? P : never;
+export type PageProps = Page["component"] extends ComponentType<infer P> ? P : never;
 
 export type AgentTool = AddedTool;
 export type ToolReply = Awaited<ReturnType<AddedTool["call"]>>;

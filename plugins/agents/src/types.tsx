@@ -1,0 +1,371 @@
+// The Databricks agent types. Each runs through Buzz's harness kit: the kit
+// decides which conversation a mention belongs to (and ignores mentions that
+// are not the owner's), builds Buzz's prompts, answers Buzz's tools, and posts
+// replies as the agent. Databricks does the thinking.
+import type { AgentType, Agents, Delivery, HarnessConversation, HarnessKit } from "@buzz/author";
+import type { ComponentType } from "react";
+import { Ai, DEFAULT_MODEL, DEFAULT_MODELS } from "@dbx/core/api/ai";
+import { Genie } from "@dbx/core/api/genie";
+import { SANDBOX_HOME } from "@dbx/core/api/sandbox";
+import { React } from "@dbx/core/react";
+import { toMarkdown } from "@dbx/core/result";
+import { type DatabricksService, describeError } from "@dbx/core/service";
+import { runLoop, trimHistory } from "./loop";
+import { SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
+import { plainText, Sessions } from "./state";
+import { type DatabricksConfig, DatabricksForm, type EndpointConfig, EndpointForm, type GenieConfig, GenieForm, SettingsTab } from "./ui";
+
+type Tab<C> = NonNullable<AgentType<C>["tabs"]>[number];
+type PropsOf<T> = T extends ComponentType<infer P> ? P : never;
+type TabProps<C> = PropsOf<Tab<C>["component"]>;
+type CreateProps<C> = PropsOf<NonNullable<AgentType<C>["Create"]>>;
+
+const TURN_TIMEOUT_MS = 30 * 60_000;
+
+/** Runs one conversation's turns in order, so saved sessions never race. */
+class Queue {
+  private tails = new Map<string, Promise<unknown>>();
+  private running = new Map<string, AbortController>();
+  private listeners = new Set<() => void>();
+  run<T>(key: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(async () => {
+      const controller = new AbortController();
+      this.running.set(key, controller);
+      this.notify();
+      try {
+        return await work(controller.signal);
+      } finally {
+        if (this.running.get(key) === controller) this.running.delete(key);
+        this.notify();
+      }
+    });
+    this.tails.set(key, next);
+    return next;
+  }
+  active(key: string) {
+    return this.running.has(key);
+  }
+  interrupt(key: string) {
+    this.running.get(key)?.abort();
+  }
+  subscribe(listener: () => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  private notify() {
+    for (const listener of [...this.listeners]) listener();
+  }
+}
+
+/** The text a mention or wake carries, for agents that want a plain question. */
+function deliveredText(delivery: Delivery): string {
+  const trigger = delivery.trigger as { type: string; event?: { content?: string }; text?: string };
+  if (trigger.type === "mention") return plainText(trigger.event?.content ?? "");
+  return trigger.text ?? "";
+}
+
+function provider(service: DatabricksService): NonNullable<AgentType["provider"]> {
+  return {
+    snapshot: () => {
+      const status = service.snapshot().status;
+      if (status === "connected") return { readiness: "ready" };
+      if (status === "checking" || status === "connecting") return { readiness: "checking" };
+      return { readiness: "attention", attentionLabel: "Connect Databricks" };
+    },
+    subscribe: (listener) => service.subscribe(listener),
+    check: () => undefined,
+    attentionAction: () => service.openSettings(),
+    DialogBody: () => null,
+  };
+}
+
+const conversationKey = (scope: "thread" | "channel", place: { channelId: string; root?: string }) =>
+  scope === "thread" && place.root ? `${place.channelId}/${place.root}` : place.channelId;
+
+export function normalizeDatabricks(config: unknown): DatabricksConfig {
+  const value = (config ?? {}) as Partial<DatabricksConfig>;
+  return {
+    model: typeof value.model === "string" && value.model ? value.model : DEFAULT_MODEL,
+    instructions: typeof value.instructions === "string" ? value.instructions : "",
+    scope: value.scope === "channel" ? "channel" : "thread",
+    sandbox: value.sandbox === true,
+  };
+}
+
+export function registerTypes(agents: Agents, kit: HarnessKit, service: DatabricksService) {
+  const sessions = new Sessions(agents.storage);
+  const queue = new Queue();
+
+  /** Wraps a turn: queueing, Stop, failure replies and the working state. */
+  function turn(delivery: Delivery, conversation: HarnessConversation, work: (signal: AbortSignal) => Promise<void>) {
+    delivery.acknowledged?.();
+    const key = `${delivery.agent.key}|${conversation.key}`;
+    const done = queue
+      .run(key, (signal) => {
+        const stop = () => queue.interrupt(key);
+        delivery.signal.addEventListener("abort", stop, { once: true });
+        delivery.interruptible?.(async () => stop());
+        return work(signal).finally(() => delivery.signal.removeEventListener("abort", stop));
+      })
+      .then(
+        () => ({ ok: true as const }),
+        async (error: unknown) => {
+          if ((error as Error)?.name === "AbortError" || (error as { name?: string })?.name === "TimeoutError")
+            return { ok: true as const, stopped: true as const };
+          const message = describeError(error);
+          await kit.reply(delivery.agent, conversation, `I couldn't finish that: ${message}`, { notifyOwner: true }).catch(() => {});
+          return { ok: false as const, error: message };
+        },
+      );
+    delivery.workingUntil(done);
+  }
+
+  // ── Databricks agent: a Databricks model with Buzz's tools (+ Sandbox) ──
+  const databricksType: AgentType<DatabricksConfig> = {
+    id: "databricks",
+    title: "Databricks",
+    description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
+    provider: provider(service),
+    defaults: () => ({ config: normalizeDatabricks({}) }),
+    summary: (agent) => {
+      const config = normalizeDatabricks(agent.config);
+      const label = DEFAULT_MODELS.find((model) => model.id === config.model)?.label ?? config.model;
+      return config.sandbox ? `${label} · Sandbox` : label;
+    },
+    adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
+    carry: (config) => (config.instructions.trim() ? { instructions: config.instructions } : {}),
+    Create: (props: CreateProps<DatabricksConfig>) => (
+      <DatabricksForm service={service} config={normalizeDatabricks(props.config)} onChange={props.onChange} disabled={props.disabled} />
+    ),
+    tabs: [
+      {
+        id: "settings",
+        title: "Settings",
+        role: "settings",
+        component: (props: TabProps<DatabricksConfig>) => (
+          <SettingsTab
+            service={service}
+            config={normalizeDatabricks(props.agent.config)}
+            save={props.save}
+            Form={DatabricksForm}
+            note={
+              normalizeDatabricks(props.agent.config).sandbox ? (
+                <SandboxNote service={service} pubkey={props.agent.pubkey} />
+              ) : null
+            }
+          />
+        ),
+      },
+    ],
+    models: (agent) => ({
+      current: normalizeDatabricks(agent.config).model,
+      models: DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, efforts: [] })),
+    }),
+    sessionControls: {
+      scope: (agent) => normalizeDatabricks(agent.config).scope,
+      state: (agent, place) => (queue.active(`${agent.key}|${conversationKey(normalizeDatabricks(agent.config).scope, place)}`) ? "active" : "idle"),
+      async run(agent, place, action) {
+        const key = conversationKey(normalizeDatabricks(agent.config).scope, place);
+        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
+        if (action === "new") return sessions.clear(agent.key, key);
+        const session = sessions.get(agent.key, key);
+        await sessions.set(agent.key, key, { ...session, messages: trimHistory(session.messages, 20_000, 12) });
+      },
+      subscribe: (listener) => queue.subscribe(listener),
+    },
+    timeoutMs: TURN_TIMEOUT_MS,
+    async run(delivery) {
+      const config = normalizeDatabricks(delivery.config);
+      const conversation = await kit.conversation(delivery, config.scope);
+      if (!conversation) {
+        delivery.ignored?.();
+        return;
+      }
+      turn(delivery, conversation, async (signal) => {
+        const client = await service.ready(signal);
+        const session = sessions.get(delivery.agent.key, conversation.key);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: config.sandbox ? `${SANDBOX_HOME}/work` : "~", instructions, tools: true });
+        const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
+        const ai = new Ai(client);
+        let answered = false;
+        try {
+          const result = await runLoop({
+            model: delivery.model ?? config.model,
+            system,
+            history: session.messages,
+            prompt: prompt.text,
+            buzz: kit.tools(delivery.agent, conversation),
+            local: config.sandbox ? sandboxTools(service, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [],
+            chat: async (request) => {
+              const completion = await ai.chat(request);
+              answered = true;
+              return completion;
+            },
+            signal,
+            onStep: (tool, target) => delivery.step?.(tool, target),
+          });
+          if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
+          await sessions.set(delivery.agent.key, conversation.key, {
+            ...session,
+            cursor: prompt.cursor,
+            messages: trimHistory([...session.messages, ...result.messages]),
+          });
+        } catch (error) {
+          if (!answered) prompt.restore();
+          throw error;
+        }
+      });
+    },
+    async runOnce(standalone) {
+      const config = normalizeDatabricks(standalone.delivery.config);
+      try {
+        const prompt = await standalone.prompt();
+        if (!prompt) return { ok: true };
+        const client = await service.ready(standalone.signal);
+        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : ""].filter(Boolean).join("\n\n");
+        const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
+        const ai = new Ai(client);
+        await runLoop({
+          model: config.model,
+          system,
+          history: [],
+          prompt,
+          buzz: kit.tools(standalone.delivery.agent),
+          local: config.sandbox ? sandboxTools(service, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [],
+          chat: (request) => ai.chat(request),
+          signal: standalone.signal,
+          onStep: (tool, target) => standalone.delivery.step?.(tool, target),
+        });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
+    },
+  };
+
+  // ── Genie agent: a Buzz agent that is a Genie agent ──
+  const genieType: AgentType<GenieConfig> = {
+    id: "genie",
+    title: "Genie",
+    description: "Answers data questions with one of your Databricks Genie agents: an explanation, a table and the SQL, in the thread.",
+    provider: provider(service),
+    defaults: () => ({ config: { spaceId: "", spaceTitle: "" } }),
+    summary: (agent) => `Genie · ${(agent.config as GenieConfig).spaceTitle || "no agent chosen"}`,
+    Create: (props: CreateProps<GenieConfig>) => <GenieForm service={service} config={props.config} onChange={props.onChange} disabled={props.disabled} />,
+    tabs: [
+      {
+        id: "settings",
+        title: "Settings",
+        role: "settings",
+        component: (props: TabProps<GenieConfig>) => <SettingsTab service={service} config={props.agent.config} save={props.save} Form={GenieForm} />,
+      },
+    ],
+    timeoutMs: 15 * 60_000,
+    async run(delivery) {
+      const config = delivery.config;
+      const conversation = await kit.conversation(delivery, "thread");
+      if (!conversation) {
+        delivery.ignored?.();
+        return;
+      }
+      turn(delivery, conversation, async (signal) => {
+        if (!config.spaceId) throw new Error("No Genie agent is chosen yet. My owner can pick one in my Settings.");
+        const question = deliveredText(delivery) || "What can I ask you about?";
+        const client = await service.ready(signal);
+        const session = sessions.get(delivery.agent.key, conversation.key);
+        delivery.step?.("genie", config.spaceTitle || "Genie");
+        const answer = await new Genie(client).answer(config.spaceId, question, {
+          ...(session.genieConversationId && { conversationId: session.genieConversationId }),
+          signal,
+          onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " ")),
+        });
+        const link = service.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
+        const parts: string[] = [];
+        if (answer.text) parts.push(answer.text);
+        if (answer.result?.columns.length) parts.push(toMarkdown(answer.result, 15));
+        if (answer.sql) parts.push(`\`\`\`sql\n${answer.sql.trim()}\n\`\`\``);
+        if (answer.message.status !== "COMPLETED") parts.push(`Genie stopped with status ${answer.message.status}${answer.error ? `: ${answer.error}` : ""}.`);
+        if (answer.suggestions.length) parts.push(`_You could also ask:_ ${answer.suggestions.slice(0, 3).map((q) => `“${q}”`).join(" · ")}`);
+        if (link) parts.push(`[Open in Genie](${link})`);
+        await kit.reply(delivery.agent, conversation, parts.join("\n\n") || "Genie had no answer.");
+        await sessions.set(delivery.agent.key, conversation.key, { ...session, genieConversationId: answer.message.conversation_id });
+      });
+    },
+  };
+
+  // ── Custom agent: your agent on Model Serving or Databricks Apps ──
+  const endpointType: AgentType<EndpointConfig> = {
+    id: "endpoint",
+    title: "Databricks custom agent",
+    description: "Brings an agent you built on Databricks (Agent Bricks, Model Serving or Databricks Apps) into Buzz conversations.",
+    provider: provider(service),
+    defaults: () => ({ config: { target: "", task: "", label: "", instructions: "" } }),
+    summary: (agent) => (agent.config as EndpointConfig).label || (agent.config as EndpointConfig).target || "No endpoint chosen",
+    Create: (props: CreateProps<EndpointConfig>) => <EndpointForm service={service} config={props.config} onChange={props.onChange} disabled={props.disabled} />,
+    tabs: [
+      {
+        id: "settings",
+        title: "Settings",
+        role: "settings",
+        component: (props: TabProps<EndpointConfig>) => <SettingsTab service={service} config={props.agent.config} save={props.save} Form={EndpointForm} />,
+      },
+    ],
+    sessionControls: {
+      scope: () => "thread",
+      state: (agent, place) => (queue.active(`${agent.key}|${conversationKey("thread", place)}`) ? "active" : "idle"),
+      async run(agent, place, action) {
+        const key = conversationKey("thread", place);
+        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
+        return sessions.clear(agent.key, key);
+      },
+      subscribe: (listener) => queue.subscribe(listener),
+    },
+    timeoutMs: 15 * 60_000,
+    async run(delivery) {
+      const config = delivery.config;
+      const conversation = await kit.conversation(delivery, "thread");
+      if (!conversation) {
+        delivery.ignored?.();
+        return;
+      }
+      turn(delivery, conversation, async (signal) => {
+        if (!config.target) throw new Error("No agent endpoint is chosen yet. My owner can pick one in my Settings.");
+        const client = await service.ready(signal);
+        const session = sessions.get(delivery.agent.key, conversation.key);
+        const question = deliveredText(delivery);
+        const history = session.messages.filter((m): m is { role: "user" | "assistant"; content: string } => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");
+        const messages = [...history, { role: "user" as const, content: question || "Hello" }];
+        delivery.step?.("agent", config.label || config.target);
+        const reply = await new Ai(client).invokeAgent(config.target, messages, { task: config.task, sessionId: `${delivery.agent.pubkey.slice(0, 16)}-${conversation.key}`, signal });
+        await kit.reply(delivery.agent, conversation, reply.text || "(The agent returned no text.)");
+        await sessions.set(delivery.agent.key, conversation.key, {
+          ...session,
+          messages: trimHistory([...messages, { role: "assistant", content: reply.text }], 60_000, 40),
+        });
+      });
+    },
+  };
+
+  agents.register(databricksType);
+  agents.register(genieType);
+  agents.register(endpointType);
+}
+
+function SandboxNote(props: { service: DatabricksService; pubkey: string }) {
+  const url = props.service.workspaceUrl("/compute/sandboxes");
+  return (
+    <div data-dbx="" style={{ fontSize: "0.75rem", color: "var(--dbx-subtle)" }}>
+      Sandbox <span className="dbx-mono">{sandboxFor(props.pubkey)}</span> belongs to you in Databricks. It runs up to 24 hours per start and keeps{" "}
+      <span className="dbx-mono">{SANDBOX_HOME}</span>.{" "}
+      {url && (
+        <a className="dbx-link" href={url} target="_blank" rel="noreferrer">
+          Manage sandboxes
+        </a>
+      )}
+    </div>
+  );
+}
+
+export const __test = { deliveredText, conversationKey, React };
