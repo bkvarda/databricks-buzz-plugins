@@ -7,7 +7,7 @@ import { Jobs, LINK_LABEL, parseWorkspaceUrl, type RunStatus, runLabel, runTone,
 import { Sql } from "@dbx/core/api/sql";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { ago, Badge, Button, DatabricksMark, DbxRoot, EmptyState, Notice, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
+import { ago, Badge, Button, DatabricksMark, DbxRoot, EmptyState, Notice, openExternal, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
 import { DataTable } from "@dbx/core/ui/data";
 import { resultSet } from "@dbx/core/result";
 
@@ -216,7 +216,7 @@ export function workspacePanel(service: DatabricksService) {
         <Stack gap={14}>
           {body}
           <Stack direction="row" gap={8}>
-            <Button variant="ghost" onClick={() => window.open(props.target, "_blank", "noopener")}>
+            <Button variant="ghost" onClick={() => openExternal(props.target)}>
               Open in Databricks
             </Button>
             <Button variant="ghost" onClick={() => state.reload()}>

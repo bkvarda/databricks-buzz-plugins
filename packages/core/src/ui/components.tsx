@@ -179,6 +179,22 @@ export function Card(props: {
   );
 }
 
+/**
+ * Opens a web page in the person's browser. Buzz's desktop opener sends
+ * clicks on `target="_blank"` links to the default browser but never sees
+ * `window.open`, so this clicks such a link. In a plain browser it opens a tab.
+ */
+export function openExternal(url: string, doc: Document = document): void {
+  const link = doc.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.style.display = "none";
+  doc.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 export function Notice(props: {
   tone?: "info" | "warning" | "danger" | "success";
   title?: ReactNode;

@@ -5,7 +5,7 @@
 import { React } from "@dbx/core/react";
 import { resultSet, type ResultSet } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
-import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { ResultView } from "@dbx/core/ui/data";
 import { Markdown, parseBlocks } from "@dbx/core/ui/markdown";
 import { Composer } from "./chat";
@@ -205,7 +205,7 @@ export function OneTurnView(props: { turn: OneTurn; compact?: boolean; actions?:
         {answer && (
           <Stack direction="row" gap={6} wrap>
             {answer.deepLink && (
-              <Button size="sm" onClick={() => window.open(answer.deepLink, "_blank", "noopener")}>
+              <Button size="sm" onClick={() => answer.deepLink && openExternal(answer.deepLink)}>
                 Explore in Databricks
               </Button>
             )}

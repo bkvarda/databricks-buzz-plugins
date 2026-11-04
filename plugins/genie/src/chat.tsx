@@ -5,7 +5,7 @@ import { React } from "@dbx/core/react";
 import type { ResultSet } from "@dbx/core/result";
 import { toMarkdown } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
-import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { ResultView } from "@dbx/core/ui/data";
 import { Markdown } from "@dbx/core/ui/markdown";
 
@@ -339,7 +339,7 @@ export function GenieChat(props: {
               </Button>
             )}
             {link && (
-              <Button variant="ghost" onClick={() => window.open(link, "_blank", "noopener")}>
+              <Button variant="ghost" onClick={() => openExternal(link)}>
                 Open in Databricks
               </Button>
             )}

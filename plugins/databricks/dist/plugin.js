@@ -1547,6 +1547,16 @@ function Text(props) {
 function Card(props) {
   return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.padding ?? 16, ...props.style } }, props.children);
 }
+function openExternal(url, doc = document) {
+  const link = doc.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.style.display = "none";
+  doc.body.appendChild(link);
+  link.click();
+  link.remove();
+}
 function Notice(props) {
   const tone = props.tone ?? "info";
   const accent = {
@@ -2029,7 +2039,7 @@ function workspacePanel(service) {
         }
       ));
     } else body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing to show for this link.");
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-panel-inset, 16px)" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, body, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => window.open(props.target, "_blank", "noopener") }, "Open in Databricks"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => state.reload() }, "Refresh"))));
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-panel-inset, 16px)" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, body, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => openExternal(props.target) }, "Open in Databricks"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => state.reload() }, "Refresh"))));
   };
 }
 
@@ -2121,7 +2131,7 @@ function Connected(props) {
   const [switching, setSwitching] = React.useState(false);
   const others = snapshot.profiles.filter((profile) => profile.name !== snapshot.profile.name);
   const url = connection.workspaceUrl("/");
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 12, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 12, align: "center", style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(StatusDot, { tone: "success", label: "Connected" }), /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { weight: 500, style: { overflow: "hidden", textOverflow: "ellipsis" } }, hostLabel(snapshot.profile.host)), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, snapshot.user.displayName ? `${snapshot.user.displayName} \xB7 ` : "", snapshot.user.userName, " \xB7 profile ", /* @__PURE__ */ React.createElement("span", { className: "dbx-mono" }, snapshot.profile.name)))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, url && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => window.open(url, "_blank", "noopener") }, "Open workspace"), /* @__PURE__ */ React.createElement(Button, { onClick: () => setSwitching(!switching) }, switching ? "Done" : "Switch workspace")))), switching && /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Switch workspace"), others.map((profile) => /* @__PURE__ */ React.createElement(Stack, { key: profile.name, direction: "row", align: "center", justify: "space-between", gap: 8 }, /* @__PURE__ */ React.createElement(Text, { size: "sm" }, hostLabel(profile.host), " ", /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs", mono: true }, profile.name)), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => run(() => connection.useProfile(profile.name)) }, "Use"))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", size: "sm", onClick: () => run(() => connection.signIn()) }, "Sign in to another workspace"), /* @__PURE__ */ React.createElement(Button, { variant: "danger", size: "sm", onClick: () => connection.disconnect() }, "Disconnect")))));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 12, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 12, align: "center", style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(StatusDot, { tone: "success", label: "Connected" }), /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { weight: 500, style: { overflow: "hidden", textOverflow: "ellipsis" } }, hostLabel(snapshot.profile.host)), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, snapshot.user.displayName ? `${snapshot.user.displayName} \xB7 ` : "", snapshot.user.userName, " \xB7 profile ", /* @__PURE__ */ React.createElement("span", { className: "dbx-mono" }, snapshot.profile.name)))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, url && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => openExternal(url) }, "Open workspace"), /* @__PURE__ */ React.createElement(Button, { onClick: () => setSwitching(!switching) }, switching ? "Done" : "Switch workspace")))), switching && /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Switch workspace"), others.map((profile) => /* @__PURE__ */ React.createElement(Stack, { key: profile.name, direction: "row", align: "center", justify: "space-between", gap: 8 }, /* @__PURE__ */ React.createElement(Text, { size: "sm" }, hostLabel(profile.host), " ", /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs", mono: true }, profile.name)), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => run(() => connection.useProfile(profile.name)) }, "Use"))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", size: "sm", onClick: () => run(() => connection.signIn()) }, "Sign in to another workspace"), /* @__PURE__ */ React.createElement(Button, { variant: "danger", size: "sm", onClick: () => connection.disconnect() }, "Disconnect")))));
 }
 function DefaultsGroup(props) {
   const { service } = props;

@@ -9,7 +9,7 @@ import { Sandboxes } from "@dbx/core/api/sandbox";
 import type { ConnectionSnapshot } from "@dbx/core/connection";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { Badge, Button, DbxRoot, Field, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { Badge, Button, DbxRoot, Field, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GENIE_ONE_CHOICE, type ToolChoice } from "./capabilities";
 
 export type AgentKind = "sandbox" | "genie-one" | "custom";
@@ -761,7 +761,7 @@ function useMcpLogins(service: DatabricksService, connected: boolean, servers: r
   const logIn = (name: string) => {
     const url = service.workspaceUrl(mcpLoginPath(name));
     if (!url) return;
-    window.open(url, "_blank", "noopener");
+    openExternal(url);
     deadline.current = Date.now() + 5 * 60_000;
     setWaiting(name);
   };

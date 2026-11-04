@@ -13,6 +13,7 @@ import {
   DbxRoot,
   Field,
   Notice,
+  openExternal,
   SectionHeader,
   Spinner,
   Stack,
@@ -269,7 +270,7 @@ function Connected(props: {
           </Stack>
           <Stack direction="row" gap={6}>
             {url && (
-              <Button variant="ghost" onClick={() => window.open(url, "_blank", "noopener")}>
+              <Button variant="ghost" onClick={() => openExternal(url)}>
                 Open workspace
               </Button>
             )}

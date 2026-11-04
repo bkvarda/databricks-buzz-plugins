@@ -435,6 +435,16 @@ function Text(props) {
     props.children
   );
 }
+function openExternal(url, doc = document) {
+  const link = doc.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.style.display = "none";
+  doc.body.appendChild(link);
+  link.click();
+  link.remove();
+}
 function Notice(props) {
   const tone = props.tone ?? "info";
   const accent = {
@@ -2624,7 +2634,7 @@ function useMcpLogins(service, connected, servers) {
   const logIn = (name) => {
     const url = service.workspaceUrl(mcpLoginPath(name));
     if (!url) return;
-    window.open(url, "_blank", "noopener");
+    openExternal(url);
     deadline.current = Date.now() + 5 * 6e4;
     setWaiting(name);
   };
