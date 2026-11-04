@@ -17,17 +17,17 @@ export const KINDS: readonly Readonly<{ id: AgentKind; label: string; detail: st
   {
     id: "sandbox",
     label: "Sandbox agent",
-    detail: "A model on AI Gateway with its own Databricks Sandbox to run code, plus Buzz's tools and the Genie and MCP servers you pick.",
+    detail: "A model with its own Databricks Sandbox to run code, plus the tools you pick.",
   },
   {
     id: "genie-one",
     label: "Genie One",
-    detail: "Answers data questions about anything you can access in the workspace, with a chart, the SQL and a link. Nothing to set up.",
+    detail: "Answers questions about any data you can access, with a chart, the SQL and a link. Nothing to set up.",
   },
   {
     id: "custom",
     label: "Custom agent",
-    detail: "An agent you already have on Databricks: Agent Bricks or Model Serving, a Databricks App, or a Genie agent.",
+    detail: "An agent you already have: Agent Bricks or Model Serving, a Databricks App, or a Genie agent.",
   },
 ];
 
@@ -56,9 +56,14 @@ export type DatabricksConfig = {
 
 type FormProps<C> = { config: C; onChange(config: C): void; disabled?: boolean };
 
+/** While the connection is starting, lists show as loading rather than failed. */
+const settling = (status: string) => status === "checking" || status === "connecting" || status === "signing-in";
+/** Lists load while connected, or will once a starting connection finishes. */
+const loads = (status: string) => status === "connected" || settling(status);
+
 function NeedsConnection(props: { service: DatabricksService }) {
   const snapshot = useConnection(props.service);
-  if (snapshot.status === "connected") return null;
+  if (snapshot.status === "connected" || settling(snapshot.status)) return null;
   return (
     <Notice tone="warning" title="Databricks isn't connected" action={<Button size="sm" variant="brand" onClick={() => props.service.openSettings()}>Connect</Button>}>
       These agents run on Databricks with your sign-in.
@@ -115,13 +120,11 @@ export function AgentForm(props: FormProps<DatabricksConfig> & { service: Databr
 function SandboxFields(props: FormProps<DatabricksConfig> & { workspace: DatabricksService }) {
   const { config, onChange, workspace } = props;
   const status = useConnection(workspace).status;
-  const available = useAsync(async (signal) => new Sandboxes(await workspace.ready(signal)).available(signal), [workspace, status]);
+  const available = useAsync(() => cachedList(workspace, "sandbox", async () => new Sandboxes(await workspace.ready()).available()), [workspace, status]);
   return (
     <>
       {available.data === false && (
-        <Notice tone="warning" title="Databricks Sandbox isn't on in this workspace">
-          A workspace admin can turn on the Databricks Sandbox preview. Until then the agent works without running code.
-        </Notice>
+        <Notice tone="warning">Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview.</Notice>
       )}
       <ModelField service={workspace} value={config.model} {...(props.disabled !== undefined && { disabled: props.disabled })} onChange={(model) => onChange({ ...config, model })} />
       <ToolsField service={workspace} tools={config.tools} {...(props.disabled !== undefined && { disabled: props.disabled })} onChange={(tools) => onChange({ ...config, tools })} />
@@ -190,6 +193,27 @@ export function useAgentService(service: DatabricksService, profile: string | un
   return React.useMemo(() => (profile && service.forProfile ? service.forProfile(profile) : service), [service, profile]);
 }
 
+const LIST_TTL_MS = 5 * 60_000;
+const lists = new WeakMap<DatabricksService, Map<string, { at: number; value: Promise<unknown> }>>();
+
+/**
+ * A workspace list (models, Genie agents, MCP servers…) loaded at most once
+ * every 5 minutes and shared by every form showing it. Failures aren't kept.
+ */
+function cachedList<T>(service: DatabricksService, key: string, load: () => Promise<T>): Promise<T> {
+  let entries = lists.get(service);
+  if (!entries) lists.set(service, (entries = new Map()));
+  const found = entries.get(key);
+  if (found && Date.now() - found.at < LIST_TTL_MS) return found.value as Promise<T>;
+  const value = load();
+  const kept = entries;
+  kept.set(key, { at: Date.now(), value });
+  value.catch(() => {
+    if (kept.get(key)?.value === value) kept.delete(key);
+  });
+  return value;
+}
+
 const ADD = "__add__";
 
 export function WorkspaceField(props: { service: DatabricksService; profile?: string; onChange(profile: string | undefined): void; disabled?: boolean }) {
@@ -216,7 +240,7 @@ export function WorkspaceField(props: { service: DatabricksService; profile?: st
     }
   };
   return (
-    <Field label="Workspace" hint="The Databricks workspace it works in, with your Databricks CLI sign-in there. Same as Buzz uses Buzz's Databricks connection.">
+    <Field label="Workspace" hint="Uses your Databricks CLI sign-in for that workspace.">
       <Stack gap={8}>
         <select
           className="dbx-select"
@@ -271,6 +295,8 @@ export type PickOption = Readonly<{
   /** Options show under their group's heading, in first-seen order. */
   group: string;
   detail?: string;
+  /** Small, dimmed text at the right, such as an ID. */
+  meta?: string;
   badge?: React.ReactNode;
   /** Extra words the search matches. */
   keywords?: string;
@@ -282,7 +308,7 @@ export function filterOptions(options: readonly PickOption[], query: string): Pi
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   const matches = words.length
     ? options.filter((option) => {
-        const text = `${option.label} ${option.detail ?? ""} ${option.keywords ?? ""} ${option.group}`.toLowerCase();
+        const text = `${option.label} ${option.detail ?? ""} ${option.meta ?? ""} ${option.keywords ?? ""} ${option.group}`.toLowerCase();
         return words.every((word) => text.includes(word));
       })
     : [...options];
@@ -344,18 +370,25 @@ function OptionList(props: {
               disabled={props.disabled || option.disabled}
               onClick={() => props.onPick(option)}
             >
-              {props.multi && <input type="checkbox" tabIndex={-1} readOnly checked={selected} aria-hidden />}
-              <span style={{ minWidth: 0, flex: 1 }}>
-                <Stack direction="row" gap={6} align="center" wrap>
-                  <Text weight={selected ? 600 : 500}>{option.label}</Text>
+              {props.multi ? (
+                <input type="checkbox" tabIndex={-1} readOnly checked={selected} aria-hidden />
+              ) : (
+                <span className="dbx-picker-check" aria-hidden>
+                  {selected ? "✓" : ""}
+                </span>
+              )}
+              <span className="dbx-picker-text">
+                <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                  <Text weight={500}>{option.label}</Text>
                   {option.badge}
-                </Stack>
+                </span>
                 {option.detail && (
-                  <Text tone="subtle" size="xs" as="div" style={{ overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                  <Text tone="subtle" size="xs" as="span" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {option.detail}
                   </Text>
                 )}
               </span>
+              {option.meta && <span className="dbx-picker-meta">{option.meta}</span>}
             </button>
           </React.Fragment>
         );
@@ -375,13 +408,14 @@ function Loading(props: { text: string }) {
   );
 }
 
-/** One choice from a searchable list that opens under its button. */
+/** One choice from a searchable list in a dropdown under its button. */
 export function SinglePicker(props: {
   label: string;
   hint?: React.ReactNode;
   value?: string;
   valueLabel?: string;
   placeholder: string;
+  searchPlaceholder?: string;
   options: readonly PickOption[];
   loading?: string | false;
   error?: string;
@@ -390,53 +424,71 @@ export function SinglePicker(props: {
 }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
-  const close = () => (setOpen(false), setQuery(""));
+  const anchor = React.useRef<HTMLDivElement>(null);
+  const close = React.useCallback(() => (setOpen(false), setQuery("")), []);
+  React.useEffect(() => {
+    if (!open) return;
+    const outside = (event: MouseEvent) => {
+      if (anchor.current && !anchor.current.contains(event.target as Node)) close();
+    };
+    document.addEventListener("mousedown", outside);
+    return () => document.removeEventListener("mousedown", outside);
+  }, [open, close]);
   const current = props.options.find((option) => option.id === props.value);
   return (
     <Section label={props.label} hint={props.hint}>
-      <button
-        type="button"
-        className="dbx-select dbx-picker-trigger"
-        aria-expanded={open}
-        disabled={props.disabled}
-        onClick={() => (open ? close() : setOpen(true))}
-      >
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: props.value ? undefined : "var(--dbx-subtle)" }}>
-          {current?.label ?? props.valueLabel ?? (props.value || props.placeholder)}
-        </span>
-        <span aria-hidden style={{ color: "var(--dbx-subtle)", fontSize: "0.7em" }}>
-          {open ? "▲" : "▼"}
-        </span>
-      </button>
-      {open && (
-        <div
-          className="dbx-picker"
-          onKeyDown={(event) => {
-            if (event.key === "Escape") (event.stopPropagation(), close());
-          }}
+      <div className="dbx-picker-anchor" ref={anchor}>
+        <button
+          type="button"
+          className="dbx-select dbx-picker-trigger"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          disabled={props.disabled}
+          onClick={() => (open ? close() : setOpen(true))}
         >
-          <input
-            className="dbx-input"
-            autoFocus
-            placeholder={`Search ${props.options.length}`}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
+          <span style={props.value ? undefined : { color: "var(--dbx-subtle)" }}>{current?.label ?? props.valueLabel ?? (props.value || props.placeholder)}</span>
+        </button>
+        {open && (
+          <div
+            className="dbx-picker"
+            data-floating=""
             onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              event.preventDefault();
-              const first = filterOptions(props.options, query).find((option) => !option.disabled);
-              if (first) (props.onChange(first), close());
+              if (event.key === "Escape") (event.stopPropagation(), close());
             }}
-          />
-          {props.loading ? (
-            <div style={{ padding: "8px 10px" }}>
-              <Loading text={props.loading} />
-            </div>
-          ) : (
-            <OptionList label={props.label} options={props.options} query={query} isSelected={(id) => id === props.value} onPick={(option) => (props.onChange(option), close())} maxHeight={260} {...(props.disabled !== undefined && { disabled: props.disabled })} />
-          )}
-        </div>
-      )}
+          >
+            <input
+              className="dbx-input"
+              autoFocus
+              placeholder={props.searchPlaceholder ?? "Search"}
+              aria-label={`Search ${props.label.toLowerCase()}`}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                const first = filterOptions(props.options, query).find((option) => !option.disabled);
+                if (first) (props.onChange(first), close());
+              }}
+            />
+            {!(props.loading && props.options.length === 0) && (
+              <OptionList
+                label={props.label}
+                options={props.options}
+                query={query}
+                isSelected={(id) => id === props.value}
+                onPick={(option) => (props.onChange(option), close())}
+                maxHeight={300}
+                {...(props.disabled !== undefined && { disabled: props.disabled })}
+              />
+            )}
+            {props.loading && (
+              <div style={{ padding: "8px 12px", borderTop: props.options.length ? "1px solid var(--dbx-border)" : undefined }}>
+                <Loading text={props.loading} />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
       {props.error && <Text tone="danger" size="sm">{props.error}</Text>}
     </Section>
   );
@@ -453,6 +505,7 @@ export function MultiPicker(props: {
   disabled?: boolean;
   onToggle(option: PickOption, on: boolean): void;
   footer?: React.ReactNode;
+  searchPlaceholder?: string;
 }) {
   const [query, setQuery] = React.useState("");
   const chosen = new Set(props.selected.map((option) => option.id));
@@ -479,7 +532,7 @@ export function MultiPicker(props: {
         </div>
       )}
       <div className="dbx-picker">
-        <input className="dbx-input" placeholder={`Search ${props.options.length}`} value={query} onChange={(event) => setQuery(event.target.value)} />
+        <input className="dbx-input" placeholder={props.searchPlaceholder ?? `Search ${props.options.length}`} aria-label={`Search ${props.label.toLowerCase()}`} value={query} onChange={(event) => setQuery(event.target.value)} />
         <OptionList
           label={props.label}
           multi
@@ -487,7 +540,7 @@ export function MultiPicker(props: {
           query={query}
           isSelected={(id) => chosen.has(id)}
           onPick={(option) => props.onToggle(option, !chosen.has(option.id))}
-          maxHeight={240}
+          maxHeight={220}
           {...(props.disabled !== undefined && { disabled: props.disabled })}
         />
         {props.loading && (
@@ -510,19 +563,22 @@ export function MultiPicker(props: {
 
 const RECOMMENDED = new Set<string>(DEFAULT_MODELS.map((model) => model.id));
 
+/** Databricks' models drop the shared "system.ai." for display. */
+const shortId = (id: string) => id.replace(/^system\.ai\./, "");
+
 /** Chat models from AI Gateway (Unity Catalog model services) as options. */
 export function modelOptions(models: readonly ChatModel[] | undefined): PickOption[] {
   const listed = models ?? DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, tools: true, builtIn: true }));
   const byId = new Map(listed.map((model) => [model.id, model]));
-  const recommended = DEFAULT_MODELS.filter((model) => !models || byId.has(model.id)).map((model) => ({ id: model.id, label: model.label, group: "Recommended", keywords: model.id }));
+  const recommended = DEFAULT_MODELS.filter((model) => !models || byId.has(model.id)).map((model) => ({ id: model.id, label: model.label, group: "Recommended", meta: shortId(model.id) }));
   const rest = listed
     .filter((model) => !RECOMMENDED.has(model.id))
     .map((model) => ({
       id: model.id,
       label: model.label,
-      group: model.builtIn ? "Databricks" : "Your workspace",
+      group: model.builtIn ? "All Databricks models" : "Your workspace",
+      meta: shortId(model.id),
       keywords: model.id,
-      ...(!model.builtIn && { detail: model.id }),
       ...(!model.tools && { disabled: true, badge: <Badge>No tool calling</Badge> }),
     }));
   return [...recommended, ...rest];
@@ -530,23 +586,26 @@ export function modelOptions(models: readonly ChatModel[] | undefined): PickOpti
 
 function ModelField(props: { service: DatabricksService; value: string; onChange(model: string): void; disabled?: boolean }) {
   const status = useConnection(props.service).status;
-  const models = useAsync(async (signal) => new Ai(await props.service.ready(signal)).models(signal), [props.service, status]);
+  const models = useAsync(() => cachedList(props.service, "models", async () => new Ai(await props.service.ready()).models()), [props.service, status]);
   const options = modelOptions(models.data);
   return (
     <SinglePicker
       label="Model"
-      hint="AI Gateway models in this workspace, from Unity Catalog. Billed to the workspace."
+      hint="From AI Gateway in this workspace."
       value={props.value}
       valueLabel={props.value}
       placeholder="Choose a model"
+      searchPlaceholder={`Search ${options.length} models`}
       options={options}
-      loading={models.loading && !models.data ? "Loading models…" : false}
-      {...(models.error && { error: `Couldn't list models: ${describeError(models.error)}` })}
+      loading={models.loading && !models.data && loads(status) ? "Loading all models…" : false}
+      {...(models.error && status === "connected" && { error: `Couldn't list models: ${describeError(models.error)}` })}
       {...(props.disabled !== undefined && { disabled: props.disabled })}
       onChange={(option) => props.onChange(option.id)}
     />
   );
 }
+
+const genieSpaces = (service: DatabricksService) => cachedList(service, "genie-spaces", async () => new Genie(await service.ready()).listSpaces());
 
 const asChoice = (server: McpServer): ToolChoice => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
 
@@ -561,7 +620,7 @@ function serverOption(server: McpServer): PickOption {
   return {
     id: server.id,
     label: server.label,
-    group: server.builtIn ? "Databricks" : "Your workspace",
+    group: server.builtIn ? "Databricks" : "Your workspace's MCP servers",
     keywords: server.id,
     ...(server.builtIn
       ? server.description && { detail: server.description }
@@ -574,17 +633,24 @@ function serverOption(server: McpServer): PickOption {
 export function ToolsField(props: { service: DatabricksService; tools: readonly ToolChoice[]; onChange(tools: ToolChoice[]): void; disabled?: boolean }) {
   const { service } = props;
   const status = useConnection(service).status;
-  const spaces = useAsync(async (signal) => new Genie(await service.ready(signal)).listSpaces(signal), [service, status]);
-  const catalog = useAsync(async (signal) => new McpCatalog(await service.ready(signal)).list(signal), [service, status]);
+  const spaces = useAsync(() => genieSpaces(service), [service, status]);
+  const catalog = useAsync(() => cachedList(service, "mcp", async () => new McpCatalog(await service.ready()).list()), [service, status]);
   const [schemaName, setSchemaName] = React.useState("");
   const choices = new Map<string, ToolChoice>([[GENIE_ONE_CHOICE.id, GENIE_ONE_CHOICE]]);
-  const options: PickOption[] = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Genie", detail: "Questions about any data you can access in this workspace." }];
+  const servers = catalog.data?.servers ?? [];
+  // Databricks' own first (Genie One and the system.ai servers), then the
+  // workspace's Genie agents and MCP servers, which can number hundreds.
+  const options: PickOption[] = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Databricks", detail: "Questions about any data you can access" }];
+  for (const server of servers.filter((candidate) => candidate.builtIn)) {
+    choices.set(server.id, asChoice(server));
+    options.push(serverOption(server));
+  }
   for (const space of spaces.data ?? []) {
     const choice: ToolChoice = { id: `genie:${space.space_id}`, kind: "genie", label: space.title };
     choices.set(choice.id, choice);
-    options.push({ id: choice.id, label: space.title, group: "Genie", detail: space.description || "Genie agent", keywords: "genie agent space" });
+    options.push({ id: choice.id, label: space.title, group: "Genie agents", ...(space.description && { detail: space.description }), keywords: "genie agent space" });
   }
-  for (const server of catalog.data?.servers ?? []) {
+  for (const server of servers.filter((candidate) => !candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
     options.push(serverOption(server));
   }
@@ -600,8 +666,8 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
     if (!choice) return;
     props.onChange(on ? [...props.tools.filter((tool) => tool.id !== id), choice] : props.tools.filter((tool) => tool.id !== id));
   };
-  const loading = spaces.loading ? "Loading Genie agents…" : catalog.loading ? "Finding MCP servers…" : false;
-  const notes = [
+  const loading = !loads(status) ? false : spaces.loading ? "Loading Genie agents…" : catalog.loading ? "Finding MCP servers…" : false;
+  const notes = status !== "connected" ? [] : [
     ...(spaces.error ? [`Couldn't list Genie agents: ${describeError(spaces.error)}`] : []),
     ...(catalog.error ? [`Couldn't list MCP servers: ${describeError(catalog.error)}`] : []),
     ...(catalog.data?.errors ?? []).map((error) => `Couldn't list ${error}`),
@@ -609,7 +675,8 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
   return (
     <MultiPicker
       label="Tools"
-      hint="Genie and MCP servers in this workspace: Databricks-provided services, ones your team registered in Unity Catalog, and external MCP connections. They run with your access."
+      hint="Genie and MCP servers from this workspace. They run with your access."
+      searchPlaceholder={`Search ${options.length} tools`}
       selected={selected}
       options={options}
       loading={loading}
@@ -620,7 +687,7 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
         <Stack direction="row" gap={8} align="center">
           <input
             className="dbx-input"
-            placeholder="catalog.schema with Unity Catalog functions"
+            placeholder="Add Unity Catalog functions: catalog.schema"
             aria-label="Unity Catalog schema with functions"
             value={schemaName}
             onChange={(event) => setSchemaName(event.target.value.trim())}
@@ -649,14 +716,12 @@ function CustomAgentField(props: { service: DatabricksService; value?: CustomAge
   const { service } = props;
   const status = useConnection(service).status;
   const found = useAsync(
-    async (signal) => {
-      const client = await service.ready(signal);
-      const ai = new Ai(client);
+    async () => {
       const errors: string[] = [];
       const [endpoints, apps, spaces] = await Promise.all([
-        ai.endpoints(signal).catch((error: unknown) => (errors.push(`serving endpoints: ${describeError(error)}`), [])),
-        ai.apps(signal).catch((error: unknown) => (errors.push(`apps: ${describeError(error)}`), [])),
-        new Genie(client).listSpaces(signal).catch((error: unknown) => (errors.push(`Genie agents: ${describeError(error)}`), [])),
+        cachedList(service, "endpoints", async () => new Ai(await service.ready()).endpoints()).catch((error: unknown) => (errors.push(`serving endpoints: ${describeError(error)}`), [])),
+        cachedList(service, "apps", async () => new Ai(await service.ready()).apps()).catch((error: unknown) => (errors.push(`apps: ${describeError(error)}`), [])),
+        genieSpaces(service).catch((error: unknown) => (errors.push(`Genie agents: ${describeError(error)}`), [])),
       ]);
       const agents = new Map<string, CustomAgent>();
       const options: PickOption[] = [];
@@ -691,13 +756,14 @@ function CustomAgentField(props: { service: DatabricksService; value?: CustomAge
     <>
       <SinglePicker
         label="Agent"
-        hint="Agents you can use in this workspace. It gets each message in the thread and its reply is posted as this agent."
+        hint="Agents in this workspace. Each message in the thread goes to it, and its reply is posted as this agent."
+        searchPlaceholder="Search agents"
         {...(value && { value })}
         {...(props.value && { valueLabel: props.value.label })}
         placeholder="Choose an agent"
         options={found.data?.options ?? []}
-        loading={found.loading && !found.data ? "Finding your agents…" : false}
-        {...(found.error && { error: describeError(found.error) })}
+        loading={found.loading && !found.data && loads(status) ? "Finding your agents…" : false}
+        {...(found.error && status === "connected" && { error: describeError(found.error) })}
         {...(props.disabled !== undefined && { disabled: props.disabled })}
         onChange={(option) => {
           const agent = found.data?.agents.get(option.id);

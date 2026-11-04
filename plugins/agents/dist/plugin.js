@@ -256,17 +256,28 @@ var STYLESHEET = `
 [data-dbx] .dbx-input:focus, [data-dbx] .dbx-select:focus, [data-dbx] .dbx-textarea:focus {
   outline: none; border-color: var(--border-focus, #4462C9); box-shadow: 0 0 0 1px var(--border-focus, #4462C9);
 }
-[data-dbx] .dbx-picker-trigger { display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; cursor: pointer; }
+[data-dbx] select.dbx-select, [data-dbx] .dbx-picker-trigger {
+  -webkit-appearance: none; appearance: none; padding-right: 30px; line-height: 1.3;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238A9199' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center; background-size: 10px 6px;
+}
+[data-dbx] .dbx-picker-trigger { display: flex; align-items: center; gap: 8px; text-align: left; cursor: pointer; }
+[data-dbx] .dbx-picker-trigger > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-dbx] .dbx-picker-anchor { position: relative; }
+[data-dbx] .dbx-picker[data-floating] { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 30; box-shadow: 0 8px 24px rgba(15, 15, 15, 0.12), 0 1px 3px rgba(15, 15, 15, 0.08); }
 [data-dbx] .dbx-picker-trigger:disabled { cursor: default; opacity: 0.6; }
 [data-dbx] .dbx-picker { border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius); background: var(--dbx-popover); overflow: hidden; }
 [data-dbx] .dbx-picker > .dbx-input { border: 0; border-bottom: 1px solid var(--dbx-border); border-radius: 0; box-shadow: none; }
 [data-dbx] .dbx-picker-list { overflow: auto; overscroll-behavior: contain; padding: 4px 0; }
 [data-dbx] .dbx-picker-group { position: sticky; top: -4px; z-index: 1; background: var(--dbx-popover); padding: 6px 10px 3px; font-size: 0.6875rem; font-weight: 500; color: var(--dbx-tertiary); text-transform: uppercase; letter-spacing: 0.03em; }
-[data-dbx] .dbx-picker-option { display: flex; gap: 8px; align-items: flex-start; width: 100%; padding: 6px 10px; border: 0; background: transparent; font: inherit; font-size: 0.8125rem; color: var(--dbx-ink); text-align: left; cursor: pointer; }
+[data-dbx] .dbx-picker-option { display: flex; gap: 8px; align-items: flex-start; width: 100%; margin: 0; padding: 6px 10px; border: 0; border-radius: 0; background: transparent; font: inherit; font-size: 0.8125rem; line-height: 1.4; color: var(--dbx-ink); text-align: left; cursor: pointer; box-shadow: none; }
+[data-dbx] .dbx-picker-option > .dbx-picker-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+[data-dbx] .dbx-picker-option .dbx-picker-meta { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.6875rem; color: var(--dbx-tertiary); padding-top: 2px; }
+[data-dbx] .dbx-picker-option .dbx-picker-check { flex: none; width: 14px; color: var(--dbx-lava-text); font-weight: 600; }
 [data-dbx] .dbx-picker-option:hover, [data-dbx] .dbx-picker-option:focus-visible { background: var(--dbx-inset); outline: none; }
 [data-dbx] .dbx-picker-option[aria-selected="true"] { background: var(--dbx-brand-tint); }
 [data-dbx] .dbx-picker-option:disabled { cursor: default; opacity: 0.55; }
-[data-dbx] .dbx-picker-option input { margin-top: 3px; flex: none; }
+[data-dbx] .dbx-picker-option input { margin: 3px 0 0; flex: none; pointer-events: none; }
 [data-dbx] .dbx-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 2px 4px 2px 8px; border: 1px solid var(--dbx-border); border-radius: 999px; background: var(--dbx-inset); font-size: 0.75rem; }
 [data-dbx] .dbx-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-dbx] .dbx-chip button { border: 0; background: transparent; color: var(--dbx-subtle); cursor: pointer; padding: 0 3px; font: inherit; line-height: 1; }
@@ -293,10 +304,16 @@ var STYLESHEET = `
 @keyframes dbx-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { [data-dbx] * { animation-duration: 0s !important; transition: none !important; } }
 `;
+function styleHash(text) {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = (hash << 5) + hash + text.charCodeAt(i) | 0;
+  return (hash >>> 0).toString(36);
+}
+var STYLE_ELEMENT_ID = `${STYLE_ID}-${styleHash(STYLESHEET)}`;
 function ensureStyles(doc = globalThis.document) {
-  if (!doc || doc.getElementById(STYLE_ID)) return;
+  if (!doc || doc.getElementById(STYLE_ELEMENT_ID)) return;
   const style = doc.createElement("style");
-  style.id = STYLE_ID;
+  style.id = STYLE_ELEMENT_ID;
   style.textContent = STYLESHEET;
   doc.head.appendChild(style);
 }
@@ -1679,7 +1696,7 @@ async function mcpLocalTools(service, choices, signal) {
   const client = await service.ready(signal);
   const workspaceId = workspaceIdOf(service);
   const problems = [];
-  const lists = await Promise.all(
+  const lists2 = await Promise.all(
     servers.map(async (server) => {
       const query = server.path.startsWith("/ai-gateway/") && workspaceId ? { o: workspaceId } : {};
       const mcp = new McpClient(client, server.path, query);
@@ -1694,7 +1711,7 @@ async function mcpLocalTools(service, choices, signal) {
   );
   const tools = [];
   const names = /* @__PURE__ */ new Set();
-  for (const { server, mcp, tools: listed } of lists) {
+  for (const { server, mcp, tools: listed } of lists2) {
     const prefix = toolPrefix(server);
     for (const tool of listed) {
       let name = `${prefix}__${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
@@ -2207,22 +2224,24 @@ var KINDS = [
   {
     id: "sandbox",
     label: "Sandbox agent",
-    detail: "A model on AI Gateway with its own Databricks Sandbox to run code, plus Buzz's tools and the Genie and MCP servers you pick."
+    detail: "A model with its own Databricks Sandbox to run code, plus the tools you pick."
   },
   {
     id: "genie-one",
     label: "Genie One",
-    detail: "Answers data questions about anything you can access in the workspace, with a chart, the SQL and a link. Nothing to set up."
+    detail: "Answers questions about any data you can access, with a chart, the SQL and a link. Nothing to set up."
   },
   {
     id: "custom",
     label: "Custom agent",
-    detail: "An agent you already have on Databricks: Agent Bricks or Model Serving, a Databricks App, or a Genie agent."
+    detail: "An agent you already have: Agent Bricks or Model Serving, a Databricks App, or a Genie agent."
   }
 ];
+var settling = (status) => status === "checking" || status === "connecting" || status === "signing-in";
+var loads = (status) => status === "connected" || settling(status);
 function NeedsConnection(props) {
   const snapshot = useConnection(props.service);
-  if (snapshot.status === "connected") return null;
+  if (snapshot.status === "connected" || settling(snapshot.status)) return null;
   return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks isn't connected", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => props.service.openSettings() }, "Connect") }, "These agents run on Databricks with your sign-in.");
 }
 function AgentForm(props) {
@@ -2253,8 +2272,8 @@ function AgentForm(props) {
 function SandboxFields(props) {
   const { config, onChange, workspace } = props;
   const status = useConnection(workspace).status;
-  const available = useAsync(async (signal) => new Sandboxes(await workspace.ready(signal)).available(signal), [workspace, status]);
-  return /* @__PURE__ */ React.createElement(React.Fragment, null, available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks Sandbox isn't on in this workspace" }, "A workspace admin can turn on the Databricks Sandbox preview. Until then the agent works without running code."), /* @__PURE__ */ React.createElement(ModelField, { service: workspace, value: config.model, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (model) => onChange({ ...config, model }) }), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
+  const available = useAsync(() => cachedList(workspace, "sandbox", async () => new Sandboxes(await workspace.ready()).available()), [workspace, status]);
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, "Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview."), /* @__PURE__ */ React.createElement(ModelField, { service: workspace, value: config.model, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (model) => onChange({ ...config, model }) }), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
 }
 function SettingsTab(props) {
   const [draft, setDraft] = React.useState(props.config);
@@ -2278,6 +2297,21 @@ function SettingsTab(props) {
 }
 function useAgentService(service, profile) {
   return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+var LIST_TTL_MS = 5 * 6e4;
+var lists = /* @__PURE__ */ new WeakMap();
+function cachedList(service, key2, load) {
+  let entries = lists.get(service);
+  if (!entries) lists.set(service, entries = /* @__PURE__ */ new Map());
+  const found = entries.get(key2);
+  if (found && Date.now() - found.at < LIST_TTL_MS) return found.value;
+  const value = load();
+  const kept = entries;
+  kept.set(key2, { at: Date.now(), value });
+  value.catch(() => {
+    if (kept.get(key2)?.value === value) kept.delete(key2);
+  });
+  return value;
 }
 var ADD = "__add__";
 function WorkspaceField(props) {
@@ -2303,7 +2337,7 @@ function WorkspaceField(props) {
       setState({ error: describeError(error) });
     }
   };
-  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "The Databricks workspace it works in, with your Databricks CLI sign-in there. Same as Buzz uses Buzz's Databricks connection." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
     "select",
     {
       className: "dbx-select",
@@ -2324,7 +2358,7 @@ function WorkspaceField(props) {
 function filterOptions(options, query) {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   const matches = words.length ? options.filter((option) => {
-    const text = `${option.label} ${option.detail ?? ""} ${option.keywords ?? ""} ${option.group}`.toLowerCase();
+    const text = `${option.label} ${option.detail ?? ""} ${option.meta ?? ""} ${option.keywords ?? ""} ${option.group}`.toLowerCase();
     return words.every((word) => text.includes(word));
   }) : [...options];
   const order = [...new Set(options.map((option) => option.group))];
@@ -2350,8 +2384,9 @@ function OptionList(props) {
         disabled: props.disabled || option.disabled,
         onClick: () => props.onPick(option)
       },
-      props.multi && /* @__PURE__ */ React.createElement("input", { type: "checkbox", tabIndex: -1, readOnly: true, checked: selected, "aria-hidden": true }),
-      /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Text, { weight: selected ? 600 : 500 }, option.label), option.badge), option.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs", as: "div", style: { overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" } }, option.detail))
+      props.multi ? /* @__PURE__ */ React.createElement("input", { type: "checkbox", tabIndex: -1, readOnly: true, checked: selected, "aria-hidden": true }) : /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-check", "aria-hidden": true }, selected ? "\u2713" : ""),
+      /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-text" }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, option.label), option.badge), option.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs", as: "span", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, option.detail)),
+      option.meta && /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-meta" }, option.meta)
     ));
   }));
 }
@@ -2361,23 +2396,33 @@ function Loading(props) {
 function SinglePicker(props) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
-  const close = () => (setOpen(false), setQuery(""));
+  const anchor = React.useRef(null);
+  const close = React.useCallback(() => (setOpen(false), setQuery("")), []);
+  React.useEffect(() => {
+    if (!open) return;
+    const outside = (event) => {
+      if (anchor.current && !anchor.current.contains(event.target)) close();
+    };
+    document.addEventListener("mousedown", outside);
+    return () => document.removeEventListener("mousedown", outside);
+  }, [open, close]);
   const current = props.options.find((option) => option.id === props.value);
-  return /* @__PURE__ */ React.createElement(Section, { label: props.label, hint: props.hint }, /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(Section, { label: props.label, hint: props.hint }, /* @__PURE__ */ React.createElement("div", { className: "dbx-picker-anchor", ref: anchor }, /* @__PURE__ */ React.createElement(
     "button",
     {
       type: "button",
       className: "dbx-select dbx-picker-trigger",
+      "aria-haspopup": "listbox",
       "aria-expanded": open,
       disabled: props.disabled,
       onClick: () => open ? close() : setOpen(true)
     },
-    /* @__PURE__ */ React.createElement("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: props.value ? void 0 : "var(--dbx-subtle)" } }, current?.label ?? props.valueLabel ?? (props.value || props.placeholder)),
-    /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { color: "var(--dbx-subtle)", fontSize: "0.7em" } }, open ? "\u25B2" : "\u25BC")
+    /* @__PURE__ */ React.createElement("span", { style: props.value ? void 0 : { color: "var(--dbx-subtle)" } }, current?.label ?? props.valueLabel ?? (props.value || props.placeholder))
   ), open && /* @__PURE__ */ React.createElement(
     "div",
     {
       className: "dbx-picker",
+      "data-floating": "",
       onKeyDown: (event) => {
         if (event.key === "Escape") event.stopPropagation(), close();
       }
@@ -2387,7 +2432,8 @@ function SinglePicker(props) {
       {
         className: "dbx-input",
         autoFocus: true,
-        placeholder: `Search ${props.options.length}`,
+        placeholder: props.searchPlaceholder ?? "Search",
+        "aria-label": `Search ${props.label.toLowerCase()}`,
         value: query,
         onChange: (event) => setQuery(event.target.value),
         onKeyDown: (event) => {
@@ -2398,8 +2444,20 @@ function SinglePicker(props) {
         }
       }
     ),
-    props.loading ? /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 10px" } }, /* @__PURE__ */ React.createElement(Loading, { text: props.loading })) : /* @__PURE__ */ React.createElement(OptionList, { label: props.label, options: props.options, query, isSelected: (id) => id === props.value, onPick: (option) => (props.onChange(option), close()), maxHeight: 260, ...props.disabled !== void 0 && { disabled: props.disabled } })
-  ), props.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, props.error));
+    !(props.loading && props.options.length === 0) && /* @__PURE__ */ React.createElement(
+      OptionList,
+      {
+        label: props.label,
+        options: props.options,
+        query,
+        isSelected: (id) => id === props.value,
+        onPick: (option) => (props.onChange(option), close()),
+        maxHeight: 300,
+        ...props.disabled !== void 0 && { disabled: props.disabled }
+      }
+    ),
+    props.loading && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 12px", borderTop: props.options.length ? "1px solid var(--dbx-border)" : void 0 } }, /* @__PURE__ */ React.createElement(Loading, { text: props.loading }))
+  )), props.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, props.error));
 }
 function MultiPicker(props) {
   const [query, setQuery] = React.useState("");
@@ -2412,7 +2470,7 @@ function MultiPicker(props) {
       aside: /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs" }, props.selected.length, " selected")
     },
     props.selected.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, props.selected.map((option) => /* @__PURE__ */ React.createElement("span", { key: option.id, className: "dbx-chip", title: option.detail ?? option.label }, /* @__PURE__ */ React.createElement("span", null, option.label), /* @__PURE__ */ React.createElement("button", { type: "button", "aria-label": `Remove ${option.label}`, disabled: props.disabled, onClick: () => props.onToggle(option, false) }, "\xD7")))),
-    /* @__PURE__ */ React.createElement("div", { className: "dbx-picker" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: `Search ${props.options.length}`, value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(
+    /* @__PURE__ */ React.createElement("div", { className: "dbx-picker" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: props.searchPlaceholder ?? `Search ${props.options.length}`, "aria-label": `Search ${props.label.toLowerCase()}`, value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(
       OptionList,
       {
         label: props.label,
@@ -2421,7 +2479,7 @@ function MultiPicker(props) {
         query,
         isSelected: (id) => chosen.has(id),
         onPick: (option) => props.onToggle(option, !chosen.has(option.id)),
-        maxHeight: 240,
+        maxHeight: 220,
         ...props.disabled !== void 0 && { disabled: props.disabled }
       }
     ), props.loading && /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 10px", borderTop: "1px solid var(--dbx-border)" } }, /* @__PURE__ */ React.createElement(Loading, { text: props.loading }))),
@@ -2430,47 +2488,50 @@ function MultiPicker(props) {
   );
 }
 var RECOMMENDED = new Set(DEFAULT_MODELS.map((model) => model.id));
+var shortId = (id) => id.replace(/^system\.ai\./, "");
 function modelOptions(models) {
   const listed = models ?? DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, tools: true, builtIn: true }));
   const byId = new Map(listed.map((model) => [model.id, model]));
-  const recommended = DEFAULT_MODELS.filter((model) => !models || byId.has(model.id)).map((model) => ({ id: model.id, label: model.label, group: "Recommended", keywords: model.id }));
+  const recommended = DEFAULT_MODELS.filter((model) => !models || byId.has(model.id)).map((model) => ({ id: model.id, label: model.label, group: "Recommended", meta: shortId(model.id) }));
   const rest = listed.filter((model) => !RECOMMENDED.has(model.id)).map((model) => ({
     id: model.id,
     label: model.label,
-    group: model.builtIn ? "Databricks" : "Your workspace",
+    group: model.builtIn ? "All Databricks models" : "Your workspace",
+    meta: shortId(model.id),
     keywords: model.id,
-    ...!model.builtIn && { detail: model.id },
     ...!model.tools && { disabled: true, badge: /* @__PURE__ */ React.createElement(Badge, null, "No tool calling") }
   }));
   return [...recommended, ...rest];
 }
 function ModelField(props) {
   const status = useConnection(props.service).status;
-  const models = useAsync(async (signal) => new Ai(await props.service.ready(signal)).models(signal), [props.service, status]);
+  const models = useAsync(() => cachedList(props.service, "models", async () => new Ai(await props.service.ready()).models()), [props.service, status]);
   const options = modelOptions(models.data);
   return /* @__PURE__ */ React.createElement(
     SinglePicker,
     {
       label: "Model",
-      hint: "AI Gateway models in this workspace, from Unity Catalog. Billed to the workspace.",
+      hint: "From AI Gateway in this workspace.",
       value: props.value,
       valueLabel: props.value,
       placeholder: "Choose a model",
+      searchPlaceholder: `Search ${options.length} models`,
       options,
-      loading: models.loading && !models.data ? "Loading models\u2026" : false,
-      ...models.error && { error: `Couldn't list models: ${describeError(models.error)}` },
+      loading: models.loading && !models.data && loads(status) ? "Loading all models\u2026" : false,
+      ...models.error && status === "connected" && { error: `Couldn't list models: ${describeError(models.error)}` },
       ...props.disabled !== void 0 && { disabled: props.disabled },
       onChange: (option) => props.onChange(option.id)
     }
   );
 }
+var genieSpaces = (service) => cachedList(service, "genie-spaces", async () => new Genie(await service.ready()).listSpaces());
 var asChoice = (server) => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
 function serverOption(server) {
   const badge = server.needsLogin ? /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") : server.id === "service:system.ai.dbsql" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") : void 0;
   return {
     id: server.id,
     label: server.label,
-    group: server.builtIn ? "Databricks" : "Your workspace",
+    group: server.builtIn ? "Databricks" : "Your workspace's MCP servers",
     keywords: server.id,
     ...server.builtIn ? server.description && { detail: server.description } : { detail: `${server.kind === "connection" ? "External MCP connection" : "MCP service"}${server.description ? ` \xB7 ${server.description}` : ""}` },
     ...badge && { badge }
@@ -2479,17 +2540,22 @@ function serverOption(server) {
 function ToolsField(props) {
   const { service } = props;
   const status = useConnection(service).status;
-  const spaces = useAsync(async (signal) => new Genie(await service.ready(signal)).listSpaces(signal), [service, status]);
-  const catalog = useAsync(async (signal) => new McpCatalog(await service.ready(signal)).list(signal), [service, status]);
+  const spaces = useAsync(() => genieSpaces(service), [service, status]);
+  const catalog = useAsync(() => cachedList(service, "mcp", async () => new McpCatalog(await service.ready()).list()), [service, status]);
   const [schemaName, setSchemaName] = React.useState("");
   const choices = /* @__PURE__ */ new Map([[GENIE_ONE_CHOICE.id, GENIE_ONE_CHOICE]]);
-  const options = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Genie", detail: "Questions about any data you can access in this workspace." }];
+  const servers = catalog.data?.servers ?? [];
+  const options = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Databricks", detail: "Questions about any data you can access" }];
+  for (const server of servers.filter((candidate) => candidate.builtIn)) {
+    choices.set(server.id, asChoice(server));
+    options.push(serverOption(server));
+  }
   for (const space of spaces.data ?? []) {
     const choice = { id: `genie:${space.space_id}`, kind: "genie", label: space.title };
     choices.set(choice.id, choice);
-    options.push({ id: choice.id, label: space.title, group: "Genie", detail: space.description || "Genie agent", keywords: "genie agent space" });
+    options.push({ id: choice.id, label: space.title, group: "Genie agents", ...space.description && { detail: space.description }, keywords: "genie agent space" });
   }
-  for (const server of catalog.data?.servers ?? []) {
+  for (const server of servers.filter((candidate) => !candidate.builtIn)) {
     choices.set(server.id, asChoice(server));
     options.push(serverOption(server));
   }
@@ -2504,8 +2570,8 @@ function ToolsField(props) {
     if (!choice) return;
     props.onChange(on ? [...props.tools.filter((tool) => tool.id !== id), choice] : props.tools.filter((tool) => tool.id !== id));
   };
-  const loading = spaces.loading ? "Loading Genie agents\u2026" : catalog.loading ? "Finding MCP servers\u2026" : false;
-  const notes = [
+  const loading = !loads(status) ? false : spaces.loading ? "Loading Genie agents\u2026" : catalog.loading ? "Finding MCP servers\u2026" : false;
+  const notes = status !== "connected" ? [] : [
     ...spaces.error ? [`Couldn't list Genie agents: ${describeError(spaces.error)}`] : [],
     ...catalog.error ? [`Couldn't list MCP servers: ${describeError(catalog.error)}`] : [],
     ...(catalog.data?.errors ?? []).map((error) => `Couldn't list ${error}`)
@@ -2514,7 +2580,8 @@ function ToolsField(props) {
     MultiPicker,
     {
       label: "Tools",
-      hint: "Genie and MCP servers in this workspace: Databricks-provided services, ones your team registered in Unity Catalog, and external MCP connections. They run with your access.",
+      hint: "Genie and MCP servers from this workspace. They run with your access.",
+      searchPlaceholder: `Search ${options.length} tools`,
       selected,
       options,
       loading,
@@ -2525,7 +2592,7 @@ function ToolsField(props) {
         "input",
         {
           className: "dbx-input",
-          placeholder: "catalog.schema with Unity Catalog functions",
+          placeholder: "Add Unity Catalog functions: catalog.schema",
           "aria-label": "Unity Catalog schema with functions",
           value: schemaName,
           onChange: (event) => setSchemaName(event.target.value.trim()),
@@ -2552,14 +2619,12 @@ function CustomAgentField(props) {
   const { service } = props;
   const status = useConnection(service).status;
   const found = useAsync(
-    async (signal) => {
-      const client = await service.ready(signal);
-      const ai = new Ai(client);
+    async () => {
       const errors = [];
       const [endpoints, apps, spaces] = await Promise.all([
-        ai.endpoints(signal).catch((error) => (errors.push(`serving endpoints: ${describeError(error)}`), [])),
-        ai.apps(signal).catch((error) => (errors.push(`apps: ${describeError(error)}`), [])),
-        new Genie(client).listSpaces(signal).catch((error) => (errors.push(`Genie agents: ${describeError(error)}`), []))
+        cachedList(service, "endpoints", async () => new Ai(await service.ready()).endpoints()).catch((error) => (errors.push(`serving endpoints: ${describeError(error)}`), [])),
+        cachedList(service, "apps", async () => new Ai(await service.ready()).apps()).catch((error) => (errors.push(`apps: ${describeError(error)}`), [])),
+        genieSpaces(service).catch((error) => (errors.push(`Genie agents: ${describeError(error)}`), []))
       ]);
       const agents = /* @__PURE__ */ new Map();
       const options = [];
@@ -2593,13 +2658,14 @@ function CustomAgentField(props) {
     SinglePicker,
     {
       label: "Agent",
-      hint: "Agents you can use in this workspace. It gets each message in the thread and its reply is posted as this agent.",
+      hint: "Agents in this workspace. Each message in the thread goes to it, and its reply is posted as this agent.",
+      searchPlaceholder: "Search agents",
       ...value && { value },
       ...props.value && { valueLabel: props.value.label },
       placeholder: "Choose an agent",
       options: found.data?.options ?? [],
-      loading: found.loading && !found.data ? "Finding your agents\u2026" : false,
-      ...found.error && { error: describeError(found.error) },
+      loading: found.loading && !found.data && loads(status) ? "Finding your agents\u2026" : false,
+      ...found.error && status === "connected" && { error: describeError(found.error) },
       ...props.disabled !== void 0 && { disabled: props.disabled },
       onChange: (option) => {
         const agent = found.data?.agents.get(option.id);

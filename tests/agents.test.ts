@@ -131,7 +131,7 @@ describe("agent helpers", () => {
     ]);
     expect(options.map((option) => [option.group, option.label])).toEqual([
       ["Recommended", "Claude Sonnet 5.5"],
-      ["Databricks", "Gemini 3.8 Flash"],
+      ["All Databricks models", "Gemini 3.8 Flash"],
       ["Your workspace", "Support Model"],
     ]);
     expect(filterOptions(options, "flash").map((option) => option.id)).toEqual(["system.ai.gemini-3-8-flash"]);
