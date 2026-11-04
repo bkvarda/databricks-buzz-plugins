@@ -256,6 +256,20 @@ var STYLESHEET = `
 [data-dbx] .dbx-input:focus, [data-dbx] .dbx-select:focus, [data-dbx] .dbx-textarea:focus {
   outline: none; border-color: var(--border-focus, #4462C9); box-shadow: 0 0 0 1px var(--border-focus, #4462C9);
 }
+[data-dbx] .dbx-picker-trigger { display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; cursor: pointer; }
+[data-dbx] .dbx-picker-trigger:disabled { cursor: default; opacity: 0.6; }
+[data-dbx] .dbx-picker { border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius); background: var(--dbx-popover); overflow: hidden; }
+[data-dbx] .dbx-picker > .dbx-input { border: 0; border-bottom: 1px solid var(--dbx-border); border-radius: 0; box-shadow: none; }
+[data-dbx] .dbx-picker-list { overflow: auto; overscroll-behavior: contain; padding: 4px 0; }
+[data-dbx] .dbx-picker-group { position: sticky; top: -4px; z-index: 1; background: var(--dbx-popover); padding: 6px 10px 3px; font-size: 0.6875rem; font-weight: 500; color: var(--dbx-tertiary); text-transform: uppercase; letter-spacing: 0.03em; }
+[data-dbx] .dbx-picker-option { display: flex; gap: 8px; align-items: flex-start; width: 100%; padding: 6px 10px; border: 0; background: transparent; font: inherit; font-size: 0.8125rem; color: var(--dbx-ink); text-align: left; cursor: pointer; }
+[data-dbx] .dbx-picker-option:hover, [data-dbx] .dbx-picker-option:focus-visible { background: var(--dbx-inset); outline: none; }
+[data-dbx] .dbx-picker-option[aria-selected="true"] { background: var(--dbx-brand-tint); }
+[data-dbx] .dbx-picker-option:disabled { cursor: default; opacity: 0.55; }
+[data-dbx] .dbx-picker-option input { margin-top: 3px; flex: none; }
+[data-dbx] .dbx-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 2px 4px 2px 8px; border: 1px solid var(--dbx-border); border-radius: 999px; background: var(--dbx-inset); font-size: 0.75rem; }
+[data-dbx] .dbx-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-dbx] .dbx-chip button { border: 0; background: transparent; color: var(--dbx-subtle); cursor: pointer; padding: 0 3px; font: inherit; line-height: 1; }
 [data-dbx] .dbx-card { background: var(--dbx-surface); border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius-card); }
 [data-dbx] .dbx-row:hover { background: var(--affordance-row-hover, var(--affordance-subtle-hover, #F2F2F2)); }
 [data-dbx] .dbx-row[aria-selected="true"] { background: var(--affordance-selected, var(--affordance-subtle, #EDEDED)); }
@@ -390,6 +404,7 @@ function Text(props) {
   return React.createElement(
     Tag,
     {
+      id: props.id,
       className: props.mono ? "dbx-mono" : void 0,
       style: {
         margin: 0,
@@ -544,6 +559,31 @@ function messageText(content) {
   if (!content) return "";
   return content.map((part) => part.text ?? "").join("");
 }
+var UPPER = /* @__PURE__ */ new Set(["gpt", "glm", "oss", "bge", "gte"]);
+var NAMED = { deepseek: "DeepSeek", openai: "OpenAI" };
+function modelLabel(name) {
+  const leaf = name.split(".").pop() ?? name;
+  const words = [];
+  for (const token of leaf.split(/[-_]+/).filter(Boolean)) {
+    const last = words.length - 1;
+    if (/^\d{1,2}$/.test(token) && last >= 0 && /^[A-Z]?\d+(\.\d+)*$/.test((words[last] ?? "").split(/[ -]/).pop() ?? "")) {
+      words[last] += `.${token}`;
+      continue;
+    }
+    if (/^\d{1,2}$/.test(token) && last >= 0 && words[last] === "GPT") {
+      words[last] += `-${token}`;
+      continue;
+    }
+    const lower = token.toLowerCase();
+    if (UPPER.has(lower)) words.push(lower.toUpperCase());
+    else if (NAMED[lower]) words.push(NAMED[lower]);
+    else if (/^\d+[a-z]$|^[a-z]\d+[a-z]?$/i.test(token)) words.push(token.toUpperCase());
+    else words.push(token.charAt(0).toUpperCase() + token.slice(1));
+  }
+  return words.join(" ");
+}
+var NO_REASONING_WITH_TOOLS = /* @__PURE__ */ new Set();
+var needsReasoningOff = (error) => /reasoning_effort/i.test(error?.message ?? "") && /not supported/i.test(error?.message ?? "");
 var Ai = class {
   constructor(client) {
     this.client = client;
@@ -551,13 +591,25 @@ var Ai = class {
   /** Remembers which chat route the workspace answers. */
   route;
   async chat(request) {
+    const tools = Boolean(request.tools?.length);
     const body = {
       model: request.model,
       messages: request.messages,
-      ...request.tools?.length && { tools: request.tools, tool_choice: "auto" },
+      ...tools && { tools: request.tools, tool_choice: "auto" },
       max_tokens: request.maxTokens ?? 4096,
-      ...request.temperature !== void 0 && { temperature: request.temperature }
+      ...request.temperature !== void 0 && { temperature: request.temperature },
+      ...tools && NO_REASONING_WITH_TOOLS.has(request.model) && { reasoning_effort: "none" }
     };
+    try {
+      return await this.send(request.model, body, request.signal);
+    } catch (error) {
+      if (!tools || NO_REASONING_WITH_TOOLS.has(request.model) || !needsReasoningOff(error)) throw error;
+      NO_REASONING_WITH_TOOLS.add(request.model);
+      return this.send(request.model, { ...body, reasoning_effort: "none" }, request.signal);
+    }
+  }
+  async send(model, body, signal) {
+    const request = { model, signal };
     const init = { timeoutMs: 17e4, ...request.signal && { signal: request.signal } };
     if (this.route !== "serving") {
       try {
@@ -577,6 +629,40 @@ var Ai = class {
       { ...body, model: void 0 },
       init
     );
+  }
+  /**
+   * Chat models in AI Gateway: the Unity Catalog model services the person can
+   * use (Databricks' system.ai models and any their team registered), built-ins
+   * first. Embedding-only services are left out.
+   */
+  async models(signal) {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 30; page++) {
+      const response = await this.client.get("/api/2.1/unity-catalog/model-services", { query: { page_size: 100, page_token: pageToken }, ...signal && { signal } });
+      for (const service of response.model_services ?? []) {
+        if (!(service.supported_api_types ?? []).includes("mlflow/v1/chat/completions")) continue;
+        const id = service.name.replace(/^model-services\//, "");
+        out.push({ id, label: modelLabel(id), tools: service.capabilities?.function_calling !== false, builtIn: id.startsWith("system.ai.") });
+      }
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return out.sort((a, b) => Number(b.builtIn) - Number(a.builtIn) || a.label.localeCompare(b.label, void 0, { numeric: true }));
+  }
+  /** Databricks Apps the person can see, for agents deployed as apps. */
+  async apps(signal) {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 10; page++) {
+      const response = await this.client.get("/api/2.0/apps", { query: { page_size: 100, page_token: pageToken }, ...signal && { signal } });
+      for (const app of response.apps ?? [])
+        if (app.url)
+          out.push({ name: app.name, url: app.url, ...app.description && { description: app.description }, running: app.compute_status?.state === "ACTIVE" });
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
   }
   /** Serving endpoints the user can see, with their task. */
   async endpoints(signal) {
@@ -1178,6 +1264,226 @@ var GenieOne = class {
   }
 };
 
+// packages/core/src/api/sandbox.ts
+var SANDBOX_HOME = "/home/sandbox-agent";
+function sandboxId(seed) {
+  const cleaned = seed.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return /^[a-z]/.test(cleaned) ? cleaned : `sb-${cleaned}`;
+}
+var isUnavailable = (error) => error.status === 404 && /requested API is not available/i.test(error.message ?? "");
+var SandboxUnavailableError = class extends Error {
+  constructor() {
+    super("Databricks Sandbox isn't turned on in this workspace. A workspace admin can turn on the Databricks Sandbox preview in Settings \u2192 Previews.");
+    this.name = "SandboxUnavailableError";
+  }
+};
+var resource = (id) => id.startsWith("sandboxes/") ? id : `sandboxes/${id}`;
+var Sandboxes = class {
+  constructor(client) {
+    this.client = client;
+  }
+  async list(signal) {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 10; page++) {
+      const response = await this.client.get("/api/2.0/sandboxes", {
+        query: { page_size: 100, page_token: pageToken },
+        ...signal && { signal }
+      });
+      out.push(...response.sandboxes ?? []);
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return out;
+  }
+  /** Whether Databricks Sandbox is on in this workspace (no retries). */
+  async available(signal) {
+    try {
+      await this.client.get("/api/2.0/sandboxes", { query: { page_size: 1 }, ...signal && { signal } });
+      return true;
+    } catch (error) {
+      if (isUnavailable(error)) return false;
+      throw error;
+    }
+  }
+  get(id, signal) {
+    return this.client.get(`/api/2.0/${resource(id)}`, signal ? { signal } : {});
+  }
+  create(id, options = {}) {
+    return this.client.post(
+      "/api/2.0/sandboxes",
+      {
+        ...options.displayName && { display_name: options.displayName },
+        ...options.tags && { metadata: { custom_tags: options.tags } }
+      },
+      { query: { sandbox_id: id }, timeoutMs: 12e4 }
+    );
+  }
+  start(id) {
+    return this.client.post(`/api/2.0/${resource(id)}/start`, {}, { timeoutMs: 12e4 });
+  }
+  stop(id) {
+    return this.client.post(`/api/2.0/${resource(id)}/stop`, {});
+  }
+  delete(id) {
+    return this.client.json(`/api/2.0/${resource(id)}`, { method: "DELETE" });
+  }
+  /** Gets or creates the sandbox and waits until it is running. */
+  async ensureRunning(id, options = {}) {
+    let sandbox = await this.find(id, options.signal);
+    if (!sandbox) {
+      options.onState?.("Creating sandbox");
+      try {
+        sandbox = await this.create(id, options);
+      } catch (error) {
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if (error.status !== 409) throw error;
+        sandbox = await this.get(id, options.signal);
+      }
+    }
+    const deadline = Date.now() + 5 * 6e4;
+    let started = false;
+    for (; ; ) {
+      const state = sandbox?.status?.state ?? "";
+      if (state === "SANDBOX_STATE_RUNNING") return sandbox;
+      if (Date.now() > deadline) throw new Error(`The sandbox did not start within 5 minutes (state: ${state || "unknown"}).`);
+      if (state === "SANDBOX_STATE_STOPPED" && !started) {
+        options.onState?.("Starting sandbox", state);
+        started = true;
+        sandbox = await this.start(id);
+        continue;
+      }
+      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox", state);
+      if (state === "SANDBOX_STATE_STOPPED") started = false;
+      await new Promise((resolve) => setTimeout(resolve, 2e3));
+      options.signal?.throwIfAborted();
+      sandbox = await this.find(id, options.signal) ?? sandbox;
+    }
+  }
+  /** The sandbox, or undefined when it doesn't exist. */
+  async find(id, signal) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.get(id, signal);
+      } catch (error) {
+        if (isUnavailable(error) && attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, 1e3));
+          continue;
+        }
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if (error.status === 404) return void 0;
+        throw error;
+      }
+    }
+  }
+  /** Runs a command and waits for it, up to `timeoutSeconds` (server-clamped). */
+  exec(id, cmd, options = {}) {
+    const timeout = options.timeoutSeconds ?? 120;
+    return this.client.post(
+      `/api/2.0/sandbox-exec/${resource(id)}/exec-sync`,
+      {
+        cmd,
+        ...options.args && { args: options.args },
+        ...options.env && { envs: options.env },
+        execution_timeout: `${timeout}s`
+      },
+      { timeoutMs: (timeout + 30) * 1e3, ...options.signal && { signal: options.signal } }
+    );
+  }
+  /** Runs a bash script in the agent's home directory. */
+  bash(id, script, options = {}) {
+    const cwd = options.cwd ?? SANDBOX_HOME;
+    return this.exec(id, "/bin/bash", {
+      args: ["-lc", `cd ${JSON.stringify(cwd)} 2>/dev/null || cd ${SANDBOX_HOME}; ${script}`],
+      ...options.timeoutSeconds !== void 0 && { timeoutSeconds: options.timeoutSeconds },
+      ...options.signal && { signal: options.signal }
+    });
+  }
+  // Files go through exec-sync, the documented API: contents travel as base64
+  // in environment variables, never in the command line.
+  /** Reads a UTF-8 text file. */
+  async readFile(id, path, signal) {
+    const result = await this.exec(id, "/bin/bash", {
+      args: ["-c", 'if [ -d "$P" ]; then echo "$P is a directory" >&2; exit 21; fi; base64 -w0 -- "$P"'],
+      env: { P: path },
+      timeoutSeconds: 60,
+      ...signal && { signal }
+    });
+    if (result.exit_code !== 0) throw new Error(result.stderr?.trim().replace(/^base64: /, "") || `Couldn't read ${path}.`);
+    if (result.truncated) throw new Error(`${path} is too large to read whole; read part of it with a command instead.`);
+    return fromBase64(result.stdout ?? "");
+  }
+  /** Creates or replaces a file (and its parent folders). */
+  async writeFile(id, path, contents, signal) {
+    const encoded = toBase64(contents);
+    const CHUNK = 96 * 1024;
+    for (let offset = 0; offset === 0 || offset < encoded.length; offset += CHUNK) {
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", offset === 0 ? 'mkdir -p -- "$(dirname -- "$P")" && printf %s "$C" | base64 -d > "$P"' : 'printf %s "$C" | base64 -d >> "$P"'],
+        env: { P: path, C: encoded.slice(offset, offset + CHUNK) },
+        timeoutSeconds: 60,
+        ...signal && { signal }
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't write ${path}.`);
+    }
+  }
+  /** Lists a folder: directory-entries when the server offers it, else `find`. */
+  async listDirectory(id, path, signal) {
+    try {
+      const response = await this.client.get(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, {
+        query: { path, page_size: 500 },
+        ...signal && { signal }
+      });
+      return (response.contents ?? []).map((entry) => {
+        const type = entry.fileType ?? entry.file_type ?? "";
+        const size = entry.size === void 0 ? void 0 : Number(entry.size);
+        const modified = entry.modifyTime ?? entry.modify_time;
+        return {
+          name: entry.name ?? entry.path?.split("/").pop() ?? "",
+          path: entry.path ?? "",
+          directory: /DIRECTORY/.test(type),
+          ...size !== void 0 && Number.isFinite(size) && { size },
+          ...modified && { modified }
+        };
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", 'find "$P" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%p\\n"'],
+        env: { P: path },
+        timeoutSeconds: 30,
+        ...signal && { signal }
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't list ${path}.`);
+      return parseFindOutput(result.stdout ?? "");
+    }
+  }
+};
+function parseFindOutput(text) {
+  return text.split("\n").filter(Boolean).map((line) => {
+    const [type = "", size = "", ...rest] = line.split("	");
+    const path = rest.join("	");
+    return {
+      name: path.split("/").pop() ?? path,
+      path,
+      directory: type === "d",
+      ...type !== "d" && Number.isFinite(Number(size)) && { size: Number(size) }
+    };
+  });
+}
+function toBase64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(binary);
+}
+function fromBase64(encoded) {
+  const binary = atob(encoded.trim());
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
 // packages/core/src/api/mcp-catalog.ts
 var NATIVE = /* @__PURE__ */ new Set(["system.ai.genie_one_mcp", "system.ai.sandbox"]);
 var plain = (text = "") => text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
@@ -1409,471 +1715,6 @@ async function mcpLocalTools(service, choices, signal) {
     }
   }
   return { tools, problems };
-}
-
-// plugins/agents/src/ui.tsx
-var GENIE_ONE_ID = "genie-one";
-function NeedsConnection(props) {
-  const snapshot = useConnection(props.service);
-  if (snapshot.status === "connected") return null;
-  return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks isn't connected", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => props.service.openSettings() }, "Connect") }, "These agents run on Databricks with your sign-in.");
-}
-function DatabricksForm(props) {
-  const { config, onChange } = props;
-  const workspace = useAgentService(props.service, config.profile);
-  const status = useConnection(workspace).status;
-  const endpoints = useAsync(async (signal) => (await new Ai(await workspace.ready(signal)).endpoints(signal)).filter((e) => /chat/.test(e.task) && !e.isAgent), [workspace, status]);
-  const known = new Set(DEFAULT_MODELS.map((model) => model.id));
-  const options = [
-    ...DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label })),
-    ...(endpoints.data ?? []).filter((endpoint) => !known.has(endpoint.name)).map((endpoint) => ({ id: endpoint.name, label: `${endpoint.label} (endpoint)` }))
-  ];
-  if (!options.some((option) => option.id === config.model)) options.unshift({ id: config.model, label: config.model });
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
-    WorkspaceField,
-    {
-      service: props.service,
-      ...config.profile && { profile: config.profile },
-      disabled: props.disabled,
-      onChange: (profile) => {
-        const { profile: _old, ...rest } = config;
-        onChange({ ...rest, ...profile && { profile }, tools: config.tools.filter((tool) => tool.kind === "genie-one") });
-      }
-    }
-  ), /* @__PURE__ */ React.createElement(Field, { label: "Model", hint: "Served by Databricks AI Gateway, billed to your workspace." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.model, onChange: (event) => onChange({ ...config, model: event.target.value }) }, options.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.id, value: option.id }, option.label)))), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 10, alignItems: "flex-start", fontSize: "0.8125rem" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", disabled: props.disabled, checked: config.sandbox, onChange: (event) => onChange({ ...config, sandbox: event.target.checked }), style: { marginTop: 3 } }), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement(Text, { weight: 500, as: "div" }, "Give it a Databricks Sandbox"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, "Its own Linux machine in Databricks to run code, with a persistent home folder, internet access and the Databricks CLI signed in as you. Created on first use."))), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, disabled: props.disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) }))));
-}
-function GenieForm(props) {
-  const { config, onChange } = props;
-  const workspace = useAgentService(props.service, config.profile);
-  const status = useConnection(workspace).status;
-  const spaces = useAsync(async (signal) => new Genie(await workspace.ready(signal)).listSpaces(signal), [workspace, status]);
-  React.useEffect(() => {
-    if (!config.spaceId) onChange({ ...config, spaceId: GENIE_ONE_ID, spaceTitle: "Genie One" });
-  }, [config, onChange]);
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
-    WorkspaceField,
-    {
-      service: props.service,
-      ...config.profile && { profile: config.profile },
-      disabled: props.disabled,
-      onChange: (profile) => onChange({ spaceId: GENIE_ONE_ID, spaceTitle: "Genie One", ...profile && { profile } })
-    }
-  ), /* @__PURE__ */ React.createElement(Field, { label: "Answers with", hint: "Mention this Buzz agent with a data question; it answers with an explanation, a table, the SQL and a link. Genie One finds the right data across the workspace; a Genie agent sticks to the data your team curated. Each thread keeps its own Genie conversation for follow-ups." }, spaces.loading ? /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading Genie agents\u2026")) : spaces.error ? /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, describeError(spaces.error)) : /* @__PURE__ */ React.createElement(
-    "select",
-    {
-      className: "dbx-select",
-      disabled: props.disabled,
-      value: config.spaceId,
-      onChange: (event) => {
-        const keep = config.profile ? { profile: config.profile } : {};
-        if (event.target.value === GENIE_ONE_ID) return onChange({ spaceId: GENIE_ONE_ID, spaceTitle: "Genie One", ...keep });
-        const space = spaces.data?.find((candidate) => candidate.space_id === event.target.value);
-        onChange({ spaceId: event.target.value, spaceTitle: space?.title ?? "", ...keep });
-      }
-    },
-    /* @__PURE__ */ React.createElement("option", { value: GENIE_ONE_ID }, "Genie One \xB7 all your data"),
-    (spaces.data ?? []).map((space) => /* @__PURE__ */ React.createElement("option", { key: space.space_id, value: space.space_id }, space.title))
-  ))));
-}
-function EndpointForm(props) {
-  const { config, onChange } = props;
-  const workspace = useAgentService(props.service, config.profile);
-  const status = useConnection(workspace).status;
-  const endpoints = useAsync(async (signal) => (await new Ai(await workspace.ready(signal)).endpoints(signal)).filter((e) => e.isAgent || /responses|chat/.test(e.task)), [workspace, status]);
-  const isApp = /^https:\/\//.test(config.target);
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(
-    WorkspaceField,
-    {
-      service: props.service,
-      ...config.profile && { profile: config.profile },
-      disabled: props.disabled,
-      onChange: (profile) => {
-        const { profile: _old, ...rest } = config;
-        onChange({ ...rest, target: "", task: "", label: "", ...profile && { profile } });
-      }
-    }
-  ), /* @__PURE__ */ React.createElement(Field, { label: "Agent endpoint", hint: "Agent Bricks agents, Knowledge Assistants, supervisors and custom agents you deployed to Model Serving." }, /* @__PURE__ */ React.createElement(
-    "select",
-    {
-      className: "dbx-select",
-      disabled: props.disabled || endpoints.loading,
-      value: isApp ? "" : config.target,
-      onChange: (event) => {
-        const endpoint = endpoints.data?.find((candidate) => candidate.name === event.target.value);
-        onChange({ ...config, target: event.target.value, task: endpoint?.task ?? "", label: endpoint?.label ?? event.target.value });
-      }
-    },
-    /* @__PURE__ */ React.createElement("option", { value: "" }, endpoints.loading ? "Loading\u2026" : "Choose an endpoint"),
-    (endpoints.data ?? []).map((endpoint) => /* @__PURE__ */ React.createElement("option", { key: endpoint.name, value: endpoint.name }, endpoint.name, endpoint.task ? ` \xB7 ${endpoint.task}` : "", endpoint.ready ? "" : " \xB7 not ready"))
-  )), /* @__PURE__ */ React.createElement(Field, { label: "Or a Databricks App URL", hint: "For agents deployed on Databricks Apps (Agent Runtime), e.g. https://my-agent-123.aws.databricksapps.com" }, /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      className: "dbx-input",
-      disabled: props.disabled,
-      value: isApp ? config.target : "",
-      placeholder: "https://\u2026databricksapps.com",
-      onChange: (event) => onChange({ ...config, target: event.target.value.trim(), task: "app", label: "Databricks App" })
-    }
-  ))));
-}
-function SettingsTab(props) {
-  const [draft, setDraft] = React.useState(props.config);
-  const [state, setState] = React.useState({});
-  const dirty = JSON.stringify(draft) !== JSON.stringify(props.config);
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(props.Form, { service: props.service, config: draft, onChange: setDraft, disabled: state.saving }), props.note, state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, justify: "flex-end", align: "center" }, state.saved && !dirty && /* @__PURE__ */ React.createElement(Text, { tone: "success", size: "sm" }, "Saved"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", disabled: !dirty || state.saving, onClick: () => setDraft(props.config) }, "Revert"), /* @__PURE__ */ React.createElement(
-    Button,
-    {
-      variant: "primary",
-      disabled: !dirty || state.saving,
-      onClick: () => {
-        setState({ saving: true });
-        props.save(draft).then(
-          () => setState({ saved: true }),
-          (error) => setState({ error: describeError(error) })
-        );
-      }
-    },
-    state.saving ? "Saving\u2026" : "Save"
-  ))));
-}
-function useAgentService(service, profile) {
-  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
-}
-var ADD = "__add__";
-function WorkspaceField(props) {
-  const main = useConnection(props.service);
-  const workspace = useAgentService(props.service, props.profile);
-  const current = useConnection(workspace);
-  const [adding, setAdding] = React.useState(false);
-  const [url, setUrl] = React.useState("");
-  const [state, setState] = React.useState({});
-  if (!props.service.forProfile) return null;
-  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
-  const profiles = props.service.profiles();
-  const mainName = main.status === "connected" ? main.profile.name : void 0;
-  const signIn = async () => {
-    setState({ busy: true });
-    try {
-      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
-      props.onChange(profile === mainName ? void 0 : profile);
-      setAdding(false);
-      setUrl("");
-      setState({});
-    } catch (error) {
-      setState({ error: describeError(error) });
-    }
-  };
-  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Where this agent's Databricks work runs: models, Genie, SQL, MCP servers and its Sandbox. Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
-    "select",
-    {
-      className: "dbx-select",
-      disabled: props.disabled,
-      value: adding ? ADD : props.profile ?? "",
-      onChange: (event) => {
-        const value = event.target.value;
-        if (value === ADD) return setAdding(true);
-        setAdding(false);
-        props.onChange(value && value !== mainName ? value : void 0);
-      }
-    },
-    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
-    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
-    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
-  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && current.status === "connecting" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026")), props.profile && current.status === "connected" && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", host(current), " as ", current.user.userName, "."), props.profile && current.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, current.message)));
-}
-function Check(props) {
-  return /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 10, alignItems: "flex-start", fontSize: "0.8125rem", cursor: props.disabled ? "default" : "pointer" } }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", disabled: props.disabled, checked: props.checked, onChange: (event) => props.onChange(event.target.checked), style: { marginTop: 3 } }), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, props.title), props.badge), props.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.detail)));
-}
-function ToolsField(props) {
-  const { service } = props;
-  const status = useConnection(service).status;
-  const spaces = useAsync(async (signal) => new Genie(await service.ready(signal)).listSpaces(signal), [service, status]);
-  const catalog = useAsync(async (signal) => new McpCatalog(await service.ready(signal)).list(signal), [service, status]);
-  const [query, setQuery] = React.useState("");
-  const [schemaName, setSchemaName] = React.useState("");
-  const chosen = new Set(props.tools.map((tool) => tool.id));
-  const toggle = (choice, on) => props.onChange(on ? [...props.tools.filter((tool) => tool.id !== choice.id), choice] : props.tools.filter((tool) => tool.id !== choice.id));
-  const servers = catalog.data?.servers ?? [];
-  const needle = query.trim().toLowerCase();
-  const visible = servers.filter((server) => chosen.has(server.id) || !needle || `${server.label} ${server.description ?? ""} ${server.id}`.toLowerCase().includes(needle));
-  const builtIn = visible.filter((server) => server.builtIn);
-  const others = visible.filter((server) => !server.builtIn);
-  const functions = props.tools.filter((tool) => tool.kind === "functions");
-  const asChoice = (server) => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Field, { label: "Genie", hint: "Genie One finds the right data on its own; a Genie agent answers from data your team curated." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
-    Check,
-    {
-      checked: chosen.has(GENIE_ONE_CHOICE.id),
-      disabled: props.disabled,
-      onChange: (on) => toggle(GENIE_ONE_CHOICE, on),
-      title: "Genie One",
-      detail: "Questions about any data you can access in this workspace."
-    }
-  ), spaces.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), (spaces.data ?? []).map((space) => /* @__PURE__ */ React.createElement(
-    Check,
-    {
-      key: space.space_id,
-      checked: chosen.has(`genie:${space.space_id}`),
-      disabled: props.disabled,
-      onChange: (on) => toggle({ id: `genie:${space.space_id}`, kind: "genie", label: space.title }, on),
-      title: space.title,
-      ...space.description && { detail: space.description }
-    }
-  )))), /* @__PURE__ */ React.createElement(Field, { label: "MCP servers", hint: "Tools from MCP servers in this workspace: Databricks-provided services, ones your team registered in Unity Catalog, and external MCP connections. They run with your access." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, catalog.loading && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finding MCP servers\u2026")), catalog.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, describeError(catalog.error)), (catalog.data?.errors ?? []).map((error) => /* @__PURE__ */ React.createElement(Text, { key: error, tone: "tertiary", size: "xs" }, "Couldn't list ", error)), servers.length > 8 && /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: `Search ${servers.length} servers`, value: query, onChange: (event) => setQuery(event.target.value) }), builtIn.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 500 }, "Databricks"), builtIn.map((server) => /* @__PURE__ */ React.createElement(
-    Check,
-    {
-      key: server.id,
-      checked: chosen.has(server.id),
-      disabled: props.disabled,
-      onChange: (on) => toggle(asChoice(server), on),
-      title: server.label,
-      ...server.description && { detail: server.description },
-      ...server.needsLogin ? { badge: /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") } : server.id === "service:system.ai.dbsql" && { badge: /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") }
-    }
-  )), others.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 500 }, "Your workspace"), /* @__PURE__ */ React.createElement("div", { style: { maxHeight: 260, overflow: "auto", display: "flex", flexDirection: "column", gap: 8 } }, others.slice(0, needle ? 200 : 40).map((server) => /* @__PURE__ */ React.createElement(
-    Check,
-    {
-      key: server.id,
-      checked: chosen.has(server.id),
-      disabled: props.disabled,
-      onChange: (on) => toggle(asChoice(server), on),
-      title: server.label,
-      detail: `${server.kind === "connection" ? "External MCP connection" : "MCP service"}${server.description ? ` \xB7 ${server.description}` : ""}`,
-      ...server.needsLogin && { badge: /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") }
-    }
-  )), !needle && others.length > 40 && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, others.length - 40, " more. Search to find them.")), functions.map((tool) => /* @__PURE__ */ React.createElement(Check, { key: tool.id, checked: true, disabled: props.disabled, onChange: () => toggle(tool, false), title: tool.label, detail: "Unity Catalog functions" })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      className: "dbx-input",
-      placeholder: "catalog.schema with Unity Catalog functions",
-      value: schemaName,
-      onChange: (event) => setSchemaName(event.target.value.trim()),
-      style: { flex: 1 }
-    }
-  ), /* @__PURE__ */ React.createElement(
-    Button,
-    {
-      size: "sm",
-      disabled: props.disabled || !/^[\w-]+\.[\w-]+$/.test(schemaName),
-      onClick: () => {
-        const [catalogName = "", schemaPart = ""] = schemaName.split(".");
-        const server = functionsServer(catalogName, schemaPart);
-        toggle(asChoice(server), true);
-        setSchemaName("");
-      }
-    },
-    "Add functions"
-  )))));
-}
-
-// packages/core/src/api/sandbox.ts
-var SANDBOX_HOME = "/home/sandbox-agent";
-function sandboxId(seed) {
-  const cleaned = seed.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-  return /^[a-z]/.test(cleaned) ? cleaned : `sb-${cleaned}`;
-}
-var isUnavailable = (error) => error.status === 404 && /requested API is not available/i.test(error.message ?? "");
-var SandboxUnavailableError = class extends Error {
-  constructor() {
-    super("Databricks Sandbox isn't turned on in this workspace. A workspace admin can turn on the Databricks Sandbox preview in Settings \u2192 Previews.");
-    this.name = "SandboxUnavailableError";
-  }
-};
-var resource = (id) => id.startsWith("sandboxes/") ? id : `sandboxes/${id}`;
-var Sandboxes = class {
-  constructor(client) {
-    this.client = client;
-  }
-  async list(signal) {
-    const out = [];
-    let pageToken;
-    for (let page = 0; page < 10; page++) {
-      const response = await this.client.get("/api/2.0/sandboxes", {
-        query: { page_size: 100, page_token: pageToken },
-        ...signal && { signal }
-      });
-      out.push(...response.sandboxes ?? []);
-      pageToken = response.next_page_token;
-      if (!pageToken) break;
-    }
-    return out;
-  }
-  get(id, signal) {
-    return this.client.get(`/api/2.0/${resource(id)}`, signal ? { signal } : {});
-  }
-  create(id, options = {}) {
-    return this.client.post(
-      "/api/2.0/sandboxes",
-      {
-        ...options.displayName && { display_name: options.displayName },
-        ...options.tags && { metadata: { custom_tags: options.tags } }
-      },
-      { query: { sandbox_id: id }, timeoutMs: 12e4 }
-    );
-  }
-  start(id) {
-    return this.client.post(`/api/2.0/${resource(id)}/start`, {}, { timeoutMs: 12e4 });
-  }
-  stop(id) {
-    return this.client.post(`/api/2.0/${resource(id)}/stop`, {});
-  }
-  delete(id) {
-    return this.client.json(`/api/2.0/${resource(id)}`, { method: "DELETE" });
-  }
-  /** Gets or creates the sandbox and waits until it is running. */
-  async ensureRunning(id, options = {}) {
-    let sandbox = await this.find(id, options.signal);
-    if (!sandbox) {
-      options.onState?.("Creating sandbox");
-      try {
-        sandbox = await this.create(id, options);
-      } catch (error) {
-        if (isUnavailable(error)) throw new SandboxUnavailableError();
-        if (error.status !== 409) throw error;
-        sandbox = await this.get(id, options.signal);
-      }
-    }
-    const deadline = Date.now() + 5 * 6e4;
-    let started = false;
-    for (; ; ) {
-      const state = sandbox?.status?.state ?? "";
-      if (state === "SANDBOX_STATE_RUNNING") return sandbox;
-      if (Date.now() > deadline) throw new Error(`The sandbox did not start within 5 minutes (state: ${state || "unknown"}).`);
-      if (state === "SANDBOX_STATE_STOPPED" && !started) {
-        options.onState?.("Starting sandbox", state);
-        started = true;
-        sandbox = await this.start(id);
-        continue;
-      }
-      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox", state);
-      if (state === "SANDBOX_STATE_STOPPED") started = false;
-      await new Promise((resolve) => setTimeout(resolve, 2e3));
-      options.signal?.throwIfAborted();
-      sandbox = await this.find(id, options.signal) ?? sandbox;
-    }
-  }
-  /** The sandbox, or undefined when it doesn't exist. */
-  async find(id, signal) {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await this.get(id, signal);
-      } catch (error) {
-        if (isUnavailable(error) && attempt < 3) {
-          await new Promise((resolve) => setTimeout(resolve, 1e3));
-          continue;
-        }
-        if (isUnavailable(error)) throw new SandboxUnavailableError();
-        if (error.status === 404) return void 0;
-        throw error;
-      }
-    }
-  }
-  /** Runs a command and waits for it, up to `timeoutSeconds` (server-clamped). */
-  exec(id, cmd, options = {}) {
-    const timeout = options.timeoutSeconds ?? 120;
-    return this.client.post(
-      `/api/2.0/sandbox-exec/${resource(id)}/exec-sync`,
-      {
-        cmd,
-        ...options.args && { args: options.args },
-        ...options.env && { envs: options.env },
-        execution_timeout: `${timeout}s`
-      },
-      { timeoutMs: (timeout + 30) * 1e3, ...options.signal && { signal: options.signal } }
-    );
-  }
-  /** Runs a bash script in the agent's home directory. */
-  bash(id, script, options = {}) {
-    const cwd = options.cwd ?? SANDBOX_HOME;
-    return this.exec(id, "/bin/bash", {
-      args: ["-lc", `cd ${JSON.stringify(cwd)} 2>/dev/null || cd ${SANDBOX_HOME}; ${script}`],
-      ...options.timeoutSeconds !== void 0 && { timeoutSeconds: options.timeoutSeconds },
-      ...options.signal && { signal: options.signal }
-    });
-  }
-  // Files go through exec-sync, the documented API: contents travel as base64
-  // in environment variables, never in the command line.
-  /** Reads a UTF-8 text file. */
-  async readFile(id, path, signal) {
-    const result = await this.exec(id, "/bin/bash", {
-      args: ["-c", 'if [ -d "$P" ]; then echo "$P is a directory" >&2; exit 21; fi; base64 -w0 -- "$P"'],
-      env: { P: path },
-      timeoutSeconds: 60,
-      ...signal && { signal }
-    });
-    if (result.exit_code !== 0) throw new Error(result.stderr?.trim().replace(/^base64: /, "") || `Couldn't read ${path}.`);
-    if (result.truncated) throw new Error(`${path} is too large to read whole; read part of it with a command instead.`);
-    return fromBase64(result.stdout ?? "");
-  }
-  /** Creates or replaces a file (and its parent folders). */
-  async writeFile(id, path, contents, signal) {
-    const encoded = toBase64(contents);
-    const CHUNK = 96 * 1024;
-    for (let offset = 0; offset === 0 || offset < encoded.length; offset += CHUNK) {
-      const result = await this.exec(id, "/bin/bash", {
-        args: ["-c", offset === 0 ? 'mkdir -p -- "$(dirname -- "$P")" && printf %s "$C" | base64 -d > "$P"' : 'printf %s "$C" | base64 -d >> "$P"'],
-        env: { P: path, C: encoded.slice(offset, offset + CHUNK) },
-        timeoutSeconds: 60,
-        ...signal && { signal }
-      });
-      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't write ${path}.`);
-    }
-  }
-  /** Lists a folder: directory-entries when the server offers it, else `find`. */
-  async listDirectory(id, path, signal) {
-    try {
-      const response = await this.client.get(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, {
-        query: { path, page_size: 500 },
-        ...signal && { signal }
-      });
-      return (response.contents ?? []).map((entry) => {
-        const type = entry.fileType ?? entry.file_type ?? "";
-        const size = entry.size === void 0 ? void 0 : Number(entry.size);
-        const modified = entry.modifyTime ?? entry.modify_time;
-        return {
-          name: entry.name ?? entry.path?.split("/").pop() ?? "",
-          path: entry.path ?? "",
-          directory: /DIRECTORY/.test(type),
-          ...size !== void 0 && Number.isFinite(size) && { size },
-          ...modified && { modified }
-        };
-      });
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      const result = await this.exec(id, "/bin/bash", {
-        args: ["-c", 'find "$P" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%p\\n"'],
-        env: { P: path },
-        timeoutSeconds: 30,
-        ...signal && { signal }
-      });
-      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't list ${path}.`);
-      return parseFindOutput(result.stdout ?? "");
-    }
-  }
-};
-function parseFindOutput(text) {
-  return text.split("\n").filter(Boolean).map((line) => {
-    const [type = "", size = "", ...rest] = line.split("	");
-    const path = rest.join("	");
-    return {
-      name: path.split("/").pop() ?? path,
-      path,
-      directory: type === "d",
-      ...type !== "d" && Number.isFinite(Number(size)) && { size: Number(size) }
-    };
-  });
-}
-function toBase64(text) {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
-  return btoa(binary);
-}
-function fromBase64(encoded) {
-  const binary = atob(encoded.trim());
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new TextDecoder().decode(bytes);
 }
 
 // plugins/agents/src/loop.ts
@@ -2361,6 +2202,413 @@ function plainText(content) {
   return content.replace(/\[([^\]]*)\]\(nostr:[^)]+\)/g, "").replace(/nostr:(npub|nprofile|note|nevent)1[0-9a-z]+/g, "").replace(/^\s*@\S+\s*/, "").replace(/[ \t]+/g, " ").trim();
 }
 
+// plugins/agents/src/ui.tsx
+var KINDS = [
+  {
+    id: "sandbox",
+    label: "Sandbox agent",
+    detail: "A model on AI Gateway with its own Databricks Sandbox to run code, plus Buzz's tools and the Genie and MCP servers you pick."
+  },
+  {
+    id: "genie-one",
+    label: "Genie One",
+    detail: "Answers data questions about anything you can access in the workspace, with a chart, the SQL and a link. Nothing to set up."
+  },
+  {
+    id: "custom",
+    label: "Custom agent",
+    detail: "An agent you already have on Databricks: Agent Bricks or Model Serving, a Databricks App, or a Genie agent."
+  }
+];
+function NeedsConnection(props) {
+  const snapshot = useConnection(props.service);
+  if (snapshot.status === "connected") return null;
+  return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks isn't connected", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => props.service.openSettings() }, "Connect") }, "These agents run on Databricks with your sign-in.");
+}
+function AgentForm(props) {
+  const { config, onChange } = props;
+  const workspace = useAgentService(props.service, config.profile);
+  const kind = KINDS.find((candidate) => candidate.id === config.kind) ?? KINDS[1];
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), /* @__PURE__ */ React.createElement(Field, { label: "Type", hint: kind.detail }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: kind.id, onChange: (event) => onChange({ ...config, kind: event.target.value }) }, KINDS.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.id, value: candidate.id }, candidate.label)))), /* @__PURE__ */ React.createElement(
+    WorkspaceField,
+    {
+      service: props.service,
+      ...config.profile && { profile: config.profile },
+      disabled: props.disabled,
+      onChange: (profile) => {
+        const { profile: _profile, custom: _custom, ...rest } = config;
+        onChange({ ...rest, ...profile && { profile }, tools: config.tools.filter((tool) => tool.kind === "genie-one") });
+      }
+    }
+  ), kind.id === "sandbox" && /* @__PURE__ */ React.createElement(SandboxFields, { workspace, config, onChange, ...props.disabled !== void 0 && { disabled: props.disabled } }), kind.id === "custom" && /* @__PURE__ */ React.createElement(
+    CustomAgentField,
+    {
+      service: workspace,
+      ...config.custom && { value: config.custom },
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onChange: (custom) => onChange({ ...config, custom })
+    }
+  ), kind.id !== "sandbox" && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Mention it in any thread or add it to a room. Each thread keeps its own conversation for follow-ups.")));
+}
+function SandboxFields(props) {
+  const { config, onChange, workspace } = props;
+  const status = useConnection(workspace).status;
+  const available = useAsync(async (signal) => new Sandboxes(await workspace.ready(signal)).available(signal), [workspace, status]);
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Databricks Sandbox isn't on in this workspace" }, "A workspace admin can turn on the Databricks Sandbox preview. Until then the agent works without running code."), /* @__PURE__ */ React.createElement(ModelField, { service: workspace, value: config.model, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (model) => onChange({ ...config, model }) }), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
+}
+function SettingsTab(props) {
+  const [draft, setDraft] = React.useState(props.config);
+  const [state, setState] = React.useState({});
+  const dirty = JSON.stringify(draft) !== JSON.stringify(props.config);
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(props.Form, { service: props.service, config: draft, onChange: setDraft, disabled: state.saving }), props.note, state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, justify: "flex-end", align: "center" }, state.saved && !dirty && /* @__PURE__ */ React.createElement(Text, { tone: "success", size: "sm" }, "Saved"), /* @__PURE__ */ React.createElement(Button, { variant: "ghost", disabled: !dirty || state.saving, onClick: () => setDraft(props.config) }, "Revert"), /* @__PURE__ */ React.createElement(
+    Button,
+    {
+      variant: "primary",
+      disabled: !dirty || state.saving,
+      onClick: () => {
+        setState({ saving: true });
+        props.save(draft).then(
+          () => setState({ saved: true }),
+          (error) => setState({ error: describeError(error) })
+        );
+      }
+    },
+    state.saving ? "Saving\u2026" : "Save"
+  ))));
+}
+function useAgentService(service, profile) {
+  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+var ADD = "__add__";
+function WorkspaceField(props) {
+  const main = useConnection(props.service);
+  const workspace = useAgentService(props.service, props.profile);
+  const current = useConnection(workspace);
+  const [adding, setAdding] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [state, setState] = React.useState({});
+  if (!props.service.forProfile) return null;
+  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
+  const profiles = props.service.profiles();
+  const mainName = main.status === "connected" ? main.profile.name : void 0;
+  const signIn = async () => {
+    setState({ busy: true });
+    try {
+      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
+      props.onChange(profile === mainName ? void 0 : profile);
+      setAdding(false);
+      setUrl("");
+      setState({});
+    } catch (error) {
+      setState({ error: describeError(error) });
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "The Databricks workspace it works in, with your Databricks CLI sign-in there. Same as Buzz uses Buzz's Databricks connection." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: adding ? ADD : props.profile ?? "",
+      onChange: (event) => {
+        const value = event.target.value;
+        if (value === ADD) return setAdding(true);
+        setAdding(false);
+        props.onChange(value && value !== mainName ? value : void 0);
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
+    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
+    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
+  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && current.status === "connecting" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026")), props.profile && current.status === "connected" && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", host(current), " as ", current.user.userName, "."), props.profile && current.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, current.message)));
+}
+function filterOptions(options, query) {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = words.length ? options.filter((option) => {
+    const text = `${option.label} ${option.detail ?? ""} ${option.keywords ?? ""} ${option.group}`.toLowerCase();
+    return words.every((word) => text.includes(word));
+  }) : [...options];
+  const order = [...new Set(options.map((option) => option.group))];
+  return matches.sort((a, b) => order.indexOf(a.group) - order.indexOf(b.group));
+}
+function Section(props) {
+  const id = React.useId();
+  return /* @__PURE__ */ React.createElement("div", { role: "group", "aria-labelledby": id, style: { display: "flex", flexDirection: "column", gap: 4, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", justify: "space-between", align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, id }, props.label), props.aside), props.children, props.hint && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", as: "div" }, props.hint));
+}
+function OptionList(props) {
+  const shown = filterOptions(props.options, props.query);
+  let group = "";
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-picker-list", role: "listbox", "aria-label": props.label, "aria-multiselectable": props.multi || void 0, style: { maxHeight: props.maxHeight } }, shown.length === 0 && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { padding: "8px 10px" } }, props.query ? `Nothing matches \u201C${props.query}\u201D.` : "Nothing to choose from here."), shown.map((option) => {
+    const heading = option.group !== group ? group = option.group : void 0;
+    const selected = props.isSelected(option.id);
+    return /* @__PURE__ */ React.createElement(React.Fragment, { key: option.id }, heading && /* @__PURE__ */ React.createElement("div", { className: "dbx-picker-group" }, heading), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        role: "option",
+        "aria-selected": selected,
+        className: "dbx-picker-option",
+        disabled: props.disabled || option.disabled,
+        onClick: () => props.onPick(option)
+      },
+      props.multi && /* @__PURE__ */ React.createElement("input", { type: "checkbox", tabIndex: -1, readOnly: true, checked: selected, "aria-hidden": true }),
+      /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Text, { weight: selected ? 600 : 500 }, option.label), option.badge), option.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs", as: "div", style: { overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" } }, option.detail))
+    ));
+  }));
+}
+function Loading(props) {
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, props.text));
+}
+function SinglePicker(props) {
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const close = () => (setOpen(false), setQuery(""));
+  const current = props.options.find((option) => option.id === props.value);
+  return /* @__PURE__ */ React.createElement(Section, { label: props.label, hint: props.hint }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      type: "button",
+      className: "dbx-select dbx-picker-trigger",
+      "aria-expanded": open,
+      disabled: props.disabled,
+      onClick: () => open ? close() : setOpen(true)
+    },
+    /* @__PURE__ */ React.createElement("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: props.value ? void 0 : "var(--dbx-subtle)" } }, current?.label ?? props.valueLabel ?? (props.value || props.placeholder)),
+    /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { color: "var(--dbx-subtle)", fontSize: "0.7em" } }, open ? "\u25B2" : "\u25BC")
+  ), open && /* @__PURE__ */ React.createElement(
+    "div",
+    {
+      className: "dbx-picker",
+      onKeyDown: (event) => {
+        if (event.key === "Escape") event.stopPropagation(), close();
+      }
+    },
+    /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "dbx-input",
+        autoFocus: true,
+        placeholder: `Search ${props.options.length}`,
+        value: query,
+        onChange: (event) => setQuery(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          const first = filterOptions(props.options, query).find((option) => !option.disabled);
+          if (first) props.onChange(first), close();
+        }
+      }
+    ),
+    props.loading ? /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 10px" } }, /* @__PURE__ */ React.createElement(Loading, { text: props.loading })) : /* @__PURE__ */ React.createElement(OptionList, { label: props.label, options: props.options, query, isSelected: (id) => id === props.value, onPick: (option) => (props.onChange(option), close()), maxHeight: 260, ...props.disabled !== void 0 && { disabled: props.disabled } })
+  ), props.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, props.error));
+}
+function MultiPicker(props) {
+  const [query, setQuery] = React.useState("");
+  const chosen = new Set(props.selected.map((option) => option.id));
+  return /* @__PURE__ */ React.createElement(
+    Section,
+    {
+      label: props.label,
+      hint: props.hint,
+      aside: /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs" }, props.selected.length, " selected")
+    },
+    props.selected.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, props.selected.map((option) => /* @__PURE__ */ React.createElement("span", { key: option.id, className: "dbx-chip", title: option.detail ?? option.label }, /* @__PURE__ */ React.createElement("span", null, option.label), /* @__PURE__ */ React.createElement("button", { type: "button", "aria-label": `Remove ${option.label}`, disabled: props.disabled, onClick: () => props.onToggle(option, false) }, "\xD7")))),
+    /* @__PURE__ */ React.createElement("div", { className: "dbx-picker" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: `Search ${props.options.length}`, value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(
+      OptionList,
+      {
+        label: props.label,
+        multi: true,
+        options: props.options,
+        query,
+        isSelected: (id) => chosen.has(id),
+        onPick: (option) => props.onToggle(option, !chosen.has(option.id)),
+        maxHeight: 240,
+        ...props.disabled !== void 0 && { disabled: props.disabled }
+      }
+    ), props.loading && /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 10px", borderTop: "1px solid var(--dbx-border)" } }, /* @__PURE__ */ React.createElement(Loading, { text: props.loading }))),
+    (props.notes ?? []).map((note) => /* @__PURE__ */ React.createElement(Text, { key: note, tone: "tertiary", size: "xs" }, note)),
+    props.footer
+  );
+}
+var RECOMMENDED = new Set(DEFAULT_MODELS.map((model) => model.id));
+function modelOptions(models) {
+  const listed = models ?? DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, tools: true, builtIn: true }));
+  const byId = new Map(listed.map((model) => [model.id, model]));
+  const recommended = DEFAULT_MODELS.filter((model) => !models || byId.has(model.id)).map((model) => ({ id: model.id, label: model.label, group: "Recommended", keywords: model.id }));
+  const rest = listed.filter((model) => !RECOMMENDED.has(model.id)).map((model) => ({
+    id: model.id,
+    label: model.label,
+    group: model.builtIn ? "Databricks" : "Your workspace",
+    keywords: model.id,
+    ...!model.builtIn && { detail: model.id },
+    ...!model.tools && { disabled: true, badge: /* @__PURE__ */ React.createElement(Badge, null, "No tool calling") }
+  }));
+  return [...recommended, ...rest];
+}
+function ModelField(props) {
+  const status = useConnection(props.service).status;
+  const models = useAsync(async (signal) => new Ai(await props.service.ready(signal)).models(signal), [props.service, status]);
+  const options = modelOptions(models.data);
+  return /* @__PURE__ */ React.createElement(
+    SinglePicker,
+    {
+      label: "Model",
+      hint: "AI Gateway models in this workspace, from Unity Catalog. Billed to the workspace.",
+      value: props.value,
+      valueLabel: props.value,
+      placeholder: "Choose a model",
+      options,
+      loading: models.loading && !models.data ? "Loading models\u2026" : false,
+      ...models.error && { error: `Couldn't list models: ${describeError(models.error)}` },
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onChange: (option) => props.onChange(option.id)
+    }
+  );
+}
+var asChoice = (server) => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
+function serverOption(server) {
+  const badge = server.needsLogin ? /* @__PURE__ */ React.createElement(Badge, null, "Needs your account") : server.id === "service:system.ai.dbsql" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning", title: "Unlike the suite's own SQL tool, this server isn't read-only" }, "Can change data") : void 0;
+  return {
+    id: server.id,
+    label: server.label,
+    group: server.builtIn ? "Databricks" : "Your workspace",
+    keywords: server.id,
+    ...server.builtIn ? server.description && { detail: server.description } : { detail: `${server.kind === "connection" ? "External MCP connection" : "MCP service"}${server.description ? ` \xB7 ${server.description}` : ""}` },
+    ...badge && { badge }
+  };
+}
+function ToolsField(props) {
+  const { service } = props;
+  const status = useConnection(service).status;
+  const spaces = useAsync(async (signal) => new Genie(await service.ready(signal)).listSpaces(signal), [service, status]);
+  const catalog = useAsync(async (signal) => new McpCatalog(await service.ready(signal)).list(signal), [service, status]);
+  const [schemaName, setSchemaName] = React.useState("");
+  const choices = /* @__PURE__ */ new Map([[GENIE_ONE_CHOICE.id, GENIE_ONE_CHOICE]]);
+  const options = [{ id: GENIE_ONE_CHOICE.id, label: "Genie One", group: "Genie", detail: "Questions about any data you can access in this workspace." }];
+  for (const space of spaces.data ?? []) {
+    const choice = { id: `genie:${space.space_id}`, kind: "genie", label: space.title };
+    choices.set(choice.id, choice);
+    options.push({ id: choice.id, label: space.title, group: "Genie", detail: space.description || "Genie agent", keywords: "genie agent space" });
+  }
+  for (const server of catalog.data?.servers ?? []) {
+    choices.set(server.id, asChoice(server));
+    options.push(serverOption(server));
+  }
+  for (const tool of props.tools)
+    if (!choices.has(tool.id)) {
+      choices.set(tool.id, tool);
+      options.push({ id: tool.id, label: tool.label, group: tool.kind === "functions" ? "Unity Catalog functions" : "Chosen", ...tool.kind === "functions" && { detail: "Unity Catalog functions" } });
+    }
+  const selected = props.tools.map((tool) => options.find((option) => option.id === tool.id)).filter(Boolean);
+  const toggle = (id, on) => {
+    const choice = choices.get(id);
+    if (!choice) return;
+    props.onChange(on ? [...props.tools.filter((tool) => tool.id !== id), choice] : props.tools.filter((tool) => tool.id !== id));
+  };
+  const loading = spaces.loading ? "Loading Genie agents\u2026" : catalog.loading ? "Finding MCP servers\u2026" : false;
+  const notes = [
+    ...spaces.error ? [`Couldn't list Genie agents: ${describeError(spaces.error)}`] : [],
+    ...catalog.error ? [`Couldn't list MCP servers: ${describeError(catalog.error)}`] : [],
+    ...(catalog.data?.errors ?? []).map((error) => `Couldn't list ${error}`)
+  ];
+  return /* @__PURE__ */ React.createElement(
+    MultiPicker,
+    {
+      label: "Tools",
+      hint: "Genie and MCP servers in this workspace: Databricks-provided services, ones your team registered in Unity Catalog, and external MCP connections. They run with your access.",
+      selected,
+      options,
+      loading,
+      notes,
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onToggle: (option, on) => toggle(option.id, on),
+      footer: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          className: "dbx-input",
+          placeholder: "catalog.schema with Unity Catalog functions",
+          "aria-label": "Unity Catalog schema with functions",
+          value: schemaName,
+          onChange: (event) => setSchemaName(event.target.value.trim()),
+          style: { flex: 1 }
+        }
+      ), /* @__PURE__ */ React.createElement(
+        Button,
+        {
+          size: "sm",
+          disabled: props.disabled || !/^[\w-]+\.[\w-]+$/.test(schemaName),
+          onClick: () => {
+            const [catalogName = "", schemaPart = ""] = schemaName.split(".");
+            const choice = asChoice(functionsServer(catalogName, schemaPart));
+            props.onChange([...props.tools.filter((tool) => tool.id !== choice.id), choice]);
+            setSchemaName("");
+          }
+        },
+        "Add functions"
+      ))
+    }
+  );
+}
+function CustomAgentField(props) {
+  const { service } = props;
+  const status = useConnection(service).status;
+  const found = useAsync(
+    async (signal) => {
+      const client = await service.ready(signal);
+      const ai = new Ai(client);
+      const errors = [];
+      const [endpoints, apps, spaces] = await Promise.all([
+        ai.endpoints(signal).catch((error) => (errors.push(`serving endpoints: ${describeError(error)}`), [])),
+        ai.apps(signal).catch((error) => (errors.push(`apps: ${describeError(error)}`), [])),
+        new Genie(client).listSpaces(signal).catch((error) => (errors.push(`Genie agents: ${describeError(error)}`), []))
+      ]);
+      const agents = /* @__PURE__ */ new Map();
+      const options = [];
+      for (const endpoint of endpoints.filter((candidate) => candidate.isAgent || candidate.isChat && !candidate.name.startsWith("databricks-"))) {
+        const id = `endpoint:${endpoint.name}`;
+        agents.set(id, { kind: "endpoint", target: endpoint.name, label: endpoint.name, task: endpoint.task });
+        options.push({
+          id,
+          label: endpoint.name,
+          group: "Agent Bricks and Model Serving",
+          detail: [endpoint.description, endpoint.task].filter(Boolean).join(" \xB7 "),
+          ...!endpoint.ready && { badge: /* @__PURE__ */ React.createElement(Badge, { tone: "warning" }, "Not ready") }
+        });
+      }
+      for (const app of apps) {
+        const id = `app:${app.url}`;
+        agents.set(id, { kind: "app", target: app.url, label: app.name });
+        options.push({ id, label: app.name, group: "Databricks Apps", detail: app.description || new URL(app.url).hostname, ...!app.running && { badge: /* @__PURE__ */ React.createElement(Badge, null, "Stopped") } });
+      }
+      for (const space of spaces) {
+        const id = `genie:${space.space_id}`;
+        agents.set(id, { kind: "genie", target: space.space_id, label: space.title });
+        options.push({ id, label: space.title, group: "Genie agents", detail: space.description || "Genie agent" });
+      }
+      return { agents, options, errors };
+    },
+    [service, status]
+  );
+  const value = props.value ? `${props.value.kind}:${props.value.target}` : void 0;
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+    SinglePicker,
+    {
+      label: "Agent",
+      hint: "Agents you can use in this workspace. It gets each message in the thread and its reply is posted as this agent.",
+      ...value && { value },
+      ...props.value && { valueLabel: props.value.label },
+      placeholder: "Choose an agent",
+      options: found.data?.options ?? [],
+      loading: found.loading && !found.data ? "Finding your agents\u2026" : false,
+      ...found.error && { error: describeError(found.error) },
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onChange: (option) => {
+        const agent = found.data?.agents.get(option.id);
+        if (agent) props.onChange(agent);
+      }
+    }
+  ), (found.data?.errors ?? []).map((error) => /* @__PURE__ */ React.createElement(Text, { key: error, tone: "tertiary", size: "xs" }, "Couldn't list ", error)));
+}
+
 // plugins/agents/src/types.tsx
 var TURN_TIMEOUT_MS = 30 * 6e4;
 var Queue = class {
@@ -2418,15 +2666,30 @@ function provider(service) {
   };
 }
 var conversationKey = (scope, place) => scope === "thread" && place.root ? `${place.channelId}/${place.root}` : place.channelId;
+var KIND_IDS = ["sandbox", "genie-one", "custom"];
+function normalizeCustom(value) {
+  const agent = value ?? {};
+  if (!agent.kind || !["endpoint", "app", "genie"].includes(agent.kind) || typeof agent.target !== "string" || !agent.target) return void 0;
+  if (agent.kind === "app" && !/^https:\/\//.test(agent.target)) return void 0;
+  return {
+    kind: agent.kind,
+    target: agent.target,
+    label: typeof agent.label === "string" && agent.label ? agent.label : agent.target,
+    ...typeof agent.task === "string" && agent.task && { task: agent.task }
+  };
+}
 function normalizeDatabricks(config) {
   const value = config ?? {};
+  const custom = normalizeCustom(value.custom);
+  const kind = KIND_IDS.includes(value.kind) ? value.kind : typeof value.model === "string" && value.model ? "sandbox" : "genie-one";
   return {
+    kind,
     model: typeof value.model === "string" && value.model ? value.model : DEFAULT_MODEL,
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
-    sandbox: value.sandbox === true,
     tools: normalizeChoices(value.tools),
-    ...typeof value.profile === "string" && value.profile && { profile: value.profile }
+    ...typeof value.profile === "string" && value.profile && { profile: value.profile },
+    ...custom && { custom }
   };
 }
 function agentService(service, profile) {
@@ -2472,6 +2735,14 @@ function registerTypes(agents, kit, service) {
     if (!found) genieOnes.set(workspace, found = new GenieOne(workspace));
     return found;
   };
+  const sandboxChecks = /* @__PURE__ */ new WeakMap();
+  const sandboxOn = (workspace, signal) => {
+    const known = sandboxChecks.get(workspace);
+    if (known && Date.now() - known.at < 10 * 6e4) return known.on;
+    const on = workspace.ready(signal).then((client) => new Sandboxes(client).available(signal)).catch(() => true);
+    sandboxChecks.set(workspace, { at: Date.now(), on });
+    return on;
+  };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
   function turn(delivery, conversation, work) {
@@ -2495,23 +2766,136 @@ function registerTypes(agents, kit, service) {
     );
     delivery.workingUntil(done);
   }
+  async function sandboxSetup(delivery, config, workspace, signal, step) {
+    const on = await sandboxOn(workspace, signal);
+    const sandbox = on ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, step) : [];
+    const tools = await databricksTools(service, workspace, config, sandbox, signal);
+    const instructions = [
+      config.instructions.trim(),
+      on ? SANDBOX_PROMPT : "Databricks Sandbox isn't turned on in this workspace, so you can't run code or keep files this turn.",
+      toolsNote(workspace, service, tools.problems)
+    ].filter(Boolean).join("\n\n");
+    return { tools, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
+  }
+  async function sandboxTurn(delivery, config, conversation, signal) {
+    const workspace = agentService(service, config.profile);
+    const client = await workspace.ready(signal);
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => delivery.step?.("sandbox", state));
+    const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
+    const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
+    const ai = new Ai(client);
+    let answered = false;
+    try {
+      const result = await runLoop({
+        model: delivery.model ?? config.model,
+        system,
+        history: session.messages,
+        prompt: prompt.text,
+        buzz: kit.tools(delivery.agent, conversation),
+        buzzFilter: tools.buzzFilter,
+        local: tools.local,
+        chat: async (request) => {
+          const completion = await ai.chat(request);
+          answered = true;
+          return completion;
+        },
+        signal,
+        onStep: (tool, target2) => delivery.step?.(tool, target2)
+      });
+      if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
+      await sessions.set(delivery.agent.key, conversation.key, {
+        ...session,
+        cursor: prompt.cursor,
+        messages: trimHistory([...session.messages, ...result.messages])
+      });
+    } catch (error) {
+      if (!answered) prompt.restore();
+      throw error;
+    }
+  }
+  async function genieOneTurn(delivery, config, conversation, signal) {
+    const question = deliveredText(delivery) || "What can I ask you about?";
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    delivery.step?.("genie", "Genie One");
+    const answer = await genieOneFor(agentService(service, config.profile)).ask(question, {
+      ...session.genieOneConversationId && { conversationId: session.genieOneConversationId },
+      signal,
+      onProgress: (steps) => {
+        const last = steps[steps.length - 1] ?? "";
+        delivery.step?.("genie", /^Running SQL/.test(last) ? "running SQL" : /^Query result/.test(last) ? "reading the result" : "thinking");
+      }
+    });
+    const parts = [];
+    const text = answerMarkdown(answer);
+    if (text) parts.push(text);
+    if (answer.status === "incomplete") parts.push("_Genie One stopped early; this may be partial._");
+    const sql = answer.sql[answer.sql.length - 1];
+    if (sql) parts.push(`\`\`\`sql
+${sql.trim()}
+\`\`\``);
+    if (answer.deepLink) parts.push(`[Explore in Databricks](${answer.deepLink})`);
+    await kit.reply(delivery.agent, conversation, parts.join("\n\n") || "Genie One had no answer.");
+    await sessions.set(delivery.agent.key, conversation.key, { ...session, genieOneConversationId: answer.conversationId });
+  }
+  async function genieSpaceTurn(delivery, config, agent, conversation, signal) {
+    const workspace = agentService(service, config.profile);
+    const client = await workspace.ready(signal);
+    const question = deliveredText(delivery) || "What can I ask you about?";
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    delivery.step?.("genie", agent.label);
+    const answer = await new Genie(client).answer(agent.target, question, {
+      ...session.genieConversationId && { conversationId: session.genieConversationId },
+      signal,
+      onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " "))
+    });
+    const link = workspace.workspaceUrl(Genie.webPath(agent.target, answer.message.conversation_id));
+    const parts = [];
+    if (answer.text) parts.push(answer.text);
+    if (answer.result?.columns.length) parts.push(resultBlock(answer.result));
+    if (answer.sql) parts.push(`\`\`\`sql
+${answer.sql.trim()}
+\`\`\``);
+    if (answer.message.status !== "COMPLETED") parts.push(`Genie stopped with status ${answer.message.status}${answer.error ? `: ${answer.error}` : ""}.`);
+    if (answer.suggestions.length) parts.push(`_You could also ask:_ ${answer.suggestions.slice(0, 3).map((q) => `\u201C${q}\u201D`).join(" \xB7 ")}`);
+    if (link) parts.push(`[Open in Genie](${link})`);
+    await kit.reply(delivery.agent, conversation, parts.join("\n\n") || "Genie had no answer.");
+    await sessions.set(delivery.agent.key, conversation.key, { ...session, genieConversationId: answer.message.conversation_id });
+  }
+  async function customTurn(delivery, config, conversation, signal) {
+    const agent = config.custom;
+    if (!agent) throw new Error("No agent is chosen yet. My owner can pick one in my Settings.");
+    if (agent.kind === "genie") return genieSpaceTurn(delivery, config, agent, conversation, signal);
+    const client = await agentService(service, config.profile).ready(signal);
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    const question = deliveredText(delivery);
+    const history = session.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");
+    const messages = [...history, { role: "user", content: question || "Hello" }];
+    delivery.step?.("agent", agent.label);
+    const reply = await new Ai(client).invokeAgent(agent.target, messages, {
+      task: agent.kind === "app" ? "app" : agent.task ?? "",
+      sessionId: `${delivery.agent.pubkey.slice(0, 16)}-${conversation.key}`,
+      signal
+    });
+    await kit.reply(delivery.agent, conversation, reply.text || "(The agent returned no text.)");
+    await sessions.set(delivery.agent.key, conversation.key, {
+      ...session,
+      messages: trimHistory([...messages, { role: "assistant", content: reply.text }], 6e4, 40)
+    });
+  }
+  const scopeOf = (config) => config.kind === "sandbox" ? config.scope : "thread";
   const databricksType = {
     id: "databricks",
     icon,
     title: "Databricks",
-    description: "An agent powered by a model on Databricks, with Buzz's tools, your Databricks tools and, optionally, its own Databricks Sandbox to run code.",
+    description: "Genie One for data questions, a Sandbox agent with a Databricks model and the tools you pick, or an agent you built on Databricks.",
     provider: provider(service),
-    // Genie One is on by default: data questions work with no setup.
-    defaults: () => ({ config: normalizeDatabricks({ tools: [GENIE_ONE_CHOICE] }) }),
-    summary: (agent) => {
-      const config = normalizeDatabricks(agent.config);
-      const label = DEFAULT_MODELS.find((model) => model.id === config.model)?.label ?? config.model;
-      const extras = [config.sandbox ? "Sandbox" : "", config.tools.length ? `${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}` : "", config.profile ?? ""].filter(Boolean);
-      return [label, ...extras].join(" \xB7 ");
-    },
+    // Genie One needs no setup: it finds the right data across the workspace.
+    defaults: () => ({ config: normalizeDatabricks({ kind: "genie-one", tools: [GENIE_ONE_CHOICE] }) }),
+    summary: (agent) => summarize2(normalizeDatabricks(agent.config)),
     adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
     carry: (config) => config.instructions.trim() ? { instructions: config.instructions } : {},
-    Create: (props) => /* @__PURE__ */ React.createElement(DatabricksForm, { service, config: normalizeDatabricks(props.config), onChange: props.onChange, disabled: props.disabled }),
+    Create: (props) => /* @__PURE__ */ React.createElement(AgentForm, { service, config: normalizeDatabricks(props.config), onChange: props.onChange, disabled: props.disabled }),
     tabs: [
       {
         id: "settings",
@@ -2523,23 +2907,28 @@ function registerTypes(agents, kit, service) {
             service,
             config: normalizeDatabricks(props.agent.config),
             save: props.save,
-            Form: DatabricksForm,
-            note: normalizeDatabricks(props.agent.config).sandbox ? /* @__PURE__ */ React.createElement(SandboxNote, { service, pubkey: props.agent.pubkey }) : null
+            Form: AgentForm,
+            note: normalizeDatabricks(props.agent.config).kind === "sandbox" ? /* @__PURE__ */ React.createElement(SandboxNote, { service, pubkey: props.agent.pubkey }) : null
           }
         )
       }
     ],
-    models: (agent) => ({
-      current: normalizeDatabricks(agent.config).model,
-      models: DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, efforts: [] }))
-    }),
+    models: (agent) => {
+      const config = normalizeDatabricks(agent.config);
+      if (config.kind !== "sandbox") return { current: "", models: [] };
+      const models = DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, efforts: [] }));
+      if (!models.some((model) => model.id === config.model)) models.unshift({ id: config.model, label: modelLabel(config.model), efforts: [] });
+      return { current: config.model, models };
+    },
     sessionControls: {
-      scope: (agent) => normalizeDatabricks(agent.config).scope,
-      state: (agent, place) => queue.active(`${agent.key}|${conversationKey(normalizeDatabricks(agent.config).scope, place)}`) ? "active" : "idle",
+      scope: (agent) => scopeOf(normalizeDatabricks(agent.config)),
+      state: (agent, place) => queue.active(`${agent.key}|${conversationKey(scopeOf(normalizeDatabricks(agent.config)), place)}`) ? "active" : "idle",
       async run(agent, place, action) {
-        const key2 = conversationKey(normalizeDatabricks(agent.config).scope, place);
+        const config = normalizeDatabricks(agent.config);
+        const key2 = conversationKey(scopeOf(config), place);
         if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
         if (action === "new") return sessions.clear(agent.key, key2);
+        if (config.kind !== "sandbox") return;
         const session = sessions.get(agent.key, key2);
         await sessions.set(agent.key, key2, { ...session, messages: trimHistory(session.messages, 2e4, 12) });
       },
@@ -2548,61 +2937,26 @@ function registerTypes(agents, kit, service) {
     timeoutMs: TURN_TIMEOUT_MS,
     async run(delivery) {
       const config = normalizeDatabricks(delivery.config);
-      const conversation = await kit.conversation(delivery, config.scope);
+      const conversation = await kit.conversation(delivery, scopeOf(config));
       if (!conversation) {
         delivery.ignored?.();
         return;
       }
-      turn(delivery, conversation, async (signal) => {
-        const workspace = agentService(service, config.profile);
-        const client = await workspace.ready(signal);
-        const session = sessions.get(delivery.agent.key, conversation.key);
-        const sandbox = config.sandbox ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, (state) => delivery.step?.("sandbox", state)) : [];
-        const tools = await databricksTools(service, workspace, config, sandbox, signal);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
-        const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: config.sandbox ? `${SANDBOX_HOME}/work` : "~", instructions, tools: true });
-        const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
-        const ai = new Ai(client);
-        let answered = false;
-        try {
-          const result = await runLoop({
-            model: delivery.model ?? config.model,
-            system,
-            history: session.messages,
-            prompt: prompt.text,
-            buzz: kit.tools(delivery.agent, conversation),
-            buzzFilter: tools.buzzFilter,
-            local: tools.local,
-            chat: async (request) => {
-              const completion = await ai.chat(request);
-              answered = true;
-              return completion;
-            },
-            signal,
-            onStep: (tool, target2) => delivery.step?.(tool, target2)
-          });
-          if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
-          await sessions.set(delivery.agent.key, conversation.key, {
-            ...session,
-            cursor: prompt.cursor,
-            messages: trimHistory([...session.messages, ...result.messages])
-          });
-        } catch (error) {
-          if (!answered) prompt.restore();
-          throw error;
-        }
-      });
+      turn(
+        delivery,
+        conversation,
+        (signal) => config.kind === "sandbox" ? sandboxTurn(delivery, config, conversation, signal) : config.kind === "custom" ? customTurn(delivery, config, conversation, signal) : genieOneTurn(delivery, config, conversation, signal)
+      );
     },
     async runOnce(standalone) {
       const config = normalizeDatabricks(standalone.delivery.config);
+      if (config.kind !== "sandbox") return { ok: false, error: "Watches and timers run on Sandbox agents; Genie One and custom agents answer mentions." };
       try {
         const prompt = await standalone.prompt();
         if (!prompt) return { ok: true };
         const workspace = agentService(service, config.profile);
         const client = await workspace.ready(standalone.signal);
-        const sandbox = config.sandbox ? sandboxTools(workspace, standalone.delivery.agent.pubkey, standalone.delivery.agent.name) : [];
-        const tools = await databricksTools(service, workspace, config, sandbox, standalone.signal);
-        const instructions = [config.instructions.trim(), config.sandbox ? SANDBOX_PROMPT : "", toolsNote(workspace, service, tools.problems)].filter(Boolean).join("\n\n");
+        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal);
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({
@@ -2623,137 +2977,15 @@ function registerTypes(agents, kit, service) {
       }
     }
   };
-  const genieType = {
-    id: "genie",
-    icon,
-    title: "Genie",
-    description: "Answers data questions in the thread with Databricks Genie: Genie One across all your data, or one of your Genie agents. Explanation, table, SQL and a link.",
-    provider: provider(service),
-    // Genie One needs no setup: it finds the right data across the workspace.
-    defaults: () => ({ config: { spaceId: GENIE_ONE_ID, spaceTitle: "Genie One" } }),
-    summary: (agent) => `Genie \xB7 ${agent.config.spaceTitle || "no agent chosen"}`,
-    Create: (props) => /* @__PURE__ */ React.createElement(GenieForm, { service, config: props.config, onChange: props.onChange, disabled: props.disabled }),
-    tabs: [
-      {
-        id: "settings",
-        title: "Settings",
-        role: "settings",
-        component: (props) => /* @__PURE__ */ React.createElement(SettingsTab, { service, config: props.agent.config, save: props.save, Form: GenieForm })
-      }
-    ],
-    timeoutMs: 15 * 6e4,
-    async run(delivery) {
-      const config = delivery.config;
-      const conversation = await kit.conversation(delivery, "thread");
-      if (!conversation) {
-        delivery.ignored?.();
-        return;
-      }
-      turn(delivery, conversation, async (signal) => {
-        if (!config.spaceId) throw new Error("No Genie agent is chosen yet. My owner can pick one in my Settings.");
-        const question = deliveredText(delivery) || "What can I ask you about?";
-        const session = sessions.get(delivery.agent.key, conversation.key);
-        const workspace = agentService(service, config.profile);
-        if (config.spaceId === GENIE_ONE_ID) {
-          delivery.step?.("genie", "Genie One");
-          const answer2 = await genieOneFor(workspace).ask(question, {
-            ...session.genieOneConversationId && { conversationId: session.genieOneConversationId },
-            signal,
-            onProgress: (steps) => {
-              const last = steps[steps.length - 1] ?? "";
-              delivery.step?.("genie", /^Running SQL/.test(last) ? "running SQL" : /^Query result/.test(last) ? "reading the result" : "thinking");
-            }
-          });
-          const parts2 = [];
-          const text = answerMarkdown(answer2);
-          if (text) parts2.push(text);
-          if (answer2.status === "incomplete") parts2.push("_Genie One stopped early; this may be partial._");
-          const sql = answer2.sql[answer2.sql.length - 1];
-          if (sql) parts2.push(`\`\`\`sql
-${sql.trim()}
-\`\`\``);
-          if (answer2.deepLink) parts2.push(`[Explore in Databricks](${answer2.deepLink})`);
-          await kit.reply(delivery.agent, conversation, parts2.join("\n\n") || "Genie One had no answer.");
-          await sessions.set(delivery.agent.key, conversation.key, { ...session, genieOneConversationId: answer2.conversationId });
-          return;
-        }
-        const client = await workspace.ready(signal);
-        delivery.step?.("genie", config.spaceTitle || "Genie");
-        const answer = await new Genie(client).answer(config.spaceId, question, {
-          ...session.genieConversationId && { conversationId: session.genieConversationId },
-          signal,
-          onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " "))
-        });
-        const link = workspace.workspaceUrl(Genie.webPath(config.spaceId, answer.message.conversation_id));
-        const parts = [];
-        if (answer.text) parts.push(answer.text);
-        if (answer.result?.columns.length) parts.push(resultBlock(answer.result));
-        if (answer.sql) parts.push(`\`\`\`sql
-${answer.sql.trim()}
-\`\`\``);
-        if (answer.message.status !== "COMPLETED") parts.push(`Genie stopped with status ${answer.message.status}${answer.error ? `: ${answer.error}` : ""}.`);
-        if (answer.suggestions.length) parts.push(`_You could also ask:_ ${answer.suggestions.slice(0, 3).map((q) => `\u201C${q}\u201D`).join(" \xB7 ")}`);
-        if (link) parts.push(`[Open in Genie](${link})`);
-        await kit.reply(delivery.agent, conversation, parts.join("\n\n") || "Genie had no answer.");
-        await sessions.set(delivery.agent.key, conversation.key, { ...session, genieConversationId: answer.message.conversation_id });
-      });
-    }
-  };
-  const endpointType = {
-    id: "endpoint",
-    icon,
-    title: "Databricks custom agent",
-    description: "Brings an agent you built on Databricks (Agent Bricks, Model Serving or Databricks Apps) into Buzz conversations.",
-    provider: provider(service),
-    defaults: () => ({ config: { target: "", task: "", label: "", instructions: "" } }),
-    summary: (agent) => agent.config.label || agent.config.target || "No endpoint chosen",
-    Create: (props) => /* @__PURE__ */ React.createElement(EndpointForm, { service, config: props.config, onChange: props.onChange, disabled: props.disabled }),
-    tabs: [
-      {
-        id: "settings",
-        title: "Settings",
-        role: "settings",
-        component: (props) => /* @__PURE__ */ React.createElement(SettingsTab, { service, config: props.agent.config, save: props.save, Form: EndpointForm })
-      }
-    ],
-    sessionControls: {
-      scope: () => "thread",
-      state: (agent, place) => queue.active(`${agent.key}|${conversationKey("thread", place)}`) ? "active" : "idle",
-      async run(agent, place, action) {
-        const key2 = conversationKey("thread", place);
-        if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
-        return sessions.clear(agent.key, key2);
-      },
-      subscribe: (listener) => queue.subscribe(listener)
-    },
-    timeoutMs: 15 * 6e4,
-    async run(delivery) {
-      const config = delivery.config;
-      const conversation = await kit.conversation(delivery, "thread");
-      if (!conversation) {
-        delivery.ignored?.();
-        return;
-      }
-      turn(delivery, conversation, async (signal) => {
-        if (!config.target) throw new Error("No agent endpoint is chosen yet. My owner can pick one in my Settings.");
-        const client = await agentService(service, config.profile).ready(signal);
-        const session = sessions.get(delivery.agent.key, conversation.key);
-        const question = deliveredText(delivery);
-        const history = session.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");
-        const messages = [...history, { role: "user", content: question || "Hello" }];
-        delivery.step?.("agent", config.label || config.target);
-        const reply = await new Ai(client).invokeAgent(config.target, messages, { task: config.task, sessionId: `${delivery.agent.pubkey.slice(0, 16)}-${conversation.key}`, signal });
-        await kit.reply(delivery.agent, conversation, reply.text || "(The agent returned no text.)");
-        await sessions.set(delivery.agent.key, conversation.key, {
-          ...session,
-          messages: trimHistory([...messages, { role: "assistant", content: reply.text }], 6e4, 40)
-        });
-      });
-    }
-  };
   agents.register(databricksType);
-  agents.register(genieType);
-  agents.register(endpointType);
+}
+function summarize2(config) {
+  const where = config.profile ? [config.profile] : [];
+  if (config.kind === "genie-one") return ["Genie One", ...where].join(" \xB7 ");
+  if (config.kind === "custom") return [config.custom?.label ?? "No agent chosen", ...where].join(" \xB7 ");
+  const model = DEFAULT_MODELS.find((candidate) => candidate.id === config.model)?.label ?? modelLabel(config.model);
+  const tools = config.tools.length ? [`${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}`] : [];
+  return ["Sandbox", model, ...tools, ...where].join(" \xB7 ");
 }
 function SandboxNote(props) {
   const url = props.service.workspaceUrl("/compute/sandboxes");

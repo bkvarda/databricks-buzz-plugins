@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { ChatCompletion, ChatMessage } from "@dbx/core/api/ai";
 import { runLoop, trimHistory } from "../plugins/agents/src/loop";
 import { plainText } from "../plugins/agents/src/state";
-import { normalizeDatabricks } from "../plugins/agents/src/types";
+import { normalizeDatabricks, summarize } from "../plugins/agents/src/types";
+import { filterOptions, modelOptions } from "../plugins/agents/src/ui";
+import { Ai, modelLabel } from "@dbx/core/api/ai";
 import { fromCsv, parseCsv, RESULT_LANGUAGE, resultBlock, resultSet } from "@dbx/core/result";
 
 function fakeBuzz(log: unknown[]) {
@@ -91,9 +93,50 @@ describe("agent helpers", () => {
     expect(plainText("[@Sales Genie](nostr:npub1abc0def) what were sales last week?")).toBe("what were sales last week?");
     expect(plainText("nostr:npub1qqqq  hello")).toBe("hello");
   });
-  it("normalizes config", () => {
-    expect(normalizeDatabricks({ scope: "channel", sandbox: true })).toMatchObject({ scope: "channel", sandbox: true, instructions: "" });
+  it("normalizes config into one of three kinds", () => {
+    expect(normalizeDatabricks(undefined)).toMatchObject({ kind: "genie-one", scope: "thread", tools: [] });
     expect(normalizeDatabricks(undefined).model).toMatch(/^system\.ai\./);
+    // Saved before kinds: a model agent.
+    expect(normalizeDatabricks({ model: "system.ai.gpt-5-4", scope: "channel" })).toMatchObject({ kind: "sandbox", scope: "channel", instructions: "" });
+    expect(normalizeDatabricks({ kind: "custom", custom: { kind: "endpoint", target: "support-agent", task: "agent/v1/responses" } }).custom).toEqual({
+      kind: "endpoint",
+      target: "support-agent",
+      label: "support-agent",
+      task: "agent/v1/responses",
+    });
+    expect(normalizeDatabricks({ kind: "custom", custom: { kind: "app", target: "http://plain" } }).custom).toBeUndefined();
+    expect(normalizeDatabricks({ kind: "nope" }).kind).toBe("genie-one");
+  });
+
+  it("summarizes each kind", () => {
+    expect(summarize(normalizeDatabricks({ kind: "genie-one", profile: "other" }))).toBe("Genie One · other");
+    expect(summarize(normalizeDatabricks({ kind: "sandbox", model: "system.ai.claude-sonnet-5-5", tools: [{ id: "genie-one", kind: "genie-one", label: "Genie One" }] }))).toBe("Sandbox · Claude Sonnet 5.5 · 1 tool");
+    expect(summarize(normalizeDatabricks({ kind: "sandbox", model: "system.ai.gpt-6-1-terra" }))).toBe("Sandbox · GPT-6.1 Terra");
+    expect(summarize(normalizeDatabricks({ kind: "custom", custom: { kind: "genie", target: "01f0", label: "NYC Taxi Trips" } }))).toBe("NYC Taxi Trips");
+    expect(summarize(normalizeDatabricks({ kind: "custom" }))).toBe("No agent chosen");
+  });
+
+  it("labels AI Gateway models and searches picker options", () => {
+    expect(["system.ai.claude-opus-5-5", "system.ai.gpt-5-6-sol", "system.ai.gpt-oss-120b", "system.ai.deepseek-v4-1-flash-1017", "system.ai.meta-llama-3-3-70b-instruct"].map(modelLabel)).toEqual([
+      "Claude Opus 5.5",
+      "GPT-5.6 Sol",
+      "GPT OSS 120B",
+      "DeepSeek V4.1 Flash 1017",
+      "Meta Llama 3.3 70B Instruct",
+    ]);
+    const options = modelOptions([
+      { id: "system.ai.gemini-3-8-flash", label: "Gemini 3.8 Flash", tools: true, builtIn: true },
+      { id: "system.ai.claude-sonnet-5-5", label: "Claude Sonnet 5.5", tools: true, builtIn: true },
+      { id: "main.team.support_model", label: "Support Model", tools: true, builtIn: false },
+    ]);
+    expect(options.map((option) => [option.group, option.label])).toEqual([
+      ["Recommended", "Claude Sonnet 5.5"],
+      ["Databricks", "Gemini 3.8 Flash"],
+      ["Your workspace", "Support Model"],
+    ]);
+    expect(filterOptions(options, "flash").map((option) => option.id)).toEqual(["system.ai.gemini-3-8-flash"]);
+    expect(filterOptions(options, "team support").map((option) => option.id)).toEqual(["main.team.support_model"]);
+    expect(filterOptions(options, "")).toHaveLength(3);
   });
 });
 
@@ -215,5 +258,30 @@ describe("result blocks", () => {
     const one = resultSet([{ name: "trips" }], [["21932"]]);
     expect(answerMarkdown({ text: "**21,932** trips.", results: [one] })).toBe("**21,932** trips.");
     expect(withoutChartCaveats("Revenue grew 4%. I can't render a graph in chat. Ask for more.")).toBe("Revenue grew 4%. Ask for more.");
+  });
+});
+
+describe("AI Gateway chat", () => {
+  it("turns reasoning off for models that need it with tools, and remembers", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const client = {
+      post: async (_path: string, body: Record<string, unknown>) => {
+        bodies.push(body);
+        if (body.tools && body.reasoning_effort !== "none")
+          throw Object.assign(new Error("Function tools with reasoning_effort are not supported for gpt-5.6-terra in /v1/chat/completions."), { status: 400 });
+        return { choices: [{ message: { role: "assistant", content: "ok" } }] };
+      },
+    };
+    const tools = [{ type: "function" as const, function: { name: "t", parameters: {} } }];
+    const ai = new Ai(client as never);
+    const first = await ai.chat({ model: "system.ai.test-reasoning", messages: [{ role: "user", content: "hi" }], tools });
+    expect(first.choices[0]?.message.content).toBe("ok");
+    expect(bodies.map((body) => body.reasoning_effort)).toEqual([undefined, "none"]);
+    await new Ai(client as never).chat({ model: "system.ai.test-reasoning", messages: [{ role: "user", content: "again" }], tools });
+    expect(bodies.length).toBe(3);
+    expect(bodies[2]?.reasoning_effort).toBe("none");
+    // Without tools nothing changes.
+    await ai.chat({ model: "system.ai.test-reasoning", messages: [{ role: "user", content: "plain" }] });
+    expect(bodies[3]?.reasoning_effort).toBeUndefined();
   });
 });

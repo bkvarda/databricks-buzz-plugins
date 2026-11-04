@@ -74,6 +74,17 @@ export class Sandboxes {
     return out;
   }
 
+  /** Whether Databricks Sandbox is on in this workspace (no retries). */
+  async available(signal?: AbortSignal): Promise<boolean> {
+    try {
+      await this.client.get("/api/2.0/sandboxes", { query: { page_size: 1 }, ...(signal && { signal }) });
+      return true;
+    } catch (error) {
+      if (isUnavailable(error)) return false;
+      throw error;
+    }
+  }
+
   get(id: string, signal?: AbortSignal) {
     return this.client.get<Sandbox>(`/api/2.0/${resource(id)}`, signal ? { signal } : {});
   }

@@ -134,6 +134,7 @@ export function Text(props: {
   as?: "p" | "span" | "div" | "h2" | "h3" | "h4";
   mono?: boolean;
   style?: CSSProperties;
+  id?: string;
 }) {
   const color = {
     standard: "var(--dbx-ink)",
@@ -151,6 +152,7 @@ export function Text(props: {
   return React.createElement(
     Tag,
     {
+      id: props.id,
       className: props.mono ? "dbx-mono" : undefined,
       style: {
         margin: 0,
