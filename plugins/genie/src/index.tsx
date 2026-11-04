@@ -38,8 +38,8 @@ export function apply(ctx: Context) {
       for (const tool of genieTools(databricks, store, genieOne)) agents.agents.addTool(tool);
     });
     return {
-      page: geniePage(databricks, store),
-      sidebar: genieSidebar(databricks, store),
+      page: geniePage(databricks, store, genieOne),
+      sidebar: genieSidebar(databricks, store, genieOne),
     };
   });
 

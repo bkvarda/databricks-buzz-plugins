@@ -1,7 +1,7 @@
 // Databricks Sandbox (Beta): serverless Linux microVMs for agents, with a
 // persistent home directory (/home/sandbox-agent), egress, and the creator's
 // Databricks credential. REST paths match databricks-sdk 0.161 SandboxAPI.
-import { apiError, type DatabricksClient } from "../client";
+import type { DatabricksClient } from "../client";
 
 export type SandboxState =
   | "SANDBOX_STATE_PENDING"
@@ -29,6 +29,8 @@ export type ExecResult = Readonly<{
   truncated?: boolean;
 }>;
 
+export type SandboxFile = Readonly<{ name: string; path: string; directory: boolean; size?: number; modified?: string }>;
+
 export const SANDBOX_HOME = "/home/sandbox-agent";
 
 /** Sandbox IDs: lowercase letters, digits and hyphens. */
@@ -39,6 +41,17 @@ export function sandboxId(seed: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 40);
   return /^[a-z]/.test(cleaned) ? cleaned : `sb-${cleaned}`;
+}
+
+/** Databricks answers this before the Databricks Sandbox preview is on. */
+const isUnavailable = (error: unknown) =>
+  (error as { status?: number }).status === 404 && /requested API is not available/i.test((error as Error).message ?? "");
+
+export class SandboxUnavailableError extends Error {
+  constructor() {
+    super("Databricks Sandbox isn't turned on in this workspace. A workspace admin can turn on the Databricks Sandbox preview in Settings → Previews.");
+    this.name = "SandboxUnavailableError";
+  }
 }
 
 const resource = (id: string) => (id.startsWith("sandboxes/") ? id : `sandboxes/${id}`);
@@ -91,30 +104,60 @@ export class Sandboxes {
   /** Gets or creates the sandbox and waits until it is running. */
   async ensureRunning(
     id: string,
-    options: Readonly<{ displayName?: string; tags?: Record<string, string>; signal?: AbortSignal; onState?(state: string): void }> = {},
+    options: Readonly<{
+      displayName?: string;
+      tags?: Record<string, string>;
+      signal?: AbortSignal;
+      /** A short label for people, and the raw API state. */
+      onState?(label: string, state?: string): void;
+    }> = {},
   ): Promise<Sandbox> {
-    let sandbox: Sandbox;
-    try {
-      sandbox = await this.get(id, options.signal);
-    } catch (error) {
-      if ((error as { status?: number }).status !== 404) throw error;
+    let sandbox: Sandbox | undefined = await this.find(id, options.signal);
+    if (!sandbox) {
       options.onState?.("Creating sandbox");
-      sandbox = await this.create(id, options);
+      try {
+        sandbox = await this.create(id, options);
+      } catch (error) {
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if ((error as { status?: number }).status !== 409) throw error;
+        sandbox = await this.get(id, options.signal);
+      }
     }
     const deadline = Date.now() + 5 * 60_000;
+    let started = false;
     for (;;) {
-      const state = sandbox.status?.state ?? "";
-      if (state === "SANDBOX_STATE_RUNNING") return sandbox;
-      if (Date.now() > deadline) throw new Error("The sandbox did not start within 5 minutes.");
-      if (state === "SANDBOX_STATE_STOPPED") {
-        options.onState?.("Starting sandbox");
+      const state = sandbox?.status?.state ?? "";
+      if (state === "SANDBOX_STATE_RUNNING") return sandbox!;
+      if (Date.now() > deadline) throw new Error(`The sandbox did not start within 5 minutes (state: ${state || "unknown"}).`);
+      if (state === "SANDBOX_STATE_STOPPED" && !started) {
+        options.onState?.("Starting sandbox", state);
+        started = true;
         sandbox = await this.start(id);
         continue;
       }
-      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox");
+      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox", state);
+      if (state === "SANDBOX_STATE_STOPPED") started = false;
       await new Promise((resolve) => setTimeout(resolve, 2000));
       options.signal?.throwIfAborted();
-      sandbox = await this.get(id, options.signal);
+      sandbox = (await this.find(id, options.signal)) ?? sandbox;
+    }
+  }
+
+  /** The sandbox, or undefined when it doesn't exist. */
+  private async find(id: string, signal?: AbortSignal): Promise<Sandbox | undefined> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.get(id, signal);
+      } catch (error) {
+        // While the preview rolls out, some servers answer "API not available".
+        if (isUnavailable(error) && attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          continue;
+        }
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if ((error as { status?: number }).status === 404) return undefined;
+        throw error;
+      }
     }
   }
 
@@ -147,31 +190,98 @@ export class Sandboxes {
     });
   }
 
+  // Files go through exec-sync, the documented API: contents travel as base64
+  // in environment variables, never in the command line.
+
+  /** Reads a UTF-8 text file. */
   async readFile(id: string, path: string, signal?: AbortSignal): Promise<string> {
-    const response = await this.client.request(`/api/2.0/sandbox-files/${resource(id)}/content`, {
-      query: { path },
-      headers: { Accept: "application/octet-stream" },
+    const result = await this.exec(id, "/bin/bash", {
+      args: ["-c", 'if [ -d "$P" ]; then echo "$P is a directory" >&2; exit 21; fi; base64 -w0 -- "$P"'],
+      env: { P: path },
+      timeoutSeconds: 60,
       ...(signal && { signal }),
     });
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
-    return response.body;
+    if (result.exit_code !== 0) throw new Error(result.stderr?.trim().replace(/^base64: /, "") || `Couldn't read ${path}.`);
+    if (result.truncated) throw new Error(`${path} is too large to read whole; read part of it with a command instead.`);
+    return fromBase64(result.stdout ?? "");
   }
 
+  /** Creates or replaces a file (and its parent folders). */
   async writeFile(id: string, path: string, contents: string, signal?: AbortSignal): Promise<void> {
-    const response = await this.client.request(`/api/2.0/sandbox-files/${resource(id)}/content`, {
-      method: "PUT",
-      query: { path },
-      body: contents,
-      headers: { "Content-Type": "application/octet-stream" },
-      ...(signal && { signal }),
-    });
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    const encoded = toBase64(contents);
+    const CHUNK = 96 * 1024;
+    for (let offset = 0; offset === 0 || offset < encoded.length; offset += CHUNK) {
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", offset === 0 ? 'mkdir -p -- "$(dirname -- "$P")" && printf %s "$C" | base64 -d > "$P"' : 'printf %s "$C" | base64 -d >> "$P"'],
+        env: { P: path, C: encoded.slice(offset, offset + CHUNK) },
+        timeoutSeconds: 60,
+        ...(signal && { signal }),
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't write ${path}.`);
+    }
   }
 
-  async listDirectory(id: string, path: string, signal?: AbortSignal) {
-    const response = await this.client.get<{
-      contents?: { name?: string; path?: string; file_type?: string; size?: number }[];
-    }>(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, { query: { path, page_size: 500 }, ...(signal && { signal }) });
-    return response.contents ?? [];
+  /** Lists a folder: directory-entries when the server offers it, else `find`. */
+  async listDirectory(id: string, path: string, signal?: AbortSignal): Promise<SandboxFile[]> {
+    type Raw = { name?: string; path?: string; fileType?: string; file_type?: string; size?: string | number; modifyTime?: string; modify_time?: string };
+    try {
+      const response = await this.client.get<{ contents?: Raw[] }>(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, {
+        query: { path, page_size: 500 },
+        ...(signal && { signal }),
+      });
+      return (response.contents ?? []).map((entry) => {
+        const type = entry.fileType ?? entry.file_type ?? "";
+        const size = entry.size === undefined ? undefined : Number(entry.size);
+        const modified = entry.modifyTime ?? entry.modify_time;
+        return {
+          name: entry.name ?? entry.path?.split("/").pop() ?? "",
+          path: entry.path ?? "",
+          directory: /DIRECTORY/.test(type),
+          ...(size !== undefined && Number.isFinite(size) && { size }),
+          ...(modified && { modified }),
+        };
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", 'find "$P" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%p\\n"'],
+        env: { P: path },
+        timeoutSeconds: 30,
+        ...(signal && { signal }),
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't list ${path}.`);
+      return parseFindOutput(result.stdout ?? "");
+    }
   }
+}
+
+/** Parses `find -printf "%y\t%s\t%p\n"` lines. */
+export function parseFindOutput(text: string): SandboxFile[] {
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [type = "", size = "", ...rest] = line.split("\t");
+      const path = rest.join("\t");
+      return {
+        name: path.split("/").pop() ?? path,
+        path,
+        directory: type === "d",
+        ...(type !== "d" && Number.isFinite(Number(size)) && { size: Number(size) }),
+      };
+    });
+}
+
+export function toBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+export function fromBase64(encoded: string): string {
+  const binary = atob(encoded.trim());
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
 }

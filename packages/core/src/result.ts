@@ -16,7 +16,11 @@ export type ResultSet = Readonly<{
 const NUMERIC_TYPES = /^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i;
 const TIME_TYPES = /^(date|timestamp)/i;
 
-export function kindOf(type: string | undefined, sample: readonly (string | null)[]): ColumnKind {
+/** Numbers that name things (IDs, ZIP codes, years) are labels, not measures. */
+const IDENTIFIER = /(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;
+
+export function kindOf(type: string | undefined, sample: readonly (string | null)[], name = ""): ColumnKind {
+  if (IDENTIFIER.test(name) && !TIME_TYPES.test(type ?? "") && !/^bool/i.test(type ?? "")) return "text";
   if (type) {
     if (NUMERIC_TYPES.test(type)) return "number";
     if (TIME_TYPES.test(type)) return "time";
@@ -44,6 +48,7 @@ export function resultSet(
       kind: kindOf(
         column.type,
         rows.slice(0, 50).map((row) => row[index] ?? null),
+        column.name,
       ),
     })),
     rows,
@@ -131,6 +136,13 @@ export type ChartPlan =
   | Readonly<{ type: "none" }>;
 
 /** Picks the chart that reads best for a result, or none. */
+/** Keeps measures within 10× of the first, so no series flattens to nothing. */
+function comparable(rows: ResultSet["rows"], indices: readonly number[]): number[] {
+  const peak = (index: number) => Math.max(0, ...rows.map((row) => Math.abs(Number(row[index]) || 0)));
+  const base = indices[0] === undefined ? 0 : peak(indices[0]);
+  return indices.filter((index, n) => n === 0 || base === 0 || (peak(index) / base <= 10 && peak(index) / base >= 0.1));
+}
+
 export function planChart(result: ResultSet): ChartPlan {
   const { columns, rows } = result;
   if (!rows.length) return { type: "none" };
@@ -142,21 +154,21 @@ export function planChart(result: ResultSet): ChartPlan {
   if (rows.length < 2 || !numeric.length) return { type: "none" };
   const time = columns.findIndex((column) => column.kind === "time");
   if (time !== -1) {
-    const series = numeric.filter((index) => index !== time).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== time)).slice(0, 4);
     return series.length ? { type: "line", x: time, series } : { type: "none" };
   }
   const label = columns.findIndex((column) => column.kind === "text");
   if (label !== -1 && rows.length <= 40) {
-    const series = numeric.slice(0, 3);
+    const series = comparable(rows, numeric).slice(0, 3);
     const longest = Math.max(...rows.map((row) => (row[label] ?? "").length));
     return { type: "bar", x: label, series, horizontal: longest > 10 || rows.length > 12 };
   }
-  // A year/month integer column is a common x-axis even without a time type.
+  // A year/month/hour integer column is a common x-axis even without a time type.
   const yearLike = numeric.find((index) =>
-    /^(year|yr|month|week|day|quarter|period)/i.test(columns[index]?.name ?? ""),
+    /(^|_)(year|yr|quarter|month|week|day|hour|minute|period)(_|s?$)/i.test(columns[index]?.name ?? ""),
   );
   if (yearLike !== undefined) {
-    const series = numeric.filter((index) => index !== yearLike).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== yearLike)).slice(0, 4);
     if (series.length) return { type: "line", x: yearLike, series };
   }
   return { type: "none" };

@@ -47,18 +47,35 @@ var Memory = class {
       { actor_id: actorId, query, ...limit && { limit } },
       signal ? { signal } : {}
     );
-    if (response.entries) return response.entries.slice(0, limit);
-    return (response.results ?? []).flatMap((result) => result.entry ? [{ ...result.entry, ...result.score !== void 0 && { score: result.score } }] : []).slice(0, limit);
+    if (response.results?.length)
+      return response.results.flatMap((hit) => {
+        const entry = hit.managed_memory_entry ?? hit.entry;
+        return entry ? [{ ...entry, ...hit.score !== void 0 && { score: hit.score } }] : [];
+      }).slice(0, limit);
+    return (response.managed_memory_entries ?? response.entries ?? []).slice(0, limit);
   }
+  /**
+   * Entries for an actor. `path` matches one path exactly; `prefix` matches
+   * everything under a folder such as /projects/.
+   */
   async list(storeId, actorId, options = {}) {
     const out = [];
     let pageToken;
     for (let page = 0; page < 20; page++) {
-      const response = await this.client.get(`${store(storeId)}/entries`, {
-        query: { actor_id: actorId, path: options.path && normalizePath(options.path), page_size: 100, page_token: pageToken },
-        ...options.signal && { signal: options.signal }
-      });
-      out.push(...response.entries ?? []);
+      const response = await this.client.get(
+        `${store(storeId)}/entries`,
+        {
+          query: {
+            actor_id: actorId,
+            path: options.path && normalizePath(options.path),
+            path_prefix: options.prefix && normalizePath(options.prefix),
+            page_size: 100,
+            page_token: pageToken
+          },
+          ...options.signal && { signal: options.signal }
+        }
+      );
+      out.push(...response.managed_memory_entries ?? response.entries ?? []);
       pageToken = response.next_page_token;
       if (!pageToken) break;
     }
@@ -82,12 +99,22 @@ var Memory = class {
         body: { content: entry.content, ...entry.description !== void 0 && { description: entry.description } }
       });
     }
-    return this.client.post(`${store(storeId)}/entries`, {
-      actor_id: entry.actorId,
-      path,
-      content: entry.content,
-      ...entry.description && { description: entry.description }
-    });
+    try {
+      return await this.client.post(`${store(storeId)}/entries`, {
+        actor_id: entry.actorId,
+        path,
+        content: entry.content,
+        ...entry.description && { description: entry.description }
+      });
+    } catch (error) {
+      const existingId = /existing entry id: ([\w-]+)/.exec(error.message ?? "")?.[1];
+      if (error.status !== 409 || !existingId) throw error;
+      return this.client.json(`${store(storeId)}/entries/${encodeURIComponent(existingId)}`, {
+        method: "PATCH",
+        query: { update_mask: "content" },
+        body: { content: entry.content }
+      });
+    }
   }
   async remove(storeId, actorId, path) {
     const existing = await this.get(storeId, actorId, path);
@@ -282,6 +309,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }
@@ -602,7 +631,7 @@ ${entry.content ?? ""}`;
       async call(_client, _context, args) {
         const { memory, store: store2, actor } = await context(service);
         const prefix = stringArg(args, "prefix", false);
-        const entries = (await memory.list(store2, actor)).filter((entry) => !prefix || entry.path.startsWith(normalizePath(prefix)));
+        const entries = await memory.list(store2, actor, prefix ? { prefix } : {});
         if (!entries.length) return prefix ? `No memories under ${prefix}.` : "No memories yet.";
         return entries.sort((a, b) => a.path.localeCompare(b.path)).map((entry) => `- ${entry.path}${entry.description ? ` \u2014 ${entry.description}` : ""}`).join("\n");
       }

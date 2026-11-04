@@ -271,7 +271,18 @@ export class Connection {
         throw new Error(`Databricks returned HTTP ${response.status}`);
       const me = JSON.parse(response.body) as { id?: string; userName?: string; displayName?: string };
       const workspaceId = response.headers["x-databricks-org-id"] ?? profile.workspaceId;
-      this.current = { profile, client };
+      // A profile can keep the ID of a workspace that was deleted and recreated
+      // at the same URL; trust the server's answer for routing headers.
+      const routed =
+        workspaceId && workspaceId !== profile.workspaceId
+          ? new DatabricksClient({
+              host: profile.host,
+              workspaceId,
+              transport: this.transport,
+              token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken,
+            })
+          : client;
+      this.current = { profile, client: routed };
       this.storage.set(SELECTION_KEY, JSON.stringify({ profile: profile.name }));
       this.set({
         status: "connected",

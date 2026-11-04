@@ -3,7 +3,9 @@
 // packages/core/src/result.ts
 var NUMERIC_TYPES = /^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i;
 var TIME_TYPES = /^(date|timestamp)/i;
-function kindOf(type, sample) {
+var IDENTIFIER = /(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;
+function kindOf(type, sample, name = "") {
+  if (IDENTIFIER.test(name) && !TIME_TYPES.test(type ?? "") && !/^bool/i.test(type ?? "")) return "text";
   if (type) {
     if (NUMERIC_TYPES.test(type)) return "number";
     if (TIME_TYPES.test(type)) return "time";
@@ -24,7 +26,8 @@ function resultSet(columns, rows, extra = {}) {
       ...column.type && { type: column.type },
       kind: kindOf(
         column.type,
-        rows.slice(0, 50).map((row) => row[index] ?? null)
+        rows.slice(0, 50).map((row) => row[index] ?? null),
+        column.name
       )
     })),
     rows,
@@ -80,6 +83,11 @@ function toCsv(result) {
     ...result.rows.map((row) => row.map(quote).join(","))
   ].join("\n");
 }
+function comparable(rows, indices) {
+  const peak = (index) => Math.max(0, ...rows.map((row) => Math.abs(Number(row[index]) || 0)));
+  const base2 = indices[0] === void 0 ? 0 : peak(indices[0]);
+  return indices.filter((index, n) => n === 0 || base2 === 0 || peak(index) / base2 <= 10 && peak(index) / base2 >= 0.1);
+}
 function planChart(result) {
   const { columns, rows } = result;
   if (!rows.length) return { type: "none" };
@@ -91,20 +99,20 @@ function planChart(result) {
   if (rows.length < 2 || !numeric.length) return { type: "none" };
   const time = columns.findIndex((column) => column.kind === "time");
   if (time !== -1) {
-    const series = numeric.filter((index) => index !== time).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== time)).slice(0, 4);
     return series.length ? { type: "line", x: time, series } : { type: "none" };
   }
   const label = columns.findIndex((column) => column.kind === "text");
   if (label !== -1 && rows.length <= 40) {
-    const series = numeric.slice(0, 3);
+    const series = comparable(rows, numeric).slice(0, 3);
     const longest = Math.max(...rows.map((row) => (row[label] ?? "").length));
     return { type: "bar", x: label, series, horizontal: longest > 10 || rows.length > 12 };
   }
   const yearLike = numeric.find(
-    (index) => /^(year|yr|month|week|day|quarter|period)/i.test(columns[index]?.name ?? "")
+    (index) => /(^|_)(year|yr|quarter|month|week|day|hour|minute|period)(_|s?$)/i.test(columns[index]?.name ?? "")
   );
   if (yearLike !== void 0) {
-    const series = numeric.filter((index) => index !== yearLike).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== yearLike)).slice(0, 4);
     if (series.length) return { type: "line", x: yearLike, series };
   }
   return { type: "none" };
@@ -535,6 +543,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }
@@ -963,7 +973,7 @@ function ResultView(props) {
 var SAFE_URL = /^https?:\/\//i;
 function renderInline(text, keyPrefix = "i") {
   const nodes = [];
-  const pattern = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)<>]+)/g;
+  const pattern = /(\\[\\`*_{}[\]()#+\-.!~|<>$])|(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)<>]+)/g;
   let last = 0;
   let match;
   let index = 0;
@@ -971,7 +981,8 @@ function renderInline(text, keyPrefix = "i") {
     if (match.index > last) nodes.push(text.slice(last, match.index));
     const token = match[0];
     const key = `${keyPrefix}-${index++}`;
-    if (token.startsWith("`")) nodes.push(/* @__PURE__ */ React.createElement("code", { key }, token.slice(1, -1)));
+    if (token.length === 2 && token.startsWith("\\")) nodes.push(token.slice(1));
+    else if (token.startsWith("`")) nodes.push(/* @__PURE__ */ React.createElement("code", { key }, token.slice(1, -1)));
     else if (token.startsWith("**") || token.startsWith("__"))
       nodes.push(/* @__PURE__ */ React.createElement("strong", { key }, renderInline(token.slice(2, -2), key)));
     else if (token.startsWith("*")) nodes.push(/* @__PURE__ */ React.createElement("em", { key }, renderInline(token.slice(1, -1), key)));
@@ -990,7 +1001,7 @@ function renderInline(text, keyPrefix = "i") {
   if (last < text.length) nodes.push(text.slice(last));
   return nodes;
 }
-var cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+var cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell2) => cell2.trim());
 function parseBlocks(source) {
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
   const blocks = [];
@@ -1060,7 +1071,7 @@ function Markdown(props) {
       case "code":
         return /* @__PURE__ */ React.createElement("pre", { key }, /* @__PURE__ */ React.createElement("code", null, block.code));
       case "table":
-        return /* @__PURE__ */ React.createElement("div", { key, style: { overflow: "auto", margin: "0 0 8px" } }, /* @__PURE__ */ React.createElement("table", { className: "dbx-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, block.header.map((cell, n) => /* @__PURE__ */ React.createElement("th", { key: `${key}-h${n}` }, renderInline(cell))))), /* @__PURE__ */ React.createElement("tbody", null, block.rows.map((row, r) => /* @__PURE__ */ React.createElement("tr", { key: `${key}-r${r}` }, row.map((cell, n) => /* @__PURE__ */ React.createElement("td", { key: `${key}-r${r}-${n}` }, renderInline(cell))))))));
+        return /* @__PURE__ */ React.createElement("div", { key, style: { overflow: "auto", margin: "0 0 8px" } }, /* @__PURE__ */ React.createElement("table", { className: "dbx-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, block.header.map((cell2, n) => /* @__PURE__ */ React.createElement("th", { key: `${key}-h${n}` }, renderInline(cell2))))), /* @__PURE__ */ React.createElement("tbody", null, block.rows.map((row, r) => /* @__PURE__ */ React.createElement("tr", { key: `${key}-r${r}` }, row.map((cell2, n) => /* @__PURE__ */ React.createElement("td", { key: `${key}-r${r}-${n}` }, renderInline(cell2))))))));
     }
     return null;
   }));
@@ -1209,7 +1220,8 @@ function useGenieConversation(service, spaceId, initialConversation) {
         signal: controller.signal,
         onUpdate: (message) => {
           const id = messageId(message) || current;
-          setTurns((existing) => existing.map((turn) => turn.key === current ? { ...turn, key: id, message } : turn));
+          const previous = current;
+          setTurns((existing) => existing.map((turn) => turn.key === previous ? { ...turn, key: id, message } : turn));
           current = id;
           if (message.conversation_id) setConversationId(message.conversation_id);
         }
@@ -1295,236 +1307,6 @@ function GenieChat(props) {
       actions: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(CopyButton, { text: turnMarkdown(space, turn, link), label: "Copy answer" }), props.answerActions?.(turn))
     }
   )), /* @__PURE__ */ React.createElement("div", { ref: bottom })), /* @__PURE__ */ React.createElement("div", { style: { position: "sticky", bottom: 0, background: "var(--surface-panel, var(--dbx-surface))", paddingTop: 8 } }, /* @__PURE__ */ React.createElement(Composer, { onAsk: (question) => void chat.ask(question), busy: chat.busy, placeholder: `Ask ${space.title}`, autoFocus: !props.compact })));
-}
-
-// plugins/genie/src/page.tsx
-var SpacesStore = class {
-  constructor(service) {
-    this.service = service;
-    service.subscribe(() => {
-      const snapshot = service.snapshot();
-      const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
-      if (host !== this.host) {
-        this.host = host;
-        this.set({ status: "idle", spaces: [] });
-        if (host && this.listeners.size) void this.load();
-      }
-    });
-  }
-  state = { status: "idle", spaces: [] };
-  listeners = /* @__PURE__ */ new Set();
-  host;
-  loading;
-  snapshot = () => this.state;
-  subscribe = (listener) => {
-    this.listeners.add(listener);
-    if (this.state.status === "idle") void this.load();
-    return () => this.listeners.delete(listener);
-  };
-  async load(force = false) {
-    if (!force && this.state.status === "ready") return this.state.spaces;
-    if (this.loading && !force) return this.loading;
-    this.set({ ...this.state, status: "loading" });
-    this.loading = (async () => {
-      try {
-        const client = await this.service.ready();
-        const spaces = await new Genie(client).listSpaces();
-        this.set({ status: "ready", spaces });
-        return spaces;
-      } catch (error) {
-        this.set({ status: "error", spaces: [], error: describeError(error) });
-        return [];
-      } finally {
-        this.loading = void 0;
-      }
-    })();
-    return this.loading;
-  }
-  /** Finds a space by ID or (case-insensitive) title. */
-  async find(nameOrId) {
-    const needle = nameOrId.trim().toLowerCase();
-    const spaces = await this.load();
-    return spaces.find((space) => space.space_id.toLowerCase() === needle) ?? spaces.find((space) => space.title.toLowerCase() === needle) ?? spaces.find((space) => space.title.toLowerCase().includes(needle));
-  }
-  set(state) {
-    this.state = state;
-    for (const listener of [...this.listeners]) listener();
-  }
-};
-function useSpaces(store) {
-  return React.useSyncExternalStore(store.subscribe, store.snapshot);
-}
-var SELECTED = "genieSpaceId";
-function genieSidebar(service, store) {
-  return function GenieSidebar(props) {
-    const spaces = useSpaces(store);
-    const [selected, setSelected] = usePreference(service, SELECTED);
-    const [query, setQuery] = React.useState("");
-    const filtered = spaces.spaces.filter(
-      (space) => !query.trim() || `${space.title} ${space.description ?? ""}`.toLowerCase().includes(query.trim().toLowerCase())
-    );
-    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { padding: "12px 10px 8px" } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie agents"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh" }, "\u21BB")), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Find an agent", value: query, onChange: (event) => setQuery(event.target.value), "aria-label": "Find a Genie agent" })), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie agents", style: { flex: 1, overflow: "auto", padding: "0 6px 8px" } }, spaces.status === "loading" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", style: { padding: 10 } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading\u2026")), spaces.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm", as: "div", style: { padding: 10 } }, spaces.error), spaces.status === "ready" && !filtered.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { padding: 10 } }, spaces.spaces.length ? "No agents match." : "No Genie agents are shared with you yet."), filtered.map((space) => /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        key: space.space_id,
-        type: "button",
-        className: "dbx-row",
-        "aria-selected": space.space_id === selected,
-        onClick: () => setSelected(space.space_id),
-        title: space.description,
-        style: {
-          display: "block",
-          width: "100%",
-          textAlign: "left",
-          border: 0,
-          background: "transparent",
-          borderRadius: "var(--radius-row, 6px)",
-          padding: "6px 8px",
-          cursor: "pointer",
-          font: "inherit",
-          color: "var(--dbx-ink)"
-        }
-      },
-      /* @__PURE__ */ React.createElement(Text, { size: "md", as: "div", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, space.title)
-    ))), props.children && /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", padding: 6 } }, props.children)));
-  };
-}
-function geniePage(service, store) {
-  return function GeniePage(_props) {
-    const snapshot = useConnection(service);
-    const spaces = useSpaces(store);
-    const [selected] = usePreference(service, SELECTED);
-    const space = spaces.spaces.find((candidate) => candidate.space_id === selected);
-    let body;
-    if (snapshot.status !== "connected")
-      body = /* @__PURE__ */ React.createElement(
-        EmptyState,
-        {
-          title: "Connect Databricks to use Genie",
-          action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect Databricks")
-        },
-        "Genie answers questions about your data in plain language, with the access you already have."
-      );
-    else if (spaces.status === "error") body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't list Genie agents" }, spaces.error);
-    else if (!space)
-      body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Pick an agent on the left to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
-    else body = /* @__PURE__ */ React.createElement(GenieChat, { key: space.space_id, service, space });
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { height: "100%", overflow: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 920, margin: "0 auto", padding: "24px 28px 16px", minHeight: "100%", display: "flex", flexDirection: "column" } }, body));
-  };
-}
-
-// plugins/genie/src/conversation.tsx
-function composerTool(service, store) {
-  return function AskGenie(props) {
-    const [open, setOpen] = React.useState(false);
-    const root = React.useRef(null);
-    React.useEffect(() => {
-      if (!open) return;
-      const onKey = (event) => {
-        if (event.key === "Escape") {
-          event.stopPropagation();
-          setOpen(false);
-          props.focus();
-        }
-      };
-      const onPointer = (event) => {
-        if (root.current && !root.current.contains(event.target)) setOpen(false);
-      };
-      document.addEventListener("keydown", onKey, true);
-      document.addEventListener("pointerdown", onPointer, true);
-      return () => {
-        document.removeEventListener("keydown", onKey, true);
-        document.removeEventListener("pointerdown", onPointer, true);
-      };
-    }, [open, props]);
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { position: "relative", display: "inline-flex" } }, /* @__PURE__ */ React.createElement("div", { ref: root, style: { display: "contents" } }, /* @__PURE__ */ React.createElement(Button, { icon: true, variant: "ghost", "aria-label": "Ask Genie", title: "Ask Genie about your data", disabled: props.disabled, onClick: () => setOpen(!open) }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 })), open && /* @__PURE__ */ React.createElement(
-      "div",
-      {
-        role: "dialog",
-        "aria-label": "Ask Genie",
-        style: {
-          position: "absolute",
-          bottom: "calc(100% + 8px)",
-          left: 0,
-          width: "min(520px, 80vw)",
-          maxHeight: "min(560px, 70vh)",
-          overflow: "auto",
-          zIndex: 50,
-          padding: 14,
-          background: "var(--dbx-popover)",
-          border: "1px solid var(--dbx-border)",
-          borderRadius: "var(--dbx-radius-card)",
-          boxShadow: "var(--shadow-panel, 0 8px 28px rgba(0,0,0,0.18))"
-        }
-      },
-      /* @__PURE__ */ React.createElement(
-        GeniePicker,
-        {
-          service,
-          store,
-          onInsert: (markdown) => {
-            if (props.insertText(`${markdown}
-`)) {
-              setOpen(false);
-              props.focus();
-            }
-          }
-        }
-      )
-    )));
-  };
-}
-function GeniePicker(props) {
-  const { service, store } = props;
-  const snapshot = useConnection(service);
-  const spaces = useSpaces(store);
-  const [selected, setSelected] = usePreference(service, "genieSpaceId");
-  if (snapshot.status !== "connected")
-    return /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Sign in once to ask Genie from any conversation.");
-  const space = spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Ask Genie"), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), spaces.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, spaces.error), spaces.spaces.length > 0 && /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: space?.space_id ?? "", onChange: (event) => setSelected(event.target.value), "aria-label": "Genie agent" }, spaces.spaces.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.space_id, value: candidate.space_id }, candidate.title))), spaces.status === "ready" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "No Genie agents are shared with you yet."), space && /* @__PURE__ */ React.createElement(
-    GenieChat,
-    {
-      key: space.space_id,
-      service,
-      space,
-      compact: true,
-      answerActions: (turn) => turn.text || turn.result ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => props.onInsert(turnMarkdown(space, turn, service.workspaceUrl(Genie.webPath(space.space_id, turn.message?.conversation_id)))) }, "Insert into message") : null
-    }
-  ), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Answers use your access. Inserting shares the answer with everyone in this conversation."));
-}
-function genieLinkChip(service, store) {
-  return function GenieLink(props) {
-    const link = parseGenieUrl(props.url);
-    const spaces = useSpaces(store);
-    const space = link && spaces.spaces.find((candidate) => candidate.space_id === link.spaceId);
-    return /* @__PURE__ */ React.createElement("span", { style: { display: "inline-flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { "data-dbx": "", style: { display: "inline-flex" } }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 11 })), /* @__PURE__ */ React.createElement("span", null, "Genie", space ? ` \xB7 ${space.title}` : link?.conversationId ? " conversation" : ""));
-  };
-}
-function geniePanel(service, store) {
-  return function GeniePanel(props) {
-    const link = React.useMemo(() => parseGenieUrl(props.target), [props.target]);
-    const snapshot = useConnection(service);
-    const space = useAsync(
-      async (signal) => {
-        if (!link) return void 0;
-        const client = await service.ready(signal);
-        if (client.host !== link.host) return "elsewhere";
-        return await store.find(link.spaceId) ?? await new Genie(client).getSpace(link.spaceId, signal);
-      },
-      [props.target, snapshot.status]
-    );
-    let body;
-    if (snapshot.status !== "connected")
-      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Sign in to chat with this Genie agent.");
-    else if (space.loading) body = /* @__PURE__ */ React.createElement(Spinner, null);
-    else if (space.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Can't open this Genie agent" }, String(space.error.message));
-    else if (space.data === "elsewhere") body = /* @__PURE__ */ React.createElement(Notice, { title: "Different workspace" }, "This Genie agent is in ", link?.host.replace("https://", ""), ".");
-    else if (space.data)
-      body = /* @__PURE__ */ React.createElement(GenieChat, { service, space: space.data, ...link?.conversationId && { conversationId: link.conversationId } });
-    else body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Not a Genie link.");
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-panel-inset, 16px)", display: "flex", flexDirection: "column", minHeight: "100%" } }, body);
-  };
 }
 
 // packages/core/src/api/mcp.ts
@@ -1666,52 +1448,37 @@ function resultJson(result) {
 
 // plugins/genie/src/genie-one.ts
 var GENIE_ONE = "system.ai.genie_one_mcp";
-var DONE = /^(completed?|succeeded|success|done|failed|error|cancell?ed)$/i;
-var FAILED = /^(failed|error|cancell?ed)$/i;
-function propertyNames(tool) {
-  const properties = tool?.inputSchema?.properties;
-  return properties ? Object.keys(properties) : [];
+var POLL_MS = 3e3;
+var MAX_RESULTS = 3;
+var cell = (value) => value === null || value === void 0 ? null : typeof value === "object" ? JSON.stringify(value) : String(value);
+function toResultSet(result) {
+  if (!result.ready || !result.columns?.length) return void 0;
+  const rows = (result.rows ?? []).map((row) => row.map(cell));
+  const total = result.total_row_count ?? void 0;
+  return resultSet(
+    result.columns.map((column) => ({ name: column.name, ...column.type_text && { type: column.type_text } })),
+    rows,
+    {
+      ...total !== void 0 && { totalRows: total },
+      truncated: Boolean(result.truncated) || total !== void 0 && total > rows.length
+    }
+  );
 }
-function pick(names, pattern, fallback) {
-  return names.find((name) => pattern.test(name)) ?? fallback;
+var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+function cleanAnswer(text) {
+  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
 }
-function findValue(value, keys, depth = 0) {
-  if (!value || typeof value !== "object" || depth > 6) return void 0;
-  for (const key of keys) if (key in value && value[key] != null) return value[key];
-  for (const child of Object.values(value)) {
-    const found = findValue(child, keys, depth + 1);
-    if (found !== void 0) return found;
-  }
-  return void 0;
-}
-function findTables(value, depth = 0, out = []) {
-  if (!value || typeof value !== "object" || depth > 7) return out;
-  const object = value;
-  const statement = object.statement_response ?? object;
-  const manifest = statement.manifest;
-  const dataArray = statement.result?.data_array ?? statement.data_array;
-  if (manifest?.schema?.columns && Array.isArray(dataArray)) {
-    out.push(resultSet(manifest.schema.columns.map((c) => ({ name: c.name, type: c.type_text ?? c.type_name ?? "" })), dataArray));
-    return out;
-  }
-  const columns = object.columns;
-  const rows = object.rows ?? object.data;
-  if (Array.isArray(columns) && Array.isArray(rows) && columns.length) {
-    const cols = columns.map(
-      (column) => typeof column === "string" ? { name: column } : { name: String(column.name ?? ""), type: String(column.type ?? column.type_name ?? "") }
-    );
-    const asRows = rows.map(
-      (row) => Array.isArray(row) ? row.map((cell) => cell == null ? null : String(cell)) : cols.map((column) => {
-        const cell = row[column.name];
-        return cell == null ? null : String(cell);
-      })
-    );
-    out.push(resultSet(cols, asRows));
-    return out;
-  }
-  for (const child of Object.values(object)) if (child && typeof child === "object") findTables(child, depth + 1, out);
-  return out;
-}
+var sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener(
+    "abort",
+    () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    },
+    { once: true }
+  );
+});
 var GenieOne = class {
   constructor(service) {
     this.service = service;
@@ -1736,110 +1503,490 @@ var GenieOne = class {
     const key = snapshot.status === "connected" ? snapshot.profile.host : "none";
     let check = this.availability.get(key);
     if (!check) {
-      check = this.mcp().then((mcp) => mcp.listTools()).then((tools) => tools.some((tool) => tool.name === "genie_ask")).catch(() => false);
+      check = this.mcp().then((mcp) => mcp.listTools()).then((tools) => tools.some((tool) => tool.name === "genie_ask")).catch(() => false).then((ok) => {
+        if (!ok) this.availability.delete(key);
+        return ok;
+      });
       this.availability.set(key, check);
     }
     return check;
   }
   async ask(question, options = {}) {
+    const { signal } = options;
     const mcp = await this.mcp();
-    const tools = await mcp.listTools(options.signal);
-    const byName = new Map(tools.map((tool) => [tool.name, tool]));
-    if (!byName.has("genie_ask")) throw new Error("Genie One isn't available in this workspace (no genie_ask tool).");
-    const askNames = propertyNames(byName.get("genie_ask"));
-    const askArgs = { [pick(askNames, /question|query|prompt|content|message|text/i, "question")]: question };
-    if (options.conversationId) askArgs[pick(askNames, /conversation/i, "conversation_id")] = options.conversationId;
-    const warehouseId = this.service.preferences.get("warehouseId");
-    const asked = await mcp.callTool("genie_ask", askArgs, {
-      ...options.signal && { signal: options.signal },
-      ...warehouseId && { meta: { warehouse_id: warehouseId } },
-      timeoutMs: 17e4
-    });
-    if (asked.isError) throw new Error(resultText(asked) || "Genie One refused the question.");
-    let latest = resultJson(asked) ?? {};
-    const conversationId = String(findValue(latest, ["conversation_id", "conversationId"]) ?? options.conversationId ?? "");
-    const responseId = String(findValue(latest, ["response_id", "responseId", "message_id"]) ?? "");
-    let status = String(findValue(latest, ["status", "state"]) ?? "");
-    const texts = [];
-    const firstText = resultText(asked);
-    const steps = [];
+    const asked = await mcp.callTool(
+      "genie_ask",
+      { question, ...options.conversationId && { conversation_id: options.conversationId } },
+      { ...signal && { signal }, timeoutMs: 17e4 }
+    );
+    if (asked.isError) throw new Error(resultText(asked) || "Genie One couldn't take the question.");
+    const started = resultJson(asked) ?? {};
+    const conversationId = started.conversation_id ?? options.conversationId ?? "";
+    const responseId = started.response_id ?? "";
+    if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
+    let state = started;
+    let markdown = resultText(asked);
+    let unknowns = 0;
+    let steps = [];
     const deadline = Date.now() + 10 * 6e4;
-    const pollNames = propertyNames(byName.get("genie_poll_response"));
-    while (!DONE.test(status) && byName.has("genie_poll_response") && responseId) {
-      if (Date.now() > deadline) throw new Error("Genie One did not finish within 10 minutes.");
-      options.signal?.throwIfAborted();
-      const pollArgs = {
-        [pick(pollNames, /conversation/i, "conversation_id")]: conversationId,
-        [pick(pollNames, /response|message/i, "response_id")]: responseId
-      };
-      const polled = await mcp.callTool("genie_poll_response", pollArgs, { ...options.signal && { signal: options.signal }, timeoutMs: 17e4 });
-      if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
-      latest = resultJson(polled) ?? { text: resultText(polled) };
-      status = String(findValue(latest, ["status", "state"]) ?? "completed");
-      const progress = findValue(latest, ["progress", "steps", "progress_steps"]);
-      if (Array.isArray(progress)) {
-        steps.splice(0, steps.length, ...progress.map((step) => typeof step === "string" ? step : String(step.title ?? step.description ?? step.name ?? "")).filter(Boolean));
-        options.onProgress?.(steps);
+    try {
+      while (!state.status || state.status === "in_progress" || state.status === "unknown" && unknowns < 5) {
+        if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
+        await sleep(POLL_MS, signal);
+        const polled = await mcp.callTool(
+          "genie_poll_response",
+          { conversation_id: conversationId, response_id: responseId },
+          { ...signal && { signal }, timeoutMs: 6e4 }
+        );
+        if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
+        state = resultJson(polled) ?? { status: "unknown" };
+        markdown = resultText(polled);
+        unknowns = state.status === "unknown" ? unknowns + 1 : 0;
+        if (state.progress_steps?.length) {
+          steps = state.progress_steps;
+          options.onProgress?.(steps);
+        }
       }
-      if (!DONE.test(status)) await new Promise((resolve) => setTimeout(resolve, 1500));
+    } catch (error) {
+      if (signal?.aborted)
+        void mcp.callTool("genie_cancel_response", { conversation_id: conversationId }).catch(() => void 0);
+      throw error;
     }
-    if (FAILED.test(status)) {
-      const message = findValue(latest, ["error", "error_message", "message"]);
-      throw new Error(typeof message === "string" ? message : "Genie One could not answer.");
-    }
-    const answer = findValue(latest, ["answer", "final_answer", "text", "content", "response"]);
-    if (typeof answer === "string") texts.push(answer);
-    else if (firstText && !firstText.trim().startsWith("{")) texts.push(firstText);
-    const results = findTables(latest);
-    if (!results.length && byName.has("genie_get_query_result")) {
-      const resultNames = propertyNames(byName.get("genie_get_query_result"));
-      const queryRef = findValue(latest, ["query_result_id", "attachment_id", "statement_id", "query_id"]);
-      if (queryRef !== void 0) {
-        const args = {
-          [pick(resultNames, /conversation/i, "conversation_id")]: conversationId,
-          [pick(resultNames, /response|message/i, "response_id")]: responseId
-        };
-        const refName = resultNames.find((name) => /attachment|statement|query/i.test(name));
-        if (refName) args[refName] = queryRef;
-        const fetched = await mcp.callTool("genie_get_query_result", args, options.signal ? { signal: options.signal } : {}).catch(() => void 0);
-        if (fetched && !fetched.isError) results.push(...findTables(resultJson(fetched) ?? {}));
-      }
-    }
-    const links = /* @__PURE__ */ new Set();
-    const sql = /* @__PURE__ */ new Set();
-    const walk = (value, depth = 0) => {
-      if (!value || depth > 7) return;
-      if (typeof value === "string") {
-        if (/^https:\/\/\S+$/.test(value)) links.add(value);
-        return;
-      }
-      if (typeof value !== "object") return;
-      for (const [key, child] of Object.entries(value)) {
-        if (/^(sql|query|query_text|statement)$/i.test(key) && typeof child === "string" && /\bselect\b/i.test(child)) sql.add(child);
-        walk(child, depth + 1);
-      }
-    };
-    walk(latest);
+    if (state.status === "failed") throw new Error(markdown.trim() || "Genie One couldn't answer that.");
+    const items = (state.query_items ?? []).slice(0, MAX_RESULTS);
+    const results = (await Promise.all(
+      items.map(
+        (item) => mcp.callTool(
+          "genie_get_query_result",
+          { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
+          { ...signal && { signal }, timeoutMs: 6e4 }
+        ).then((fetched) => fetched.isError ? void 0 : toResultSet(resultJson(fetched) ?? {})).catch(() => void 0)
+      )
+    )).filter((result) => result !== void 0);
     return {
-      ...conversationId && { conversationId },
-      ...responseId && { responseId },
-      status: status || "completed",
-      text: texts.join("\n\n").trim(),
+      conversationId,
+      responseId,
+      status: state.status ?? "completed",
+      text: (state.final_answer ?? "").trim(),
+      markdown: markdown.trim(),
       steps,
       results,
-      links: [...links],
-      sql: [...sql]
+      sql: items.flatMap((item) => item.sql ? [item.sql] : []),
+      ...state.deep_link && { deepLink: state.deep_link }
     };
   }
+  /** Plain text for agents: the answer (with its tables and links), the SQL and the deep link. */
   format(answer) {
-    const lines = ["Genie One", answer.conversationId ? `conversation_id: ${answer.conversationId}` : ""].filter(Boolean);
-    if (answer.text) lines.push("", answer.text);
-    for (const result of answer.results) lines.push("", toMarkdown(result, 20));
-    for (const statement of answer.sql.slice(0, 2)) lines.push("", "```sql", statement.trim(), "```");
-    if (answer.links.length) lines.push("", `Sources: ${answer.links.slice(0, 5).join(" ")}`);
+    const lines = ["Genie One", `conversation_id: ${answer.conversationId}`];
+    if (answer.status === "incomplete") lines.push("(Genie One stopped before finishing; the answer may be partial.)");
+    const text = cleanAnswer(answer.text);
+    if (text) lines.push("", text);
+    else for (const result of answer.results) lines.push("", toMarkdown(result, 20));
+    for (const statement of answer.sql.slice(0, 2)) lines.push("", "SQL Genie One ran:", "```sql", statement.trim(), "```");
+    if (answer.deepLink) lines.push("", `[Explore in Databricks](${answer.deepLink})`);
     return lines.join("\n");
   }
 };
+
+// plugins/genie/src/genie-one-chat.tsx
+function parseStep(raw) {
+  const clean = (text) => stripComments(text).replace(/\s*\|.*\|\s*$/s, "").trim();
+  const match = /^(Thinking|Running SQL|Query result|[A-Z][\w ]{1,24}):\s*(.*)$/s.exec(raw.trim());
+  if (!match) return { kind: "other", text: clean(raw) };
+  const [, label = "", rest = ""] = match;
+  if (label === "Thinking") return { kind: "thought", text: clean(rest.replace(/^Genie:\s*none\s*[—-]\s*/i, "")) };
+  if (label === "Running SQL") return { kind: "sql", text: rest.trim() };
+  if (label === "Query result") return { kind: "result", text: clean(rest).replace(/:$/, "") };
+  return { kind: "other", text: clean(`${label}: ${rest}`) };
+}
+var plain = (cell2) => cell2.replace(/\*\*|__|`/g, "").trim();
+function answerParts(answer) {
+  const text = cleanAnswer(answer.text);
+  const lines = text.split("\n");
+  const kept = [];
+  const tables = [];
+  const row = /^\s*\|.*\|\s*$/;
+  for (let i = 0; i < lines.length; i++) {
+    if (row.test(lines[i] ?? "") && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
+      const table = [];
+      while (i < lines.length && row.test(lines[i] ?? "")) table.push(lines[i++] ?? "");
+      i--;
+      tables.push(table);
+      continue;
+    }
+    kept.push(lines[i] ?? "");
+  }
+  if (!tables.length) return { text, results: answer.results };
+  const parsed = answer.results.length ? answer.results : tables.flatMap((table) => {
+    const block = parseBlocks(table.join("\n")).find((candidate) => candidate.type === "table");
+    if (!block || block.type !== "table") return [];
+    return [resultSet(block.header.map((name) => ({ name: plain(name) })), block.rows.map((cells2) => cells2.map((cell2) => plain(cell2) || null)))];
+  });
+  return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), results: parsed };
+}
+function formatSql(sql) {
+  if (sql.includes("\n")) return sql.trim();
+  return sql.trim().replace(/\s+(FROM|WHERE|GROUP BY|HAVING|ORDER BY|LIMIT|QUALIFY|UNION ALL|UNION|(?:LEFT |RIGHT |FULL |INNER |CROSS )?JOIN)\s+/gi, (_, clause) => `
+${clause.toUpperCase()} `).replace(/^(SELECT\s+)(.+?)(?=\nFROM)/is, (_, select, list) => {
+    const items = list.split(/,\s+(?![^()]*\))/);
+    return items.length > 2 ? `${select.trim()}
+  ${items.join(",\n  ")}` : `${select}${list}`;
+  });
+}
+var seconds = (turn) => Math.max(1, Math.round(((turn.finished ?? Date.now()) - turn.started) / 1e3));
+function Timeline(props) {
+  const steps = props.steps.map(parseStep);
+  return /* @__PURE__ */ React.createElement("ol", { style: { listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 10 } }, steps.map((step, index) => {
+    const last = index === steps.length - 1;
+    return /* @__PURE__ */ React.createElement("li", { key: `${index}-${step.kind}`, style: { display: "flex", gap: 10, alignItems: "flex-start" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, display: "inline-flex", justifyContent: "center", paddingTop: 4, flex: "none" } }, props.live && last ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : /* @__PURE__ */ React.createElement(
+      "span",
+      {
+        "aria-hidden": true,
+        style: {
+          width: 7,
+          height: 7,
+          borderRadius: "50%",
+          background: step.kind === "sql" ? "var(--dbx-lava)" : "var(--dbx-border-strong)"
+        }
+      }
+    )), /* @__PURE__ */ React.createElement(Stack, { gap: 4, style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 500 }, { thought: "Thinking", sql: "Ran SQL", result: "Result", other: "Step" }[step.kind]), step.kind === "sql" ? /* @__PURE__ */ React.createElement(CodeView, { code: formatSql(step.text), maxHeight: 180, copy: false }) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", as: "div" }, step.text)));
+  }), props.live && !steps.length && /* @__PURE__ */ React.createElement("li", { style: { display: "flex", gap: 10, alignItems: "center" } }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Finding the right data\u2026")));
+}
+function oneTurnMarkdown(turn) {
+  const answer = turn.answer;
+  if (!answer) return "";
+  const parts = [`**Genie One** \xB7 _${turn.question}_`, cleanAnswer(answer.text)];
+  if (answer.deepLink) parts.push(`[Explore in Databricks](${answer.deepLink})`);
+  return parts.filter(Boolean).join("\n\n");
+}
+function OneTurnView(props) {
+  const { turn } = props;
+  const answer = turn.answer;
+  const live = !answer && !turn.error;
+  const parts = React.useMemo(() => answer ? answerParts(answer) : void 0, [answer]);
+  const [, tick] = React.useState(0);
+  React.useEffect(() => {
+    if (!live) return;
+    const timer = setInterval(() => tick((n) => n + 1), 1e3);
+    return () => clearInterval(timer);
+  }, [live]);
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, turn.question), /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.compact ? 12 : 16, display: "flex", flexDirection: "column", gap: 14 } }, live ? /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Thinking \xB7 ", seconds(turn), "s"), /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: true })) : turn.steps.length > 0 && /* @__PURE__ */ React.createElement(Disclosure, { summary: `Thought for ${seconds(turn)}s \xB7 ${turn.steps.length} ${turn.steps.length === 1 ? "step" : "steps"}` }, /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: false })), turn.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Genie One couldn't answer" }, turn.error), answer?.status === "incomplete" && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Genie One stopped early" }, "The answer may be partial."), parts?.text && /* @__PURE__ */ React.createElement(Markdown, { source: parts.text }), parts && parts.results.length > 0 && // The last query is the one the answer describes; earlier ones are drafts.
+  /* @__PURE__ */ React.createElement(ResultView, { result: parts.results[parts.results.length - 1], maxHeight: props.compact ? 200 : 320 }), parts && parts.results.length > 1 && /* @__PURE__ */ React.createElement(Disclosure, { summary: `Earlier results (${parts.results.length - 1})` }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, parts.results.slice(0, -1).map((result, index) => /* @__PURE__ */ React.createElement(ResultView, { key: index, result, maxHeight: 240 })))), answer && answer.sql.length > 0 && /* @__PURE__ */ React.createElement(Disclosure, { summary: answer.sql.length === 1 ? "SQL Genie One ran" : `SQL Genie One ran (${answer.sql.length})` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, answer.sql.map((statement, index) => /* @__PURE__ */ React.createElement(CodeView, { key: index, code: formatSql(statement) })))), answer && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, answer.deepLink && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => window.open(answer.deepLink, "_blank", "noopener") }, "Explore in Databricks"), props.actions)));
+}
+function useGenieOneConversation(genieOne) {
+  const [conversationId, setConversationId] = React.useState();
+  const [turns, setTurns] = React.useState([]);
+  const [busy, setBusy] = React.useState(false);
+  const abort = React.useRef(void 0);
+  React.useEffect(() => () => abort.current?.abort(), []);
+  const update = (key, change) => setTurns((current) => current.map((turn) => turn.key === key ? { ...turn, ...change } : turn));
+  const ask = async (question) => {
+    const text = question.trim();
+    if (!text || busy) return;
+    const controller = new AbortController();
+    abort.current = controller;
+    const key = `one-${Date.now()}`;
+    setTurns((existing) => [...existing, { key, question: text, steps: [], started: Date.now() }]);
+    setBusy(true);
+    try {
+      const answer = await genieOne.ask(text, {
+        ...conversationId && { conversationId },
+        signal: controller.signal,
+        onProgress: (steps) => update(key, { steps: [...steps] })
+      });
+      setConversationId(answer.conversationId);
+      update(key, { answer, steps: [...answer.steps], finished: Date.now() });
+    } catch (error) {
+      if (!controller.signal.aborted) update(key, { error: describeError(error), finished: Date.now() });
+    } finally {
+      if (abort.current === controller) setBusy(false);
+    }
+  };
+  const stop = () => {
+    abort.current?.abort();
+    setBusy(false);
+    setTurns((current) => current.map((turn) => turn.answer || turn.error ? turn : { ...turn, error: "Stopped.", finished: Date.now() }));
+  };
+  const reset = () => {
+    abort.current?.abort();
+    setBusy(false);
+    setTurns([]);
+    setConversationId(void 0);
+  };
+  return { turns, busy, ask, stop, reset, conversationId };
+}
+var EXAMPLES = ["What data do I have access to?", "Which tables are used the most?", "What changed in the last week?"];
+function GenieOneChat(props) {
+  const chat = useGenieOneConversation(props.genieOne);
+  const bottom = React.useRef(null);
+  const last = chat.turns[chat.turns.length - 1];
+  React.useEffect(() => {
+    bottom.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+  }, [chat.turns.length, last?.steps.length, Boolean(last?.answer)]);
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 16, style: { minHeight: 0, flex: 1 } }, !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "flex-start", justify: "space-between", gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 16 }), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "lg", weight: 500 }, "Genie One"), /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, "All your data")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { maxWidth: 680 } }, "Ask anything about data you can access in this workspace. Genie One finds the right tables and Genie agents, writes the SQL and runs it as you.")), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, chat.busy && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: chat.stop }, "Stop"), chat.turns.length > 0 && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: chat.reset }, "New chat"))), /* @__PURE__ */ React.createElement(Stack, { gap: 22, style: { flex: 1 } }, chat.turns.length === 0 && !props.compact && /* @__PURE__ */ React.createElement(Stack, { gap: 10, style: { padding: "24px 0" } }, /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Genie One usually answers in under a minute and shows its work as it goes."), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, EXAMPLES.map((example) => /* @__PURE__ */ React.createElement(Button, { key: example, size: "sm", variant: "ghost", style: { border: "1px solid var(--dbx-border)" }, onClick: () => void chat.ask(example) }, example)))), chat.turns.map((turn) => /* @__PURE__ */ React.createElement(
+    OneTurnView,
+    {
+      key: turn.key,
+      turn,
+      ...props.compact !== void 0 && { compact: props.compact },
+      actions: turn.answer && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(CopyButton, { text: oneTurnMarkdown(turn), label: "Copy answer" }), props.answerActions?.(turn))
+    }
+  )), /* @__PURE__ */ React.createElement("div", { ref: bottom })), /* @__PURE__ */ React.createElement("div", { style: { position: "sticky", bottom: 0, background: "var(--surface-panel, var(--dbx-surface))", paddingTop: 8 } }, /* @__PURE__ */ React.createElement(Composer, { onAsk: (question) => void chat.ask(question), busy: chat.busy, placeholder: "Ask Genie One about any of your data", autoFocus: !props.compact })));
+}
+
+// plugins/genie/src/page.tsx
+var SpacesStore = class {
+  constructor(service) {
+    this.service = service;
+    service.subscribe(() => {
+      const snapshot = service.snapshot();
+      const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
+      if (host !== this.host) {
+        this.host = host;
+        this.set({ status: "idle", spaces: [] });
+        if (host && this.listeners.size) void this.load();
+      }
+    });
+  }
+  state = { status: "idle", spaces: [] };
+  listeners = /* @__PURE__ */ new Set();
+  host;
+  loading;
+  snapshot = () => this.state;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    if (this.state.status === "idle") void this.load();
+    return () => this.listeners.delete(listener);
+  };
+  async load(force = false) {
+    if (!force && this.state.status === "ready") return this.state.spaces;
+    if (this.loading && !force) return this.loading;
+    this.set({ ...this.state, status: "loading" });
+    this.loading = (async () => {
+      try {
+        const client = await this.service.ready();
+        const spaces = await new Genie(client).listSpaces();
+        this.set({ status: "ready", spaces });
+        return spaces;
+      } catch (error) {
+        this.set({ status: "error", spaces: [], error: describeError(error) });
+        return [];
+      } finally {
+        this.loading = void 0;
+      }
+    })();
+    return this.loading;
+  }
+  /** Finds a space by ID or (case-insensitive) title. */
+  async find(nameOrId) {
+    const needle = nameOrId.trim().toLowerCase();
+    const spaces = await this.load();
+    return spaces.find((space) => space.space_id.toLowerCase() === needle) ?? spaces.find((space) => space.title.toLowerCase() === needle) ?? spaces.find((space) => space.title.toLowerCase().includes(needle));
+  }
+  set(state) {
+    this.state = state;
+    for (const listener of [...this.listeners]) listener();
+  }
+};
+function useSpaces(store) {
+  return React.useSyncExternalStore(store.subscribe, store.snapshot);
+}
+var SELECTED = "genieSpaceId";
+var GENIE_ONE_ENTRY = "genie-one";
+function useGenieOneAvailable(service, genieOne) {
+  const snapshot = useConnection(service);
+  const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
+  return useAsync(async () => host ? genieOne.available() : false, [host]).data === true;
+}
+function useSelection(service, oneAvailable) {
+  const [selected, setSelected] = usePreference(service, SELECTED);
+  return [selected ?? (oneAvailable ? GENIE_ONE_ENTRY : void 0), setSelected];
+}
+var rowStyle = {
+  display: "block",
+  width: "100%",
+  textAlign: "left",
+  border: 0,
+  background: "transparent",
+  borderRadius: "var(--radius-row, 6px)",
+  padding: "6px 8px",
+  cursor: "pointer",
+  font: "inherit",
+  color: "var(--dbx-ink)"
+};
+function genieSidebar(service, store, genieOne) {
+  return function GenieSidebar(props) {
+    const spaces = useSpaces(store);
+    const oneAvailable = useGenieOneAvailable(service, genieOne);
+    const [selected, setSelected] = useSelection(service, oneAvailable);
+    const [query, setQuery] = React.useState("");
+    const filtered = spaces.spaces.filter(
+      (space) => !query.trim() || `${space.title} ${space.description ?? ""}`.toLowerCase().includes(query.trim().toLowerCase())
+    );
+    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { padding: "12px 10px 8px" } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie agents"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh" }, "\u21BB")), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Find an agent", value: query, onChange: (event) => setQuery(event.target.value), "aria-label": "Find a Genie agent" })), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie agents", style: { flex: 1, overflow: "auto", padding: "0 6px 8px" } }, oneAvailable && /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "dbx-row",
+        "aria-selected": selected === GENIE_ONE_ENTRY,
+        onClick: () => setSelected(GENIE_ONE_ENTRY),
+        style: { ...rowStyle, marginBottom: 6 }
+      },
+      /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie One"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Ask across all your data")))
+    ), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", style: { padding: 10 } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading\u2026")), spaces.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm", as: "div", style: { padding: 10 } }, spaces.error), spaces.status === "ready" && !filtered.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { padding: 10 } }, spaces.spaces.length ? "No agents match." : "No Genie agents are shared with you yet."), filtered.map((space) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: space.space_id,
+        type: "button",
+        className: "dbx-row",
+        "aria-selected": space.space_id === selected,
+        onClick: () => setSelected(space.space_id),
+        title: space.description,
+        style: rowStyle
+      },
+      /* @__PURE__ */ React.createElement(Text, { size: "md", as: "div", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, space.title)
+    ))), props.children && /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", padding: 6 } }, props.children)));
+  };
+}
+function geniePage(service, store, genieOne) {
+  return function GeniePage(_props) {
+    const snapshot = useConnection(service);
+    const spaces = useSpaces(store);
+    const oneAvailable = useGenieOneAvailable(service, genieOne);
+    const [selected] = useSelection(service, oneAvailable);
+    const space = spaces.spaces.find((candidate) => candidate.space_id === selected);
+    let body;
+    if (snapshot.status !== "connected")
+      body = /* @__PURE__ */ React.createElement(
+        EmptyState,
+        {
+          title: "Connect Databricks to use Genie",
+          action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect Databricks")
+        },
+        "Genie answers questions about your data in plain language, with the access you already have."
+      );
+    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = /* @__PURE__ */ React.createElement(GenieOneChat, { service, genieOne });
+    else if (spaces.status === "error") body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't list Genie agents" }, spaces.error);
+    else if (!space)
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Pick an agent on the left to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
+    else body = /* @__PURE__ */ React.createElement(GenieChat, { key: space.space_id, service, space });
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { height: "100%", overflow: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 920, margin: "0 auto", padding: "24px 28px 16px", minHeight: "100%", display: "flex", flexDirection: "column" } }, body));
+  };
+}
+
+// plugins/genie/src/conversation.tsx
+function composerTool(service, store) {
+  return function AskGenie(props) {
+    const [open, setOpen] = React.useState(false);
+    const root = React.useRef(null);
+    React.useEffect(() => {
+      if (!open) return;
+      const onKey = (event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          setOpen(false);
+          props.focus();
+        }
+      };
+      const onPointer = (event) => {
+        if (root.current && !root.current.contains(event.target)) setOpen(false);
+      };
+      document.addEventListener("keydown", onKey, true);
+      document.addEventListener("pointerdown", onPointer, true);
+      return () => {
+        document.removeEventListener("keydown", onKey, true);
+        document.removeEventListener("pointerdown", onPointer, true);
+      };
+    }, [open, props]);
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { position: "relative", display: "inline-flex" } }, /* @__PURE__ */ React.createElement("div", { ref: root, style: { display: "contents" } }, /* @__PURE__ */ React.createElement(Button, { icon: true, variant: "ghost", "aria-label": "Ask Genie", title: "Ask Genie about your data", disabled: props.disabled, onClick: () => setOpen(!open) }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 })), open && /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        role: "dialog",
+        "aria-label": "Ask Genie",
+        style: {
+          position: "absolute",
+          bottom: "calc(100% + 8px)",
+          left: 0,
+          width: "min(520px, 80vw)",
+          maxHeight: "min(560px, 70vh)",
+          overflow: "auto",
+          zIndex: 50,
+          padding: 14,
+          background: "var(--dbx-popover)",
+          border: "1px solid var(--dbx-border)",
+          borderRadius: "var(--dbx-radius-card)",
+          boxShadow: "var(--shadow-panel, 0 8px 28px rgba(0,0,0,0.18))"
+        }
+      },
+      /* @__PURE__ */ React.createElement(
+        GeniePicker,
+        {
+          service,
+          store,
+          onInsert: (markdown) => {
+            if (props.insertText(`${markdown}
+`)) {
+              setOpen(false);
+              props.focus();
+            }
+          }
+        }
+      )
+    )));
+  };
+}
+function GeniePicker(props) {
+  const { service, store } = props;
+  const snapshot = useConnection(service);
+  const spaces = useSpaces(store);
+  const [selected, setSelected] = usePreference(service, "genieSpaceId");
+  if (snapshot.status !== "connected")
+    return /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Sign in once to ask Genie from any conversation.");
+  const space = spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Ask Genie"), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), spaces.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, spaces.error), spaces.spaces.length > 0 && /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: space?.space_id ?? "", onChange: (event) => setSelected(event.target.value), "aria-label": "Genie agent" }, spaces.spaces.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.space_id, value: candidate.space_id }, candidate.title))), spaces.status === "ready" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "No Genie agents are shared with you yet."), space && /* @__PURE__ */ React.createElement(
+    GenieChat,
+    {
+      key: space.space_id,
+      service,
+      space,
+      compact: true,
+      answerActions: (turn) => turn.text || turn.result ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => props.onInsert(turnMarkdown(space, turn, service.workspaceUrl(Genie.webPath(space.space_id, turn.message?.conversation_id)))) }, "Insert into message") : null
+    }
+  ), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Answers use your access. Inserting shares the answer with everyone in this conversation."));
+}
+function genieLinkChip(service, store) {
+  return function GenieLink(props) {
+    const link = parseGenieUrl(props.url);
+    const spaces = useSpaces(store);
+    const space = link && spaces.spaces.find((candidate) => candidate.space_id === link.spaceId);
+    return /* @__PURE__ */ React.createElement("span", { style: { display: "inline-flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { "data-dbx": "", style: { display: "inline-flex" } }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 11 })), /* @__PURE__ */ React.createElement("span", null, "Genie", space ? ` \xB7 ${space.title}` : link?.conversationId ? " conversation" : ""));
+  };
+}
+function geniePanel(service, store) {
+  return function GeniePanel(props) {
+    const link = React.useMemo(() => parseGenieUrl(props.target), [props.target]);
+    const snapshot = useConnection(service);
+    const space = useAsync(
+      async (signal) => {
+        if (!link) return void 0;
+        const client = await service.ready(signal);
+        if (client.host !== link.host) return "elsewhere";
+        return await store.find(link.spaceId) ?? await new Genie(client).getSpace(link.spaceId, signal);
+      },
+      [props.target, snapshot.status]
+    );
+    let body;
+    if (snapshot.status !== "connected")
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Sign in to chat with this Genie agent.");
+    else if (space.loading) body = /* @__PURE__ */ React.createElement(Spinner, null);
+    else if (space.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Can't open this Genie agent" }, String(space.error.message));
+    else if (space.data === "elsewhere") body = /* @__PURE__ */ React.createElement(Notice, { title: "Different workspace" }, "This Genie agent is in ", link?.host.replace("https://", ""), ".");
+    else if (space.data)
+      body = /* @__PURE__ */ React.createElement(GenieChat, { service, space: space.data, ...link?.conversationId && { conversationId: link.conversationId } });
+    else body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Not a Genie link.");
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-panel-inset, 16px)", display: "flex", flexDirection: "column", minHeight: "100%" } }, body);
+  };
+}
 
 // plugins/genie/src/tools.ts
 var AUDIENCE = "Note: these results came from the owner's Databricks access. Everyone in this conversation can read what you post, so share only what this audience should see.";
@@ -1940,8 +2087,8 @@ function apply(ctx) {
       for (const tool of genieTools(databricks, store, genieOne)) agents.agents.addTool(tool);
     });
     return {
-      page: geniePage(databricks, store),
-      sidebar: genieSidebar(databricks, store)
+      page: geniePage(databricks, store, genieOne),
+      sidebar: genieSidebar(databricks, store, genieOne)
     };
   });
   ctx.pages.register({

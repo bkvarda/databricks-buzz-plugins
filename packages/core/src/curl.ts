@@ -58,7 +58,14 @@ export function curlQuote(value: string): string {
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
-export function curlConfig(request: HttpRequest): string {
+/**
+ * curl prints HTTP trailers (e.g. `grpc-status: 0`) after the body when
+ * `--include` is on. To cut them off, each request asks curl to append the
+ * body's byte count after a per-request marker, which `bodyAndTrailers` uses.
+ */
+export const endMarker = (nonce: string) => `\n--dbx-curl-end-${nonce} `;
+
+export function curlConfig(request: HttpRequest, nonce?: string): string {
   const url = new URL(request.url);
   if (url.protocol !== "https:")
     throw new TransportError("Only HTTPS URLs are allowed", null);
@@ -77,6 +84,7 @@ export function curlConfig(request: HttpRequest): string {
       throw new TransportError(`Invalid header ${name}`, null);
     lines.push(`header = ${curlQuote(`${name}: ${value}`)}`);
   }
+  if (nonce) lines.push(`write-out = ${curlQuote(`${endMarker(nonce)}%{size_download}\n`)}`);
   if (request.method === "HEAD") lines.push("head");
   if (request.body !== undefined) {
     // `data-binary` reads a file when its value starts with "@"; `data-raw`
@@ -114,20 +122,65 @@ export function splitHead(
   }
 }
 
+const parseHeaderLines = (text: string) => {
+  const headers: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const colon = line.indexOf(":");
+    if (colon > 0) headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  return headers;
+};
+
+/**
+ * Separates the body from trailers and the end marker, using the byte count
+ * curl reported. Without a marker (or a count), returns the text unchanged.
+ */
+export function bodyAndTrailers(text: string, nonce: string): { body: string; trailers: Record<string, string> } {
+  const marker = endMarker(nonce);
+  const at = text.lastIndexOf(marker);
+  if (at < 0) return { body: text, trailers: {} };
+  const payload = text.slice(0, at);
+  const size = Number(/^(\d+)/.exec(text.slice(at + marker.length))?.[1]);
+  if (!Number.isFinite(size)) return { body: payload, trailers: {} };
+  const bytes = new TextEncoder().encode(payload);
+  if (bytes.length <= size) return { body: payload, trailers: {} };
+  const decoder = new TextDecoder();
+  return { body: decoder.decode(bytes.slice(0, size)), trailers: parseHeaderLines(decoder.decode(bytes.slice(size))) };
+}
+
+const nonceOf = () => {
+  const bytes = new Uint8Array(9);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
 export function curlTransport(host: Host, processId = "curl"): Transport {
   return async (request) => {
     if (!host.spawn) throw new DesktopOnlyError();
     request.signal?.throwIfAborted();
-    const config = curlConfig(request);
+    const nonce = nonceOf();
+    const config = curlConfig(request, nonce);
+    // Streamed text is held back by the marker's length (plus the count), so
+    // listeners don't see the marker; trailers may still precede it.
+    const holdBack = endMarker(nonce).length + 24;
     let raw = "";
     let stderr = "";
     let head: HeadState | undefined;
     let body = "";
+    let emitted = 0;
+    const emit = (final: string | undefined) => {
+      if (!request.onBody) return;
+      const ready = final ?? body.slice(0, Math.max(0, body.length - holdBack));
+      if (ready.length > emitted) {
+        request.onBody(ready.slice(emitted));
+        emitted = ready.length;
+      }
+    };
     const child = await host.spawn(processId, {
       onStdout(data) {
         if (head) {
           body += data;
-          request.onBody?.(data);
+          emit(undefined);
           return;
         }
         raw += data;
@@ -135,10 +188,8 @@ export function curlTransport(host: Host, processId = "curl"): Transport {
         if (!split) return;
         head = split.head;
         raw = "";
-        if (split.rest) {
-          body += split.rest;
-          request.onBody?.(split.rest);
-        }
+        body += split.rest;
+        emit(undefined);
       },
       onStderr(data) {
         stderr += data;
@@ -156,7 +207,9 @@ export function curlTransport(host: Host, processId = "curl"): Transport {
           `curl exited with ${code ?? "a signal"}`;
         throw new TransportError(message, code);
       }
-      return { status: head.status, headers: head.headers, body };
+      const clean = bodyAndTrailers(body, nonce);
+      emit(clean.body);
+      return { status: head.status, headers: { ...clean.trailers, ...head.headers }, body: clean.body };
     } finally {
       request.signal?.removeEventListener("abort", kill);
     }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseProfiles, parseToken, normalizeHost, isWorkspaceProfile } from "@dbx/core/cli";
-import { curlConfig, curlQuote, splitHead } from "@dbx/core/curl";
+import { bodyAndTrailers, curlConfig, curlQuote, endMarker, splitHead } from "@dbx/core/curl";
 import { parseSse, SseParser } from "@dbx/core/sse";
 import { fromStatement, planChart, resultSet, toMarkdown } from "@dbx/core/result";
 import { isReadOnlySql } from "@dbx/core/api/sql";
@@ -37,6 +37,20 @@ describe("curl config", () => {
     expect(split?.head.headers["mcp-session-id"]).toBe("abc");
     expect(split?.rest).toBe('{"ok":true}');
     expect(splitHead("HTTP/2 200\r\ncontent-type: x")).toBeUndefined();
+  });
+  it("asks curl for the body size after a per-request marker", () => {
+    expect(curlConfig({ url: "https://example.com" }, "abc")).toContain('write-out = "\\n--dbx-curl-end-abc %{size_download}\\n"');
+    expect(curlConfig({ url: "https://example.com" })).not.toContain("write-out");
+  });
+  it("cuts HTTP trailers off the body using the reported byte count", () => {
+    const body = '{"stdout":"héllo 🧱"}';
+    const bytes = new TextEncoder().encode(body).length;
+    const text = `${body}grpc-status: 0\r\ngrpc-message: \r\n${endMarker("n1")}${bytes}\n`;
+    expect(bodyAndTrailers(text, "n1")).toEqual({ body, trailers: { "grpc-status": "0", "grpc-message": "" } });
+    expect(bodyAndTrailers(`${body}${endMarker("n1")}${bytes}\n`, "n1")).toEqual({ body, trailers: {} });
+    expect(bodyAndTrailers(`${endMarker("n1")}0\n`, "n1")).toEqual({ body: "", trailers: {} });
+    // A body that happens to contain another request's marker is left alone.
+    expect(bodyAndTrailers(`x${endMarker("other")}5`, "n1").body).toBe(`x${endMarker("other")}5`);
   });
 });
 
@@ -163,5 +177,22 @@ describe("markdown", () => {
   it("parses tables, lists and code", () => {
     const blocks = parseBlocks("Intro **bold**\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- one\n- two\n\n```sql\nSELECT 1\n```");
     expect(blocks.map((b) => b.type)).toEqual(["p", "table", "ul", "code"]);
+  });
+});
+
+describe("column kinds", () => {
+  it("treats identifier-like numeric columns as labels, so they chart as categories", () => {
+    const result = resultSet([{ name: "pickup_zip", type: "INT" }, { name: "trip_count", type: "BIGINT" }, { name: "avg_fare" }], [["10001", "1227", "10.62"], ["10003", "1181", "10.98"]]);
+    expect(result.columns.map((column) => column.kind)).toEqual(["text", "number", "number"]);
+    // Fares (~10) and trips (~1,000) don't share an axis; the first measure wins.
+    expect(planChart(result)).toMatchObject({ type: "bar", x: 0, series: [1] });
+    expect(resultSet([{ name: "order_date", type: "DATE" }], [["2016-01-01"]]).columns[0]?.kind).toBe("time");
+  });
+});
+
+describe("chart planning for hour columns", () => {
+  it("charts an integer hour column as the x-axis", () => {
+    const result = resultSet([{ name: "pickup_hour", type: "INT" }, { name: "trips", type: "BIGINT" }, { name: "avg_fare_usd", type: "DOUBLE" }], Array.from({ length: 24 }, (_, h) => [String(h), String(500 + h * 30), "12.5"]));
+    expect(planChart(result)).toMatchObject({ type: "line", x: 0, series: [1] });
   });
 });

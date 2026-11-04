@@ -19,39 +19,6 @@ function optionalService(ctx, name) {
 var EXPIRY_MARGIN_MS = 3 * 6e4;
 var DEFAULT_LIFETIME_MS = 30 * 6e4;
 
-// packages/core/src/client.ts
-var DatabricksApiError = class extends Error {
-  constructor(status, errorCode, message, body) {
-    super(message);
-    this.status = status;
-    this.errorCode = errorCode;
-    this.body = body;
-    this.name = "DatabricksApiError";
-  }
-  get isPermission() {
-    return this.status === 403 || this.errorCode === "PERMISSION_DENIED";
-  }
-  get isNotFound() {
-    return this.status === 404 || this.errorCode === "RESOURCE_DOES_NOT_EXIST" || this.errorCode === "NOT_FOUND";
-  }
-  get isFeatureDisabled() {
-    return this.errorCode === "FEATURE_DISABLED" || this.errorCode === "NOT_IMPLEMENTED" || /not enabled|feature.*disabled|preview/i.test(this.message);
-  }
-};
-function apiError(response) {
-  let code;
-  let message = `Databricks returned HTTP ${response.status}`;
-  try {
-    const parsed = JSON.parse(response.body);
-    code = parsed.error_code ?? (typeof parsed.error === "object" ? parsed.error?.code : void 0);
-    message = parsed.message ?? (typeof parsed.error === "object" ? parsed.error?.message : parsed.error) ?? parsed.error_description ?? message;
-  } catch {
-    const text = response.body.trim();
-    if (text && text.length < 400 && !text.startsWith("<")) message = text;
-  }
-  return new DatabricksApiError(response.status, code, message, response.body);
-}
-
 // packages/core/src/service.ts
 var SERVICE_NAME = "databricks";
 var CORE_PLUGIN_ID = "bkvarda.databricks";
@@ -184,6 +151,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }
@@ -524,7 +493,9 @@ function agentText(raw) {
 // packages/core/src/result.ts
 var NUMERIC_TYPES = /^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i;
 var TIME_TYPES = /^(date|timestamp)/i;
-function kindOf(type, sample) {
+var IDENTIFIER = /(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;
+function kindOf(type, sample, name = "") {
+  if (IDENTIFIER.test(name) && !TIME_TYPES.test(type ?? "") && !/^bool/i.test(type ?? "")) return "text";
   if (type) {
     if (NUMERIC_TYPES.test(type)) return "number";
     if (TIME_TYPES.test(type)) return "time";
@@ -545,7 +516,8 @@ function resultSet(columns, rows, extra = {}) {
       ...column.type && { type: column.type },
       kind: kindOf(
         column.type,
-        rows.slice(0, 50).map((row) => row[index] ?? null)
+        rows.slice(0, 50).map((row) => row[index] ?? null),
+        column.name
       )
     })),
     rows,
@@ -718,6 +690,13 @@ function sandboxId(seed) {
   const cleaned = seed.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
   return /^[a-z]/.test(cleaned) ? cleaned : `sb-${cleaned}`;
 }
+var isUnavailable = (error) => error.status === 404 && /requested API is not available/i.test(error.message ?? "");
+var SandboxUnavailableError = class extends Error {
+  constructor() {
+    super("Databricks Sandbox isn't turned on in this workspace. A workspace admin can turn on the Databricks Sandbox preview in Settings \u2192 Previews.");
+    this.name = "SandboxUnavailableError";
+  }
+};
 var resource = (id) => id.startsWith("sandboxes/") ? id : `sandboxes/${id}`;
 var Sandboxes = class {
   constructor(client) {
@@ -761,28 +740,50 @@ var Sandboxes = class {
   }
   /** Gets or creates the sandbox and waits until it is running. */
   async ensureRunning(id, options = {}) {
-    let sandbox;
-    try {
-      sandbox = await this.get(id, options.signal);
-    } catch (error) {
-      if (error.status !== 404) throw error;
+    let sandbox = await this.find(id, options.signal);
+    if (!sandbox) {
       options.onState?.("Creating sandbox");
-      sandbox = await this.create(id, options);
+      try {
+        sandbox = await this.create(id, options);
+      } catch (error) {
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if (error.status !== 409) throw error;
+        sandbox = await this.get(id, options.signal);
+      }
     }
     const deadline = Date.now() + 5 * 6e4;
+    let started = false;
     for (; ; ) {
-      const state = sandbox.status?.state ?? "";
+      const state = sandbox?.status?.state ?? "";
       if (state === "SANDBOX_STATE_RUNNING") return sandbox;
-      if (Date.now() > deadline) throw new Error("The sandbox did not start within 5 minutes.");
-      if (state === "SANDBOX_STATE_STOPPED") {
-        options.onState?.("Starting sandbox");
+      if (Date.now() > deadline) throw new Error(`The sandbox did not start within 5 minutes (state: ${state || "unknown"}).`);
+      if (state === "SANDBOX_STATE_STOPPED" && !started) {
+        options.onState?.("Starting sandbox", state);
+        started = true;
         sandbox = await this.start(id);
         continue;
       }
-      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox");
+      options.onState?.(state === "SANDBOX_STATE_STOPPING" ? "Waiting for sandbox to stop" : "Starting sandbox", state);
+      if (state === "SANDBOX_STATE_STOPPED") started = false;
       await new Promise((resolve) => setTimeout(resolve, 2e3));
       options.signal?.throwIfAborted();
-      sandbox = await this.get(id, options.signal);
+      sandbox = await this.find(id, options.signal) ?? sandbox;
+    }
+  }
+  /** The sandbox, or undefined when it doesn't exist. */
+  async find(id, signal) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.get(id, signal);
+      } catch (error) {
+        if (isUnavailable(error) && attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, 1e3));
+          continue;
+        }
+        if (isUnavailable(error)) throw new SandboxUnavailableError();
+        if (error.status === 404) return void 0;
+        throw error;
+      }
     }
   }
   /** Runs a command and waits for it, up to `timeoutSeconds` (server-clamped). */
@@ -808,30 +809,90 @@ var Sandboxes = class {
       ...options.signal && { signal: options.signal }
     });
   }
+  // Files go through exec-sync, the documented API: contents travel as base64
+  // in environment variables, never in the command line.
+  /** Reads a UTF-8 text file. */
   async readFile(id, path, signal) {
-    const response = await this.client.request(`/api/2.0/sandbox-files/${resource(id)}/content`, {
-      query: { path },
-      headers: { Accept: "application/octet-stream" },
+    const result = await this.exec(id, "/bin/bash", {
+      args: ["-c", 'if [ -d "$P" ]; then echo "$P is a directory" >&2; exit 21; fi; base64 -w0 -- "$P"'],
+      env: { P: path },
+      timeoutSeconds: 60,
       ...signal && { signal }
     });
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
-    return response.body;
+    if (result.exit_code !== 0) throw new Error(result.stderr?.trim().replace(/^base64: /, "") || `Couldn't read ${path}.`);
+    if (result.truncated) throw new Error(`${path} is too large to read whole; read part of it with a command instead.`);
+    return fromBase64(result.stdout ?? "");
   }
+  /** Creates or replaces a file (and its parent folders). */
   async writeFile(id, path, contents, signal) {
-    const response = await this.client.request(`/api/2.0/sandbox-files/${resource(id)}/content`, {
-      method: "PUT",
-      query: { path },
-      body: contents,
-      headers: { "Content-Type": "application/octet-stream" },
-      ...signal && { signal }
-    });
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    const encoded = toBase64(contents);
+    const CHUNK = 96 * 1024;
+    for (let offset = 0; offset === 0 || offset < encoded.length; offset += CHUNK) {
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", offset === 0 ? 'mkdir -p -- "$(dirname -- "$P")" && printf %s "$C" | base64 -d > "$P"' : 'printf %s "$C" | base64 -d >> "$P"'],
+        env: { P: path, C: encoded.slice(offset, offset + CHUNK) },
+        timeoutSeconds: 60,
+        ...signal && { signal }
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't write ${path}.`);
+    }
   }
+  /** Lists a folder: directory-entries when the server offers it, else `find`. */
   async listDirectory(id, path, signal) {
-    const response = await this.client.get(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, { query: { path, page_size: 500 }, ...signal && { signal } });
-    return response.contents ?? [];
+    try {
+      const response = await this.client.get(`/api/2.0/sandbox-files/${resource(id)}/directory-entries`, {
+        query: { path, page_size: 500 },
+        ...signal && { signal }
+      });
+      return (response.contents ?? []).map((entry) => {
+        const type = entry.fileType ?? entry.file_type ?? "";
+        const size = entry.size === void 0 ? void 0 : Number(entry.size);
+        const modified = entry.modifyTime ?? entry.modify_time;
+        return {
+          name: entry.name ?? entry.path?.split("/").pop() ?? "",
+          path: entry.path ?? "",
+          directory: /DIRECTORY/.test(type),
+          ...size !== void 0 && Number.isFinite(size) && { size },
+          ...modified && { modified }
+        };
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const result = await this.exec(id, "/bin/bash", {
+        args: ["-c", 'find "$P" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%p\\n"'],
+        env: { P: path },
+        timeoutSeconds: 30,
+        ...signal && { signal }
+      });
+      if (result.exit_code !== 0) throw new Error(result.stderr?.trim() || `Couldn't list ${path}.`);
+      return parseFindOutput(result.stdout ?? "");
+    }
   }
 };
+function parseFindOutput(text) {
+  return text.split("\n").filter(Boolean).map((line) => {
+    const [type = "", size = "", ...rest] = line.split("	");
+    const path = rest.join("	");
+    return {
+      name: path.split("/").pop() ?? path,
+      path,
+      directory: type === "d",
+      ...type !== "d" && Number.isFinite(Number(size)) && { size: Number(size) }
+    };
+  });
+}
+function toBase64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(binary);
+}
+function fromBase64(encoded) {
+  const binary = atob(encoded.trim());
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
 
 // plugins/agents/src/loop.ts
 var MESSAGE_TOOLS = /* @__PURE__ */ new Set(["send", "reply_in_subthread"]);
@@ -960,7 +1021,7 @@ function trimHistory(messages, maxChars = 12e4, maxMessages = 120) {
 // plugins/agents/src/sandbox.ts
 var sandboxFor = (pubkey) => sandboxId(`buzz-agent-${pubkey.slice(0, 12)}`);
 var SANDBOX_PROMPT = `<databricks-sandbox>
-You have your own Databricks Sandbox: a Linux machine in Databricks with a persistent home directory (${SANDBOX_HOME}, kept across restarts; other paths reset when it stops), Python, Node.js, Rust, git and the Databricks CLI already signed in as your owner, and internet access. Use sandbox_exec to run shell commands there (each call is a fresh bash login shell in your home directory; keep state in files), and sandbox_read_file / sandbox_write_file / sandbox_list for files. Work in ${SANDBOX_HOME}/work. Commands time out after the limit you give (default 120 seconds, up to 1800); start long jobs in the background with nohup and check on them. Never print secrets into conversations.
+You have your own Databricks Sandbox: a Linux machine in Databricks with Python, Node.js, Rust, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${SANDBOX_HOME}/work; relative paths in every sandbox tool are relative to it, and each sandbox_exec call is a fresh bash login shell that starts there. Files under ${SANDBOX_HOME} persist across restarts; other paths reset when the sandbox stops. Keep state in files. Use sandbox_read_file / sandbox_write_file / sandbox_list for files. Commands time out after the limit you give (default 120 seconds, up to 1800); start long jobs in the background with nohup and check on them. Never print secrets into conversations.
 </databricks-sandbox>`;
 var clip2 = (text, max = 2e4) => text.length > max ? `${text.slice(0, max / 2)}
 \u2026 (${text.length - max} characters cut) \u2026
@@ -1054,7 +1115,7 @@ ${clip2(result.stderr, 8e3)}` : ""
         const sandboxes = await ensure(signal);
         const path = typeof args.path === "string" && args.path ? args.path : `${SANDBOX_HOME}/work`;
         const entries = await sandboxes.listDirectory(id, path, signal);
-        return entries.map((entry) => `${entry.file_type?.includes("DIRECTORY") ? "d" : "-"} ${entry.name ?? entry.path} ${entry.size ?? ""}`.trim()).join("\n") || "(empty)";
+        return entries.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)).map((entry) => entry.directory ? `${entry.name}/` : `${entry.name}${entry.size !== void 0 ? `  (${entry.size} bytes)` : ""}`).join("\n") || "(empty)";
       }
     }
   ];

@@ -195,6 +195,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }
@@ -471,7 +473,9 @@ function MissingCore(props) {
 // packages/core/src/result.ts
 var NUMERIC_TYPES = /^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i;
 var TIME_TYPES = /^(date|timestamp)/i;
-function kindOf(type, sample) {
+var IDENTIFIER = /(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;
+function kindOf(type, sample, name = "") {
+  if (IDENTIFIER.test(name) && !TIME_TYPES.test(type ?? "") && !/^bool/i.test(type ?? "")) return "text";
   if (type) {
     if (NUMERIC_TYPES.test(type)) return "number";
     if (TIME_TYPES.test(type)) return "time";
@@ -492,7 +496,8 @@ function resultSet(columns, rows, extra = {}) {
       ...column.type && { type: column.type },
       kind: kindOf(
         column.type,
-        rows.slice(0, 50).map((row) => row[index] ?? null)
+        rows.slice(0, 50).map((row) => row[index] ?? null),
+        column.name
       )
     })),
     rows,
@@ -548,6 +553,11 @@ function toCsv(result) {
     ...result.rows.map((row) => row.map(quote).join(","))
   ].join("\n");
 }
+function comparable(rows, indices) {
+  const peak = (index) => Math.max(0, ...rows.map((row) => Math.abs(Number(row[index]) || 0)));
+  const base = indices[0] === void 0 ? 0 : peak(indices[0]);
+  return indices.filter((index, n) => n === 0 || base === 0 || peak(index) / base <= 10 && peak(index) / base >= 0.1);
+}
 function planChart(result) {
   const { columns, rows } = result;
   if (!rows.length) return { type: "none" };
@@ -559,20 +569,20 @@ function planChart(result) {
   if (rows.length < 2 || !numeric.length) return { type: "none" };
   const time = columns.findIndex((column) => column.kind === "time");
   if (time !== -1) {
-    const series = numeric.filter((index) => index !== time).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== time)).slice(0, 4);
     return series.length ? { type: "line", x: time, series } : { type: "none" };
   }
   const label = columns.findIndex((column) => column.kind === "text");
   if (label !== -1 && rows.length <= 40) {
-    const series = numeric.slice(0, 3);
+    const series = comparable(rows, numeric).slice(0, 3);
     const longest = Math.max(...rows.map((row) => (row[label] ?? "").length));
     return { type: "bar", x: label, series, horizontal: longest > 10 || rows.length > 12 };
   }
   const yearLike = numeric.find(
-    (index) => /^(year|yr|month|week|day|quarter|period)/i.test(columns[index]?.name ?? "")
+    (index) => /(^|_)(year|yr|quarter|month|week|day|hour|minute|period)(_|s?$)/i.test(columns[index]?.name ?? "")
   );
   if (yearLike !== void 0) {
-    const series = numeric.filter((index) => index !== yearLike).slice(0, 4);
+    const series = comparable(rows, numeric.filter((index) => index !== yearLike)).slice(0, 4);
     if (series.length) return { type: "line", x: yearLike, series };
   }
   return { type: "none" };

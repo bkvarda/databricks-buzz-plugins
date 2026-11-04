@@ -5,9 +5,11 @@ import type { PageSidebarProps } from "@buzz/author";
 import type { PageProps } from "@dbx/core/host-types";
 import { Genie, type GenieSpace } from "@dbx/core/api/genie";
 import { React } from "@dbx/core/react";
-import { type DatabricksService, describeError, useConnection, usePreference } from "@dbx/core/service";
-import { Button, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
+import { Button, DatabricksMark, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GenieChat } from "./chat";
+import type { GenieOne } from "./genie-one";
+import { GenieOneChat } from "./genie-one-chat";
 
 type SpacesState = { status: "idle" | "loading" | "ready" | "error"; spaces: readonly GenieSpace[]; error?: string };
 
@@ -79,11 +81,40 @@ export function useSpaces(store: SpacesStore) {
 }
 
 const SELECTED = "genieSpaceId";
+/** The sidebar entry for Genie One (not a space ID). */
+export const GENIE_ONE_ENTRY = "genie-one";
 
-export function genieSidebar(service: DatabricksService, store: SpacesStore) {
+/** Whether Genie One answers here; rechecked when the workspace changes. */
+function useGenieOneAvailable(service: DatabricksService, genieOne: GenieOne) {
+  const snapshot = useConnection(service);
+  const host = snapshot.status === "connected" ? snapshot.profile.host : undefined;
+  return useAsync(async () => (host ? genieOne.available() : false), [host]).data === true;
+}
+
+/** The selected entry, defaulting to Genie One when nothing is chosen. */
+function useSelection(service: DatabricksService, oneAvailable: boolean) {
+  const [selected, setSelected] = usePreference<string>(service, SELECTED);
+  return [selected ?? (oneAvailable ? GENIE_ONE_ENTRY : undefined), setSelected] as const;
+}
+
+const rowStyle = {
+  display: "block",
+  width: "100%",
+  textAlign: "left",
+  border: 0,
+  background: "transparent",
+  borderRadius: "var(--radius-row, 6px)",
+  padding: "6px 8px",
+  cursor: "pointer",
+  font: "inherit",
+  color: "var(--dbx-ink)",
+} as const;
+
+export function genieSidebar(service: DatabricksService, store: SpacesStore, genieOne: GenieOne) {
   return function GenieSidebar(props: PageSidebarProps) {
     const spaces = useSpaces(store);
-    const [selected, setSelected] = usePreference<string>(service, SELECTED);
+    const oneAvailable = useGenieOneAvailable(service, genieOne);
+    const [selected, setSelected] = useSelection(service, oneAvailable);
     const [query, setQuery] = React.useState("");
     const filtered = spaces.spaces.filter(
       (space) => !query.trim() || `${space.title} ${space.description ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()),
@@ -101,6 +132,25 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore) {
             <input className="dbx-input" placeholder="Find an agent" value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Find a Genie agent" />
           </Stack>
           <nav aria-label="Genie agents" style={{ flex: 1, overflow: "auto", padding: "0 6px 8px" }}>
+            {oneAvailable && (
+              <button
+                type="button"
+                className="dbx-row"
+                aria-selected={selected === GENIE_ONE_ENTRY}
+                onClick={() => setSelected(GENIE_ONE_ENTRY)}
+                style={{ ...rowStyle, marginBottom: 6 }}
+              >
+                <Stack direction="row" gap={8} align="center">
+                  <DatabricksMark size={13} />
+                  <Stack gap={0} style={{ minWidth: 0 }}>
+                    <Text size="md">Genie One</Text>
+                    <Text size="xs" tone="subtle">
+                      Ask across all your data
+                    </Text>
+                  </Stack>
+                </Stack>
+              </button>
+            )}
             {spaces.status === "loading" && (
               <Stack direction="row" gap={8} align="center" style={{ padding: 10 }}>
                 <Spinner size={12} />
@@ -127,18 +177,7 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore) {
                 aria-selected={space.space_id === selected}
                 onClick={() => setSelected(space.space_id)}
                 title={space.description}
-                style={{
-                  display: "block",
-                  width: "100%",
-                  textAlign: "left",
-                  border: 0,
-                  background: "transparent",
-                  borderRadius: "var(--radius-row, 6px)",
-                  padding: "6px 8px",
-                  cursor: "pointer",
-                  font: "inherit",
-                  color: "var(--dbx-ink)",
-                }}
+                style={rowStyle}
               >
                 <Text size="md" as="div" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {space.title}
@@ -153,11 +192,12 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore) {
   };
 }
 
-export function geniePage(service: DatabricksService, store: SpacesStore) {
+export function geniePage(service: DatabricksService, store: SpacesStore, genieOne: GenieOne) {
   return function GeniePage(_props: PageProps) {
     const snapshot = useConnection(service);
     const spaces = useSpaces(store);
-    const [selected] = usePreference<string>(service, SELECTED);
+    const oneAvailable = useGenieOneAvailable(service, genieOne);
+    const [selected] = useSelection(service, oneAvailable);
     const space = spaces.spaces.find((candidate) => candidate.space_id === selected);
     let body: React.ReactNode;
     if (snapshot.status !== "connected")
@@ -173,6 +213,7 @@ export function geniePage(service: DatabricksService, store: SpacesStore) {
           Genie answers questions about your data in plain language, with the access you already have.
         </EmptyState>
       );
+    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = <GenieOneChat service={service} genieOne={genieOne} />;
     else if (spaces.status === "error") body = <Notice tone="danger" title="Couldn't list Genie agents">{spaces.error}</Notice>;
     else if (!space)
       body = (

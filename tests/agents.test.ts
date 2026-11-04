@@ -95,3 +95,59 @@ describe("agent helpers", () => {
     expect(normalizeDatabricks(undefined).model).toMatch(/^system\.ai\./);
   });
 });
+
+import { answerParts, answerText, cleanAnswer, parseStep } from "../plugins/genie/src/genie-one-chat";
+import { stripComments, toResultSet } from "../plugins/genie/src/genie-one";
+
+describe("Genie One rendering", () => {
+  it("parses progress steps, dropping embedded tables and comment markers", () => {
+    expect(parseStep("Thinking: Genie: none — user explicitly named the sample table; I'll inspect its schema next.")).toEqual({
+      kind: "thought",
+      text: "user explicitly named the sample table; I'll inspect its schema next.",
+    });
+    expect(parseStep("Running SQL: SELECT COUNT(*) FROM `samples`.`nyctaxi`.`trips`")).toEqual({ kind: "sql", text: "SELECT COUNT(*) FROM `samples`.`nyctaxi`.`trips`" });
+    expect(
+      parseStep("Query result: Query returned 1 rows: <!-- begin:query_5a5312 -- > | total_trips | avg_fare | | --- | --- | | 21932 | 12.35 | <!-- end:query_5a5312 -- >"),
+    ).toEqual({ kind: "result", text: "Query returned 1 rows" });
+  });
+  it("strips comments, including the escaped `-- >` form", () => {
+    expect(stripComments("a <!-- agent: note --> b <!-- x -- > c")).toBe("a  b  c");
+  });
+  it("drops Markdown tables from the answer when rows render natively", () => {
+    const result = toResultSet({ ready: true, columns: [{ name: "n", type_text: "BIGINT" }], rows: [[21932]], total_row_count: 1 })!;
+    const text = "## Trips\n\nThere are **21,932** trips.\n\n| n |\n| --- |\n| 21932 |\n\n- Sample data.";
+    const answer = { conversationId: "c", responseId: "r", status: "completed" as const, text, markdown: "", steps: [], results: [result], sql: [] };
+    expect(answerText(answer)).toBe("## Trips\n\nThere are **21,932** trips.\n\n- Sample data.");
+    // Without typed rows, the answer's own table becomes a native result.
+    const fromText = answerParts({ ...answer, results: [] });
+    expect(fromText.text).toBe("## Trips\n\nThere are **21,932** trips.\n\n- Sample data.");
+    expect(fromText.results[0]?.columns).toEqual([{ name: "n", kind: "number" }]);
+    expect(fromText.results[0]?.rows).toEqual([["21932"]]);
+    expect(result.columns[0]?.kind).toBe("number");
+    expect(result.rows[0]?.[0]).toBe("21932");
+  });
+  it("merges a code span with the link that repeats it", () => {
+    expect(cleanAnswer("Only one table, `samples.nyctaxi.trips` [samples.nyctaxi.trips](https://h/t). Done")).toBe("Only one table, [samples.nyctaxi.trips](https://h/t). Done");
+  });
+  it("removes citation directives and embed-only result links", () => {
+    expect(cleanAnswer("**21,932** trips. :citation[sql.pub_toolu_x] [Query Result](https://h/one/chat/threads/1?o=2#embed-query_5a) [trips](https://h/explore/data/samples/nyctaxi/trips)")).toBe(
+      "**21,932** trips. [trips](https://h/explore/data/samples/nyctaxi/trips)",
+    );
+  });
+});
+
+import { formatSql } from "../plugins/genie/src/genie-one-chat";
+import { parseBlocks, renderInline } from "@dbx/core/ui/markdown";
+
+describe("Genie One display helpers", () => {
+  it("breaks one-line SQL at clauses and select items", () => {
+    expect(formatSql("SELECT HOUR(`t`) AS h, COUNT(*) AS n, ROUND(AVG(`d`), 2) AS d FROM `s`.`n`.`trips` GROUP BY 1 ORDER BY 1")).toBe(
+      "SELECT\n  HOUR(`t`) AS h,\n  COUNT(*) AS n,\n  ROUND(AVG(`d`), 2) AS d\nFROM `s`.`n`.`trips`\nGROUP BY 1\nORDER BY 1",
+    );
+    expect(formatSql("SELECT a\nFROM b")).toBe("SELECT a\nFROM b");
+  });
+  it("unescapes Markdown backslash escapes", () => {
+    expect(renderInline("about \\~$14.80 and 2\\*3")).toEqual(["about ", "~", "$14.80 and 2", "*", "3"]);
+    expect(parseBlocks("a \\~b")[0]).toEqual({ type: "p", text: "a \\~b" });
+  });
+});

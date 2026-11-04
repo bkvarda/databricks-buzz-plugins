@@ -104,6 +104,8 @@ export const STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }

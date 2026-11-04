@@ -19,7 +19,13 @@ export type MemoryEntry = Readonly<{
   score?: number;
 }>;
 
-export type MemoryStore = Readonly<{ name?: string; description?: string; create_time?: string }>;
+export type MemoryStore = Readonly<{
+  name?: string;
+  display_name?: string;
+  description?: string;
+  create_time?: string;
+  storage_backend?: { backend_type?: string; backend_id?: string };
+}>;
 
 export const entryId = (entry: MemoryEntry) => entry.name?.split("/").pop() ?? "";
 
@@ -71,26 +77,48 @@ export class Memory {
   }
 
   async search(storeId: string, actorId: string, query: string, limit = 10, signal?: AbortSignal): Promise<MemoryEntry[]> {
-    const response = await this.client.post<{ entries?: MemoryEntry[]; results?: { entry?: MemoryEntry; score?: number }[] }>(
+    type Hit = { managed_memory_entry?: MemoryEntry; entry?: MemoryEntry; score?: number };
+    const response = await this.client.post<{ results?: Hit[]; managed_memory_entries?: MemoryEntry[]; entries?: MemoryEntry[] }>(
       `${store(storeId)}/entries:search`,
       { actor_id: actorId, query, ...(limit && { limit }) },
       signal ? { signal } : {},
     );
-    if (response.entries) return response.entries.slice(0, limit);
-    return (response.results ?? [])
-      .flatMap((result) => (result.entry ? [{ ...result.entry, ...(result.score !== undefined && { score: result.score }) }] : []))
-      .slice(0, limit);
+    if (response.results?.length)
+      return response.results
+        .flatMap((hit) => {
+          const entry = hit.managed_memory_entry ?? hit.entry;
+          return entry ? [{ ...entry, ...(hit.score !== undefined && { score: hit.score }) }] : [];
+        })
+        .slice(0, limit);
+    return (response.managed_memory_entries ?? response.entries ?? []).slice(0, limit);
   }
 
-  async list(storeId: string, actorId: string, options: Readonly<{ path?: string; signal?: AbortSignal }> = {}): Promise<MemoryEntry[]> {
+  /**
+   * Entries for an actor. `path` matches one path exactly; `prefix` matches
+   * everything under a folder such as /projects/.
+   */
+  async list(
+    storeId: string,
+    actorId: string,
+    options: Readonly<{ path?: string; prefix?: string; signal?: AbortSignal }> = {},
+  ): Promise<MemoryEntry[]> {
     const out: MemoryEntry[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < 20; page++) {
-      const response = await this.client.get<{ entries?: MemoryEntry[]; next_page_token?: string }>(`${store(storeId)}/entries`, {
-        query: { actor_id: actorId, path: options.path && normalizePath(options.path), page_size: 100, page_token: pageToken },
-        ...(options.signal && { signal: options.signal }),
-      });
-      out.push(...(response.entries ?? []));
+      const response = await this.client.get<{ managed_memory_entries?: MemoryEntry[]; entries?: MemoryEntry[]; next_page_token?: string }>(
+        `${store(storeId)}/entries`,
+        {
+          query: {
+            actor_id: actorId,
+            path: options.path && normalizePath(options.path),
+            path_prefix: options.prefix && normalizePath(options.prefix),
+            page_size: 100,
+            page_token: pageToken,
+          },
+          ...(options.signal && { signal: options.signal }),
+        },
+      );
+      out.push(...(response.managed_memory_entries ?? response.entries ?? []));
       pageToken = response.next_page_token;
       if (!pageToken) break;
     }
@@ -119,12 +147,23 @@ export class Memory {
         body: { content: entry.content, ...(entry.description !== undefined && { description: entry.description }) },
       });
     }
-    return this.client.post<MemoryEntry>(`${store(storeId)}/entries`, {
-      actor_id: entry.actorId,
-      path,
-      content: entry.content,
-      ...(entry.description && { description: entry.description }),
-    });
+    try {
+      return await this.client.post<MemoryEntry>(`${store(storeId)}/entries`, {
+        actor_id: entry.actorId,
+        path,
+        content: entry.content,
+        ...(entry.description && { description: entry.description }),
+      });
+    } catch (error) {
+      // Lost a race with another writer: the server names the entry to update.
+      const existingId = /existing entry id: ([\w-]+)/.exec((error as Error).message ?? "")?.[1];
+      if ((error as { status?: number }).status !== 409 || !existingId) throw error;
+      return this.client.json<MemoryEntry>(`${store(storeId)}/entries/${encodeURIComponent(existingId)}`, {
+        method: "PATCH",
+        query: { update_mask: "content" },
+        body: { content: entry.content },
+      });
+    }
   }
 
   async remove(storeId: string, actorId: string, path: string): Promise<boolean> {

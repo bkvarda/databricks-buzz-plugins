@@ -531,7 +531,9 @@ function curlQuote(value) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t").replace(/\v/g, "\\v")}"`;
 }
 var HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-function curlConfig(request) {
+var endMarker = (nonce) => `
+--dbx-curl-end-${nonce} `;
+function curlConfig(request, nonce) {
   const url = new URL(request.url);
   if (url.protocol !== "https:")
     throw new TransportError("Only HTTPS URLs are allowed", null);
@@ -550,6 +552,8 @@ function curlConfig(request) {
       throw new TransportError(`Invalid header ${name}`, null);
     lines.push(`header = ${curlQuote(`${name}: ${value}`)}`);
   }
+  if (nonce) lines.push(`write-out = ${curlQuote(`${endMarker(nonce)}%{size_download}
+`)}`);
   if (request.method === "HEAD") lines.push("head");
   if (request.body !== void 0) {
     lines.push(`data-raw = ${curlQuote(request.body)}`);
@@ -577,20 +581,56 @@ function splitHead(text) {
     return { head: { status, headers }, rest: remaining };
   }
 }
+var parseHeaderLines = (text) => {
+  const headers = {};
+  for (const line of text.split(/\r?\n/)) {
+    const colon = line.indexOf(":");
+    if (colon > 0) headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  return headers;
+};
+function bodyAndTrailers(text, nonce) {
+  const marker = endMarker(nonce);
+  const at = text.lastIndexOf(marker);
+  if (at < 0) return { body: text, trailers: {} };
+  const payload = text.slice(0, at);
+  const size = Number(/^(\d+)/.exec(text.slice(at + marker.length))?.[1]);
+  if (!Number.isFinite(size)) return { body: payload, trailers: {} };
+  const bytes = new TextEncoder().encode(payload);
+  if (bytes.length <= size) return { body: payload, trailers: {} };
+  const decoder = new TextDecoder();
+  return { body: decoder.decode(bytes.slice(0, size)), trailers: parseHeaderLines(decoder.decode(bytes.slice(size))) };
+}
+var nonceOf = () => {
+  const bytes = new Uint8Array(9);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 function curlTransport(host, processId = "curl") {
   return async (request) => {
     if (!host.spawn) throw new DesktopOnlyError();
     request.signal?.throwIfAborted();
-    const config = curlConfig(request);
+    const nonce = nonceOf();
+    const config = curlConfig(request, nonce);
+    const holdBack = endMarker(nonce).length + 24;
     let raw = "";
     let stderr = "";
     let head;
     let body = "";
+    let emitted = 0;
+    const emit = (final) => {
+      if (!request.onBody) return;
+      const ready = final ?? body.slice(0, Math.max(0, body.length - holdBack));
+      if (ready.length > emitted) {
+        request.onBody(ready.slice(emitted));
+        emitted = ready.length;
+      }
+    };
     const child = await host.spawn(processId, {
       onStdout(data) {
         if (head) {
           body += data;
-          request.onBody?.(data);
+          emit(void 0);
           return;
         }
         raw += data;
@@ -598,10 +638,8 @@ function curlTransport(host, processId = "curl") {
         if (!split) return;
         head = split.head;
         raw = "";
-        if (split.rest) {
-          body += split.rest;
-          request.onBody?.(split.rest);
-        }
+        body += split.rest;
+        emit(void 0);
       },
       onStderr(data) {
         stderr += data;
@@ -618,7 +656,9 @@ function curlTransport(host, processId = "curl") {
         const message = stderr.trim().replace(/^curl:\s*/, "") || `curl exited with ${code ?? "a signal"}`;
         throw new TransportError(message, code);
       }
-      return { status: head.status, headers: head.headers, body };
+      const clean = bodyAndTrailers(body, nonce);
+      emit(clean.body);
+      return { status: head.status, headers: { ...clean.trailers, ...head.headers }, body: clean.body };
     } finally {
       request.signal?.removeEventListener("abort", kill);
     }
@@ -819,7 +859,13 @@ var Connection = class {
         throw new Error(`Databricks returned HTTP ${response.status}`);
       const me = JSON.parse(response.body);
       const workspaceId = response.headers["x-databricks-org-id"] ?? profile.workspaceId;
-      this.current = { profile, client };
+      const routed = workspaceId && workspaceId !== profile.workspaceId ? new DatabricksClient({
+        host: profile.host,
+        workspaceId,
+        transport: this.transport,
+        token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken
+      }) : client;
+      this.current = { profile, client: routed };
       this.storage.set(SELECTION_KEY, JSON.stringify({ profile: profile.name }));
       this.set({
         status: "connected",
@@ -1044,7 +1090,9 @@ function createService(connection, openSettings) {
 // packages/core/src/result.ts
 var NUMERIC_TYPES = /^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i;
 var TIME_TYPES = /^(date|timestamp)/i;
-function kindOf(type, sample) {
+var IDENTIFIER = /(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;
+function kindOf(type, sample, name = "") {
+  if (IDENTIFIER.test(name) && !TIME_TYPES.test(type ?? "") && !/^bool/i.test(type ?? "")) return "text";
   if (type) {
     if (NUMERIC_TYPES.test(type)) return "number";
     if (TIME_TYPES.test(type)) return "time";
@@ -1065,7 +1113,8 @@ function resultSet(columns, rows, extra = {}) {
       ...column.type && { type: column.type },
       kind: kindOf(
         column.type,
-        rows.slice(0, 50).map((row) => row[index] ?? null)
+        rows.slice(0, 50).map((row) => row[index] ?? null),
+        column.name
       )
     })),
     rows,
@@ -1288,6 +1337,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-table tbody tr:hover td { background: var(--affordance-row-hover, rgba(127,127,127,0.06)); }
 [data-dbx] .dbx-link { color: var(--text-link, #2272B4); text-decoration: none; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
 [data-dbx] .dbx-link:hover { text-decoration: underline; }
+[data-dbx] .dbx-md a.dbx-link { text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
+[data-dbx] .dbx-md a.dbx-link:hover { text-decoration-color: currentColor; }
 [data-dbx] .dbx-md p { margin: 0 0 8px; }
 [data-dbx] .dbx-md p:last-child { margin-bottom: 0; }
 [data-dbx] .dbx-md ul, [data-dbx] .dbx-md ol { margin: 0 0 8px; padding-left: 20px; }

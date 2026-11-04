@@ -10,7 +10,7 @@ const SAFE_URL = /^https?:\/\//i;
 export function renderInline(text: string, keyPrefix = "i"): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern =
-    /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)<>]+)/g;
+    /(\\[\\`*_{}[\]()#+\-.!~|<>$])|(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)<>]+)/g;
   let last = 0;
   let match: RegExpExecArray | null;
   let index = 0;
@@ -19,7 +19,8 @@ export function renderInline(text: string, keyPrefix = "i"): ReactNode[] {
     if (match.index > last) nodes.push(text.slice(last, match.index));
     const token = match[0];
     const key = `${keyPrefix}-${index++}`;
-    if (token.startsWith("`")) nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
+    if (token.length === 2 && token.startsWith("\\")) nodes.push(token.slice(1));
+    else if (token.startsWith("`")) nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
     else if (token.startsWith("**") || token.startsWith("__"))
       nodes.push(<strong key={key}>{renderInline(token.slice(2, -2), key)}</strong>);
     else if (token.startsWith("*")) nodes.push(<em key={key}>{renderInline(token.slice(1, -1), key)}</em>);

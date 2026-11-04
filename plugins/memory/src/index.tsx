@@ -97,7 +97,7 @@ export function memoryTools(service: DatabricksService): AgentTool[] {
       async call(_client, _context, args) {
         const { memory, store, actor } = await context(service);
         const prefix = stringArg(args, "prefix", false);
-        const entries = (await memory.list(store, actor)).filter((entry) => !prefix || entry.path.startsWith(normalizePath(prefix)));
+        const entries = await memory.list(store, actor, prefix ? { prefix } : {});
         if (!entries.length) return prefix ? `No memories under ${prefix}.` : "No memories yet.";
         return entries
           .sort((a, b) => a.path.localeCompare(b.path))

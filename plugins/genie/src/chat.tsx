@@ -226,7 +226,9 @@ export function useGenieConversation(service: DatabricksService, spaceId: string
         signal: controller.signal,
         onUpdate: (message) => {
           const id = messageId(message) || current;
-          setTurns((existing) => existing.map((turn) => (turn.key === current ? { ...turn, key: id, message } : turn)));
+          // React runs this updater later, after `current` moves on; capture it now.
+          const previous = current;
+          setTurns((existing) => existing.map((turn) => (turn.key === previous ? { ...turn, key: id, message } : turn)));
           current = id;
           if (message.conversation_id) setConversationId(message.conversation_id);
         },

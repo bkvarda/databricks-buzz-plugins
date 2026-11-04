@@ -9,7 +9,7 @@ import type { LocalTool } from "./loop";
 export const sandboxFor = (pubkey: string) => sandboxId(`buzz-agent-${pubkey.slice(0, 12)}`);
 
 export const SANDBOX_PROMPT = `<databricks-sandbox>
-You have your own Databricks Sandbox: a Linux machine in Databricks with a persistent home directory (${SANDBOX_HOME}, kept across restarts; other paths reset when it stops), Python, Node.js, Rust, git and the Databricks CLI already signed in as your owner, and internet access. Use sandbox_exec to run shell commands there (each call is a fresh bash login shell in your home directory; keep state in files), and sandbox_read_file / sandbox_write_file / sandbox_list for files. Work in ${SANDBOX_HOME}/work. Commands time out after the limit you give (default 120 seconds, up to 1800); start long jobs in the background with nohup and check on them. Never print secrets into conversations.
+You have your own Databricks Sandbox: a Linux machine in Databricks with Python, Node.js, Rust, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${SANDBOX_HOME}/work; relative paths in every sandbox tool are relative to it, and each sandbox_exec call is a fresh bash login shell that starts there. Files under ${SANDBOX_HOME} persist across restarts; other paths reset when the sandbox stops. Keep state in files. Use sandbox_read_file / sandbox_write_file / sandbox_list for files. Commands time out after the limit you give (default 120 seconds, up to 1800); start long jobs in the background with nohup and check on them. Never print secrets into conversations.
 </databricks-sandbox>`;
 
 const clip = (text: string, max = 20_000) => (text.length > max ? `${text.slice(0, max / 2)}\n… (${text.length - max} characters cut) …\n${text.slice(-max / 2)}` : text);
@@ -103,7 +103,12 @@ export function sandboxTools(service: DatabricksService, pubkey: string, agentNa
         const sandboxes = await ensure(signal);
         const path = typeof args.path === "string" && args.path ? args.path : `${SANDBOX_HOME}/work`;
         const entries = await sandboxes.listDirectory(id, path, signal);
-        return entries.map((entry) => `${entry.file_type?.includes("DIRECTORY") ? "d" : "-"} ${entry.name ?? entry.path} ${entry.size ?? ""}`.trim()).join("\n") || "(empty)";
+        return (
+          entries
+            .sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
+            .map((entry) => (entry.directory ? `${entry.name}/` : `${entry.name}${entry.size !== undefined ? `  (${entry.size} bytes)` : ""}`))
+            .join("\n") || "(empty)"
+        );
       },
     },
   ];

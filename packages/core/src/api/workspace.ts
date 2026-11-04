@@ -176,6 +176,59 @@ export class Jobs {
 }
 
 /** Lakebase (managed Postgres) projects and the PostgREST-style Data API. */
+const detail = (error: unknown) => {
+  const body = (error as { body?: string }).body ?? "";
+  try {
+    const parsed = JSON.parse(body) as { message?: string; code?: string };
+    return [parsed.code, parsed.message].filter(Boolean).join(": ") || `HTTP ${(error as { status?: number }).status}`;
+  } catch {
+    return `HTTP ${(error as { status?: number }).status}`;
+  }
+};
+
+/**
+ * What a Lakebase project owner runs once so the Data API can act as `user`
+ * (https://docs.databricks.com/aws/en/oltp/projects/data-api). Roles added in
+ * the Lakebase UI or API, and owners/admins, can't be used by the Data API.
+ */
+export function dataApiSetupSql(user: string, schema = "public"): string {
+  const role = `"${user.replace(/"/g, '""')}"`;
+  const literal = `'${user.replace(/'/g, "''")}'`;
+  return [
+    "CREATE EXTENSION IF NOT EXISTS databricks_auth;",
+    `SELECT databricks_create_role(${literal}, 'USER');`,
+    `GRANT ${role} TO authenticator;`,
+    `GRANT USAGE ON SCHEMA ${schema} TO ${role};`,
+    `GRANT SELECT ON ALL TABLES IN SCHEMA ${schema} TO ${role};`,
+  ].join("\n");
+}
+
+export class DataApiRoleError extends Error {
+  constructor(cause: unknown) {
+    super(
+      "The Data API can't act as you yet. A Lakebase project owner needs to create your Postgres role with databricks_create_role and grant it to authenticator (Settings → Lakebase shows the SQL).",
+      { cause },
+    );
+    this.name = "DataApiRoleError";
+  }
+}
+
+/** Plain-language errors for the Data API's most common failures. */
+export function dataApiError(error: unknown, table: string): Error {
+  const status = (error as { status?: number }).status;
+  const message = (error as Error).message ?? String(error);
+  if (status === 503 && /data api is not enabled/i.test(message))
+    return new Error("The Data API isn't turned on for this Lakebase project. Turn it on in Lakebase → the project → Data API.", { cause: error });
+  if (status === 404 && /PGRST205|could not find the table/i.test(`${message} ${(error as { body?: string }).body ?? ""}`))
+    return new Error(`There's no table or view named ${table} that you can read. Check the name and schema, and that it's in an exposed schema.`, { cause: error });
+  if (/permission denied to set role/i.test(detail(error))) return new DataApiRoleError(error);
+  if (status === 401 || status === 403)
+    return new Error(`Lakebase refused the request (${detail(error)}). You need a Postgres role on this branch with access to the table.`, { cause: error });
+  return error instanceof Error ? error : new Error(message);
+}
+
+export type DataApiTarget = Readonly<{ project: string; branch: string; database: string; url: string }>;
+
 export class Lakebase {
   constructor(private readonly client: DatabricksClient) {}
 
@@ -192,11 +245,39 @@ export class Lakebase {
   }
 
   async branches(projectId: string, signal?: AbortSignal) {
-    const response = await this.client.get<{ branches?: { name: string; status?: Record<string, unknown> }[] }>(
+    const response = await this.client.get<{ branches?: { name: string; status?: { default?: boolean; current_state?: string } }[] }>(
       `/api/2.0/postgres/projects/${encodeURIComponent(projectId)}/branches`,
       signal ? { signal } : {},
     );
     return response.branches ?? [];
+  }
+
+  /**
+   * Data API base URLs for a project's default branch, one per database:
+   * https://<read-write host>/api/2.0/workspace/<workspace-id>/rest/<database>
+   */
+  async dataApiTargets(projectId: string, workspaceId: string, signal?: AbortSignal): Promise<DataApiTarget[]> {
+    const branches = await this.branches(projectId, signal);
+    const branch = branches.find((candidate) => candidate.status?.default) ?? branches[0];
+    if (!branch) return [];
+    const opts = signal ? { signal } : {};
+    const [endpoints, databases] = await Promise.all([
+      this.client.get<{ endpoints?: { name: string; status?: { endpoint_type?: string; hosts?: { host?: string }; disabled?: boolean } }[] }>(
+        `/api/2.0/postgres/${branch.name}/endpoints`,
+        opts,
+      ),
+      this.client.get<{ databases?: { name: string; status?: { postgres_database?: string } }[] }>(`/api/2.0/postgres/${branch.name}/databases`, opts),
+    ]);
+    const host = (endpoints.endpoints ?? []).find(
+      (endpoint) => endpoint.status?.endpoint_type === "ENDPOINT_TYPE_READ_WRITE" && !endpoint.status.disabled && endpoint.status.hosts?.host,
+    )?.status?.hosts?.host;
+    if (!host) return [];
+    return (databases.databases ?? []).flatMap((database) => {
+      const name = database.status?.postgres_database;
+      return name
+        ? [{ project: projectId, branch: branch.name.split("/").pop() ?? "", database: name, url: `https://${host}/api/2.0/workspace/${workspaceId}/rest/${encodeURIComponent(name)}` }]
+        : [];
+    });
   }
 
   /**
@@ -212,15 +293,19 @@ export class Lakebase {
   ): Promise<Record<string, unknown>[]> {
     if (!/^https:\/\//.test(endpoint)) throw new Error("The Data API endpoint must be an https:// URL.");
     if (!/^[A-Za-z_][\w$]*$/.test(schema) || !/^[A-Za-z_][\w$]*$/.test(table)) throw new Error("Invalid schema or table name.");
-    return this.client.get<Record<string, unknown>[]>(`${endpoint.replace(/\/+$/, "")}/${schema}/${table}`, {
-      query: {
-        select: options.select ?? "*",
-        limit: Math.min(options.limit ?? 50, 1000),
-        ...(options.order && { order: options.order }),
-        ...options.filters,
-      },
-      headers: { "Accept-Profile": schema },
-      ...(options.signal && { signal: options.signal }),
-    });
+    try {
+      return await this.client.get<Record<string, unknown>[]>(`${endpoint.replace(/\/+$/, "")}/${schema}/${table}`, {
+        query: {
+          select: options.select ?? "*",
+          limit: Math.min(options.limit ?? 50, 1000),
+          ...(options.order && { order: options.order }),
+          ...options.filters,
+        },
+        headers: { "Accept-Profile": schema },
+        ...(options.signal && { signal: options.signal }),
+      });
+    } catch (error) {
+      throw dataApiError(error, table);
+    }
   }
 }
