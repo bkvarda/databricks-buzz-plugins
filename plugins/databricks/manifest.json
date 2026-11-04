@@ -1,0 +1,78 @@
+{
+  "id": "bkvarda.databricks",
+  "name": "Databricks",
+  "apiVersion": 1,
+  "description": "Sign in to Databricks once for every Databricks plugin, and see live status for Databricks links in conversations.",
+  "discovery": {
+    "category": "developer-tools-and-integrations",
+    "tags": [
+      "Databricks",
+      "Data",
+      "Lakehouse",
+      "Jobs",
+      "Single sign-on"
+    ]
+  },
+  "host": {
+    "processes": [
+      {
+        "id": "cli-version",
+        "program": "databricks",
+        "args": [
+          "--version"
+        ]
+      },
+      {
+        "id": "cli-profiles",
+        "program": "databricks",
+        "args": [
+          "auth",
+          "profiles",
+          "--skip-validate",
+          "--output",
+          "json"
+        ]
+      },
+      {
+        "id": "cli-token",
+        "program": "databricks",
+        "args": [
+          "auth",
+          "token",
+          "--output",
+          "json"
+        ]
+      },
+      {
+        "id": "cli-login",
+        "program": "databricks",
+        "args": [
+          "auth",
+          "login"
+        ]
+      },
+      {
+        "id": "cli-install",
+        "program": "bash",
+        "args": [
+          "-c",
+          "set -eu\ncommand -v curl >/dev/null || { echo \"curl is required\" >&2; exit 2; }\nos=$(uname -s | tr A-Z a-z)\ncase $(uname -m) in x86_64|amd64) a=amd64;; arm64|aarch64) a=arm64;; *) echo \"Unsupported CPU $(uname -m)\" >&2; exit 2;; esac\nt=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/databricks/cli/releases/latest); v=${t##*/v}\nf=databricks_cli_${v}_${os}_$a.tar.gz; u=https://github.com/databricks/cli/releases/download/v$v\nd=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; cd \"$d\"\ncurl -fsSLO \"$u/$f\"; curl -fsSL \"$u/databricks_cli_${v}_SHA256SUMS\" | grep \" $f\\$\" > sums\nif command -v sha256sum >/dev/null; then sha256sum -c sums; else shasum -a 256 -c sums; fi\ntar -xzf \"$f\" databricks; mkdir -p \"$HOME/.local/bin\"; mv -f databricks \"$HOME/.local/bin/databricks\"\n\"$HOME/.local/bin/databricks\" --version"
+        ]
+      },
+      {
+        "id": "curl",
+        "program": "curl",
+        "args": [
+          "--silent",
+          "--show-error",
+          "--no-buffer",
+          "--include",
+          "--proto",
+          "=https",
+          "--config",
+          "-"
+        ]
+      }
+    ]
+  }
+}
