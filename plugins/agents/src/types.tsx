@@ -10,7 +10,7 @@ import { Genie } from "@dbx/core/api/genie";
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { SANDBOX_HOME, Sandboxes } from "@dbx/core/api/sandbox";
 import { React } from "@dbx/core/react";
-import { databricksIcon } from "@dbx/core/ui/components";
+import { databricksIcon, Text } from "@dbx/core/ui/components";
 import { RESULT_LANGUAGE, resultBlock } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
@@ -380,7 +380,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     id: "databricks",
     icon,
     title: "Databricks",
-    description: "Genie One for data questions, a Sandbox agent with a Databricks model and the tools you pick, or an agent you built on Databricks.",
+    description: "Runs from your Buzz, so it answers while Buzz is open: Genie One, a Sandbox agent with Buzz's tools and the Databricks tools you pick, or an agent you built on Databricks.",
     provider: provider(service),
     // Genie One needs no setup: it finds the right data across the workspace.
     defaults: () => ({ config: normalizeDatabricks({ kind: "genie-one", tools: [GENIE_ONE_CHOICE] }) }),
@@ -388,7 +388,17 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
     carry: (config) => (config.instructions.trim() ? { instructions: config.instructions } : {}),
     Create: (props: CreateProps<DatabricksConfig>) => (
-      <AgentForm service={service} config={normalizeDatabricks(props.config)} onChange={props.onChange} disabled={props.disabled} />
+      <AgentForm
+        service={service}
+        config={normalizeDatabricks(props.config)}
+        onChange={props.onChange}
+        disabled={props.disabled}
+        intro={
+          <Text tone="subtle" size="sm">
+            Runs from your Buzz, so it answers while Buzz is open on this computer, with Buzz's tools. For an agent that answers with Buzz closed, pick Databricks (hosted).
+          </Text>
+        }
+      />
     ),
     tabs: [
       {

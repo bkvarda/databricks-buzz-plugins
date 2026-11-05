@@ -163,7 +163,7 @@ function WorkspaceStatus(props: { service: DatabricksService; snapshot: Connecti
   }
 }
 
-export function AgentForm(props: FormProps<DatabricksConfig> & { service: DatabricksService }) {
+export function AgentForm(props: FormProps<DatabricksConfig> & { service: DatabricksService; intro?: React.ReactNode }) {
   const { config, onChange } = props;
   const workspace = useAgentService(props.service, config.profile);
   const kind = KINDS.find((candidate) => candidate.id === config.kind) ?? KINDS[1]!;
@@ -171,6 +171,7 @@ export function AgentForm(props: FormProps<DatabricksConfig> & { service: Databr
     <DbxRoot>
       <Stack gap={14}>
         <NeedsConnection service={props.service} />
+        {props.intro}
         <Field label="Type" hint={kind.detail}>
           <select className="dbx-select" disabled={props.disabled} value={kind.id} onChange={(event) => onChange({ ...config, kind: event.target.value as AgentKind })}>
             {KINDS.map((candidate) => (

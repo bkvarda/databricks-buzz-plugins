@@ -1,7 +1,9 @@
 // The hosted Databricks agent's runner, inside its Databricks Sandbox. It
 // holds the agent's key, stays connected to the Buzz community, answers its
 // owner's mentions with Genie or a coding harness (Claude Code, Codex, Pi),
-// and posts replies as the agent: with the owner's laptop on or off.
+// and posts replies as the agent: with the owner's Buzz open or closed.
+// Databricks stops the Sandbox 24 hours after it starts; the owner's Buzz
+// starts it (and this runner) again when it's open.
 //
 //   node runner.mjs keygen       make (or read) the agent's key; prints {"pubkey"}
 //   node runner.mjs profile      publish the agent's profile from config.json
@@ -9,7 +11,7 @@
 //   node runner.mjs serve        the runner itself
 //   node runner.mjs stop         stop it
 //   node runner.mjs interrupt <channel> <root>   stop a conversation's turn; prints true/false
-//   node runner.mjs status       prints status.json
+//   node runner.mjs status       prints status.json, plus whether it's running and when the Sandbox started
 //   node runner.mjs ask <text>   answers once with the configured Genie or harness (a diagnostic)
 import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
@@ -22,7 +24,7 @@ import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversatio
 import { sandboxService } from "./databricks";
 import { runLocalTurn } from "./harness";
 import { HttpRelay } from "./http";
-import { ensureDirs, paths, readConfig, readSecretKey, readState, type RunnerConfig, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
+import { ensureDirs, paths, readConfig, readSecretKey, readState, type RunnerConfig, sandboxStartedAt, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
 
 const TURN_TIMEOUT_MS = 30 * 60_000;
 const PROFILE_ABOUT = "A Databricks agent in its own Databricks Sandbox.";
@@ -260,7 +262,7 @@ async function serve() {
       // The owner's Buzz keeps the agent awake while it's open (it touches this file).
       const heartbeat = existsSync(paths.awake) ? statSync(paths.awake).mtimeMs : 0;
       if (active || !idle || Date.now() - heartbeat < 10 * 60_000) return;
-      log("idle; stopping the Sandbox until the keeper wakes it");
+      log("idle with the owner's Buzz closed; stopping the Sandbox until Buzz wakes it");
       save();
       relay.close();
       execFile("databricks", ["api", "post", `/api/2.0/sandboxes/${config.sandbox}/stop`, "--json", "{}"], (error) => {
@@ -334,8 +336,11 @@ async function main() {
     }
     case "status": {
       const pid = runnerPid();
-      const saved = existsSync(paths.status) ? JSON.parse(readFileSync(paths.status, "utf8")) : {};
-      return console.log(JSON.stringify({ ...saved, running: Boolean(pid) }));
+      // What the runner last wrote, unless it was another run (before a restart, or a moment after one).
+      const written = existsSync(paths.status) ? JSON.parse(readFileSync(paths.status, "utf8")) : {};
+      const saved = pid && written.pid === pid ? written : {};
+      const bootedAt = sandboxStartedAt();
+      return console.log(JSON.stringify({ ...saved, running: Boolean(pid), ...(bootedAt && { bootedAt }) }));
     }
     case "ask": {
       // Answers one question without the relay, to check Genie or the harness from inside the Sandbox.

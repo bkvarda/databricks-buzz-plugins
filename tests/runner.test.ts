@@ -11,7 +11,7 @@ import { build } from "esbuild";
 import { finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { attestedOwner, channelKind, conversationOf, splitMessage, threadRoot, turnPrompt } from "../plugins/agents/runner/buzz";
-import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
+import { hoursLeft, normalizeHosted, REFRESH_AFTER_HOURS, runnerConfigOf, shouldRefresh, summarizeHosted } from "../plugins/agents/src/hosted";
 import { type FakeRelay, fakeRelay } from "./fake-relay";
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
@@ -49,9 +49,24 @@ describe("runner protocol", () => {
   it("normalizes hosted settings: Standard permissions only", () => {
     const config = normalizeHosted({ kind: "sandbox", harness: "codex", model: "system.ai.claude-opus-5-5", availability: "always", permissions: "full" });
     expect(config).toMatchObject({ kind: "sandbox", harness: "codex", model: "system.ai.gpt-5-6-sol", availability: "always" });
-    expect(summarizeHosted(normalizeHosted({}))).toBe("Genie One · sleeps when idle");
+    expect(summarizeHosted(normalizeHosted({}))).toBe("Genie One · sleeps when Buzz is closed");
     const runner = runnerConfigOf({ sandbox: "sb", name: "Probe", config, community: "wss://x", owner: "o", authTag: ["auth"], createdAt: 0 });
     expect(runner.permissions).toBe("standard");
+  });
+  it("restarts a long-running Sandbox only at a quiet moment", () => {
+    const now = Date.parse("2026-11-05T12:00:00Z");
+    const hoursAgo = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    const long = { running: true, active: 0, bootedAt: hoursAgo(REFRESH_AFTER_HOURS + 1), lastActivity: hoursAgo(1) };
+    expect(shouldRefresh(long, now)).toBe(true);
+    expect(shouldRefresh({ ...long, active: 1 }, now)).toBe(false);
+    expect(shouldRefresh({ ...long, lastActivity: hoursAgo(0.05) }, now)).toBe(false);
+    expect(shouldRefresh({ ...long, bootedAt: hoursAgo(REFRESH_AFTER_HOURS - 1) }, now)).toBe(false);
+    expect(shouldRefresh({ ...long, running: false }, now)).toBe(false);
+    const { bootedAt: _unknown, ...noBoot } = long;
+    expect(shouldRefresh(noBoot, now)).toBe(false);
+    expect(hoursLeft(hoursAgo(20), now)).toBeCloseTo(4);
+    expect(hoursLeft(hoursAgo(30), now)).toBe(0);
+    expect(hoursLeft(undefined, now)).toBeUndefined();
   });
 });
 

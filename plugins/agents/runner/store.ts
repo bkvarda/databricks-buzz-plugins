@@ -2,20 +2,27 @@
 //   key.json       the agent's secret key (0600); it never leaves the Sandbox
 //   config.json    what the plugin activated it with
 //   state.json     harness sessions per conversation, and the last event seen
+//   runner.log / status.json / awake
+// and, for this run of the Sandbox only, outside the home folder (Databricks
+// clears it when the Sandbox stops, so a PID from before a restart, which may
+// now be another process, is never trusted):
+//   runner.pid     the runner's PID
 //   turns/<key>    the PID of a conversation's running harness, for Stop
-//   runner.pid / runner.log / status.json
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+//   started        made by the first runner command after the Sandbox starts
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Permissions, RemoteHarness } from "../src/remote";
 
 export const AGENT_DIR = process.env.BUZZ_AGENT_DIR ?? join(homedir(), ".buzz", "agent");
+const RUN_DIR = process.env.BUZZ_AGENT_RUN_DIR ?? (process.env.BUZZ_AGENT_DIR ? join(AGENT_DIR, "run") : "/tmp/buzz-agent");
 export const paths = {
   key: join(AGENT_DIR, "key.json"),
   config: join(AGENT_DIR, "config.json"),
   state: join(AGENT_DIR, "state.json"),
-  turns: join(AGENT_DIR, "turns"),
-  pid: join(AGENT_DIR, "runner.pid"),
+  turns: join(RUN_DIR, "turns"),
+  pid: join(RUN_DIR, "runner.pid"),
+  started: join(RUN_DIR, "started"),
   log: join(AGENT_DIR, "runner.log"),
   status: join(AGENT_DIR, "status.json"),
   /** Touched by the owner's Buzz while it's open, so a sleeping agent stays awake. */
@@ -63,7 +70,17 @@ export type RunnerState = {
 };
 
 export function ensureDirs() {
-  for (const dir of [AGENT_DIR, paths.turns, paths.runs]) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const dir of [AGENT_DIR, RUN_DIR, paths.turns, paths.runs]) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!existsSync(paths.started)) writeFileSync(paths.started, "");
+}
+
+/** About when the Sandbox started: the first runner command after a start (the plugin runs one right away) leaves `started`. */
+export function sandboxStartedAt(): string | undefined {
+  try {
+    return new Date(statSync(paths.started).mtimeMs).toISOString();
+  } catch {
+    return undefined;
+  }
 }
 
 function readJson<T>(path: string, fallback: T): T {

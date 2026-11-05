@@ -1,9 +1,13 @@
-// The Databricks agent type: hosted, so each agent runs fully remote in its
-// own Databricks Sandbox and answers with the owner's laptop off. Buzz calls
-// `provision` (we make the Sandbox, which makes the agent's key: it never
-// leaves Databricks) and `activate` (we hand the runner the owner's
-// attestation and start it, plus a keeper job that brings it back after the
-// Sandbox's 24-hour limit or a sleep). The runner (../runner) does the rest.
+// The hosted Databricks agent type ("Databricks (hosted)"): each agent runs in
+// its own Databricks Sandbox, so it keeps answering with the owner's Buzz
+// closed. Buzz calls `provision` (we make the Sandbox, which makes the agent's
+// key: it never leaves Databricks) and `activate` (we hand the runner the
+// owner's attestation and start it). The runner (../runner) does the rest.
+//
+// Nothing outside the Sandbox runs on a schedule. The owner's Buzz, while it's
+// open, starts a stopped Sandbox again and restarts a long-running one at a
+// quiet moment: Databricks stops a Sandbox 24 hours after it starts, so this
+// gives an always-on agent a fresh day ahead whenever its owner leaves.
 //
 // Hosted agents run unattended, so their harnesses always use Standard
 // permissions (each harness's own guarded mode) and answer only their owner.
@@ -15,15 +19,22 @@ import { type DatabricksService, describeError, useAsync, useConnection } from "
 import { Button, DbxRoot, databricksIcon, Field, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { RUNNER, RUNNER_SHA } from "virtual:agent-runner";
 import type { RunnerConfig } from "../runner/store";
-import { deleteKeeper, ensureKeeper } from "./keeper";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, useAgentService, WorkspaceField } from "./ui";
 
 export const HOSTED_TYPE_ID = "databricks-hosted";
 const AGENT_DIR = `${SANDBOX_HOME}/.buzz/agent`;
 const RECORD_PREFIX = "bkvarda.databricks-hosted.v1:";
-/** A sleeping agent stops its Sandbox after this many minutes without work. */
+/** A sleeping agent stops its Sandbox after this many minutes without work (once its owner's Buzz is closed). */
 const IDLE_MINUTES = 5;
+/** How often the owner's open Buzz looks after its hosted agents. */
+const TEND_EVERY_MS = 4 * 60_000;
+/** An always-on agent's Sandbox is restarted, at a quiet moment, once it has run this long. */
+export const REFRESH_AFTER_HOURS = 8;
+/** "A quiet moment": no turn running and none for this long. */
+const QUIET_MINUTES = 10;
+/** Databricks stops a Sandbox this long after each start. */
+const SANDBOX_DAY_HOURS = 24;
 
 export type HostedKind = "genie" | "sandbox";
 export type Availability = "always" | "sleep";
@@ -61,7 +72,7 @@ export function normalizeHosted(value: unknown): HostedConfig {
 
 export function summarizeHosted(config: HostedConfig): string {
   const what = config.kind === "genie" ? (config.genie ? `Genie · ${config.genie.label}` : "Genie One") : `${harnessLabel(config.harness)} · ${harnessModel(config.harness, config.model).replace(/^system\.ai\./, "")}`;
-  return [what, config.availability === "always" ? "always on" : "sleeps when idle", ...(config.profile ? [config.profile] : [])].join(" · ");
+  return [what, config.availability === "always" ? "always on" : "sleeps when Buzz is closed", ...(config.profile ? [config.profile] : [])].join(" · ");
 }
 
 // ── Provider records (this device) ──
@@ -76,6 +87,7 @@ export type HostedRecord = {
   community?: string;
   owner?: string;
   authTag?: string[];
+  /** A keeper job from an earlier version of this plugin, deleted when next seen. */
   jobId?: number;
   createdAt: number;
 };
@@ -144,6 +156,50 @@ async function runner(sandboxes: Sandboxes, sandbox: string, args: string, signa
   return (result.stdout ?? "").trim();
 }
 
+/** What `runner.mjs status` reports. `bootedAt` is when the Sandbox started. */
+export type RunnerStatus = Readonly<{ running?: boolean; connected?: boolean; active?: number; lastError?: string; lastActivity?: string; bootedAt?: string }>;
+
+/**
+ * Whether an always-on agent's Sandbox should restart now: it has run for
+ * `REFRESH_AFTER_HOURS` and nothing has happened for a while. Restarting
+ * resets Databricks' 24-hour clock, so the agent has most of a day ahead of
+ * it whenever its owner closes Buzz.
+ */
+export function shouldRefresh(status: RunnerStatus | undefined, now = Date.now()): boolean {
+  if (!status?.running || status.active || !status.bootedAt) return false;
+  const booted = Date.parse(status.bootedAt);
+  const last = Math.max(booted, Date.parse(status.lastActivity ?? "") || 0);
+  return now - booted > REFRESH_AFTER_HOURS * 3_600_000 && now - last > QUIET_MINUTES * 60_000;
+}
+
+/** Hours until Databricks stops the Sandbox, from when it started. */
+export function hoursLeft(bootedAt: string | undefined, now = Date.now()): number | undefined {
+  const booted = Date.parse(bootedAt ?? "");
+  return Number.isFinite(booted) ? Math.max(0, SANDBOX_DAY_HOURS - (now - booted) / 3_600_000) : undefined;
+}
+
+/** Deletes a keeper job an earlier version of this plugin made. Already gone counts as deleted. */
+async function dropKeeper(client: DatabricksClient, jobId: number, signal?: AbortSignal) {
+  try {
+    await client.post("/api/2.2/jobs/delete", { job_id: jobId }, signal ? { signal } : {});
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status !== 400 && status !== 404) throw error;
+  }
+}
+
+/** Waits for a Sandbox that was told to stop to finish stopping. */
+async function stopped(sandboxes: Sandboxes, sandbox: string, signal?: AbortSignal) {
+  const deadline = Date.now() + 4 * 60_000;
+  for (;;) {
+    const state = (await sandboxes.get(sandbox, signal)).status?.state;
+    if (state === "SANDBOX_STATE_STOPPED") return;
+    if (Date.now() > deadline) throw new Error(`The agent's Sandbox didn't stop (state: ${state ?? "unknown"}).`);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    signal?.throwIfAborted();
+  }
+}
+
 /** Starts the Sandbox if it sleeps, refreshes the runner and its config, and (re)starts it. */
 async function deploy(service: DatabricksService, record: HostedRecord, options: Readonly<{ restart: boolean; publishProfile: boolean; signal?: AbortSignal }>) {
   const { client, sandboxes } = await sandboxOf(service, record, options.signal);
@@ -208,8 +264,7 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
         owner: String(input.auth[1]),
         authTag: [...input.auth].map(String),
       };
-      const { client } = await deploy(service, record, { restart: true, publishProfile: true, signal: input.signal });
-      record.jobId = await ensureKeeper(client, { ...(record.jobId && { jobId: record.jobId }), sandbox: record.sandbox, agentName: record.name, pubkey: input.pubkey, availability: record.config.availability, signal: input.signal });
+      await deploy(service, record, { restart: true, publishProfile: true, signal: input.signal });
       await write(record);
       await storage.set(pendingKey(input.community, found.name), null);
     },
@@ -232,7 +287,7 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       const record = read(input.pubkey);
       if (!record) return;
       const { client, sandboxes } = await sandboxOf(service, record, input.signal);
-      if (record.jobId) await deleteKeeper(client, record.jobId, input.signal);
+      if (record.jobId) await dropKeeper(client, record.jobId, input.signal);
       try {
         await sandboxes.delete(record.sandbox);
       } catch (error) {
@@ -245,18 +300,47 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       const found = read(pubkey);
       if (!found) throw new Error("This agent is managed from another device.");
       const record: HostedRecord = { ...found, config: { ...config, kind: found.config.kind, ...(found.config.profile ? { profile: found.config.profile } : {}) } };
-      const { client } = await deploy(service, record, { restart: true, publishProfile: false, ...(signal && { signal }) });
-      record.jobId = await ensureKeeper(client, { ...(record.jobId && { jobId: record.jobId }), sandbox: record.sandbox, agentName: record.name, pubkey, availability: record.config.availability, ...(signal && { signal }) });
+      await deploy(service, record, { restart: true, publishProfile: false, ...(signal && { signal }) });
       await write(record);
     },
-    /** Wakes the agent's Sandbox now and starts its runner. */
-    async wake(pubkey: string, signal?: AbortSignal) {
+    /**
+     * Wakes the agent: starts its Sandbox if it has stopped (never making a
+     * new one: a deleted Sandbox took the agent's key with it), keeps a
+     * sleeping one awake, and starts the runner if it isn't running. Then,
+     * for an always-on agent, restarts a long-running Sandbox at a quiet
+     * moment (`shouldRefresh`) unless `refresh` is false. Resolves with the
+     * runner's status.
+     */
+    async wake(pubkey: string, options: Readonly<{ refresh?: boolean; signal?: AbortSignal }> = {}): Promise<RunnerStatus | undefined> {
+      const { signal } = options;
       const record = read(pubkey);
       if (!record) throw new Error("This agent is managed from another device.");
-      const { sandboxes } = await sandboxOf(service, record, signal);
-      await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
-      await sandboxes.bash(record.sandbox, `touch ${shellQuote(`${AGENT_DIR}/awake`)}`, { timeoutSeconds: 30, ...(signal && { signal }) });
-      await runner(sandboxes, record.sandbox, "start", signal);
+      const { client, sandboxes } = await sandboxOf(service, record, signal);
+      if (record.jobId) {
+        await dropKeeper(client, record.jobId, signal);
+        const { jobId: _old, ...rest } = record;
+        await write(rest);
+      }
+      await sandboxes.get(record.sandbox, signal).catch((error: unknown) => {
+        if ((error as { status?: number }).status === 404) throw new Error(`The agent's Sandbox ${record.sandbox} is gone; remove the agent and create it again.`);
+        throw error;
+      });
+      const node = `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)}`;
+      // The heartbeat a sleeping agent checks before it sleeps, the runner (if it isn't running) and its status, in one call.
+      const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
+      const start = async () => {
+        await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
+        const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...(signal && { signal }) });
+        if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
+        return JSON.parse((result.stdout ?? "").trim() || "{}") as RunnerStatus;
+      };
+      const status = await start();
+      if (options.refresh === false || record.config.availability !== "always" || !shouldRefresh(status)) return status;
+      // A fresh 24 hours: stop the runner cleanly, then the Sandbox, then start both again.
+      await runner(sandboxes, record.sandbox, "stop", signal);
+      await sandboxes.stop(record.sandbox);
+      await stopped(sandboxes, record.sandbox, signal);
+      return start();
     },
     async status(pubkey: string, signal?: AbortSignal) {
       const record = read(pubkey);
@@ -265,24 +349,34 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       const sandbox = await sandboxes.get(record.sandbox, signal).catch(() => undefined);
       const state = sandbox?.status?.state ?? "missing";
       if (state !== "SANDBOX_STATE_RUNNING") return { record, state, runner: undefined };
-      const runnerStatus = JSON.parse(await runner(sandboxes, record.sandbox, "status", signal).catch(() => "{}")) as { running?: boolean; connected?: boolean; active?: number; lastError?: string; lastActivity?: string };
+      const runnerStatus = JSON.parse(await runner(sandboxes, record.sandbox, "status", signal).catch(() => "{}")) as RunnerStatus;
       return { record, state, runner: runnerStatus };
     },
   };
 }
 
 /**
- * While this Buzz is open, its sleeping agents stay awake: every few minutes
- * it touches each one's heartbeat (starting a stopped Sandbox), so mentions
- * get answered in seconds. With the laptop off, the keeper wakes them.
+ * While this Buzz is open it looks after its hosted agents every few minutes
+ * (`wake`): a stopped Sandbox starts again, a sleeping agent stays awake, and
+ * an always-on agent gets a fresh 24 hours at a quiet moment. This is the
+ * only thing that restarts a stopped agent; nothing runs on a schedule in
+ * Databricks.
  */
-export function keepAgentsAwake(provider: HostedProvider): () => void {
+export function tendAgents(provider: HostedProvider): () => void {
+  const busy = new Set<string>();
   const beat = () => {
-    for (const record of provider.records())
-      if (record.config.availability === "sleep" && record.community) void provider.wake(record.pubkey!).catch(() => {});
+    for (const record of provider.records()) {
+      const pubkey = record.pubkey!;
+      if (!record.community || busy.has(pubkey)) continue;
+      busy.add(pubkey);
+      void provider
+        .wake(pubkey)
+        .catch(() => {})
+        .finally(() => busy.delete(pubkey));
+    }
   };
   const first = setTimeout(beat, 30_000);
-  const timer = setInterval(beat, 4 * 60_000);
+  const timer = setInterval(beat, TEND_EVERY_MS);
   return () => {
     clearTimeout(first);
     clearInterval(timer);
@@ -299,8 +393,8 @@ const KIND_CHOICES: readonly { id: HostedKind; label: string; detail: string }[]
 ];
 
 const AVAILABILITY_HINT: Record<Availability, string> = {
-  always: "Replies within seconds at any time. Its Sandbox runs all the time.",
-  sleep: `Its Sandbox sleeps after ${IDLE_MINUTES} minutes without work. It stays awake while your Buzz is open; with your laptop off it wakes every 15 minutes, so a reply can take that long.`,
+  always: `Replies within seconds, with Buzz open or closed. Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts, so with Buzz closed it keeps answering for ${SANDBOX_DAY_HOURS - REFRESH_AFTER_HOURS} to ${SANDBOX_DAY_HOURS} hours. Your Buzz restarts it whenever it's open, and it then answers anything it missed.`,
+  sleep: "Runs while your Buzz is open and finishes any work after you close it, then sleeps about 10 minutes later. Opening Buzz wakes it, and it answers anything it missed. Costs less than Always on.",
 };
 
 /** Genie One, or one of the workspace's Genie agents. */
@@ -339,6 +433,11 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
     <DbxRoot>
       <Stack gap={14}>
         <NeedsConnection service={props.service} />
+        {!props.locked && (
+          <Text tone="subtle" size="sm">
+            Runs in Databricks, in its own Sandbox, so it can answer with Buzz closed. It can't use Buzz's own tools, and Buzz doesn't show it working.
+          </Text>
+        )}
         {available.data === false && <Notice tone="warning">Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview.</Notice>}
         {!props.locked && (
           <Field label="Type" hint={kind.detail}>
@@ -403,7 +502,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
         )}
         <Field label="Availability" hint={AVAILABILITY_HINT[config.availability]}>
           <select className="dbx-select" {...disabled} value={config.availability} onChange={(event) => onChange({ ...config, availability: event.target.value as Availability })}>
-            <option value="sleep">Sleep when idle</option>
+            <option value="sleep">Sleep when Buzz is closed</option>
             <option value="always">Always on</option>
           </select>
         </Field>
@@ -420,7 +519,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
         )}
         {!props.locked && (
           <Text tone="tertiary" size="xs">
-            Runs in Databricks, so it answers you with your laptop off. Only your own messages reach it. Its Sandbox and a small scheduled job that keeps it running belong to you in Databricks; removing the agent deletes both.
+            Only your own messages reach it. Its Sandbox belongs to you in Databricks; removing the agent deletes it.
           </Text>
         )}
       </Stack>
@@ -432,11 +531,12 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
 
 const STATE_LABEL: Record<string, string> = {
   SANDBOX_STATE_RUNNING: "Running",
-  SANDBOX_STATE_STOPPED: "Asleep",
-  SANDBOX_STATE_STOPPING: "Going to sleep",
+  SANDBOX_STATE_STOPPING: "Stopping",
   SANDBOX_STATE_PENDING: "Starting",
   missing: "Its Sandbox is gone",
 };
+const stateLabel = (state: string | undefined, availability: Availability) =>
+  state === "SANDBOX_STATE_STOPPED" ? (availability === "sleep" ? "Asleep" : "Stopped") : (STATE_LABEL[state ?? ""] ?? state ?? "Unknown");
 
 export function HostedSettings(props: { service: DatabricksService; provider: HostedProvider; pubkey: string }) {
   const [nonce, setNonce] = React.useState(0);
@@ -451,8 +551,7 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
         <Notice tone="info">This agent was set up from another device, which manages its settings.</Notice>
       </DbxRoot>
     );
-  const workspace = workspaceOf(props.service, record.config.profile);
-  const run = (label: string, work: () => Promise<void>) => {
+  const run = (label: string, work: () => Promise<unknown>) => {
     setBusy(label);
     setError(undefined);
     work().then(
@@ -469,15 +568,15 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
   const state = status.data?.state;
   const runnerState = status.data?.runner;
   const dirty = JSON.stringify(draft) !== JSON.stringify(record.config);
-  const job = record.jobId ? workspace.workspaceUrl(`/jobs/${record.jobId}`) : undefined;
+  const left = hoursLeft(runnerState?.bootedAt);
   return (
     <DbxRoot style={{ padding: "4px 0 24px" }}>
       <Stack gap={16}>
         <Notice
           tone={state === "SANDBOX_STATE_RUNNING" && runnerState?.running === false ? "warning" : "info"}
-          title={status.loading && !status.data ? "Checking…" : (STATE_LABEL[state ?? ""] ?? state ?? "Unknown")}
+          title={status.loading && !status.data ? "Checking…" : stateLabel(state, record.config.availability)}
           action={
-            <Button size="sm" disabled={Boolean(busy)} onClick={() => run("wake", () => props.provider.wake(props.pubkey))}>
+            <Button size="sm" disabled={Boolean(busy)} onClick={() => run("wake", () => props.provider.wake(props.pubkey, { refresh: false }))}>
               {busy === "wake" ? <Spinner size={11} /> : null}
               {state === "SANDBOX_STATE_RUNNING" ? "Check again" : "Wake now"}
             </Button>
@@ -485,16 +584,15 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
         >
           {state === "SANDBOX_STATE_RUNNING"
             ? runnerState?.running
-              ? `${runnerState.connected ? "Connected to the community" : "Connecting"}${runnerState.active ? ` · working on ${runnerState.active}` : ""}${runnerState.lastError ? ` · last error: ${runnerState.lastError}` : ""}.`
+              ? `${runnerState.connected ? "Connected to the community" : "Connecting"}${runnerState.active ? ` · working on ${runnerState.active}` : ""}${runnerState.lastError ? ` · last error: ${runnerState.lastError}` : ""}.${
+                  record.config.availability === "always" && left !== undefined ? ` Databricks stops its Sandbox in about ${Math.max(1, Math.round(left))} h; your Buzz restarts it sooner, at a quiet moment.` : ""
+                }`
               : "The Sandbox is up but the agent isn't running; Wake now starts it."
             : state === "SANDBOX_STATE_STOPPED"
-              ? "It wakes on its schedule, or now with Wake now."
-              : `Sandbox ${record.sandbox}.`}{" "}
-          {job && (
-            <a className="dbx-link" href={job} target="_blank" rel="noreferrer">
-              Keeper job
-            </a>
-          )}
+              ? record.config.availability === "sleep"
+                ? "It slept while Buzz was closed. Buzz wakes it within a few minutes, or now with Wake now."
+                : `Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts. Buzz starts it again within a few minutes, or now with Wake now.`
+              : `Sandbox ${record.sandbox}.`}
         </Notice>
         <HostedForm service={props.service} config={draft} onChange={setDraft} {...(busy && { disabled: true })} locked />
         {error && <Notice tone="danger">{error}</Notice>}
@@ -520,7 +618,7 @@ export function registerHostedType(agents: Agents, service: DatabricksService): 
     id: HOSTED_TYPE_ID,
     icon,
     title: "Databricks",
-    description: "Genie, or Claude Code, Codex or Pi in a Databricks Sandbox. Runs in Databricks, so it answers with your laptop off.",
+    description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, or Claude Code, Codex or Pi in its own Sandbox. No Buzz tools or working indicator.",
     defaults: () => ({ config: normalizeHosted({}) }),
     summary: (agent: { config: unknown; pubkey?: string }) => summarizeHosted(provider.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config)),
     Create: (props: { config: unknown; onChange(config: unknown): void; disabled: boolean }) => (
@@ -543,5 +641,5 @@ export function registerHostedType(agents: Agents, service: DatabricksService): 
     },
   };
   agents.register(type as unknown as AgentType);
-  return keepAgentsAwake(provider);
+  return tendAgents(provider);
 }
