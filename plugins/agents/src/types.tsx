@@ -13,8 +13,11 @@ import { React } from "@dbx/core/react";
 import { databricksIcon, Text } from "@dbx/core/ui/components";
 import { RESULT_LANGUAGE, resultBlock } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
-import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
+import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice, toolLabels, workspaceIdOf } from "./capabilities";
 import { uploadRunner } from "./runner-upload";
+import { genieOneStep, genieStatusStep } from "./activity";
+import { ActivityLog, type TurnReporter } from "./activity-log";
+import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
 import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
@@ -189,24 +192,37 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
+  const activity = new ActivityLog(agents.storage);
 
-  /** Wraps a turn: queueing, Stop, failure replies and the working state. */
-  function turn(delivery: Delivery, conversation: HarnessConversation, work: (signal: AbortSignal) => Promise<void>) {
+  /** Wraps a turn: queueing, Stop, failure replies, the working state and its Activity record. */
+  function turn(delivery: Delivery, conversation: HarnessConversation, config: DatabricksConfig, work: (signal: AbortSignal, report: TurnReporter) => Promise<void>) {
     delivery.acknowledged?.();
     const key = `${delivery.agent.key}|${conversation.key}`;
+    const report = activity.start(delivery, {
+      channelId: conversation.channel,
+      ...(conversation.root && { root: conversation.root }),
+      request: deliveredText(delivery),
+      labels: toolLabels(config.tools),
+    });
     const done = queue
       .run(key, (signal) => {
         const stop = () => queue.interrupt(key);
         delivery.signal.addEventListener("abort", stop, { once: true });
         delivery.interruptible?.(async () => stop());
-        return work(signal).finally(() => delivery.signal.removeEventListener("abort", stop));
+        return work(signal, report).finally(() => delivery.signal.removeEventListener("abort", stop));
       })
       .then(
-        () => ({ ok: true as const }),
+        () => {
+          report.end("done");
+          return { ok: true as const };
+        },
         async (error: unknown) => {
-          if ((error as Error)?.name === "AbortError" || (error as { name?: string })?.name === "TimeoutError")
+          if ((error as Error)?.name === "AbortError" || (error as { name?: string })?.name === "TimeoutError") {
+            report.end("stopped");
             return { ok: true as const, stopped: true as const };
+          }
           const message = describeError(error);
+          report.end("error", message);
           await kit.reply(delivery.agent, conversation, `I couldn't finish that: ${message}`, { notifyOwner: true }).catch(() => {});
           return { ok: false as const, error: message };
         },
@@ -229,11 +245,11 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     return { tools, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
   }
 
-  async function sandboxTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal) {
+  async function sandboxTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
-    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => delivery.step?.("sandbox", state));
+    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state));
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
     const ai = new Ai(client);
@@ -253,7 +269,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           return completion;
         },
         signal,
-        onStep: (tool, target) => delivery.step?.(tool, target),
+        onStep: (tool, target) => report.tool(tool, target),
+        onThought: (text) => report.thought(text),
       });
       if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
       await sessions.set(delivery.agent.key, conversation.key, {
@@ -268,12 +285,12 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   }
 
   /** A Sandbox agent whose harness is Claude Code, Codex or Pi, running in its Sandbox. */
-  async function remoteTurn(delivery: Delivery, config: DatabricksConfig, harness: RemoteHarness, conversation: HarnessConversation, signal: AbortSignal) {
+  async function remoteTurn(delivery: Delivery, config: DatabricksConfig, harness: RemoteHarness, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     if (!(await sandboxOn(workspace, signal)))
       throw new Error(`Databricks Sandbox isn't turned on in this workspace, and ${harnessLabel(harness)} runs there. A workspace admin can turn on the Sandbox preview.`);
-    const sandbox = await ensureAgentSandbox(workspace, delivery.agent.pubkey, delivery.agent.name, signal, (state) => delivery.step?.("sandbox", state));
+    const sandbox = await ensureAgentSandbox(workspace, delivery.agent.pubkey, delivery.agent.name, signal, (state) => report.tool("sandbox", state));
     // The agent's Genie and MCP picks reach the harness through the runner bundle's tools bridge.
     const tools = config.tools.length ? { tools: config.tools, ...(workspaceIdOf(workspace) && { workspaceId: workspaceIdOf(workspace) }) } : undefined;
     if (tools) await uploadRunner(sandbox, sandboxFor(delivery.agent.pubkey), signal);
@@ -297,7 +314,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         signal,
         ...(tools && { tools }),
         onLaunch: () => (started = true),
-        onStep: (tool, target) => delivery.step?.(tool, target),
+        onStep: (tool, target) => report.tool(tool, target),
+        onThought: (text) => report.thought(text),
         // Kept as soon as the harness has it, so a failed turn's context isn't lost.
         onSession: (remote) => void sessions.set(delivery.agent.key, conversation.key, { ...sessions.get(delivery.agent.key, conversation.key), remote }),
       });
@@ -309,16 +327,18 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     }
   }
 
-  async function genieOneTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal) {
+  async function genieOneTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const question = deliveredText(delivery) || "What can I ask you about?";
     const session = sessions.get(delivery.agent.key, conversation.key);
-    delivery.step?.("genie", "Genie One");
+    report.step({ tool: "Asking Genie One", target: question });
+    let shown = 0;
     const answer = await genieOneFor(agentService(service, config.profile)).ask(question, {
       ...(session.genieOneConversationId && { conversationId: session.genieOneConversationId }),
       signal,
+      // Genie One's own timeline ("Thinking: …", "Running SQL: …"), each step once.
       onProgress: (steps) => {
-        const last = steps[steps.length - 1] ?? "";
-        delivery.step?.("genie", /^Running SQL/.test(last) ? "running SQL" : /^Query result/.test(last) ? "reading the result" : "thinking");
+        for (const line of steps.slice(shown)) report.step(genieOneStep(line));
+        shown = Math.max(shown, steps.length);
       },
     });
     const parts: string[] = [];
@@ -333,16 +353,21 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     await sessions.set(delivery.agent.key, conversation.key, { ...session, genieOneConversationId: answer.conversationId });
   }
 
-  async function genieSpaceTurn(delivery: Delivery, config: DatabricksConfig, agent: CustomAgent, conversation: HarnessConversation, signal: AbortSignal) {
+  async function genieSpaceTurn(delivery: Delivery, config: DatabricksConfig, agent: CustomAgent, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const question = deliveredText(delivery) || "What can I ask you about?";
     const session = sessions.get(delivery.agent.key, conversation.key);
-    delivery.step?.("genie", agent.label);
+    report.step({ tool: `Asking ${agent.label}`, target: question });
+    let status = "";
     const answer = await new Genie(client).answer(agent.target, question, {
       ...(session.genieConversationId && { conversationId: session.genieConversationId }),
       signal,
-      onUpdate: (message) => delivery.step?.("genie", message.status.toLowerCase().replace(/_/g, " ")),
+      onUpdate: (message) => {
+        if (message.status === status) return;
+        status = message.status;
+        report.step(genieStatusStep(agent.label, status));
+      },
     });
     const link = workspace.workspaceUrl(Genie.webPath(agent.target, answer.message.conversation_id));
     const parts: string[] = [];
@@ -356,16 +381,16 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     await sessions.set(delivery.agent.key, conversation.key, { ...session, genieConversationId: answer.message.conversation_id });
   }
 
-  async function customTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal) {
+  async function customTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const agent = config.custom;
     if (!agent) throw new Error("No agent is chosen yet. My owner can pick one in my Settings.");
-    if (agent.kind === "genie") return genieSpaceTurn(delivery, config, agent, conversation, signal);
+    if (agent.kind === "genie") return genieSpaceTurn(delivery, config, agent, conversation, signal, report);
     const client = await agentService(service, config.profile).ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
     const question = deliveredText(delivery);
     const history = session.messages.filter((m): m is { role: "user" | "assistant"; content: string } => (m.role === "user" || m.role === "assistant") && typeof m.content === "string");
     const messages = [...history, { role: "user" as const, content: question || "Hello" }];
-    delivery.step?.("agent", agent.label);
+    report.step({ tool: `Asking ${agent.label}` });
     const reply = await new Ai(client).invokeAgent(agent.target, messages, {
       task: agent.kind === "app" ? "app" : (agent.task ?? ""),
       sessionId: `${delivery.agent.pubkey.slice(0, 16)}-${conversation.key}`,
@@ -420,6 +445,12 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           />
         ),
       },
+      {
+        id: "activity",
+        title: "Activity",
+        role: "activity",
+        component: (props: ActivityTabProps) => <LocalActivity log={activity} {...props} />,
+      },
     ],
     models: (agent) => {
       const config = normalizeDatabricks(agent.config);
@@ -453,14 +484,14 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         return;
       }
       const harness = config.harness;
-      turn(delivery, conversation, (signal) =>
+      turn(delivery, conversation, config, (signal, report) =>
         config.kind === "sandbox"
           ? isRemote(harness)
-            ? remoteTurn(delivery, config, harness, conversation, signal)
-            : sandboxTurn(delivery, config, conversation, signal)
+            ? remoteTurn(delivery, config, harness, conversation, signal, report)
+            : sandboxTurn(delivery, config, conversation, signal, report)
           : config.kind === "custom"
-            ? customTurn(delivery, config, conversation, signal)
-            : genieOneTurn(delivery, config, conversation, signal),
+            ? customTurn(delivery, config, conversation, signal, report)
+            : genieOneTurn(delivery, config, conversation, signal, report),
       );
     },
     async runOnce(standalone) {
@@ -468,12 +499,21 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       if (config.kind !== "sandbox") return { ok: false, error: "Watches and timers run on Sandbox agents; Genie One and custom agents answer mentions." };
       if (isRemote(config.harness))
         return { ok: false, error: `Watches and timers run on the Built-in harness for now; ${harnessLabel(config.harness)} answers mentions.` };
+      const trigger = standalone.delivery.trigger as { type: string; slug?: string };
+      const report = activity.start(standalone.delivery, {
+        ...(standalone.delivery.channelId && { channelId: standalone.delivery.channelId }),
+        request: trigger.type === "watch" ? `Watch: ${trigger.slug ?? "a matching event"}` : trigger.type === "timer" ? "Timer" : deliveredText(standalone.delivery),
+        labels: toolLabels(config.tools),
+      });
       try {
         const prompt = await standalone.prompt();
-        if (!prompt) return { ok: true };
+        if (!prompt) {
+          report.end("done");
+          return { ok: true };
+        }
         const workspace = agentService(service, config.profile);
         const client = await workspace.ready(standalone.signal);
-        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal);
+        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal, (state) => report.tool("sandbox", state));
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({
@@ -486,16 +526,40 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           local: tools.local,
           chat: (request) => ai.chat(request),
           signal: standalone.signal,
-          onStep: (tool, target) => standalone.delivery.step?.(tool, target),
+          onStep: (tool, target) => report.tool(tool, target),
+          onThought: (text) => report.thought(text),
         });
+        report.end("done");
         return { ok: true };
       } catch (error) {
+        report.end("error", describeError(error));
         return { ok: false, error: describeError(error) };
       }
     },
   };
 
   agents.register(databricksType);
+}
+
+/** The local type's Activity tab: this device's records of the agent's turns, live. */
+function LocalActivity(props: ActivityTabProps & { log: ActivityLog }) {
+  const turns = React.useSyncExternalStore(
+    (listener) => props.log.subscribe(listener),
+    () => props.log.turns(props.agent.pubkey),
+  );
+  return (
+    <ActivityView
+      turns={turns}
+      {...(props.conversation && { conversation: props.conversation })}
+      {...(props.openConversation && { openConversation: props.openConversation })}
+      {...(props.initialTranscript && { initialTranscript: props.initialTranscript })}
+      note={
+        <Text tone="tertiary" size="xs">
+          What this agent did on this device: each step it took and its thinking, for its last 25 turns.
+        </Text>
+      }
+    />
+  );
 }
 
 /** One short line under the agent's name. */

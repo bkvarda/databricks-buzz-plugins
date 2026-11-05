@@ -412,6 +412,7 @@ function AgentsDemo() {
   React.useSyncExternalStore((listener) => (postedListeners.add(listener), () => postedListeners.delete(listener)), () => posted.length);
   React.useEffect(() => setConfig(type?.defaults().config), [type]);
   if (!type) return <div style={{ padding: 24 }}>No agent types registered (is the harness kit available?).</div>;
+  const activityTab = (type.tabs as Any[] | undefined)?.find((tab) => tab.role === "activity");
   const run = async () => {
     setSteps([]);
     setState("running");
@@ -457,6 +458,12 @@ function AgentsDemo() {
           </div>
         ))}
       </div>
+      {activityTab && (
+        <div id="agent-activity" style={{ border: "1px solid var(--border-standard)", borderRadius: 12, padding: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>{activityTab.title} tab</div>
+          <activityTab.component agent={{ key: "playground-agent", pubkey: "f".repeat(64), config }} conversation={{ channelId: "playground" }} openConversation={() => {}} save={async () => {}} />
+        </div>
+      )}
     </div>
   );
 }

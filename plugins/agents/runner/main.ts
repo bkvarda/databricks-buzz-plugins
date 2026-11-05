@@ -23,6 +23,9 @@ import { generateSecretKey, getPublicKey, type NostrEvent, verifyEvent } from "n
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { harnessLabel, RESULT_PROMPT, remoteNote } from "../src/remote";
 import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversationOf, fromOwner, mentionsAgent, plainText, profileTemplate, replyTemplate, splitMessage, turnPrompt } from "./buzz";
+import { genieOneStep, genieStatusStep } from "../src/activity";
+import { toolLabels } from "../src/capabilities";
+import { Observer, RunnerActivity, type TurnActivity } from "./activity";
 import { bridgeTools, serveBridge } from "./bridge";
 import { sandboxService } from "./databricks";
 import { runLocalTurn } from "./harness";
@@ -93,11 +96,21 @@ async function names(relay: HttpRelay, pubkeys: string[]): Promise<Map<string, s
 /** The bridge config for a Sandbox agent's Databricks tools. */
 const toolsOf = (config: RunnerConfig) => ({ tools: config.tools ?? [], ...(config.workspaceId && { workspaceId: config.workspaceId }) });
 
-async function genieAnswer(config: RunnerConfig, question: string, conversationId: string | undefined, signal: AbortSignal): Promise<{ text: string; conversation: string }> {
-  const service = sandboxService();
+async function genieAnswer(config: RunnerConfig, question: string, conversationId: string | undefined, signal: AbortSignal, activity?: TurnActivity): Promise<{ text: string; conversation: string }> {
+  const service = sandboxService(config.workspaceId);
   const space = config.genieSpace;
   if (!space) {
-    const answer = await new GenieOne(service).ask(question, { ...(conversationId && { conversationId }), signal });
+    activity?.step({ tool: "Asking Genie One", target: question });
+    let shown = 0;
+    const answer = await new GenieOne(service).ask(question, {
+      ...(conversationId && { conversationId }),
+      signal,
+      // Genie One's own timeline ("Thinking: …", "Running SQL: …"), each step once.
+      onProgress: (steps) => {
+        for (const line of steps.slice(shown)) activity?.step(genieOneStep(line));
+        shown = Math.max(shown, steps.length);
+      },
+    });
     const parts = [answerMarkdown(answer)];
     if (answer.status === "incomplete") parts.push("_Genie One stopped early; this may be partial._");
     const sql = answer.sql[answer.sql.length - 1];
@@ -106,7 +119,18 @@ async function genieAnswer(config: RunnerConfig, question: string, conversationI
     return { text: parts.filter(Boolean).join("\n\n") || "Genie One had no answer.", conversation: answer.conversationId };
   }
   const client = await service.ready();
-  const answer = await new Genie(client).answer(space, question, { ...(conversationId && { conversationId }), signal });
+  const label = config.genieLabel ?? "Genie";
+  activity?.step({ tool: `Asking ${label}`, target: question });
+  let status = "";
+  const answer = await new Genie(client).answer(space, question, {
+    ...(conversationId && { conversationId }),
+    signal,
+    onUpdate: (message) => {
+      if (message.status === status) return;
+      status = message.status;
+      activity?.step(genieStatusStep(label, status));
+    },
+  });
   const parts: string[] = [];
   if (answer.text) parts.push(answer.text);
   if (answer.result?.columns.length) parts.push(resultBlock(answer.result));
@@ -134,6 +158,9 @@ async function serve() {
   let lastError: string | undefined;
   log(`starting as ${pubkey.slice(0, 12)}… (${config.kind === "genie" ? "Genie" : harnessLabel(config.harness)}, ${config.availability})`);
   const relay = connect(config, secret);
+  // Each turn's steps and thinking: a log for the Activity tab, and frames for the owner's Buzz.
+  const activities = new RunnerActivity(paths.activity, new Observer(relay, secret, config.owner, log));
+  const labels = toolLabels(config.tools ?? []);
 
   const save = () => writeState({ ...state, handled: [...handled] });
   const status = () =>
@@ -152,12 +179,12 @@ async function serve() {
     for (const part of splitMessage(text)) await relay.publish(replyTemplate({ conversation, content: part, authTag: config.authTag, ...(notify && { notify }) }));
   }
 
-  async function answer(event: NostrEvent, conversation: Conversation, signal: AbortSignal): Promise<string> {
+  async function answer(event: NostrEvent, conversation: Conversation, signal: AbortSignal, activity: TurnActivity): Promise<string> {
     const saved = state.sessions[conversation.key];
     if (config.kind === "genie") {
       const tag = config.genieSpace ? `genie:${config.genieSpace}` : "genie-one";
       const continued = saved?.harness === tag ? saved.id : undefined;
-      const result = await genieAnswer(config, plainText(event.content) || "What can I ask you about?", continued, signal);
+      const result = await genieAnswer(config, plainText(event.content) || "What can I ask you about?", continued, signal, activity);
       state.sessions[conversation.key] = { harness: tag, id: result.conversation, at: event.created_at };
       return result.text;
     }
@@ -183,7 +210,11 @@ async function serve() {
       signal,
       pidFile: turnPidPath(conversation.key),
       ...(config.tools?.length && { tools: toolsOf(config) }),
-      onStep: (tool, target) => log(`  ${tool}${target ? ` · ${target}` : ""}`),
+      onStep: (tool, target) => {
+        log(`  ${tool}${target ? ` · ${target}` : ""}`);
+        activity.tool(tool, target);
+      },
+      onThought: (text) => activity.thought(text),
       onSession: (id) => {
         state.sessions[conversation.key] = { harness: config.harness, id, at: session?.at ?? 0 };
         save();
@@ -200,19 +231,25 @@ async function serve() {
     lastActivity = Date.now();
     status();
     log(`mention ${event.id.slice(0, 8)} in ${conversation.key}`);
+    const activity = activities.start({ eventId: event.id, channel: conversation.channel, ...(conversation.key !== conversation.channel && { root: conversation.root }), request: plainText(event.content), labels });
+    let outcome: "done" | "stopped" | "error" = "done";
     try {
-      const text = await answer(event, conversation, AbortSignal.timeout(TURN_TIMEOUT_MS));
+      const text = await answer(event, conversation, AbortSignal.timeout(TURN_TIMEOUT_MS), activity);
       await post(conversation, text);
       log(`replied in ${conversation.key}`);
     } catch (error) {
       if (existsSync(stopped)) {
+        outcome = "stopped";
         log(`stopped in ${conversation.key}`);
       } else {
         lastError = (error as Error).message ?? String(error);
+        outcome = "error";
         log(`turn failed: ${lastError}`);
         await post(conversation, `I couldn't finish that: ${lastError}`, config.owner).catch((e) => log(`couldn't post the failure: ${e.message}`));
       }
     } finally {
+      // After the reply, so Buzz stops showing the agent working once it's there.
+      await activity.end(outcome, outcome === "error" ? lastError : undefined);
       rmSync(stopped, { force: true });
       active--;
       lastActivity = Date.now();

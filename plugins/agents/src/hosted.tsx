@@ -19,6 +19,8 @@ import { type DatabricksService, describeError, useAsync, useConnection } from "
 import { Button, DbxRoot, databricksIcon, Field, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import type { RunnerConfig } from "../runner/store";
 import { uploadRunner } from "./runner-upload";
+import { type ActivityLine, type ActivityTurn, turnsFromLines } from "./activity";
+import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
 import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, ToolsField, useAgentService, WorkspaceField } from "./ui";
@@ -119,7 +121,7 @@ export function runnerConfigOf(record: HostedRecord, host?: string, workspaceId?
     name: record.name,
     ...(record.picture && { picture: record.picture }),
     kind: config.kind,
-    ...(config.genie && { genieSpace: config.genie.space }),
+    ...(config.genie && { genieSpace: config.genie.space, genieLabel: config.genie.label }),
     harness: config.harness,
     model: harnessModel(config.harness, config.model),
     // Unattended: always each harness's guarded mode.
@@ -331,6 +333,8 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
       const start = async () => {
         await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
+        // A newer plugin brings a newer runner: put it in place and restart the runner on it.
+        if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
         const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...(signal && { signal }) });
         if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
         return JSON.parse((result.stdout ?? "").trim() || "{}") as RunnerStatus;
@@ -342,6 +346,23 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       await sandboxes.stop(record.sandbox);
       await stopped(sandboxes, record.sandbox, signal);
       return start();
+    },
+    /** The agent's recent turns from its Sandbox's activity log, newest first; undefined while its Sandbox sleeps. */
+    async activity(pubkey: string, signal?: AbortSignal): Promise<ActivityTurn[] | undefined> {
+      const record = read(pubkey);
+      if (!record) return [];
+      const { sandboxes } = await sandboxOf(service, record, signal);
+      const sandbox = await sandboxes.get(record.sandbox, signal).catch(() => undefined);
+      if (sandbox?.status?.state !== "SANDBOX_STATE_RUNNING") return undefined;
+      const result = await sandboxes.bash(record.sandbox, `tail -n 1500 ${shellQuote(`${AGENT_DIR}/activity.jsonl`)} 2>/dev/null; true`, { timeoutSeconds: 30, ...(signal && { signal }) });
+      const lines = (result.stdout ?? "").split("\n").flatMap((line): ActivityLine[] => {
+        try {
+          return line.trim() ? [JSON.parse(line) as ActivityLine] : [];
+        } catch {
+          return [];
+        }
+      });
+      return turnsFromLines(lines).slice(0, 25);
     },
     async status(pubkey: string, signal?: AbortSignal) {
       const record = read(pubkey);
@@ -612,6 +633,63 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
   );
 }
 
+// ── Activity tab ──
+
+const shown = new Map<string, ActivityTurn[]>();
+
+/** The hosted type's Activity tab: the runner's log in the agent's Sandbox, checked every few seconds while open. */
+function HostedActivity(props: ActivityTabProps & { provider: HostedProvider }) {
+  const { provider } = props;
+  const pubkey = props.agent.pubkey;
+  const [turns, setTurns] = React.useState<ActivityTurn[]>(() => shown.get(pubkey) ?? []);
+  const [state, setState] = React.useState<{ loading: boolean; asleep?: boolean; error?: string }>({ loading: true });
+  React.useEffect(() => {
+    if (!provider.read(pubkey)) return setState({ loading: false });
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const load = async () => {
+      try {
+        const found = await provider.activity(pubkey, controller.signal);
+        if (controller.signal.aborted) return;
+        if (found) {
+          shown.set(pubkey, found);
+          setTurns(found);
+        }
+        setState({ loading: false, ...(found === undefined && { asleep: true }) });
+      } catch (error) {
+        if (!controller.signal.aborted) setState({ loading: false, error: describeError(error) });
+      }
+      if (!controller.signal.aborted) timer = setTimeout(() => void load(), 4000);
+    };
+    void load();
+    return () => {
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [provider, pubkey]);
+  if (!provider.read(pubkey))
+    return (
+      <DbxRoot style={{ padding: "4px 0 24px" }}>
+        <Notice tone="info">This agent was set up from another device; its activity shows there.</Notice>
+      </DbxRoot>
+    );
+  return (
+    <ActivityView
+      turns={turns}
+      loading={state.loading}
+      {...(state.error && { error: `Couldn't read its activity: ${state.error}` })}
+      {...(props.conversation && { conversation: props.conversation })}
+      {...(props.openConversation && { openConversation: props.openConversation })}
+      {...(props.initialTranscript && { initialTranscript: props.initialTranscript })}
+      note={
+        <Text tone="tertiary" size="xs">
+          {state.asleep ? "Its Sandbox is asleep, so this is what it last showed. " : ""}Each step it took in its Sandbox and its thinking, for its last 25 turns.
+        </Text>
+      }
+    />
+  );
+}
+
 // ── The type ──
 
 export function registerHostedType(agents: Agents, service: DatabricksService): () => void {
@@ -633,6 +711,12 @@ export function registerHostedType(agents: Agents, service: DatabricksService): 
         title: "Settings",
         role: "settings" as const,
         component: (props: { agent: { pubkey: string } }) => <HostedSettings service={service} provider={provider} pubkey={props.agent.pubkey} />,
+      },
+      {
+        id: "activity",
+        title: "Activity",
+        role: "activity" as const,
+        component: (props: ActivityTabProps) => <HostedActivity provider={provider} {...props} />,
       },
     ],
     remote: {

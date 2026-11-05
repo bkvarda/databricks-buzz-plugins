@@ -23,6 +23,8 @@ export type LocalTurn = Readonly<{
   /** The agent's Databricks tools, served to the harness by this runner's bridge. */
   tools?: BridgeConfig;
   onStep?(tool: string, target?: string): void;
+  /** Its thinking, and narration it wrote before its next step. */
+  onThought?(text: string): void;
   onSession?(id: string): void;
 }>;
 
@@ -65,6 +67,7 @@ function once(turn: LocalTurn): Promise<{ text: string; session: string }> {
     const child = spawn("bash", ["-lc", `cd '${WORK_DIR}' && ${command}`], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
     writeFileSync(turn.pidFile, String(child.pid ?? ""), { mode: 0o600 });
     let text = "";
+    let narration: string | undefined;
     let final: string | undefined;
     let error: string | undefined;
     let stderr = "";
@@ -89,8 +92,14 @@ function once(turn: LocalTurn): Promise<{ text: string; session: string }> {
         announced = true;
         turn.onSession?.(sessionId);
       }
-      if (event.step) turn.onStep?.(event.step.tool, event.step.target);
-      if (event.text) text = event.text;
+      if (event.thought) turn.onThought?.(event.thought);
+      if (event.step) {
+        // Text written before another step narrated the work; the last text is the reply.
+        if (narration) turn.onThought?.(narration);
+        narration = undefined;
+        turn.onStep?.(event.step.tool, event.step.target);
+      }
+      if (event.text) text = narration = event.text;
       if (event.final !== undefined) final = event.final;
       if (event.error) error = event.error;
     });

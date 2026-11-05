@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { build } from "esbuild";
+import { decrypt, getConversationKey } from "nostr-tools/nip44";
 import { finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { attestedOwner, channelKind, conversationOf, splitMessage, threadRoot, turnPrompt } from "../plugins/agents/runner/buzz";
@@ -138,6 +139,33 @@ describe("runner against a relay", () => {
     expect(reply.tags).toContainEqual(["e", mention.id, "", "reply"]);
     expect(reply.tags).toContainEqual(["h", "general"]);
     expect(attestedOwner(reply)).toBe(ownerPubkey);
+  });
+
+  it("tells its owner's Buzz it's working: encrypted activity frames for the turn, and its activity log", async () => {
+    const mention = post(owner, "general", "frames please", [["p", agentPubkey]]);
+    await relay.waitFor(fromAgent((e) => e.content.includes("frames please")));
+    const key = getConversationKey(owner, agentPubkey);
+    const frames = () =>
+      relay.events
+        .filter((e) => e.kind === 24200 && e.pubkey === agentPubkey)
+        .flatMap((e) => {
+          const plain = JSON.parse(decrypt(e.content, key)) as { kind: string; payload?: { events?: unknown[] } };
+          return (plain.kind === "batch" ? plain.payload!.events! : [plain]) as { kind: string; turnId: string; channelId: string; timestamp: string; payload?: { triggeringEventIds?: string[] } }[];
+        });
+    const started = await (async () => {
+      for (let i = 0; i < 50; i++) {
+        const found = frames().find((f) => f.kind === "turn_started" && f.payload?.triggeringEventIds?.includes(mention.id));
+        if (found && frames().some((f) => f.kind === "turn_completed" && f.turnId === found.turnId)) return found;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error("no frames for the turn");
+    })();
+    expect(started).toMatchObject({ channelId: "general" });
+    expect(Number.isFinite(Date.parse(started.timestamp))).toBe(true);
+    const envelope = relay.events.find((e) => e.kind === 24200 && e.pubkey === agentPubkey)!;
+    for (const [name, value] of [["p", ownerPubkey], ["agent", agentPubkey], ["frame", "telemetry"]]) expect(envelope.tags.filter((t) => t[0] === name)).toEqual([[name, value]]);
+    const log = readFileSync(join(dir, "agent", "activity.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(log.filter((line) => line.turn === started.turnId).map((line) => line.type)).toEqual(["start", "end"]);
   });
 
   it("follows up in a thread with the messages it hasn't seen", async () => {

@@ -26,6 +26,8 @@ export const paths = {
   started: join(RUN_DIR, "started"),
   log: join(AGENT_DIR, "runner.log"),
   status: join(AGENT_DIR, "status.json"),
+  /** Each turn's steps and thinking, for the plugin's Activity tab. */
+  activity: join(AGENT_DIR, "activity.jsonl"),
   /** Touched by the owner's Buzz while it's open, so a sleeping agent stays awake. */
   awake: join(AGENT_DIR, "awake"),
   runs: join(AGENT_DIR, "runs"),
@@ -44,8 +46,9 @@ export type RunnerConfig = Readonly<{
   picture?: string;
   /** "genie": Genie One or a Genie agent answers; "sandbox": a coding harness does. */
   kind: "genie" | "sandbox";
-  /** A Genie agent (space) to ask instead of Genie One. */
+  /** A Genie agent (space) to ask instead of Genie One, and its name. */
   genieSpace?: string;
+  genieLabel?: string;
   harness: RemoteHarness;
   model: string;
   permissions: Permissions;

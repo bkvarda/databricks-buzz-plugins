@@ -72,6 +72,25 @@ export function fromAgentTool(tool: AgentTool): LocalTool {
   };
 }
 
+/** Display labels for an agent's tools, for its steps: each Genie tool's name, and each MCP server's tool prefix. */
+export function toolLabels(choices: readonly ToolChoice[]): Map<string, string> {
+  const labels = new Map<string, string>();
+  const used = new Set<string>();
+  for (const choice of choices) {
+    if (choice.kind === "genie") labels.set(genieToolName(choice.label, used), choice.label);
+    else if (choice.path) labels.set(toolPrefix(choice), choice.label);
+  }
+  return labels;
+}
+
+/** A Genie agent's tool name, unique among `used` (which it adds to). */
+function genieToolName(label: string, used: Set<string>): string {
+  let name = `genie_${slug(label, 40)}_ask`;
+  for (let n = 2; used.has(name); n++) name = `genie_${slug(label, 36)}_${n}_ask`;
+  used.add(name);
+  return name;
+}
+
 export function genieLocalTools(service: DatabricksService, choices: readonly ToolChoice[]): LocalTool[] {
   const tools: LocalTool[] = [];
   const used = new Set<string>();
@@ -94,9 +113,7 @@ export function genieLocalTools(service: DatabricksService, choices: readonly To
       });
     } else if (choice.kind === "genie") {
       const spaceId = choice.id.replace(/^genie:/, "");
-      let name = `genie_${slug(choice.label, 40)}_ask`;
-      for (let n = 2; used.has(name); n++) name = `genie_${slug(choice.label, 36)}_${n}_ask`;
-      used.add(name);
+      const name = genieToolName(choice.label, used);
       tools.push({
         name,
         description: `Asks the "${choice.label}" Genie agent, curated by the owner's data team, a question about its data. It answers with an explanation, a table and the SQL. Pass conversation_id to follow up.`,

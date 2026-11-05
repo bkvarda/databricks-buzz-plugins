@@ -28,6 +28,8 @@ export type LoopInput = Readonly<{
   signal: AbortSignal;
   maxSteps?: number;
   onStep?(tool: string, target?: string): void;
+  /** What the model said alongside its tool calls, and any reasoning it returned. */
+  onThought?(text: string): void;
 }>;
 
 export type LoopResult = Readonly<{
@@ -98,6 +100,17 @@ async function callBuzz(handler: McpHandler, name: string, args: Record<string, 
   return { text: text || (result.isError ? "Error" : "OK"), error: Boolean(result.isError) };
 }
 
+/** Reasoning parts some models return in content: summaries or text. */
+function reasoningText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((part: { type?: string; summary?: { text?: string }[]; text?: string }) =>
+      part?.type === "reasoning" ? (Array.isArray(part.summary) ? part.summary.map((entry) => entry?.text ?? "") : [part.text ?? ""]) : [],
+    )
+    .join("\n")
+    .trim();
+}
+
 function target(args: Record<string, unknown>): string | undefined {
   for (const key of ["channel", "path", "command", "agent", "statement", "question", "query", "url"]) {
     const value = args[key];
@@ -139,6 +152,9 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     if (!choice) throw new Error("The model returned no answer.");
     const content = messageText(choice.message.content);
     const calls = choice.message.tool_calls ?? [];
+    const reasoning = reasoningText(choice.message.content);
+    if (reasoning) input.onThought?.(reasoning);
+    if (calls.length && content.trim()) input.onThought?.(content);
     added.push({ role: "assistant", content: content || null, ...(calls.length && { tool_calls: calls }) });
     if (!calls.length) {
       text = content;

@@ -218,15 +218,17 @@ export type HarnessEvent = Readonly<{
   step?: Readonly<{ tool: string; target?: string }>;
   /** The harness's own session (thread) ID. */
   session?: string;
-  /** Message text the harness wrote; the last one is the reply. */
+  /** Message text the harness wrote; the last one is the reply, earlier ones narrate its work. */
   text?: string;
+  /** The harness's thinking: a thinking block, or Codex's reasoning summary. */
+  thought?: string;
   /** The final reply, when the harness reports one. */
   final?: string;
   /** The turn failed. */
   error?: string;
 }>;
 
-const TARGET_KEYS = ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "prompt"];
+const TARGET_KEYS = ["command", "cmd", "file_path", "path", "pattern", "query", "question", "statement", "url", "description", "prompt"];
 
 function targetOf(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -237,7 +239,21 @@ function targetOf(value: unknown): string | undefined {
   return undefined;
 }
 
-const shellTarget = (command: string) => command.replace(/^\/bin\/(ba)?sh -lc '?/, "").replace(/'$/, "");
+/** The command inside Codex's `/bin/bash -lc '…'` (or "…") wrapper. */
+const shellTarget = (command: string) => {
+  const wrapped = /^\/bin\/(?:ba)?sh -lc (['"])([\s\S]*)\1$/.exec(command);
+  return wrapped ? (wrapped[1] === '"' ? wrapped[2]!.replace(/\\(["\\$`])/g, "$1") : wrapped[2]!) : command;
+};
+
+/** Thinking blocks: Claude's `thinking`, Pi's `thinking` parts. */
+const thinkingOf = (content: unknown) =>
+  Array.isArray(content)
+    ? content
+        .filter((part): part is { type: string; thinking: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "thinking" && typeof (part as { thinking?: unknown }).thinking === "string")
+        .map((part) => part.thinking.trim())
+        .filter(Boolean)
+        .join("\n\n")
+    : "";
 
 const textOf = (content: unknown) =>
   Array.isArray(content)
@@ -263,10 +279,11 @@ export function parseEvent(harness: RemoteHarness, line: string): HarnessEvent |
     if (event.type === "system" && event.subtype === "api_retry")
       return { step: { tool: "model", target: `retrying after ${event.error_status ?? "an error"}${event.error ? ` (${event.error})` : ""}` } };
     if (event.type === "assistant" && Array.isArray(event.message?.content)) {
+      const thought = thinkingOf(event.message.content);
       const tool = event.message.content.find((part: any) => part?.type === "tool_use");
-      if (tool) return { step: { tool: String(tool.name ?? "tool"), ...(targetOf(tool.input) && { target: targetOf(tool.input)! }) } };
+      if (tool) return { ...(thought && { thought }), step: { tool: String(tool.name ?? "tool"), ...(targetOf(tool.input) && { target: targetOf(tool.input)! }) } };
       const text = textOf(event.message.content);
-      return text ? { text } : undefined;
+      return text || thought ? { ...(text && { text }), ...(thought && { thought }) } : undefined;
     }
     if (event.type === "result") {
       const text = typeof event.result === "string" ? event.result : "";
@@ -283,11 +300,12 @@ export function parseEvent(harness: RemoteHarness, line: string): HarnessEvent |
     if (event.type === "item.started") {
       if (item.type === "command_execution" && typeof item.command === "string") return { step: { tool: "shell", target: targetOf({ command: shellTarget(item.command) })! } };
       if (item.type === "file_change") return { step: { tool: "edit", ...(item.changes?.[0]?.path && { target: String(item.changes[0].path) }) } };
-      if (item.type === "mcp_tool_call") return { step: { tool: String(item.tool ?? "tool"), ...(item.server && { target: String(item.server) }) } };
+      if (item.type === "mcp_tool_call") return { step: { tool: String(item.tool ?? "tool"), ...(targetOf(item.arguments) && { target: targetOf(item.arguments)! }) } };
       if (item.type === "web_search") return { step: { tool: "web search", ...(item.query && { target: String(item.query) }) } };
       return undefined;
     }
     if (event.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") return { text: item.text };
+    if (event.type === "item.completed" && item.type === "reasoning" && typeof item.text === "string" && item.text.trim()) return { thought: item.text };
     return undefined;
   }
   // Pi
@@ -296,7 +314,8 @@ export function parseEvent(harness: RemoteHarness, line: string): HarnessEvent |
   if (event.type === "message_end" && event.message?.role === "assistant") {
     if (event.message.stopReason === "error" && event.message.errorMessage) return { error: String(event.message.errorMessage) };
     const text = textOf(event.message.content);
-    return text ? { text } : undefined;
+    const thought = thinkingOf(event.message.content);
+    return text || thought ? { ...(text && { text }), ...(thought && { thought }) } : undefined;
   }
   return undefined;
 }
@@ -320,6 +339,8 @@ export type RemoteTurnInput = Readonly<{
   /** The agent's Databricks tools, served by the runner bundle at RUNNER_PATH (the caller uploads it). */
   tools?: BridgeConfig;
   onStep?(tool: string, target?: string): void;
+  /** Its thinking, and narration it wrote before its next step. */
+  onThought?(text: string): void;
   /** The harness has its session; save it so a later turn continues it, even if this one fails. */
   onSession?(session: RemoteSession): void;
   /** The harness started, so the prompt reached it. */
@@ -405,6 +426,7 @@ async function runTurn(input: RemoteTurnInput): Promise<{ text: string; session:
   let text = "";
   let final: string | undefined;
   let error: string | undefined;
+  let narration: string | undefined;
   let failures = 0;
   try {
     for (;;) {
@@ -430,8 +452,14 @@ async function runTurn(input: RemoteTurnInput): Promise<{ text: string; session:
           announced = true;
           input.onSession?.({ harness, id: sessionId });
         }
-        if (event.step) input.onStep?.(event.step.tool, event.step.target);
-        if (event.text) text = event.text;
+        if (event.thought) input.onThought?.(event.thought);
+        if (event.step) {
+          // Text written before another step narrated the work; the last text is the reply.
+          if (narration) input.onThought?.(narration);
+          narration = undefined;
+          input.onStep?.(event.step.tool, event.step.target);
+        }
+        if (event.text) text = narration = event.text;
         if (event.final !== undefined) final = event.final;
         if (event.error) error = event.error;
       }
