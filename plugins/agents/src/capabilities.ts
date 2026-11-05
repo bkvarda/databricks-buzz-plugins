@@ -38,7 +38,7 @@ export function normalizeChoices(value: unknown): ToolChoice[] {
 const slug = (text: string, max: number) =>
   (text.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "x").slice(0, max).replace(/_+$/, "");
 
-const workspaceIdOf = (service: DatabricksService) => {
+export const workspaceIdOf = (service: DatabricksService): string | undefined => {
   const snapshot = service.snapshot();
   return snapshot.status === "connected" ? (snapshot.workspaceId ?? snapshot.profile.workspaceId) : undefined;
 };
@@ -117,6 +117,9 @@ export function genieLocalTools(service: DatabricksService, choices: readonly To
   return tools;
 }
 
+/** A chosen MCP server that didn't list its tools: why, and the login page when it's a per-user login. */
+export type ToolFailure = Readonly<{ server: ToolChoice; message: string; login?: string }>;
+
 /**
  * Lists the tools of the chosen MCP servers and wraps each as a local tool
  * named <server>__<tool>. A server that fails to answer is reported, not fatal.
@@ -125,12 +128,13 @@ export async function mcpLocalTools(
   service: DatabricksService,
   choices: readonly ToolChoice[],
   signal: AbortSignal,
-): Promise<{ tools: LocalTool[]; problems: string[] }> {
+): Promise<{ tools: LocalTool[]; problems: string[]; failures: ToolFailure[] }> {
   const servers = choices.filter((choice) => choice.path);
-  if (!servers.length) return { tools: [], problems: [] };
+  if (!servers.length) return { tools: [], problems: [], failures: [] };
   const client = await service.ready(signal);
   const workspaceId = workspaceIdOf(service);
   const problems: string[] = [];
+  const failures: ToolFailure[] = [];
   const lists = await Promise.all(
     servers.map(async (server) => {
       const query: Record<string, string> = server.path!.startsWith("/ai-gateway/") && workspaceId ? { o: workspaceId } : {};
@@ -141,6 +145,7 @@ export async function mcpLocalTools(
       } catch (error) {
         // A per-user OAuth service the owner hasn't logged in to: give the model the link.
         const login = server.kind === "service" && isLoginRejection(error) ? service.workspaceUrl(mcpLoginPath(server.id.replace(/^service:/, ""))) : undefined;
+        failures.push({ server, message: (error as Error).message ?? String(error), ...(login && { login }) });
         problems.push(
           login
             ? `${server.label}: your owner isn't logged in to ${server.label} yet. Ask them to log in at ${login}, then try again`
@@ -172,5 +177,5 @@ export async function mcpLocalTools(
       });
     }
   }
-  return { tools, problems };
+  return { tools, problems, failures };
 }

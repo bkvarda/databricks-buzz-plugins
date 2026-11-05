@@ -351,7 +351,7 @@ describe("remote harnesses", () => {
     const codexFull = harnessCommand({ harness: "codex", model: "system.ai.gpt-5-6-sol", permissions: "full", session: { id: "t-9", resume: true }, files });
     expect(codexFull).toMatch(/^codex exec resume 't-9' --json .*--dangerously-bypass-approvals-and-sandbox - < /);
     const pi = (permissions: "standard" | "full") => harnessCommand({ harness: "pi", model: "system.ai.claude-sonnet-5-5", permissions, session: { id: "p-1", resume: true }, files });
-    expect(pi("standard")).toContain("--tools read,grep,find,ls,edit,write");
+    expect(pi("standard")).toContain(`--tools "read,grep,find,ls,edit,write"`);
     expect(pi("full")).not.toContain("--tools");
     expect(pi("full")).toMatch(/'@.*prompt\.md' < \/dev\/null$/);
   });

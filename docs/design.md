@@ -94,7 +94,13 @@ In the Databricks type, a Sandbox agent's **Harness** is either **Built-in** (th
   - Pi: file tools only (`--tools read,grep,find,ls,edit,write`), since it has no approval step.
 
   **Full access** is `bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`, or Pi's default tools.
-- **Limits.** These harnesses don't get Buzz's tools; they answer the conversation they're in. The Genie and MCP picks apply to Built-in only, and watches and timers run on Built-in. Prompt input must be closed (`< /dev/null`), or Pi waits on stdin.
+- **Databricks tools.** Every harness gets the same **Tools** picks as Built-in (Genie One, Genie agents, MCP servers and Unity Catalog functions, with the same login badges and checks in the form), in the local and hosted types alike. The runner bundle (uploaded to the agent's Sandbox at `~/.buzz/agent/runner.mjs`) is also an MCP bridge: `runner.mjs mcp tools.json` serves, over stdio, the tools `capabilities.ts` builds for Built-in, calling Databricks with the Sandbox's own credential (its DEFAULT profile, re-read on every call), so no token reaches a harness. A server that didn't list its tools becomes one tool that says why, with the login link when the owner hasn't logged in (`github__log_in`). Each harness is pointed at it (`src/harness-tools.ts`):
+  - Claude Code: `--mcp-config` with the bridge as server `dbx`, `--strict-mcp-config`, and in Standard `--allowedTools mcp__dbx` (the owner chose these tools), with longer MCP timeouts for Genie.
+  - Codex: `mcp_servers.dbx.*` overrides, including `default_tools_approval_mode="approve"`: `codex exec` never asks, so a tool needing approval would otherwise be refused.
+  - Pi has no MCP support, so a small extension (`-e`) starts the bridge and registers its tools. Pi's `--tools` allowlist also filters extension tools, so in Standard the run lists the bridge's names first (`runner.mjs mcp-names`); if that fails, Pi keeps only its file tools, never a shell.
+
+  Unity Gateway's own stdio bridge (`ug mcp-proxy`) was tried first and didn't answer `initialize` inside a Sandbox.
+- **Limits.** These harnesses don't get Buzz's own tools; they answer the conversation they're in. Watches and timers run on Built-in. Prompt input must be closed (`< /dev/null`), or Pi waits on stdin.
 
 ### Hosted Databricks agents
 

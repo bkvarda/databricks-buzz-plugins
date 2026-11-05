@@ -12,6 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ToolChoice } from "../src/capabilities";
 import type { Permissions, RemoteHarness } from "../src/remote";
 
 export const AGENT_DIR = process.env.BUZZ_AGENT_DIR ?? join(homedir(), ".buzz", "agent");
@@ -56,6 +57,9 @@ export type RunnerConfig = Readonly<{
   /** This Sandbox's ID, for stopping itself. */
   sandbox: string;
   workspaceHost?: string;
+  workspaceId?: string;
+  /** A Sandbox agent's Databricks tools: Genie One, Genie agents and MCP servers. */
+  tools?: ToolChoice[];
 }>;
 
 export type RunnerState = {

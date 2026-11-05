@@ -65,13 +65,14 @@ async function fetchTransport(request: HttpRequest): Promise<HttpResponse> {
   }
 }
 
-/** The Sandbox's Databricks connection, as a `databricks` service for Genie. */
-export function sandboxService(): DatabricksService {
+/** The Sandbox's Databricks connection, as a `databricks` service for Genie and MCP servers. */
+export function sandboxService(workspaceId?: string): DatabricksService {
   const { host } = profile();
   const client = new DatabricksClient({ host, transport: fetchTransport, token: async () => profile().token });
   const snapshot = {
     status: "connected" as const,
-    profile: { name: "DEFAULT", host },
+    ...(workspaceId && { workspaceId }),
+    profile: { name: "DEFAULT", host, ...(workspaceId && { workspaceId }) },
     user: { userName: "" },
     profiles: [],
   };

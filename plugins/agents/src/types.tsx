@@ -13,7 +13,8 @@ import { React } from "@dbx/core/react";
 import { databricksIcon, Text } from "@dbx/core/ui/components";
 import { RESULT_LANGUAGE, resultBlock } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
-import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
+import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
+import { uploadRunner } from "./runner-upload";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
 import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
@@ -273,10 +274,13 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     if (!(await sandboxOn(workspace, signal)))
       throw new Error(`Databricks Sandbox isn't turned on in this workspace, and ${harnessLabel(harness)} runs there. A workspace admin can turn on the Sandbox preview.`);
     const sandbox = await ensureAgentSandbox(workspace, delivery.agent.pubkey, delivery.agent.name, signal, (state) => delivery.step?.("sandbox", state));
+    // The agent's Genie and MCP picks reach the harness through the runner bundle's tools bridge.
+    const tools = config.tools.length ? { tools: config.tools, ...(workspaceIdOf(workspace) && { workspaceId: workspaceIdOf(workspace) }) } : undefined;
+    if (tools) await uploadRunner(sandbox, sandboxFor(delivery.agent.pubkey), signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
     // A session of another harness (or the built-in loop) doesn't carry over: the new one is shown the conversation.
     const continued = session.remote?.harness === harness ? { harness, id: session.remote.id } : undefined;
-    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
+    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions, config.tools), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: WORK_DIR, instructions, tools: false });
     const prompt = await kit.turnPrompt(delivery, conversation, continued && session.cursor ? { cursor: session.cursor } : {});
     let started = false;
@@ -291,6 +295,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         prompt: prompt.text,
         system,
         signal,
+        ...(tools && { tools }),
         onLaunch: () => (started = true),
         onStep: (tool, target) => delivery.step?.(tool, target),
         // Kept as soon as the harness has it, so a failed turn's context isn't lost.

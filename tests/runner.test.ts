@@ -50,8 +50,12 @@ describe("runner protocol", () => {
     const config = normalizeHosted({ kind: "sandbox", harness: "codex", model: "system.ai.claude-opus-5-5", availability: "always", permissions: "full" });
     expect(config).toMatchObject({ kind: "sandbox", harness: "codex", model: "system.ai.gpt-5-6-sol", availability: "always" });
     expect(summarizeHosted(normalizeHosted({}))).toBe("Genie One · sleeps when Buzz is closed");
-    const runner = runnerConfigOf({ sandbox: "sb", name: "Probe", config, community: "wss://x", owner: "o", authTag: ["auth"], createdAt: 0 });
+    const runner = runnerConfigOf({ sandbox: "sb", name: "Probe", config, community: "wss://x", owner: "o", authTag: ["auth"], createdAt: 0 }, "https://h", "42");
     expect(runner.permissions).toBe("standard");
+    // Genie One unless the owner chose otherwise, and an empty choice stays empty.
+    expect(runner).toMatchObject({ tools: [{ id: "genie-one" }], workspaceId: "42" });
+    expect(normalizeHosted({ kind: "sandbox", tools: [] }).tools).toEqual([]);
+    expect(runnerConfigOf({ sandbox: "sb", name: "G", config: normalizeHosted({ kind: "genie" }), community: "wss://x", owner: "o", authTag: ["auth"], createdAt: 0 }).tools).toBeUndefined();
   });
   it("restarts a long-running Sandbox only at a quiet moment", () => {
     const now = Date.parse("2026-11-05T12:00:00Z");

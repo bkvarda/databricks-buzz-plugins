@@ -13,6 +13,8 @@
 //   node runner.mjs interrupt <channel> <root>   stop a conversation's turn; prints true/false
 //   node runner.mjs status       prints status.json, plus whether it's running and when the Sandbox started
 //   node runner.mjs ask <text>   answers once with the configured Genie or harness (a diagnostic)
+//   node runner.mjs mcp <tools.json>        the Databricks tools bridge for a harness (./bridge.ts)
+//   node runner.mjs mcp-names <tools.json>  its tool names, for Pi's allowlist
 import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, openSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { Genie } from "@dbx/core/api/genie";
@@ -21,6 +23,7 @@ import { generateSecretKey, getPublicKey, type NostrEvent, verifyEvent } from "n
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { harnessLabel, RESULT_PROMPT, remoteNote } from "../src/remote";
 import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversationOf, fromOwner, mentionsAgent, plainText, profileTemplate, replyTemplate, splitMessage, turnPrompt } from "./buzz";
+import { bridgeTools, serveBridge } from "./bridge";
 import { sandboxService } from "./databricks";
 import { runLocalTurn } from "./harness";
 import { HttpRelay } from "./http";
@@ -66,7 +69,7 @@ function systemPrompt(config: RunnerConfig, pubkey: string): string {
   return [
     `<identity>You are ${config.name} (pubkey ${pubkey}), an agent in Buzz, a chat app, owned by ${config.owner}.</identity>`,
     "People mention you in channels, threads and Solo chats; each mention is a turn. Messages in the conversation you haven't seen arrive with the mention, as JSON. Your final message is posted as your reply in that conversation: make it the answer itself, in Markdown, written for the people there, without saying that you're posting it.",
-    remoteNote(config.harness, "standard"),
+    remoteNote(config.harness, "standard", config.kind === "sandbox" ? (config.tools ?? []) : []),
     RESULT_PROMPT,
     config.instructions.trim() ? `<agent-instructions>\n${config.instructions.trim()}\n</agent-instructions>` : "",
   ]
@@ -86,6 +89,9 @@ async function names(relay: HttpRelay, pubkeys: string[]): Promise<Map<string, s
   }
   return found;
 }
+
+/** The bridge config for a Sandbox agent's Databricks tools. */
+const toolsOf = (config: RunnerConfig) => ({ tools: config.tools ?? [], ...(config.workspaceId && { workspaceId: config.workspaceId }) });
 
 async function genieAnswer(config: RunnerConfig, question: string, conversationId: string | undefined, signal: AbortSignal): Promise<{ text: string; conversation: string }> {
   const service = sandboxService();
@@ -176,6 +182,7 @@ async function serve() {
       system: systemPrompt(config, pubkey),
       signal,
       pidFile: turnPidPath(conversation.key),
+      ...(config.tools?.length && { tools: toolsOf(config) }),
       onStep: (tool, target) => log(`  ${tool}${target ? ` · ${target}` : ""}`),
       onSession: (id) => {
         state.sessions[conversation.key] = { harness: config.harness, id, at: session?.at ?? 0 };
@@ -282,6 +289,17 @@ async function serve() {
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
+  // The tools bridge is started by a harness, in any Sandbox; it keeps to stdin, stdout and stderr.
+  // Both exit when done: idle HTTP connections would otherwise keep them alive.
+  if (command === "mcp") {
+    await serveBridge(need(args[0], "a tools config"));
+    process.exit(0);
+  }
+  if (command === "mcp-names") {
+    const names = (await bridgeTools(need(args[0], "a tools config"), AbortSignal.timeout(120_000))).map((tool) => `,${tool.name}`).join("");
+    process.stdout.write(names, () => process.exit(0));
+    return;
+  }
   ensureDirs();
   switch (command) {
     case "keygen": {
@@ -355,6 +373,7 @@ async function main() {
         system: systemPrompt(config, "diagnostic"),
         signal: AbortSignal.timeout(TURN_TIMEOUT_MS),
         pidFile: turnPidPath("ask"),
+        ...(config.tools?.length && { tools: toolsOf(config) }),
         onStep: (tool, target) => console.error(`step: ${tool}${target ? ` · ${target}` : ""}`),
       });
       return console.log(result.text);
@@ -362,7 +381,7 @@ async function main() {
     case "serve":
       return serve();
     default:
-      console.error("usage: runner.mjs keygen|profile|start|serve|stop|interrupt|status");
+      console.error("usage: runner.mjs keygen|profile|start|serve|stop|interrupt|status|ask|mcp|mcp-names");
       process.exit(2);
   }
 }

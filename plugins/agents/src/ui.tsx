@@ -252,16 +252,15 @@ function SandboxFields(props: FormProps<DatabricksConfig> & { workspace: Databri
         {...(remote && { accepts: (id: string) => harnessAccepts(remote, id), hint: `Models ${harness.label} can use, from AI Gateway in this workspace.` })}
         onChange={(model) => onChange({ ...config, model })}
       />
-      {remote ? (
+      {remote && (
         <Field label="Permissions" hint={permissionsHint(remote, config.permissions)}>
           <select className="dbx-select" {...disabled} value={config.permissions} onChange={(event) => onChange({ ...config, permissions: event.target.value as Permissions })}>
             <option value="standard">Standard</option>
             <option value="full">Full access</option>
           </select>
         </Field>
-      ) : (
-        <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
       )}
+      <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
       <Field label="Conversation" hint="Thread: each thread is its own conversation. Channel: one conversation for the whole channel.">
         <select className="dbx-select" disabled={props.disabled} value={config.scope} onChange={(event) => onChange({ ...config, scope: event.target.value as DatabricksConfig["scope"] })}>
           <option value="thread">One per thread</option>

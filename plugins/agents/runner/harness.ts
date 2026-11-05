@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { type BridgeConfig, hasBridgeTools, toolFiles } from "../src/harness-tools";
 import { harnessCommand, harnessLabel, parseEvent, type Permissions, type RemoteHarness, runFiles, stderrSummary, WORK_DIR } from "../src/remote";
 import { paths } from "./store";
 
@@ -19,6 +20,8 @@ export type LocalTurn = Readonly<{
   signal: AbortSignal;
   /** Where the harness's process ID goes while it runs (for Stop). */
   pidFile: string;
+  /** The agent's Databricks tools, served to the harness by this runner's bridge. */
+  tools?: BridgeConfig;
   onStep?(tool: string, target?: string): void;
   onSession?(id: string): void;
 }>;
@@ -45,12 +48,16 @@ function once(turn: LocalTurn): Promise<{ text: string; session: string }> {
   const prompt = harness === "codex" && !turn.session ? `<instructions>\n${turn.system}\n</instructions>\n\n${turn.prompt}` : turn.prompt;
   writeFileSync(files.prompt, prompt, { mode: 0o600 });
   writeFileSync(files.system, turn.system, { mode: 0o600 });
+  // This runner bundle is the bridge: the harness starts it as `node <this file> mcp tools.json`.
+  const tools = hasBridgeTools(turn.tools?.tools) ? { runner: process.argv[1]! } : undefined;
+  if (tools) for (const file of toolFiles(harness, files, tools.runner, turn.tools!)) writeFileSync(file.path, file.content, { mode: 0o600 });
   const command = harnessCommand({
     harness,
     model: turn.model,
     permissions: turn.permissions,
     session: sessionId ? { id: sessionId, resume: Boolean(turn.session) } : undefined,
     files,
+    ...(tools && { tools }),
   });
   mkdirSync(WORK_DIR, { recursive: true });
   return new Promise((resolve, reject) => {

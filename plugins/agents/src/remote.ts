@@ -12,6 +12,7 @@
 // final message, which Buzz posts as the agent's reply.
 import { SANDBOX_HOME, type Sandboxes } from "@dbx/core/api/sandbox";
 import { RESULT_LANGUAGE } from "@dbx/core/result";
+import { BRIDGE_NAME, type BridgeConfig, bridgeCommand, hasBridgeTools, RUNNER_PATH, toolFiles } from "./harness-tools";
 
 export type HarnessId = "builtin" | "claude" | "codex" | "pi";
 export type RemoteHarness = Exclude<HarnessId, "builtin">;
@@ -72,7 +73,20 @@ export const RESULT_PROMPT = [
 
 // ── Commands ──
 
-export type RunFiles = Readonly<{ dir: string; prompt: string; system: string; events: string; stderr: string; exit: string; pid: string; script: string }>;
+export type RunFiles = Readonly<{
+  dir: string;
+  prompt: string;
+  system: string;
+  events: string;
+  stderr: string;
+  exit: string;
+  pid: string;
+  script: string;
+  /** The Databricks tools bridge's config, Claude Code's MCP config, and Pi's tools extension. */
+  tools: string;
+  mcp: string;
+  piTools: string;
+}>;
 
 export const RUNS_DIR = `${SANDBOX_HOME}/.buzz/runs`;
 export const WORK_DIR = `${SANDBOX_HOME}/work`;
@@ -86,6 +100,9 @@ export const runFiles = (dir: string): RunFiles => ({
   exit: `${dir}/exit`,
   pid: `${dir}/pid`,
   script: `${dir}/run.sh`,
+  tools: `${dir}/tools.json`,
+  mcp: `${dir}/mcp.json`,
+  piTools: `${dir}/databricks-tools.mjs`,
 });
 
 /** A single-quoted shell word. */
@@ -97,17 +114,34 @@ const PI_STANDARD_TOOLS = "read,grep,find,ls,edit,write";
  * The harness command for one turn. `session` is the harness session to
  * continue: Claude Code and Pi take the ID we choose (Claude Code creates it
  * with --session-id, then --resume continues it); Codex names its own thread,
- * so a first Codex turn has none.
+ * so a first Codex turn has none. With `tools`, the harness also gets the
+ * agent's Databricks tools from the runner's bridge (see ./harness-tools.ts),
+ * whose files the turn writes first (`toolFiles`).
  */
-export function harnessCommand(input: Readonly<{ harness: RemoteHarness; model: string; permissions: Permissions; session: Readonly<{ id: string; resume: boolean }> | undefined; files: RunFiles }>): string {
-  const { model, files, session } = input;
+export function harnessCommand(
+  input: Readonly<{
+    harness: RemoteHarness;
+    model: string;
+    permissions: Permissions;
+    session: Readonly<{ id: string; resume: boolean }> | undefined;
+    files: RunFiles;
+    /** The runner bundle's path in the Sandbox, when the agent has Databricks tools. */
+    tools?: Readonly<{ runner: string }>;
+  }>,
+): string {
+  const { model, files, session, tools } = input;
   const full = input.permissions === "full";
+  const bridge = tools ? bridgeCommand(tools.runner, files.tools) : undefined;
   switch (input.harness) {
     case "claude": {
       if (!session) throw new Error("Claude Code needs a session ID.");
       return [
+        // A Genie answer can take minutes; the bridge lists every server before it answers.
+        ...(bridge ? ["MCP_TIMEOUT=120000", "MCP_TOOL_TIMEOUT=600000"] : []),
         "claude", "-p", "--model", shellQuote(model), "--output-format", "stream-json", "--verbose",
         "--permission-mode", full ? "bypassPermissions" : "auto",
+        // The owner chose these tools, so Standard doesn't second-guess them.
+        ...(bridge ? ["--mcp-config", shellQuote(files.mcp), "--strict-mcp-config", ...(full ? [] : ["--allowedTools", `mcp__${BRIDGE_NAME}`])] : []),
         "--append-system-prompt-file", shellQuote(files.system),
         session.resume ? "--resume" : "--session-id", shellQuote(session.id),
         "<", shellQuote(files.prompt),
@@ -118,16 +152,32 @@ export function harnessCommand(input: Readonly<{ harness: RemoteHarness; model: 
         "codex", "exec", ...(session ? ["resume", shellQuote(session.id)] : []),
         "--json", "--skip-git-repo-check", "-m", shellQuote(model),
         ...(full ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", shellQuote('sandbox_mode="workspace-write"'), "-c", "sandbox_workspace_write.network_access=true"]),
+        ...(bridge
+          ? [
+              "-c", shellQuote(`mcp_servers.${BRIDGE_NAME}.command=${JSON.stringify(bridge[0])}`),
+              "-c", shellQuote(`mcp_servers.${BRIDGE_NAME}.args=${JSON.stringify(bridge.slice(1))}`),
+              "-c", `mcp_servers.${BRIDGE_NAME}.startup_timeout_sec=120`,
+              "-c", `mcp_servers.${BRIDGE_NAME}.tool_timeout_sec=600`,
+              // codex exec never asks, so a tool needing approval would be refused; the owner chose these.
+              "-c", shellQuote(`mcp_servers.${BRIDGE_NAME}.default_tools_approval_mode="approve"`),
+            ]
+          : []),
         "-", "<", shellQuote(files.prompt),
       ].join(" ");
-    case "pi":
+    case "pi": {
       if (!session) throw new Error("Pi needs a session ID.");
+      // Pi's --tools allowlist covers extension tools too, so Standard lists the bridge's by name;
+      // if that fails, Pi still has only its file tools.
+      const names = bridge ? `$(${[...bridge.slice(0, 2), "mcp-names", files.tools].map(shellQuote).join(" ")} 2>/dev/null)` : "";
       return [
+        ...(bridge ? [`BUZZ_TOOLS_BRIDGE=${shellQuote(JSON.stringify(bridge))}`] : []),
         "pi", "-p", "--mode", "json", "--model", shellQuote(model), "--session-id", shellQuote(session.id),
         "--append-system-prompt", shellQuote(files.system),
-        ...(full ? [] : ["--tools", PI_STANDARD_TOOLS]),
+        ...(bridge ? ["-e", shellQuote(files.piTools)] : []),
+        ...(full ? [] : ["--tools", `"${PI_STANDARD_TOOLS}${names}"`]),
         shellQuote(`@${files.prompt}`), "<", "/dev/null",
       ].join(" ");
+    }
   }
 }
 
@@ -267,6 +317,8 @@ export type RemoteTurnInput = Readonly<{
   prompt: string;
   system: string;
   signal: AbortSignal;
+  /** The agent's Databricks tools, served by the runner bundle at RUNNER_PATH (the caller uploads it). */
+  tools?: BridgeConfig;
   onStep?(tool: string, target?: string): void;
   /** The harness has its session; save it so a later turn continues it, even if this one fails. */
   onSession?(session: RemoteSession): void;
@@ -328,13 +380,16 @@ async function runTurn(input: RemoteTurnInput): Promise<{ text: string; session:
   // Claude Code and Pi continue a session ID we choose; Codex names its own.
   const known = input.session?.harness === harness ? input.session : undefined;
   let sessionId = known?.id ?? (harness === "codex" ? undefined : newId());
+  const tools = hasBridgeTools(input.tools?.tools) ? { runner: RUNNER_PATH } : undefined;
   const command = harnessCommand({
     harness,
     model: input.model,
     permissions: input.permissions,
     session: sessionId ? { id: sessionId, resume: Boolean(known) } : undefined,
     files,
+    ...(tools && { tools }),
   });
+  if (tools) for (const file of toolFiles(harness, files, tools.runner, input.tools!)) await sandboxes.writeFile(sandbox, file.path, file.content, signal);
   // Codex has no system-prompt flag; a new Codex thread gets the instructions with its first message.
   const prompt = harness === "codex" && !known ? `<instructions>\n${input.system}\n</instructions>\n\n${input.prompt}` : input.prompt;
   await sandboxes.writeFile(sandbox, files.prompt, prompt, signal);
@@ -403,12 +458,15 @@ async function runTurn(input: RemoteTurnInput): Promise<{ text: string; session:
 }
 
 /** What a remote harness is told about where it is and how its answer reaches Buzz. */
-export function remoteNote(harness: RemoteHarness, permissions: Permissions): string {
+export function remoteNote(harness: RemoteHarness, permissions: Permissions, tools: readonly Readonly<{ label: string }>[] = []): string {
   return [
     `<databricks-sandbox>`,
     `You are running as ${harnessLabel(harness)} inside your own Databricks Sandbox, a Linux machine in Databricks with Python, Node.js, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${WORK_DIR}; files under ${SANDBOX_HOME} persist across restarts.`,
     "Your final message is posted to the Buzz conversation as your reply, so make it the answer itself, written for the people there. You don't have Buzz's own tools in this session.",
     harness === "pi" && permissions === "standard" ? "You can read, search and edit files, but you have no shell in this session." : "",
+    tools.length
+      ? `Your owner gave you these Databricks tools, which run with their access: ${tools.map((tool) => tool.label).join(", ")}. Use them for questions about data (Genie One finds the right tables and runs the SQL). If a tool says your owner hasn't logged in yet, give them its login link.`
+      : "",
     "Never print secrets into the conversation.",
     `</databricks-sandbox>`,
   ]

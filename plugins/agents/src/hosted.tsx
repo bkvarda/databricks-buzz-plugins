@@ -17,10 +17,11 @@ import type { DatabricksClient } from "@dbx/core/client";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { Button, DbxRoot, databricksIcon, Field, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
-import { RUNNER, RUNNER_SHA } from "virtual:agent-runner";
 import type { RunnerConfig } from "../runner/store";
+import { uploadRunner } from "./runner-upload";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
-import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, useAgentService, WorkspaceField } from "./ui";
+import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
+import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, ToolsField, useAgentService, WorkspaceField } from "./ui";
 
 export const HOSTED_TYPE_ID = "databricks-hosted";
 const AGENT_DIR = `${SANDBOX_HOME}/.buzz/agent`;
@@ -47,6 +48,8 @@ export type HostedConfig = {
   genie?: { space: string; label: string };
   harness: RemoteHarness;
   model: string;
+  /** A Sandbox agent's Databricks tools (Genie One, Genie agents, MCP servers), as the local type's. */
+  tools: ToolChoice[];
   availability: Availability;
   scope: "thread" | "channel";
   instructions: string;
@@ -62,6 +65,8 @@ export function normalizeHosted(value: unknown): HostedConfig {
     kind: config.kind === "sandbox" ? "sandbox" : "genie",
     harness,
     model: typeof config.model === "string" && harnessAccepts(harness, config.model) ? config.model : HARNESS_MODEL[harness],
+    // Genie One unless the owner chose otherwise (an empty list is a choice).
+    tools: Array.isArray(config.tools) ? normalizeChoices(config.tools) : [GENIE_ONE_CHOICE],
     availability: config.availability === "always" ? "always" : "sleep",
     scope: config.scope === "channel" ? "channel" : "thread",
     instructions: typeof config.instructions === "string" ? config.instructions : "",
@@ -104,7 +109,7 @@ const parse = (raw: string | null): HostedRecord | undefined => {
 
 const randomHex = (bytes: number) => [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-export function runnerConfigOf(record: HostedRecord, host?: string): RunnerConfig {
+export function runnerConfigOf(record: HostedRecord, host?: string, workspaceId?: string): RunnerConfig {
   if (!record.community || !record.owner || !record.authTag) throw new Error("This agent hasn't been activated yet.");
   const config = record.config;
   return {
@@ -125,6 +130,8 @@ export function runnerConfigOf(record: HostedRecord, host?: string): RunnerConfi
     idleMinutes: IDLE_MINUTES,
     sandbox: record.sandbox,
     ...(host && { workspaceHost: host }),
+    ...(workspaceId && { workspaceId }),
+    ...(config.kind === "sandbox" && config.tools.length && { tools: config.tools }),
   };
 }
 
@@ -142,13 +149,6 @@ async function sandboxOf(service: DatabricksService, record: Pick<HostedRecord, 
 /** A hosted agent's Sandbox never stops on idle: the runner decides when to sleep, between turns. */
 const keepAwake = (client: DatabricksClient, sandbox: string, signal?: AbortSignal) =>
   client.json(`/api/2.0/lakebox/sandboxes/${encodeURIComponent(sandbox)}`, { method: "PATCH", body: { no_autostop: true }, ...(signal && { signal }) });
-
-async function uploadRunner(sandboxes: Sandboxes, sandbox: string, signal?: AbortSignal) {
-  const current = await sandboxes.bash(sandbox, `cat ${shellQuote(`${AGENT_DIR}/runner.sha`)} 2>/dev/null`, { timeoutSeconds: 30, ...(signal && { signal }) });
-  if (current.stdout?.trim() === RUNNER_SHA) return;
-  await sandboxes.writeFile(sandbox, `${AGENT_DIR}/runner.mjs`, RUNNER, signal);
-  await sandboxes.bash(sandbox, `echo ${RUNNER_SHA} > ${shellQuote(`${AGENT_DIR}/runner.sha`)}`, { timeoutSeconds: 30, ...(signal && { signal }) });
-}
 
 async function runner(sandboxes: Sandboxes, sandbox: string, args: string, signal?: AbortSignal, timeoutSeconds = 90): Promise<string> {
   const result = await sandboxes.bash(sandbox, `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)} ${args}`, { timeoutSeconds, ...(signal && { signal }) });
@@ -205,7 +205,8 @@ async function deploy(service: DatabricksService, record: HostedRecord, options:
   const { client, sandboxes } = await sandboxOf(service, record, options.signal);
   await sandboxes.ensureRunning(record.sandbox, { ...(options.signal && { signal: options.signal }) });
   await uploadRunner(sandboxes, record.sandbox, options.signal);
-  await sandboxes.writeFile(record.sandbox, `${AGENT_DIR}/config.json`, `${JSON.stringify(runnerConfigOf(record, client.host), null, 2)}\n`, options.signal);
+  const workspaceId = workspaceIdOf(workspaceOf(service, record.config.profile));
+  await sandboxes.writeFile(record.sandbox, `${AGENT_DIR}/config.json`, `${JSON.stringify(runnerConfigOf(record, client.host, workspaceId), null, 2)}\n`, options.signal);
   // Best effort: the relay may admit the agent only once Buzz writes its listing, after
   // activation; the runner keeps trying until the profile is accepted.
   if (options.publishProfile) await runner(sandboxes, record.sandbox, "profile", options.signal).catch(() => {});
@@ -456,8 +457,9 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
             {...(config.profile && { profile: config.profile })}
             {...disabled}
             onChange={(profile) => {
+              // Genie agents and MCP servers belong to a workspace; keep only Genie One.
               const { profile: _old, genie: _genie, ...rest } = config;
-              onChange({ ...rest, ...(profile && { profile }) });
+              onChange({ ...rest, ...(profile && { profile }), tools: config.tools.filter((tool) => tool.kind === "genie-one") });
             }}
           />
         )}
@@ -498,6 +500,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
               hint={`Models ${harness.label} can use, from AI Gateway in this workspace.`}
               onChange={(model) => onChange({ ...config, model })}
             />
+            <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
           </>
         )}
         <Field label="Availability" hint={AVAILABILITY_HINT[config.availability]}>
