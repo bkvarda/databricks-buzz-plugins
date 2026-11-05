@@ -882,6 +882,373 @@ function MissingCore(props) {
   ));
 }
 
+// plugins/genie/src/chats.ts
+var CONVERSATIONS = "genieConversations";
+var GENIE_ONE_CHAT = "genieOneChat";
+var KEEP_ONE_TURNS = 10;
+var KEEP_STEPS = 12;
+var turnCount = 0;
+var turnKey = (prefix) => `${prefix}-${Date.now()}-${++turnCount}`;
+var Store = class {
+  constructor(state) {
+    this.state = state;
+  }
+  listeners = /* @__PURE__ */ new Set();
+  snapshot = () => this.state;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  set(change) {
+    this.state = { ...this.state, ...typeof change === "function" ? change(this.state) : change };
+    for (const listener of [...this.listeners]) listener();
+  }
+};
+function useChat(chat) {
+  return React.useSyncExternalStore(chat.subscribe, chat.snapshot);
+}
+function useOwnChat(create, deps) {
+  const chat = React.useMemo(create, deps);
+  React.useEffect(() => () => chat.dispose(), [chat]);
+  return chat;
+}
+function turnFromMessage(message) {
+  const parts = summarize(message);
+  return {
+    key: messageId(message),
+    question: message.content,
+    message,
+    suggestions: parts.suggestions,
+    ...parts.text && { text: parts.text },
+    ...parts.sql && { sql: parts.sql },
+    ...parts.queryTitle && { queryTitle: parts.queryTitle },
+    ...parts.error && { error: parts.error }
+  };
+}
+var SpaceChat = class extends Store {
+  constructor(service, spaceId, conversationId, remember) {
+    super({ turns: [], busy: false, loading: false, ...conversationId && { conversationId } });
+    this.service = service;
+    this.spaceId = spaceId;
+    this.remember = remember;
+    if (conversationId) void this.reopen(conversationId);
+  }
+  asking;
+  history;
+  /** Disposed: it no longer saves (its workspace may have changed). */
+  gone = false;
+  update(key, change) {
+    this.set((state) => ({ turns: state.turns.map((turn) => turn.key === key ? { ...turn, ...change } : turn) }));
+  }
+  continues(conversationId) {
+    if (!conversationId || conversationId === this.state.conversationId) return;
+    this.set({ conversationId });
+    if (!this.gone) this.remember?.(conversationId);
+  }
+  /** Loads an earlier conversation, follows a question still running in it,
+   * and shows the latest answer's result. */
+  async reopen(conversationId) {
+    const controller = new AbortController();
+    this.history = controller;
+    this.set({ loading: true });
+    try {
+      const client = await this.service.ready(controller.signal);
+      const response = await client.get(
+        `/api/2.0/genie/spaces/${encodeURIComponent(this.spaceId)}/conversations/${encodeURIComponent(conversationId)}/messages`,
+        { query: { page_size: 50 }, signal: controller.signal }
+      );
+      if (controller.signal.aborted) return;
+      const messages = [...response.messages ?? []].map((message) => ({ ...message, conversation_id: conversationId })).sort((a, b) => (a.created_timestamp ?? 0) - (b.created_timestamp ?? 0));
+      this.set({ turns: messages.map(turnFromMessage), loading: false });
+      const last = messages[messages.length - 1];
+      if (last && !TERMINAL.has(last.status)) await this.follow(last, controller);
+      const latest = this.state.turns[this.state.turns.length - 1];
+      if (latest?.sql && !latest.result && !controller.signal.aborted) await this.loadResult(latest.key);
+    } catch (error) {
+      if (!controller.signal.aborted) this.set({ loading: false, historyError: describeError(error) });
+    } finally {
+      if (this.history === controller) this.history = void 0;
+    }
+  }
+  /** Waits for a question asked before Buzz last closed. */
+  async follow(message, controller) {
+    const key = messageId(message);
+    this.asking = controller;
+    this.set({ busy: true });
+    try {
+      const client = await this.service.ready(controller.signal);
+      const genie = new Genie(client);
+      const settled = await genie.wait(this.spaceId, message, (update) => this.update(key, { message: update }), controller.signal);
+      this.update(key, turnFromMessage(settled));
+      const attachment = summarize(settled).queryAttachmentId;
+      if (settled.status === "COMPLETED" && attachment) this.update(key, { result: await genie.result(this.spaceId, settled, attachment, controller.signal) });
+    } catch (error) {
+      if (!controller.signal.aborted) this.update(key, { error: describeError(error) });
+    } finally {
+      if (this.asking === controller) this.set({ busy: false });
+    }
+  }
+  async loadResult(key) {
+    const turn = this.state.turns.find((candidate) => candidate.key === key);
+    const message = turn?.message;
+    const attachment = message && summarize(message).queryAttachmentId;
+    if (!message || !attachment) return;
+    this.update(key, { loadingResult: true });
+    try {
+      const client = await this.service.ready();
+      const result = await new Genie(client).result(this.spaceId, message, attachment);
+      this.update(key, { result, loadingResult: false });
+    } catch (error) {
+      this.update(key, { loadingResult: false, error: describeError(error) });
+    }
+  }
+  async ask(question) {
+    const text = question.trim();
+    if (!text || this.state.busy) return;
+    this.asking?.abort();
+    const controller = new AbortController();
+    this.asking = controller;
+    let current = turnKey("pending");
+    this.set((state) => ({ turns: [...state.turns, { key: current, question: text, suggestions: [] }], busy: true }));
+    try {
+      const client = await this.service.ready(controller.signal);
+      const answer = await new Genie(client).answer(this.spaceId, text, {
+        ...this.state.conversationId && { conversationId: this.state.conversationId },
+        signal: controller.signal,
+        onUpdate: (message) => {
+          const previous = current;
+          current = messageId(message) || current;
+          this.update(previous, { key: current, message });
+          this.continues(message.conversation_id);
+        }
+      });
+      this.continues(answer.message.conversation_id);
+      this.update(current, {
+        message: answer.message,
+        suggestions: answer.suggestions,
+        ...answer.text && { text: answer.text },
+        ...answer.sql && { sql: answer.sql },
+        ...answer.queryTitle && { queryTitle: answer.queryTitle },
+        ...answer.result && { result: answer.result },
+        ...answer.error && { error: answer.error }
+      });
+    } catch (error) {
+      if (!controller.signal.aborted) this.update(current, { error: describeError(error) });
+    } finally {
+      if (this.asking === controller) this.set({ busy: false });
+    }
+  }
+  /** New chat: forgets this conversation (Databricks keeps it). */
+  reset() {
+    this.halt();
+    this.set({ turns: [], busy: false, loading: false, conversationId: void 0, historyError: void 0 });
+    if (!this.gone) this.remember?.(void 0);
+  }
+  halt() {
+    this.asking?.abort();
+    this.history?.abort();
+  }
+  dispose() {
+    this.gone = true;
+    this.halt();
+  }
+};
+var clip = (text, max) => text.length > max ? `${text.slice(0, max - 1)}\u2026` : text;
+function saveOneChat(state) {
+  if (!state.conversationId) return void 0;
+  return {
+    conversationId: state.conversationId,
+    turns: state.turns.slice(-KEEP_ONE_TURNS).map((turn) => {
+      const askAgain = Boolean(turn.responseId && turn.error && !turn.answer && !turn.stopped);
+      return {
+        question: clip(turn.question, 2e3),
+        started: turn.started,
+        ...turn.responseId && { responseId: turn.responseId },
+        ...turn.steps.length && { steps: turn.steps.slice(-KEEP_STEPS).map((step) => clip(step, 300)) },
+        ...turn.finished && !askAgain && { finished: turn.finished },
+        ...turn.error && !askAgain && { error: clip(turn.error, 300) }
+      };
+    })
+  };
+}
+var OneChat = class extends Store {
+  constructor(genieOne, saved, remember) {
+    super({ turns: [], busy: false, ...saved && { conversationId: saved.conversationId } });
+    this.genieOne = genieOne;
+    this.remember = remember;
+    if (saved?.turns.length) void this.reopen(saved);
+  }
+  asking;
+  reopening;
+  /** Disposed: it no longer saves (its workspace may have changed). */
+  gone = false;
+  save() {
+    if (!this.gone) this.remember?.(saveOneChat(this.state));
+  }
+  update(key, change) {
+    this.set((state) => ({ turns: state.turns.map((turn) => turn.key === key ? { ...turn, ...change } : turn) }));
+  }
+  /** Shows the remembered turns, then gets each answer back from Genie One, newest first. */
+  async reopen(saved) {
+    const controller = new AbortController();
+    this.reopening = controller;
+    const turns = saved.turns.map((turn, index) => ({
+      key: `saved-${index}-${turn.started}`,
+      question: turn.question,
+      steps: turn.steps ?? [],
+      started: turn.started,
+      ...turn.finished && { finished: turn.finished },
+      ...turn.responseId && { responseId: turn.responseId },
+      ...turn.error ? { error: turn.error } : turn.responseId ? { reopening: true } : { error: "This question didn't reach Genie One." }
+    }));
+    const unfinished = turns.some((turn) => turn.reopening && !turn.finished);
+    this.set({ turns, busy: unfinished });
+    try {
+      for (const turn of [...turns].reverse()) {
+        if (!turn.reopening || !turn.responseId) continue;
+        try {
+          const answer = await this.genieOne.response(saved.conversationId, turn.responseId, {
+            signal: controller.signal,
+            onProgress: (steps) => this.update(turn.key, { steps: [...steps] })
+          });
+          this.update(turn.key, {
+            answer,
+            reopening: false,
+            steps: answer.steps.length ? [...answer.steps] : turn.steps,
+            finished: turn.finished ?? Date.now()
+          });
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          this.update(turn.key, { reopening: false, error: `Couldn't get this answer back from Genie One: ${describeError(error)}`, finished: turn.finished ?? Date.now() });
+        }
+        if (!turn.finished) this.save();
+      }
+    } finally {
+      if (this.reopening === controller) {
+        this.reopening = void 0;
+        if (unfinished) this.set({ busy: false });
+      }
+    }
+  }
+  async ask(question) {
+    const text = question.trim();
+    if (!text || this.state.busy) return;
+    const controller = new AbortController();
+    this.asking = controller;
+    const key = turnKey("one");
+    this.set((state) => ({ turns: [...state.turns, { key, question: text, steps: [], started: Date.now() }], busy: true }));
+    try {
+      const answer = await this.genieOne.ask(text, {
+        ...this.state.conversationId && { conversationId: this.state.conversationId },
+        signal: controller.signal,
+        onStarted: ({ conversationId, responseId }) => {
+          this.set({ conversationId });
+          this.update(key, { responseId });
+          this.save();
+        },
+        onProgress: (steps) => this.update(key, { steps: [...steps] })
+      });
+      this.set({ conversationId: answer.conversationId });
+      this.update(key, { answer, steps: [...answer.steps], finished: Date.now() });
+    } catch (error) {
+      if (!controller.signal.aborted) this.update(key, { error: describeError(error), finished: Date.now() });
+    } finally {
+      if (this.asking === controller) this.set({ busy: false });
+      this.save();
+    }
+  }
+  stop() {
+    this.asking?.abort();
+    this.reopening?.abort();
+    this.set((state) => ({
+      busy: false,
+      turns: state.turns.map((turn) => turn.answer || turn.error ? turn : { ...turn, reopening: false, stopped: true, error: "Stopped.", finished: Date.now() })
+    }));
+    this.save();
+  }
+  /** New chat: forgets this conversation (Databricks keeps it). */
+  reset() {
+    this.halt();
+    this.set({ turns: [], busy: false, conversationId: void 0 });
+    if (!this.gone) this.remember?.(void 0);
+  }
+  halt() {
+    this.asking?.abort();
+    this.reopening?.abort();
+  }
+  dispose() {
+    this.gone = true;
+    this.halt();
+  }
+};
+var hostOf = (service) => {
+  const snapshot = service.snapshot();
+  return snapshot.status === "connected" ? snapshot.profile.host : void 0;
+};
+var GenieChats = class {
+  constructor(service, genieOne) {
+    this.service = service;
+    this.genieOne = genieOne;
+    this.host = hostOf(service);
+    this.stopWatching = service.subscribe(() => {
+      const host = hostOf(service);
+      if (host === this.host) return;
+      this.host = host;
+      this.clear();
+    });
+  }
+  spaces = /* @__PURE__ */ new Map();
+  one;
+  host;
+  stopWatching;
+  /** The Genie page's chat with a Genie agent: it reopens the conversation it had. */
+  space(spaceId) {
+    const key = `page|${spaceId}`;
+    let chat = this.spaces.get(key);
+    if (!chat) {
+      const prefs = this.service.preferences;
+      const saved = prefs.get(CONVERSATIONS)?.[spaceId];
+      chat = new SpaceChat(this.service, spaceId, saved, (conversationId) => {
+        const next = { ...prefs.get(CONVERSATIONS) ?? {} };
+        if (conversationId) next[spaceId] = conversationId;
+        else delete next[spaceId];
+        prefs.set(CONVERSATIONS, Object.keys(next).length ? next : void 0);
+      });
+      this.spaces.set(key, chat);
+    }
+    return chat;
+  }
+  /** A chat opened from a Genie link: kept while Buzz runs, not remembered. */
+  linked(spaceId, conversationId) {
+    const key = `link|${spaceId}|${conversationId ?? ""}`;
+    let chat = this.spaces.get(key);
+    if (!chat) {
+      chat = new SpaceChat(this.service, spaceId, conversationId);
+      this.spaces.set(key, chat);
+    }
+    return chat;
+  }
+  /** The Genie page's Genie One chat: it reopens the conversation it had. */
+  genieOneChat() {
+    if (!this.one) {
+      const prefs = this.service.preferences;
+      const saved = prefs.get(GENIE_ONE_CHAT);
+      this.one = new OneChat(this.genieOne, saved?.conversationId ? saved : void 0, (chat) => prefs.set(GENIE_ONE_CHAT, chat));
+    }
+    return this.one;
+  }
+  clear() {
+    for (const chat of this.spaces.values()) chat.dispose();
+    this.one?.dispose();
+    this.spaces.clear();
+    this.one = void 0;
+  }
+  dispose() {
+    this.stopWatching();
+    this.clear();
+  }
+};
+
 // packages/core/src/ui/data.tsx
 function DataTable(props) {
   const { result } = props;
@@ -1189,110 +1556,6 @@ function TurnView(props) {
     done && props.actions
   ));
 }
-function fromMessage(message) {
-  const parts = summarize(message);
-  return {
-    key: messageId(message),
-    question: message.content,
-    message,
-    suggestions: parts.suggestions,
-    ...parts.text && { text: parts.text },
-    ...parts.sql && { sql: parts.sql },
-    ...parts.queryTitle && { queryTitle: parts.queryTitle },
-    ...parts.error && { error: parts.error }
-  };
-}
-function useGenieConversation(service, spaceId, initialConversation) {
-  const [conversationId, setConversationId] = React.useState(initialConversation);
-  const [turns, setTurns] = React.useState([]);
-  const [busy, setBusy] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState();
-  const abort = React.useRef(void 0);
-  React.useEffect(() => {
-    setTurns([]);
-    setConversationId(initialConversation);
-    setHistoryError(void 0);
-    if (!initialConversation) return;
-    const controller = new AbortController();
-    void (async () => {
-      try {
-        const client = await service.ready(controller.signal);
-        const response = await client.get(
-          `/api/2.0/genie/spaces/${encodeURIComponent(spaceId)}/conversations/${encodeURIComponent(initialConversation)}/messages`,
-          { query: { page_size: 50 }, signal: controller.signal }
-        );
-        const messages = [...response.messages ?? []].map((message) => ({ ...message, conversation_id: initialConversation })).sort((a, b) => (a.created_timestamp ?? 0) - (b.created_timestamp ?? 0));
-        if (!controller.signal.aborted) setTurns(messages.map(fromMessage));
-      } catch (error) {
-        if (!controller.signal.aborted) setHistoryError(describeError(error));
-      }
-    })();
-    return () => controller.abort();
-  }, [service, spaceId, initialConversation]);
-  React.useEffect(() => () => abort.current?.abort(), []);
-  const update = (key, change) => setTurns((current) => current.map((turn) => turn.key === key ? { ...turn, ...change } : turn));
-  const loadResult = async (key) => {
-    const turn = turns.find((candidate) => candidate.key === key);
-    const message = turn?.message;
-    const attachment = message && summarize(message).queryAttachmentId;
-    if (!message || !attachment) return;
-    update(key, { loadingResult: true });
-    try {
-      const client = await service.ready();
-      const result = await new Genie(client).result(spaceId, message, attachment);
-      update(key, { result, loadingResult: false });
-    } catch (error) {
-      update(key, { loadingResult: false, error: describeError(error) });
-    }
-  };
-  const ask = async (question) => {
-    const text = question.trim();
-    if (!text || busy) return;
-    abort.current?.abort();
-    const controller = new AbortController();
-    abort.current = controller;
-    const key = `pending-${Date.now()}`;
-    let current = key;
-    setTurns((existing) => [...existing, { key, question: text, suggestions: [] }]);
-    setBusy(true);
-    try {
-      const client = await service.ready(controller.signal);
-      const genie = new Genie(client);
-      const answer = await genie.answer(spaceId, text, {
-        ...conversationId && { conversationId },
-        signal: controller.signal,
-        onUpdate: (message) => {
-          const id = messageId(message) || current;
-          const previous = current;
-          setTurns((existing) => existing.map((turn) => turn.key === previous ? { ...turn, key: id, message } : turn));
-          current = id;
-          if (message.conversation_id) setConversationId(message.conversation_id);
-        }
-      });
-      setConversationId(answer.message.conversation_id);
-      update(current, {
-        message: answer.message,
-        suggestions: answer.suggestions,
-        ...answer.text && { text: answer.text },
-        ...answer.sql && { sql: answer.sql },
-        ...answer.queryTitle && { queryTitle: answer.queryTitle },
-        ...answer.result && { result: answer.result },
-        ...answer.error && { error: answer.error }
-      });
-    } catch (error) {
-      if (!controller.signal.aborted) update(current, { error: describeError(error) });
-    } finally {
-      if (abort.current === controller) setBusy(false);
-    }
-  };
-  const reset = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns([]);
-    setConversationId(void 0);
-  };
-  return { turns, busy, ask, reset, loadResult, conversationId, historyError };
-}
 function Composer(props) {
   const [text, setText] = React.useState("");
   const submit = () => {
@@ -1333,13 +1596,19 @@ function Composer(props) {
 }
 function GenieChat(props) {
   const { service, space } = props;
-  const chat = useGenieConversation(service, space.space_id, props.conversationId);
+  const state = useChat(props.chat);
+  const chat = {
+    ...state,
+    ask: (question) => props.chat.ask(question),
+    reset: () => props.chat.reset(),
+    loadResult: (key) => props.chat.loadResult(key)
+  };
   const bottom = React.useRef(null);
   React.useEffect(() => {
     bottom.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [chat.turns.length, chat.turns[chat.turns.length - 1]?.message?.status]);
   const link = service.workspaceUrl(Genie.webPath(space.space_id, chat.conversationId));
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 16, style: { minHeight: 0, flex: 1 } }, !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "flex-start", justify: "space-between", gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 16 }), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "lg", weight: 500 }, space.title), /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, "Genie")), space.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { maxWidth: 680 } }, space.description)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, chat.turns.length > 0 && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: chat.reset }, "New chat"), link && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => openExternal(link) }, "Open in Databricks"))), chat.historyError && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Couldn't load this conversation" }, chat.historyError), /* @__PURE__ */ React.createElement(Stack, { gap: 22, style: { flex: 1 } }, chat.turns.length === 0 && !props.compact && /* @__PURE__ */ React.createElement(Stack, { gap: 10, style: { padding: "24px 0" } }, /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Ask a question in plain language. Genie writes the SQL, runs it with your access, and charts the answer."), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, ["What data can I ask about?", "What are the key metrics here?", "Show the trend over the last 12 months"].map((example) => /* @__PURE__ */ React.createElement(Button, { key: example, size: "sm", variant: "ghost", style: { border: "1px solid var(--dbx-border)" }, onClick: () => void chat.ask(example) }, example)))), chat.turns.map((turn) => /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 16, style: { minHeight: 0, flex: 1 } }, !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "flex-start", justify: "space-between", gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 16 }), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "lg", weight: 500 }, space.title), /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, "Genie")), space.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { maxWidth: 680 } }, space.description)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, chat.turns.length > 0 && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: chat.reset }, "New chat"), link && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: () => openExternal(link) }, "Open in Databricks"))), chat.historyError && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Couldn't load this conversation" }, chat.historyError), /* @__PURE__ */ React.createElement(Stack, { gap: 22, style: { flex: 1 } }, chat.loading && chat.turns.length === 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", style: { padding: "24px 0" } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Opening this conversation\u2026")), chat.turns.length === 0 && !chat.loading && !props.compact && /* @__PURE__ */ React.createElement(Stack, { gap: 10, style: { padding: "24px 0" } }, /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Ask a question in plain language. Genie writes the SQL, runs it with your access, and charts the answer."), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, ["What data can I ask about?", "What are the key metrics here?", "Show the trend over the last 12 months"].map((example) => /* @__PURE__ */ React.createElement(Button, { key: example, size: "sm", variant: "ghost", style: { border: "1px solid var(--dbx-border)" }, onClick: () => void chat.ask(example) }, example)))), chat.turns.map((turn) => /* @__PURE__ */ React.createElement(
     TurnView,
     {
       key: turn.key,
@@ -1572,15 +1841,28 @@ var GenieOne = class {
     const conversationId = started.conversation_id ?? options.conversationId ?? "";
     const responseId = started.response_id ?? "";
     if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
+    options.onStarted?.({ conversationId, responseId });
+    return this.follow(mcp, conversationId, responseId, started, resultText(asked), options);
+  }
+  /**
+   * An earlier response, by its IDs: Genie One keeps them, even after later
+   * questions in the conversation. A response still running is followed to
+   * its end.
+   */
+  async response(conversationId, responseId, options = {}) {
+    return this.follow(await this.mcp(), conversationId, responseId, {}, "", options);
+  }
+  async follow(mcp, conversationId, responseId, started, startedMarkdown, options) {
+    const { signal } = options;
     let state = started;
-    let markdown = resultText(asked);
+    let markdown = startedMarkdown;
     let unknowns = 0;
     let steps = [];
     const deadline = Date.now() + 10 * 6e4;
     try {
       while (!state.status || state.status === "in_progress" || state.status === "unknown" && unknowns < 5) {
         if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
-        await sleep(POLL_MS, signal);
+        if (state.status) await sleep(POLL_MS, signal);
         const polled = await mcp.callTool(
           "genie_poll_response",
           { conversation_id: conversationId, response_id: responseId },
@@ -1711,7 +1993,8 @@ function oneTurnMarkdown(turn) {
 function OneTurnView(props) {
   const { turn } = props;
   const answer = turn.answer;
-  const live = !answer && !turn.error;
+  const fetching = Boolean(turn.reopening && turn.finished);
+  const live = !answer && !turn.error && !fetching;
   const parts = React.useMemo(() => answer ? answerParts(answer) : void 0, [answer]);
   const [, tick] = React.useState(0);
   React.useEffect(() => {
@@ -1719,54 +2002,13 @@ function OneTurnView(props) {
     const timer = setInterval(() => tick((n) => n + 1), 1e3);
     return () => clearInterval(timer);
   }, [live]);
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, turn.question), /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.compact ? 12 : 16, display: "flex", flexDirection: "column", gap: 14 } }, live ? /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Thinking \xB7 ", seconds(turn), "s"), /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: true })) : turn.steps.length > 0 && /* @__PURE__ */ React.createElement(Disclosure, { summary: `Thought for ${seconds(turn)}s \xB7 ${turn.steps.length} ${turn.steps.length === 1 ? "step" : "steps"}` }, /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: false })), turn.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Genie One couldn't answer" }, turn.error), answer?.status === "incomplete" && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Genie One stopped early" }, "The answer may be partial."), parts?.text && /* @__PURE__ */ React.createElement(Markdown, { source: parts.text }), parts && parts.results.length > 0 && // The last query is the one the answer describes; earlier ones are drafts.
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, turn.question), /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.compact ? 12 : 16, display: "flex", flexDirection: "column", gap: 14 } }, live ? /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Thinking \xB7 ", seconds(turn), "s"), /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: true })) : turn.steps.length > 0 && /* @__PURE__ */ React.createElement(Disclosure, { summary: `Thought for ${seconds(turn)}s \xB7 ${turn.steps.length} ${turn.steps.length === 1 ? "step" : "steps"}` }, /* @__PURE__ */ React.createElement(Timeline, { steps: turn.steps, live: false })), fetching && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Getting this answer back from Genie One\u2026")), turn.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Genie One couldn't answer" }, turn.error), answer?.status === "incomplete" && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Genie One stopped early" }, "The answer may be partial."), parts?.text && /* @__PURE__ */ React.createElement(Markdown, { source: parts.text }), parts && parts.results.length > 0 && // The last query is the one the answer describes; earlier ones are drafts.
   /* @__PURE__ */ React.createElement(ResultView, { result: parts.results[parts.results.length - 1], maxHeight: props.compact ? 200 : 320 }), parts && parts.results.length > 1 && /* @__PURE__ */ React.createElement(Disclosure, { summary: `Earlier results (${parts.results.length - 1})` }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, parts.results.slice(0, -1).map((result, index) => /* @__PURE__ */ React.createElement(ResultView, { key: index, result, maxHeight: 240 })))), answer && answer.sql.length > 0 && /* @__PURE__ */ React.createElement(Disclosure, { summary: answer.sql.length === 1 ? "SQL Genie One ran" : `SQL Genie One ran (${answer.sql.length})` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, answer.sql.map((statement, index) => /* @__PURE__ */ React.createElement(CodeView, { key: index, code: formatSql(statement) })))), answer && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, answer.deepLink && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => answer.deepLink && openExternal(answer.deepLink) }, "Explore in Databricks"), props.actions)));
-}
-function useGenieOneConversation(genieOne) {
-  const [conversationId, setConversationId] = React.useState();
-  const [turns, setTurns] = React.useState([]);
-  const [busy, setBusy] = React.useState(false);
-  const abort = React.useRef(void 0);
-  React.useEffect(() => () => abort.current?.abort(), []);
-  const update = (key, change) => setTurns((current) => current.map((turn) => turn.key === key ? { ...turn, ...change } : turn));
-  const ask = async (question) => {
-    const text = question.trim();
-    if (!text || busy) return;
-    const controller = new AbortController();
-    abort.current = controller;
-    const key = `one-${Date.now()}`;
-    setTurns((existing) => [...existing, { key, question: text, steps: [], started: Date.now() }]);
-    setBusy(true);
-    try {
-      const answer = await genieOne.ask(text, {
-        ...conversationId && { conversationId },
-        signal: controller.signal,
-        onProgress: (steps) => update(key, { steps: [...steps] })
-      });
-      setConversationId(answer.conversationId);
-      update(key, { answer, steps: [...answer.steps], finished: Date.now() });
-    } catch (error) {
-      if (!controller.signal.aborted) update(key, { error: describeError(error), finished: Date.now() });
-    } finally {
-      if (abort.current === controller) setBusy(false);
-    }
-  };
-  const stop = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns((current) => current.map((turn) => turn.answer || turn.error ? turn : { ...turn, error: "Stopped.", finished: Date.now() }));
-  };
-  const reset = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns([]);
-    setConversationId(void 0);
-  };
-  return { turns, busy, ask, stop, reset, conversationId };
 }
 var EXAMPLES = ["What data do I have access to?", "Which tables are used the most?", "What changed in the last week?"];
 function GenieOneChat(props) {
-  const chat = useGenieOneConversation(props.genieOne);
+  const state = useChat(props.chat);
+  const chat = { ...state, ask: (question) => props.chat.ask(question), stop: () => props.chat.stop(), reset: () => props.chat.reset() };
   const bottom = React.useRef(null);
   const last = chat.turns[chat.turns.length - 1];
   React.useEffect(() => {
@@ -1897,7 +2139,7 @@ function genieSidebar(service, store, genieOne) {
     ))), props.children && /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", padding: 6 } }, props.children)));
   };
 }
-function geniePage(service, store, genieOne) {
+function geniePage(service, store, genieOne, chats) {
   return function GeniePage(_props) {
     const snapshot = useConnection(service);
     const spaces = useSpaces(store);
@@ -1914,11 +2156,11 @@ function geniePage(service, store, genieOne) {
         },
         "Genie answers questions about your data in plain language, with the access you already have."
       );
-    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = /* @__PURE__ */ React.createElement(GenieOneChat, { service, genieOne });
+    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = /* @__PURE__ */ React.createElement(GenieOneChat, { chat: chats.genieOneChat() });
     else if (spaces.status === "error") body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't list Genie agents" }, spaces.error);
     else if (!space)
       body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Pick an agent on the left to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
-    else body = /* @__PURE__ */ React.createElement(GenieChat, { key: space.space_id, service, space });
+    else body = /* @__PURE__ */ React.createElement(GenieChat, { key: space.space_id, service, space, chat: chats.space(space.space_id) });
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { height: "100%", overflow: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 920, margin: "0 auto", padding: "24px 28px 16px", minHeight: "100%", display: "flex", flexDirection: "column" } }, body));
   };
 }
@@ -2008,15 +2250,14 @@ function GeniePicker(props) {
   const space = useOne ? void 0 : spaces.spaces.find((candidate) => candidate.space_id === selected) ?? spaces.spaces[0];
   const value = useOne ? GENIE_ONE_ENTRY : space?.space_id ?? "";
   return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 14 }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Ask Genie"), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), spaces.status === "error" && !oneAvailable && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, spaces.error), (oneAvailable || spaces.spaces.length > 0) && /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value, onChange: (event) => setSelected(event.target.value), "aria-label": "Ask" }, oneAvailable && /* @__PURE__ */ React.createElement("option", { value: GENIE_ONE_ENTRY }, "Genie One \xB7 all your data"), spaces.spaces.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.space_id, value: candidate.space_id }, candidate.title))), !oneAvailable && spaces.status === "ready" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "No Genie agents are shared with you yet."), useOne && /* @__PURE__ */ React.createElement(
-    GenieOneChat,
+    OwnGenieOneChat,
     {
-      service,
       genieOne,
       compact: true,
       answerActions: (turn) => /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => props.onInsert(oneTurnMarkdown(turn)) }, "Insert into message")
     }
   ), space && /* @__PURE__ */ React.createElement(
-    GenieChat,
+    OwnGenieChat,
     {
       key: space.space_id,
       service,
@@ -2034,7 +2275,16 @@ function genieLinkChip(service, store) {
     return /* @__PURE__ */ React.createElement("span", { style: { display: "inline-flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { "data-dbx": "", style: { display: "inline-flex" } }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 11 })), /* @__PURE__ */ React.createElement("span", null, "Genie", space ? ` \xB7 ${space.title}` : link?.conversationId ? " conversation" : ""));
   };
 }
-function geniePanel(service, store) {
+function OwnGenieOneChat(props) {
+  const { genieOne, ...rest } = props;
+  const chat = useOwnChat(() => new OneChat(genieOne), [genieOne]);
+  return /* @__PURE__ */ React.createElement(GenieOneChat, { chat, ...rest });
+}
+function OwnGenieChat(props) {
+  const chat = useOwnChat(() => new SpaceChat(props.service, props.space.space_id), [props.service, props.space.space_id]);
+  return /* @__PURE__ */ React.createElement(GenieChat, { chat, ...props });
+}
+function geniePanel(service, store, chats) {
   return function GeniePanel(props) {
     const link = React.useMemo(() => parseGenieUrl(props.target), [props.target]);
     const snapshot = useConnection(service);
@@ -2054,7 +2304,7 @@ function geniePanel(service, store) {
     else if (space.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Can't open this Genie agent" }, String(space.error.message));
     else if (space.data === "elsewhere") body = /* @__PURE__ */ React.createElement(Notice, { title: "Different workspace" }, "This Genie agent is in ", link?.host.replace("https://", ""), ".");
     else if (space.data)
-      body = /* @__PURE__ */ React.createElement(GenieChat, { service, space: space.data, ...link?.conversationId && { conversationId: link.conversationId } });
+      body = /* @__PURE__ */ React.createElement(GenieChat, { service, space: space.data, chat: chats.linked(space.data.space_id, link?.conversationId) });
     else body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Not a Genie link.");
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-panel-inset, 16px)", display: "flex", flexDirection: "column", minHeight: "100%" } }, body);
   };
@@ -2139,6 +2389,8 @@ function apply(ctx) {
   const live = attach(ctx, { id: "bkvarda.databricks-genie", name: "Databricks Genie" }, (scope, databricks) => {
     const store = new SpacesStore(databricks);
     const genieOne = new GenieOne(databricks);
+    const chats = new GenieChats(databricks, genieOne);
+    scope.effect(() => () => chats.dispose());
     scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store, genieOne) });
     scope.conversation.registerLink({
       id: "genie-link",
@@ -2153,13 +2405,13 @@ function apply(ctx) {
       matches: (url) => parseGenieUrl(url) !== void 0,
       order: -10,
       keepOpen: true,
-      component: geniePanel(databricks, store)
+      component: geniePanel(databricks, store, chats)
     });
     scope.inject(["agents"], (agents) => {
       for (const tool of genieTools(databricks, store, genieOne)) agents.agents.addTool(tool);
     });
     return {
-      page: geniePage(databricks, store, genieOne),
+      page: geniePage(databricks, store, genieOne, chats),
       sidebar: genieSidebar(databricks, store, genieOne)
     };
   });

@@ -9,7 +9,8 @@ import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice
 import { ResultView } from "@dbx/core/ui/data";
 import { Markdown, parseBlocks } from "@dbx/core/ui/markdown";
 import { Composer } from "./chat";
-import { cleanAnswer, type GenieOne, type GenieOneAnswer, stripComments, withoutChartCaveats } from "./genie-one";
+import { type OneChat, useChat } from "./chats";
+import { cleanAnswer, type GenieOneAnswer, stripComments, withoutChartCaveats } from "./genie-one";
 
 export { cleanAnswer };
 
@@ -21,6 +22,12 @@ export type OneTurn = {
   finished?: number;
   answer?: GenieOneAnswer;
   error?: string;
+  /** Genie One's ID for this answer, which gets it back later. */
+  responseId?: string;
+  /** Getting a remembered answer back from Genie One. */
+  reopening?: boolean;
+  /** You stopped it. */
+  stopped?: boolean;
 };
 
 export type Step = Readonly<{ kind: "thought" | "sql" | "result" | "other"; text: string }>;
@@ -151,7 +158,9 @@ export function oneTurnMarkdown(turn: OneTurn): string {
 export function OneTurnView(props: { turn: OneTurn; compact?: boolean; actions?: React.ReactNode }) {
   const { turn } = props;
   const answer = turn.answer;
-  const live = !answer && !turn.error;
+  // A remembered answer being fetched again; one still unfinished shows live.
+  const fetching = Boolean(turn.reopening && turn.finished);
+  const live = !answer && !turn.error && !fetching;
   const parts = React.useMemo(() => (answer ? answerParts(answer) : undefined), [answer]);
   const [, tick] = React.useState(0);
   React.useEffect(() => {
@@ -176,6 +185,14 @@ export function OneTurnView(props: { turn: OneTurn; compact?: boolean; actions?:
               <Timeline steps={turn.steps} live={false} />
             </Disclosure>
           )
+        )}
+        {fetching && (
+          <Stack direction="row" gap={8} align="center">
+            <Spinner size={12} />
+            <Text size="sm" tone="subtle">
+              Getting this answer back from Genie One…
+            </Text>
+          </Stack>
         )}
         {turn.error && <Notice tone="danger" title="Genie One couldn't answer">{turn.error}</Notice>}
         {answer?.status === "incomplete" && <Notice tone="warning" title="Genie One stopped early">The answer may be partial.</Notice>}
@@ -217,64 +234,16 @@ export function OneTurnView(props: { turn: OneTurn; compact?: boolean; actions?:
   );
 }
 
-export function useGenieOneConversation(genieOne: GenieOne) {
-  const [conversationId, setConversationId] = React.useState<string>();
-  const [turns, setTurns] = React.useState<OneTurn[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const abort = React.useRef<AbortController | undefined>(undefined);
-  React.useEffect(() => () => abort.current?.abort(), []);
-
-  const update = (key: string, change: Partial<OneTurn>) =>
-    setTurns((current) => current.map((turn) => (turn.key === key ? { ...turn, ...change } : turn)));
-
-  const ask = async (question: string) => {
-    const text = question.trim();
-    if (!text || busy) return;
-    const controller = new AbortController();
-    abort.current = controller;
-    const key = `one-${Date.now()}`;
-    setTurns((existing) => [...existing, { key, question: text, steps: [], started: Date.now() }]);
-    setBusy(true);
-    try {
-      const answer = await genieOne.ask(text, {
-        ...(conversationId && { conversationId }),
-        signal: controller.signal,
-        onProgress: (steps) => update(key, { steps: [...steps] }),
-      });
-      setConversationId(answer.conversationId);
-      update(key, { answer, steps: [...answer.steps], finished: Date.now() });
-    } catch (error) {
-      if (!controller.signal.aborted) update(key, { error: describeError(error), finished: Date.now() });
-    } finally {
-      if (abort.current === controller) setBusy(false);
-    }
-  };
-
-  const stop = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns((current) => current.map((turn) => (turn.answer || turn.error ? turn : { ...turn, error: "Stopped.", finished: Date.now() })));
-  };
-
-  const reset = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns([]);
-    setConversationId(undefined);
-  };
-
-  return { turns, busy, ask, stop, reset, conversationId };
-}
-
 const EXAMPLES = ["What data do I have access to?", "Which tables are used the most?", "What changed in the last week?"];
 
 export function GenieOneChat(props: {
-  service: DatabricksService;
-  genieOne: GenieOne;
+  /** The chat: the Genie page's, kept by the plugin, or the composer's own. */
+  chat: OneChat;
   compact?: boolean;
   answerActions?(turn: OneTurn): React.ReactNode;
 }) {
-  const chat = useGenieOneConversation(props.genieOne);
+  const state = useChat(props.chat);
+  const chat = { ...state, ask: (question: string) => props.chat.ask(question), stop: () => props.chat.stop(), reset: () => props.chat.reset() };
   const bottom = React.useRef<HTMLDivElement>(null);
   const last = chat.turns[chat.turns.length - 1];
   React.useEffect(() => {

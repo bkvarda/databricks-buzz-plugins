@@ -1834,6 +1834,7 @@ var StatementError = class extends Error {
   }
 };
 var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
+var EXPIRED = "Databricks no longer keeps this result. Run the statement again to see it.";
 var Sql = class {
   constructor(client) {
     this.client = client;
@@ -1855,7 +1856,9 @@ var Sql = class {
       {
         statement,
         warehouse_id: options.warehouseId,
-        wait_timeout: "30s",
+        // Short, so the statement ID comes back soon: with it, a run cut off
+        // (Buzz closing) can be picked up again.
+        wait_timeout: "10s",
         on_wait_timeout: "CONTINUE",
         disposition: "INLINE",
         format: "JSON_ARRAY",
@@ -1863,9 +1866,30 @@ var Sql = class {
         ...options.catalog && { catalog: options.catalog },
         ...options.schema && { schema: options.schema }
       },
-      { timeoutMs: 45e3, ...signal && { signal } }
+      { timeoutMs: 3e4, ...signal && { signal } }
     );
     options.onStatement?.(response.statement_id);
+    return this.follow(response, options);
+  }
+  /**
+   * A statement started earlier, by its ID: waits for it if it's still
+   * running, then returns its first result chunk. Databricks keeps a result
+   * only for a while; after that this fails with `state` CLOSED.
+   */
+  async resume(statementId, options = {}) {
+    const signal = options.signal;
+    let response;
+    try {
+      response = await this.client.get(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}`, signal ? { signal } : {});
+    } catch (error) {
+      if (error.status === 404) throw new StatementError(EXPIRED, statementId, "CLOSED");
+      throw error;
+    }
+    return this.follow(response, options);
+  }
+  async follow(first, options) {
+    const signal = options.signal;
+    let response = first;
     const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
     const cancel = () => void this.cancel(response.statement_id).catch(() => {
     });
@@ -1889,6 +1913,7 @@ var Sql = class {
       signal?.removeEventListener("abort", cancel);
     }
     const state = response.status?.state;
+    if (state === "CLOSED") throw new StatementError(EXPIRED, response.statement_id, state);
     if (state !== "SUCCEEDED")
       throw new StatementError(
         response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,

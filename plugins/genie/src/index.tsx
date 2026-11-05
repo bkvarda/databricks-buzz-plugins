@@ -6,6 +6,7 @@ import { parseGenieUrl } from "@dbx/core/api/genie";
 import { bindReact, React } from "@dbx/core/react";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
 import { DATABRICKS_ICON_MONO } from "@dbx/core/ui/theme";
+import { GenieChats } from "./chats";
 import { composerTool, genieLinkChip, geniePanel } from "./conversation";
 import { GenieOne } from "./genie-one";
 import { geniePage, genieSidebar, SpacesStore } from "./page";
@@ -18,6 +19,9 @@ export function apply(ctx: Context) {
   const live = attach(ctx, { id: "bkvarda.databricks-genie", name: "Databricks Genie" }, (scope, databricks) => {
     const store = new SpacesStore(databricks);
     const genieOne = new GenieOne(databricks);
+    // Chats outlive the page: a question keeps running while you're elsewhere.
+    const chats = new GenieChats(databricks, genieOne);
+    scope.effect(() => () => chats.dispose());
     scope.conversation.registerTool({ id: "ask-genie", title: "Ask Genie", order: 20, component: composerTool(databricks, store, genieOne) });
     scope.conversation.registerLink({
       id: "genie-link",
@@ -32,13 +36,13 @@ export function apply(ctx: Context) {
       matches: (url) => parseGenieUrl(url) !== undefined,
       order: -10,
       keepOpen: true,
-      component: geniePanel(databricks, store),
+      component: geniePanel(databricks, store, chats),
     });
     scope.inject(["agents"], (agents: Context) => {
       for (const tool of genieTools(databricks, store, genieOne)) agents.agents.addTool(tool);
     });
     return {
-      page: geniePage(databricks, store, genieOne),
+      page: geniePage(databricks, store, genieOne, chats),
       sidebar: genieSidebar(databricks, store, genieOne),
     };
   });

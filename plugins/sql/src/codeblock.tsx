@@ -109,7 +109,7 @@ export function sqlBlock(service: DatabricksService, runs: Runs) {
                 <ResultView result={run.result} maxHeight={260} />
                 <Stack direction="row" gap={8} align="center" justify="space-between">
                   <Text tone="tertiary" size="xs">
-                    Ran as you on {run.warehouse} in {(run.ms / 1000).toFixed(1)}s
+                    Ran as you on {run.warehouse}{run.ms !== undefined && ` in ${(run.ms / 1000).toFixed(1)}s`}
                   </Text>
                   <Button size="sm" variant="ghost" onClick={() => runs.clear(props.code)}>
                     Hide result

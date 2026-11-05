@@ -801,7 +801,7 @@ function sqlBlock(service, runs) {
         action: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => void runs.run(props.code) }, "Run anyway"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(props.code) }, "Cancel"))
       },
       "It will run with your Databricks access. Check it before running."
-    ), run.status === "running" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Running on Databricks\u2026"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.cancel(props.code) }, "Cancel")), run.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "The query failed", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(props.code) }, "Dismiss") }, run.message), run.status === "done" && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(ResultView, { result: run.result, maxHeight: 260 }), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Ran as you on ", run.warehouse, " in ", (run.ms / 1e3).toFixed(1), "s"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(props.code) }, "Hide result")))));
+    ), run.status === "running" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Running on Databricks\u2026"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.cancel(props.code) }, "Cancel")), run.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "The query failed", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(props.code) }, "Dismiss") }, run.message), run.status === "done" && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(ResultView, { result: run.result, maxHeight: 260 }), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Ran as you on ", run.warehouse, run.ms !== void 0 && ` in ${(run.ms / 1e3).toFixed(1)}s`), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(props.code) }, "Hide result")))));
   };
 }
 function sqlBlockAction(service, runs) {
@@ -833,6 +833,7 @@ var StatementError = class extends Error {
   }
 };
 var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
+var EXPIRED = "Databricks no longer keeps this result. Run the statement again to see it.";
 var Sql = class {
   constructor(client) {
     this.client = client;
@@ -854,7 +855,9 @@ var Sql = class {
       {
         statement,
         warehouse_id: options.warehouseId,
-        wait_timeout: "30s",
+        // Short, so the statement ID comes back soon: with it, a run cut off
+        // (Buzz closing) can be picked up again.
+        wait_timeout: "10s",
         on_wait_timeout: "CONTINUE",
         disposition: "INLINE",
         format: "JSON_ARRAY",
@@ -862,9 +865,30 @@ var Sql = class {
         ...options.catalog && { catalog: options.catalog },
         ...options.schema && { schema: options.schema }
       },
-      { timeoutMs: 45e3, ...signal && { signal } }
+      { timeoutMs: 3e4, ...signal && { signal } }
     );
     options.onStatement?.(response.statement_id);
+    return this.follow(response, options);
+  }
+  /**
+   * A statement started earlier, by its ID: waits for it if it's still
+   * running, then returns its first result chunk. Databricks keeps a result
+   * only for a while; after that this fails with `state` CLOSED.
+   */
+  async resume(statementId, options = {}) {
+    const signal = options.signal;
+    let response;
+    try {
+      response = await this.client.get(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}`, signal ? { signal } : {});
+    } catch (error) {
+      if (error.status === 404) throw new StatementError(EXPIRED, statementId, "CLOSED");
+      throw error;
+    }
+    return this.follow(response, options);
+  }
+  async follow(first, options) {
+    const signal = options.signal;
+    let response = first;
     const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
     const cancel = () => void this.cancel(response.statement_id).catch(() => {
     });
@@ -888,6 +912,7 @@ var Sql = class {
       signal?.removeEventListener("abort", cancel);
     }
     const state = response.status?.state;
+    if (state === "CLOSED") throw new StatementError(EXPIRED, response.statement_id, state);
     if (state !== "SUCCEEDED")
       throw new StatementError(
         response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
@@ -942,14 +967,32 @@ async function resolveWarehouse(service, explicit) {
   if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
   return { id: chosen.id, name: chosen.name };
 }
+var hostOf = (service) => {
+  const snapshot = service.snapshot();
+  return snapshot.status === "connected" ? snapshot.profile.host : void 0;
+};
 var Runs = class {
   constructor(service) {
     this.service = service;
+    this.host = hostOf(service);
   }
   runs = /* @__PURE__ */ new Map();
   controllers = /* @__PURE__ */ new Map();
   listeners = /* @__PURE__ */ new Set();
   version = 0;
+  host;
+  /** Stops and forgets every run when the workspace changes; returns the unsubscribe. */
+  watchWorkspace() {
+    return this.service.subscribe(() => {
+      const host = hostOf(this.service);
+      if (host === this.host) return;
+      this.host = host;
+      for (const controller of this.controllers.values()) controller.abort();
+      this.controllers.clear();
+      this.runs.clear();
+      this.bump();
+    });
+  }
   get(code) {
     return this.runs.get(code.trim());
   }
@@ -978,12 +1021,31 @@ var Runs = class {
         warehouseId: warehouse.id,
         rowLimit: 1e3,
         signal: controller.signal,
-        onStatement: (id) => this.set(key, { status: "running", startedAt, statementId: id })
+        onStatement: (id) => this.set(key, { status: "running", startedAt, statementId: id, warehouse: warehouse.name })
       });
       this.set(key, { status: "done", result, statementId, ms: Date.now() - startedAt, warehouse: warehouse.name });
     } catch (error) {
       if (controller.signal.aborted) this.clear(key);
       else this.set(key, { status: "error", message: describeError(error) });
+    }
+  }
+  /** Shows a statement started earlier (before a restart) again: Databricks
+   * gives its result back by statement ID, or a running one's when it ends. */
+  async resume(code, earlier) {
+    const key = code.trim();
+    if (this.runs.has(key)) return;
+    const controller = new AbortController();
+    this.controllers.set(key, controller);
+    this.set(key, { status: "running", startedAt: earlier.startedAt, statementId: earlier.statementId, ...earlier.warehouse && { warehouse: earlier.warehouse } });
+    try {
+      const client = await this.service.ready(controller.signal);
+      const { statementId, result } = await new Sql(client).resume(earlier.statementId, { signal: controller.signal });
+      this.set(key, { status: "done", result, statementId, ...earlier.ms !== void 0 && { ms: earlier.ms }, warehouse: earlier.warehouse ?? "SQL warehouse" });
+    } catch (error) {
+      if (controller.signal.aborted) this.clear(key);
+      else this.set(key, { status: "error", message: describeError(error) });
+    } finally {
+      if (this.controllers.get(key) === controller) this.controllers.delete(key);
     }
   }
   cancel(code) {
@@ -1109,17 +1171,80 @@ ${table.comment}` : "",
 }
 
 // plugins/sql/src/page.tsx
+var SQL_TEXT = "sqlText";
+var SQL_LAST_RUN = "sqlLastRun";
+var DEFAULT_TEXT = "SELECT current_user(), current_catalog(), current_date()";
+var MAX_SAVED_TEXT = 5e4;
 var Editor = class {
-  text = "SELECT current_user(), current_catalog(), current_date()";
+  constructor(service, runs) {
+    this.service = service;
+    this.runs = runs;
+  }
+  state = { text: DEFAULT_TEXT };
   listeners = /* @__PURE__ */ new Set();
-  snapshot = () => this.text;
+  restoredFor;
+  edited = false;
+  saving;
+  snapshot = () => this.state;
   subscribe = (listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
-  set(text) {
-    this.text = text;
+  change(next) {
+    this.state = { ...this.state, ...next };
     for (const listener of [...this.listeners]) listener();
+  }
+  /** What the page last showed in this workspace; once per workspace. */
+  restore() {
+    const snapshot = this.service.snapshot();
+    const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
+    if (!host || host === this.restoredFor) return;
+    const first = this.restoredFor === void 0;
+    this.restoredFor = host;
+    if (first && this.edited) return this.set(this.state.text);
+    const prefs = this.service.preferences;
+    const run = prefs.get(SQL_LAST_RUN);
+    this.change({ text: prefs.get(SQL_TEXT) ?? DEFAULT_TEXT, shown: run?.statement });
+    if (run?.statementId) void this.runs.resume(run.statement, run);
+  }
+  set(text) {
+    this.edited = true;
+    this.change({ text });
+    if (this.saving) clearTimeout(this.saving);
+    const host = this.restoredFor;
+    this.saving = setTimeout(() => {
+      if (host !== this.restoredFor) return;
+      this.service.preferences.set(SQL_TEXT, text === DEFAULT_TEXT || text.length > MAX_SAVED_TEXT ? void 0 : text);
+    }, 600);
+  }
+  /** Runs `text` and shows that run, remembering it once it has a statement ID. */
+  execute(text) {
+    if (!text.trim()) return;
+    this.edited = true;
+    this.change({ shown: text });
+    this.service.preferences.set(SQL_LAST_RUN, void 0);
+    this.runs.request(text);
+  }
+  /** Saves the shown run when it gets a statement ID or finishes. */
+  watch() {
+    let saved;
+    return this.runs.subscribe(() => {
+      const statement = this.state.shown;
+      const run = statement ? this.runs.get(statement) : void 0;
+      if (!statement || !run || run.status !== "running" && run.status !== "done" || !run.statementId) return;
+      const previous = this.service.preferences.get(SQL_LAST_RUN);
+      const value = {
+        statement,
+        statementId: run.statementId,
+        startedAt: run.status === "running" ? run.startedAt : previous?.statementId === run.statementId ? previous.startedAt : Date.now() - (run.ms ?? 0),
+        ...run.warehouse && { warehouse: run.warehouse },
+        ...run.status === "done" && run.ms !== void 0 && { ms: run.ms }
+      };
+      const key = JSON.stringify(value);
+      if (key === saved || statement.length > MAX_SAVED_TEXT) return;
+      saved = key;
+      this.service.preferences.set(SQL_LAST_RUN, value);
+    });
   }
 };
 function Tree(props) {
@@ -1195,19 +1320,16 @@ function sqlSidebar(service, editor) {
 function sqlPage(service, editor, runs) {
   return function SqlPage(_props) {
     const snapshot = useConnection(service);
-    const text = React.useSyncExternalStore(editor.subscribe, editor.snapshot);
+    const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
+    React.useEffect(() => editor.restore(), [host]);
+    const { text, shown: lastRun } = React.useSyncExternalStore(editor.subscribe, editor.snapshot);
     React.useSyncExternalStore(runs.subscribe, runs.snapshot);
     const [warehouseId, setWarehouseId] = usePreference(service, "warehouseId");
     const warehouses = useAsync(async (signal) => new Sql(await service.ready(signal)).warehouses(signal), [snapshot.status]);
-    const [lastRun, setLastRun] = React.useState();
     const run = lastRun ? runs.get(lastRun) : void 0;
     if (snapshot.status !== "connected")
       return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: 32 } }, /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks to run SQL", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect Databricks") }, "Queries run on your SQL warehouses with your Unity Catalog permissions."));
-    const execute = () => {
-      if (!text.trim()) return;
-      setLastRun(text);
-      runs.request(text);
-    };
+    const execute = () => editor.execute(text);
     const list = warehouses.data ?? [];
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { height: "100%", overflow: "auto" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14, style: { padding: "22px 28px", maxWidth: 1100, margin: "0 auto" } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 12, wrap: true }, /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "lg", weight: 500 }, "SQL"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: warehouseId ?? "", onChange: (event) => setWarehouseId(event.target.value || void 0), "aria-label": "SQL warehouse", style: { width: 280 } }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Automatic warehouse"), list.map((w) => /* @__PURE__ */ React.createElement("option", { key: w.id, value: w.id }, w.name, " \xB7 ", w.state?.toLowerCase()))), /* @__PURE__ */ React.createElement(Button, { variant: "primary", onClick: execute, disabled: run?.status === "running", title: "Run (\u2318\u21B5)" }, run?.status === "running" ? /* @__PURE__ */ React.createElement(Spinner, { size: 12, label: "Running" }) : null, "Run"))), /* @__PURE__ */ React.createElement(
       "textarea",
@@ -1234,7 +1356,7 @@ function sqlPage(service, editor, runs) {
         action: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: () => void runs.run(lastRun) }, "Run anyway"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => runs.clear(lastRun) }, "Cancel"))
       },
       "It will run with your Databricks access."
-    ), run?.status === "running" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Running\u2026"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => lastRun && runs.cancel(lastRun) }, "Cancel")), run?.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "The query failed" }, run.message), run?.status === "done" && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(ResultView, { result: run.result, maxHeight: 480 }), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, run.warehouse, " \xB7 ", (run.ms / 1e3).toFixed(1), "s \xB7 statement ", run.statementId))));
+    ), run?.status === "running" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Running\u2026"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => lastRun && runs.cancel(lastRun) }, "Cancel")), run?.status === "error" && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "The query failed" }, run.message), run?.status === "done" && /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(ResultView, { result: run.result, maxHeight: 480 }), /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, [run.warehouse, run.ms !== void 0 && `${(run.ms / 1e3).toFixed(1)}s`, `statement ${run.statementId}`].filter(Boolean).join(" \xB7 ")))));
   };
 }
 function sqlSettings(service) {
@@ -1260,7 +1382,13 @@ function apply(ctx) {
   bindReact(ctx.react);
   const live = attach(ctx, { id: "bkvarda.databricks-sql", name: "Databricks SQL" }, (scope, databricks) => {
     const runs = new Runs(databricks);
-    const editor = new Editor();
+    const editor = new Editor(databricks, runs);
+    const stopWatching = runs.watchWorkspace();
+    const stopSaving = editor.watch();
+    scope.effect(() => () => {
+      stopWatching();
+      stopSaving();
+    });
     scope.conversation.registerCodeBlock({
       id: "sql",
       title: "Databricks SQL",

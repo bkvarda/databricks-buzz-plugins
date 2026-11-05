@@ -8,6 +8,7 @@ import { type DatabricksService, describeError } from "@dbx/core/service";
 import { Badge, Button, CodeView, CopyButton, DatabricksMark, Disclosure, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { ResultView } from "@dbx/core/ui/data";
 import { Markdown } from "@dbx/core/ui/markdown";
+import { type SpaceChat, useChat } from "./chats";
 
 export type Turn = {
   key: string;
@@ -143,123 +144,6 @@ export function TurnView(props: {
   );
 }
 
-function fromMessage(message: GenieMessage): Turn {
-  const parts = summarize(message);
-  return {
-    key: messageId(message),
-    question: message.content,
-    message,
-    suggestions: parts.suggestions,
-    ...(parts.text && { text: parts.text }),
-    ...(parts.sql && { sql: parts.sql }),
-    ...(parts.queryTitle && { queryTitle: parts.queryTitle }),
-    ...(parts.error && { error: parts.error }),
-  };
-}
-
-export function useGenieConversation(service: DatabricksService, spaceId: string, initialConversation?: string) {
-  const [conversationId, setConversationId] = React.useState(initialConversation);
-  const [turns, setTurns] = React.useState<Turn[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const [historyError, setHistoryError] = React.useState<string>();
-  const abort = React.useRef<AbortController | undefined>(undefined);
-
-  React.useEffect(() => {
-    setTurns([]);
-    setConversationId(initialConversation);
-    setHistoryError(undefined);
-    if (!initialConversation) return;
-    const controller = new AbortController();
-    void (async () => {
-      try {
-        const client = await service.ready(controller.signal);
-        const response = await client.get<{ messages?: GenieMessage[] }>(
-          `/api/2.0/genie/spaces/${encodeURIComponent(spaceId)}/conversations/${encodeURIComponent(initialConversation)}/messages`,
-          { query: { page_size: 50 }, signal: controller.signal },
-        );
-        const messages = [...(response.messages ?? [])]
-          .map((message) => ({ ...message, conversation_id: initialConversation }))
-          .sort((a, b) => (a.created_timestamp ?? 0) - (b.created_timestamp ?? 0));
-        if (!controller.signal.aborted) setTurns(messages.map(fromMessage));
-      } catch (error) {
-        if (!controller.signal.aborted) setHistoryError(describeError(error));
-      }
-    })();
-    return () => controller.abort();
-  }, [service, spaceId, initialConversation]);
-
-  React.useEffect(() => () => abort.current?.abort(), []);
-
-  const update = (key: string, change: Partial<Turn>) =>
-    setTurns((current) => current.map((turn) => (turn.key === key ? { ...turn, ...change } : turn)));
-
-  const loadResult = async (key: string) => {
-    const turn = turns.find((candidate) => candidate.key === key);
-    const message = turn?.message;
-    const attachment = message && summarize(message).queryAttachmentId;
-    if (!message || !attachment) return;
-    update(key, { loadingResult: true });
-    try {
-      const client = await service.ready();
-      const result = await new Genie(client).result(spaceId, message, attachment);
-      update(key, { result, loadingResult: false });
-    } catch (error) {
-      update(key, { loadingResult: false, error: describeError(error) });
-    }
-  };
-
-  const ask = async (question: string) => {
-    const text = question.trim();
-    if (!text || busy) return;
-    abort.current?.abort();
-    const controller = new AbortController();
-    abort.current = controller;
-    const key = `pending-${Date.now()}`;
-    let current = key;
-    setTurns((existing) => [...existing, { key, question: text, suggestions: [] }]);
-    setBusy(true);
-    try {
-      const client = await service.ready(controller.signal);
-      const genie = new Genie(client);
-      const answer = await genie.answer(spaceId, text, {
-        ...(conversationId && { conversationId }),
-        signal: controller.signal,
-        onUpdate: (message) => {
-          const id = messageId(message) || current;
-          // React runs this updater later, after `current` moves on; capture it now.
-          const previous = current;
-          setTurns((existing) => existing.map((turn) => (turn.key === previous ? { ...turn, key: id, message } : turn)));
-          current = id;
-          if (message.conversation_id) setConversationId(message.conversation_id);
-        },
-      });
-      setConversationId(answer.message.conversation_id);
-      update(current, {
-        message: answer.message,
-        suggestions: answer.suggestions,
-        ...(answer.text && { text: answer.text }),
-        ...(answer.sql && { sql: answer.sql }),
-        ...(answer.queryTitle && { queryTitle: answer.queryTitle }),
-        ...(answer.result && { result: answer.result }),
-        ...(answer.error && { error: answer.error }),
-      });
-    } catch (error) {
-      if (!controller.signal.aborted) update(current, { error: describeError(error) });
-    } finally {
-      if (abort.current === controller) setBusy(false);
-    }
-  };
-
-  const reset = () => {
-    abort.current?.abort();
-    setBusy(false);
-    setTurns([]);
-    setConversationId(undefined);
-  };
-
-  return { turns, busy, ask, reset, loadResult, conversationId, historyError };
-}
-
 export function Composer(props: { onAsk(question: string): void; busy: boolean; placeholder?: string; autoFocus?: boolean }) {
   const [text, setText] = React.useState("");
   const submit = () => {
@@ -302,13 +186,20 @@ export function Composer(props: { onAsk(question: string): void; busy: boolean; 
 export function GenieChat(props: {
   service: DatabricksService;
   space: GenieSpace;
-  conversationId?: string;
+  /** The chat: the Genie page's or a link panel's, kept by the plugin, or the composer's own. */
+  chat: SpaceChat;
   compact?: boolean;
   /** Extra per-answer actions, e.g. inserting it into a message. */
   answerActions?(turn: Turn): React.ReactNode;
 }) {
   const { service, space } = props;
-  const chat = useGenieConversation(service, space.space_id, props.conversationId);
+  const state = useChat(props.chat);
+  const chat = {
+    ...state,
+    ask: (question: string) => props.chat.ask(question),
+    reset: () => props.chat.reset(),
+    loadResult: (key: string) => props.chat.loadResult(key),
+  };
   const bottom = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     bottom.current?.scrollIntoView({ block: "end", behavior: "smooth" });
@@ -348,7 +239,13 @@ export function GenieChat(props: {
       )}
       {chat.historyError && <Notice tone="warning" title="Couldn't load this conversation">{chat.historyError}</Notice>}
       <Stack gap={22} style={{ flex: 1 }}>
-        {chat.turns.length === 0 && !props.compact && (
+        {chat.loading && chat.turns.length === 0 && (
+          <Stack direction="row" gap={8} align="center" style={{ padding: "24px 0" }}>
+            <Spinner size={12} />
+            <Text tone="subtle">Opening this conversation…</Text>
+          </Stack>
+        )}
+        {chat.turns.length === 0 && !chat.loading && !props.compact && (
           <Stack gap={10} style={{ padding: "24px 0" }}>
             <Text tone="subtle">Ask a question in plain language. Genie writes the SQL, runs it with your access, and charts the answer.</Text>
             <Stack direction="row" gap={6} wrap>

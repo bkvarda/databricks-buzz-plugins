@@ -18,8 +18,16 @@ const ICON = svgDataUri(
 export function apply(ctx: Context) {
   bindReact(ctx.react);
   const live = attach(ctx, { id: "bkvarda.databricks-sql", name: "Databricks SQL" }, (scope, databricks) => {
+    // Runs and the SQL page's statement belong to the plugin, so they're still
+    // there when you come back to the page.
     const runs = new Runs(databricks);
-    const editor = new Editor();
+    const editor = new Editor(databricks, runs);
+    const stopWatching = runs.watchWorkspace();
+    const stopSaving = editor.watch();
+    scope.effect(() => () => {
+      stopWatching();
+      stopSaving();
+    });
     scope.conversation.registerCodeBlock({
       id: "sql",
       title: "Databricks SQL",

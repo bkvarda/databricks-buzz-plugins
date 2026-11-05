@@ -239,7 +239,13 @@ export class GenieOne {
 
   async ask(
     question: string,
-    options: Readonly<{ conversationId?: string; signal?: AbortSignal; onProgress?(steps: readonly string[]): void }> = {},
+    options: Readonly<{
+      conversationId?: string;
+      signal?: AbortSignal;
+      onProgress?(steps: readonly string[]): void;
+      /** As soon as Genie One takes the question: the IDs that get its answer back later. */
+      onStarted?(ids: Readonly<{ conversationId: string; responseId: string }>): void;
+    }> = {},
   ): Promise<GenieOneAnswer> {
     const { signal } = options;
     const mcp = await this.mcp();
@@ -253,9 +259,34 @@ export class GenieOne {
     const conversationId = started.conversation_id ?? options.conversationId ?? "";
     const responseId = started.response_id ?? "";
     if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
+    options.onStarted?.({ conversationId, responseId });
+    return this.follow(mcp, conversationId, responseId, started, resultText(asked), options);
+  }
 
+  /**
+   * An earlier response, by its IDs: Genie One keeps them, even after later
+   * questions in the conversation. A response still running is followed to
+   * its end.
+   */
+  async response(
+    conversationId: string,
+    responseId: string,
+    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void }> = {},
+  ): Promise<GenieOneAnswer> {
+    return this.follow(await this.mcp(), conversationId, responseId, {}, "", options);
+  }
+
+  private async follow(
+    mcp: McpClient,
+    conversationId: string,
+    responseId: string,
+    started: PollResult,
+    startedMarkdown: string,
+    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void }>,
+  ): Promise<GenieOneAnswer> {
+    const { signal } = options;
     let state: PollResult = started;
-    let markdown = resultText(asked);
+    let markdown = startedMarkdown;
     let unknowns = 0;
     // The server clears progress_steps once the response is done; keep the last ones.
     let steps: readonly string[] = [];
@@ -263,7 +294,8 @@ export class GenieOne {
     try {
       while (!state.status || state.status === "in_progress" || (state.status === "unknown" && unknowns < 5)) {
         if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
-        await sleep(POLL_MS, signal);
+        // A response looked up again is polled at once.
+        if (state.status) await sleep(POLL_MS, signal);
         const polled = await mcp.callTool(
           "genie_poll_response",
           { conversation_id: conversationId, response_id: responseId },

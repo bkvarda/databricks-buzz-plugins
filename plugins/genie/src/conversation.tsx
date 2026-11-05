@@ -7,6 +7,7 @@ import { React } from "@dbx/core/react";
 import { type DatabricksService, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { Button, DatabricksMark, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GenieChat, turnMarkdown } from "./chat";
+import { type GenieChats, OneChat, SpaceChat, useOwnChat } from "./chats";
 import type { GenieOne } from "./genie-one";
 import { GenieOneChat, oneTurnMarkdown } from "./genie-one-chat";
 import { GENIE_ONE_ENTRY, type SpacesStore, useGenieOneAvailable, useSelection, useSpaces } from "./page";
@@ -120,8 +121,7 @@ function GeniePicker(props: { service: DatabricksService; store: SpacesStore; ge
       )}
       {!oneAvailable && spaces.status === "ready" && !spaces.spaces.length && <Text tone="subtle">No Genie agents are shared with you yet.</Text>}
       {useOne && (
-        <GenieOneChat
-          service={service}
+        <OwnGenieOneChat
           genieOne={genieOne}
           compact
           answerActions={(turn) => (
@@ -132,7 +132,7 @@ function GeniePicker(props: { service: DatabricksService; store: SpacesStore; ge
         />
       )}
       {space && (
-        <GenieChat
+        <OwnGenieChat
           key={space.space_id}
           service={service}
           space={space}
@@ -169,7 +169,19 @@ export function genieLinkChip(service: DatabricksService, store: SpacesStore) {
   };
 }
 
-export function geniePanel(service: DatabricksService, store: SpacesStore) {
+// The composer's chats are its own: they stop when it closes, as a draft would.
+function OwnGenieOneChat(props: Omit<React.ComponentProps<typeof GenieOneChat>, "chat"> & { genieOne: GenieOne }) {
+  const { genieOne, ...rest } = props;
+  const chat = useOwnChat(() => new OneChat(genieOne), [genieOne]);
+  return <GenieOneChat chat={chat} {...rest} />;
+}
+
+function OwnGenieChat(props: Omit<React.ComponentProps<typeof GenieChat>, "chat">) {
+  const chat = useOwnChat(() => new SpaceChat(props.service, props.space.space_id), [props.service, props.space.space_id]);
+  return <GenieChat chat={chat} {...props} />;
+}
+
+export function geniePanel(service: DatabricksService, store: SpacesStore, chats: GenieChats) {
   return function GeniePanel(props: PanelProps) {
     const link = React.useMemo(() => parseGenieUrl(props.target), [props.target]);
     const snapshot = useConnection(service);
@@ -193,7 +205,7 @@ export function geniePanel(service: DatabricksService, store: SpacesStore) {
     else if (space.error) body = <Notice tone="danger" title="Can't open this Genie agent">{String(space.error.message)}</Notice>;
     else if (space.data === "elsewhere") body = <Notice title="Different workspace">This Genie agent is in {link?.host.replace("https://", "")}.</Notice>;
     else if (space.data)
-      body = <GenieChat service={service} space={space.data} {...(link?.conversationId && { conversationId: link.conversationId })} />;
+      body = <GenieChat service={service} space={space.data} chat={chats.linked(space.data.space_id, link?.conversationId)} />;
     else body = <Text tone="subtle">Not a Genie link.</Text>;
     return <DbxRoot style={{ padding: "var(--space-panel-inset, 16px)", display: "flex", flexDirection: "column", minHeight: "100%" }}>{body}</DbxRoot>;
   };

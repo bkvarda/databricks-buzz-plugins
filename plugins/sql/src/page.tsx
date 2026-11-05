@@ -9,18 +9,101 @@ import { ResultView } from "@dbx/core/ui/data";
 import { ALLOW_WRITES } from "./tools";
 import type { Runs } from "./runs";
 
-/** The editor text, shared so the sidebar can insert statements. */
+/** Preferences: the SQL page's statement, and its last run. */
+export const SQL_TEXT = "sqlText";
+export const SQL_LAST_RUN = "sqlLastRun";
+const DEFAULT_TEXT = "SELECT current_user(), current_catalog(), current_date()";
+const MAX_SAVED_TEXT = 50_000;
+
+export type SavedRun = Readonly<{ statement: string; statementId: string; startedAt: number; warehouse?: string; ms?: number }>;
+type EditorState = Readonly<{ text: string; shown?: string }>;
+
+/**
+ * The SQL page's statement and the run it shows. The plugin keeps them (the
+ * sidebar inserts statements, and Buzz removes the page when you leave it),
+ * and saves them with the suite's preferences, per workspace on this device.
+ * After a restart the page shows the statement again and gets its result
+ * back from Databricks by statement ID.
+ */
 export class Editor {
-  text = "SELECT current_user(), current_catalog(), current_date()";
+  private state: EditorState = { text: DEFAULT_TEXT };
   private listeners = new Set<() => void>();
-  snapshot = () => this.text;
+  private restoredFor: string | undefined;
+  private edited = false;
+  private saving: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(
+    private readonly service: DatabricksService,
+    private readonly runs: Runs,
+  ) {}
+
+  snapshot = () => this.state;
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
-  set(text: string) {
-    this.text = text;
+  private change(next: Partial<EditorState>) {
+    this.state = { ...this.state, ...next };
     for (const listener of [...this.listeners]) listener();
+  }
+
+  /** What the page last showed in this workspace; once per workspace. */
+  restore() {
+    const snapshot = this.service.snapshot();
+    const host = snapshot.status === "connected" ? snapshot.profile.host : undefined;
+    if (!host || host === this.restoredFor) return;
+    const first = this.restoredFor === undefined;
+    this.restoredFor = host;
+    // What was typed (or run) before the first restore wins over what was saved.
+    if (first && this.edited) return this.set(this.state.text);
+    const prefs = this.service.preferences;
+    const run = prefs.get<SavedRun>(SQL_LAST_RUN);
+    this.change({ text: prefs.get<string>(SQL_TEXT) ?? DEFAULT_TEXT, shown: run?.statement });
+    if (run?.statementId) void this.runs.resume(run.statement, run);
+  }
+
+  set(text: string) {
+    this.edited = true;
+    this.change({ text });
+    if (this.saving) clearTimeout(this.saving);
+    const host = this.restoredFor;
+    this.saving = setTimeout(() => {
+      // A different workspace has its own statement.
+      if (host !== this.restoredFor) return;
+      this.service.preferences.set(SQL_TEXT, text === DEFAULT_TEXT || text.length > MAX_SAVED_TEXT ? undefined : text);
+    }, 600);
+  }
+
+  /** Runs `text` and shows that run, remembering it once it has a statement ID. */
+  execute(text: string) {
+    if (!text.trim()) return;
+    this.edited = true;
+    this.change({ shown: text });
+    this.service.preferences.set(SQL_LAST_RUN, undefined);
+    this.runs.request(text);
+  }
+
+  /** Saves the shown run when it gets a statement ID or finishes. */
+  watch(): () => void {
+    let saved: string | undefined;
+    return this.runs.subscribe(() => {
+      const statement = this.state.shown;
+      const run = statement ? this.runs.get(statement) : undefined;
+      if (!statement || !run || (run.status !== "running" && run.status !== "done") || !run.statementId) return;
+      const previous = this.service.preferences.get<SavedRun>(SQL_LAST_RUN);
+      const value: SavedRun = {
+        statement,
+        statementId: run.statementId,
+        startedAt:
+          run.status === "running" ? run.startedAt : previous?.statementId === run.statementId ? previous.startedAt : Date.now() - (run.ms ?? 0),
+        ...(run.warehouse && { warehouse: run.warehouse }),
+        ...(run.status === "done" && run.ms !== undefined && { ms: run.ms }),
+      };
+      const key = JSON.stringify(value);
+      if (key === saved || statement.length > MAX_SAVED_TEXT) return;
+      saved = key;
+      this.service.preferences.set(SQL_LAST_RUN, value);
+    });
   }
 }
 
@@ -132,11 +215,12 @@ export function sqlSidebar(service: DatabricksService, editor: Editor) {
 export function sqlPage(service: DatabricksService, editor: Editor, runs: Runs) {
   return function SqlPage(_props: PageProps) {
     const snapshot = useConnection(service);
-    const text = React.useSyncExternalStore(editor.subscribe, editor.snapshot);
+    const host = snapshot.status === "connected" ? snapshot.profile.host : undefined;
+    React.useEffect(() => editor.restore(), [host]);
+    const { text, shown: lastRun } = React.useSyncExternalStore(editor.subscribe, editor.snapshot);
     React.useSyncExternalStore(runs.subscribe, runs.snapshot);
     const [warehouseId, setWarehouseId] = usePreference<string>(service, "warehouseId");
     const warehouses = useAsync(async (signal) => new Sql(await service.ready(signal)).warehouses(signal), [snapshot.status]);
-    const [lastRun, setLastRun] = React.useState<string>();
     const run = lastRun ? runs.get(lastRun) : undefined;
     if (snapshot.status !== "connected")
       return (
@@ -146,11 +230,7 @@ export function sqlPage(service: DatabricksService, editor: Editor, runs: Runs) 
           </EmptyState>
         </DbxRoot>
       );
-    const execute = () => {
-      if (!text.trim()) return;
-      setLastRun(text);
-      runs.request(text);
-    };
+    const execute = () => editor.execute(text);
     const list: readonly Warehouse[] = warehouses.data ?? [];
     return (
       <DbxRoot style={{ height: "100%", overflow: "auto" }}>
@@ -215,7 +295,7 @@ export function sqlPage(service: DatabricksService, editor: Editor, runs: Runs) 
             <Stack gap={8}>
               <ResultView result={run.result} maxHeight={480} />
               <Text tone="tertiary" size="xs">
-                {run.warehouse} · {(run.ms / 1000).toFixed(1)}s · statement {run.statementId}
+                {[run.warehouse, run.ms !== undefined && `${(run.ms / 1000).toFixed(1)}s`, `statement ${run.statementId}`].filter(Boolean).join(" · ")}
               </Text>
             </Stack>
           )}

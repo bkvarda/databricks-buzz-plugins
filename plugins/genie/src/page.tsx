@@ -8,6 +8,7 @@ import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { Button, DatabricksMark, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GenieChat } from "./chat";
+import type { GenieChats } from "./chats";
 import type { GenieOne } from "./genie-one";
 import { GenieOneChat } from "./genie-one-chat";
 
@@ -192,7 +193,7 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore, gen
   };
 }
 
-export function geniePage(service: DatabricksService, store: SpacesStore, genieOne: GenieOne) {
+export function geniePage(service: DatabricksService, store: SpacesStore, genieOne: GenieOne, chats: GenieChats) {
   return function GeniePage(_props: PageProps) {
     const snapshot = useConnection(service);
     const spaces = useSpaces(store);
@@ -213,7 +214,7 @@ export function geniePage(service: DatabricksService, store: SpacesStore, genieO
           Genie answers questions about your data in plain language, with the access you already have.
         </EmptyState>
       );
-    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = <GenieOneChat service={service} genieOne={genieOne} />;
+    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = <GenieOneChat chat={chats.genieOneChat()} />;
     else if (spaces.status === "error") body = <Notice tone="danger" title="Couldn't list Genie agents">{spaces.error}</Notice>;
     else if (!space)
       body = (
@@ -223,7 +224,7 @@ export function geniePage(service: DatabricksService, store: SpacesStore, genieO
             : "Pick an agent on the left to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support."}
         </EmptyState>
       );
-    else body = <GenieChat key={space.space_id} service={service} space={space} />;
+    else body = <GenieChat key={space.space_id} service={service} space={space} chat={chats.space(space.space_id)} />;
     return (
       <DbxRoot style={{ height: "100%", overflow: "auto" }}>
         <div style={{ maxWidth: 920, margin: "0 auto", padding: "24px 28px 16px", minHeight: "100%", display: "flex", flexDirection: "column" }}>{body}</div>
