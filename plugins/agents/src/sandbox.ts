@@ -14,20 +14,26 @@ You have your own Databricks Sandbox: a Linux machine in Databricks with Python,
 
 const clip = (text: string, max = 20_000) => (text.length > max ? `${text.slice(0, max / 2)}\n… (${text.length - max} characters cut) …\n${text.slice(-max / 2)}` : text);
 
+/** Creates or starts the agent's sandbox, with its work folder, and returns its API. */
+export async function ensureAgentSandbox(service: DatabricksService, pubkey: string, agentName: string, signal: AbortSignal, onState?: (state: string) => void): Promise<Sandboxes> {
+  const client = await service.ready(signal);
+  const sandboxes = new Sandboxes(client);
+  const id = sandboxFor(pubkey);
+  await sandboxes.ensureRunning(id, {
+    displayName: `Buzz agent: ${agentName}`.slice(0, 60),
+    tags: { created_by: "buzz", buzz_agent: pubkey.slice(0, 16) },
+    signal,
+    ...(onState && { onState }),
+  });
+  await sandboxes.bash(id, `mkdir -p ${SANDBOX_HOME}/work`, { timeoutSeconds: 30, signal });
+  return sandboxes;
+}
+
 export function sandboxTools(service: DatabricksService, pubkey: string, agentName: string, onState?: (state: string) => void): LocalTool[] {
   const id = sandboxFor(pubkey);
   let ready: Promise<void> | undefined;
   const ensure = async (signal: AbortSignal) => {
-    ready ??= (async () => {
-      const client = await service.ready(signal);
-      await new Sandboxes(client).ensureRunning(id, {
-        displayName: `Buzz agent: ${agentName}`.slice(0, 60),
-        tags: { created_by: "buzz", buzz_agent: pubkey.slice(0, 16) },
-        signal,
-        ...(onState && { onState }),
-      });
-      await new Sandboxes(client).bash(id, `mkdir -p ${SANDBOX_HOME}/work`, { timeoutSeconds: 30, signal });
-    })().catch((error) => {
+    ready ??= ensureAgentSandbox(service, pubkey, agentName, signal, onState).then(() => {}).catch((error) => {
       ready = undefined;
       throw error;
     });

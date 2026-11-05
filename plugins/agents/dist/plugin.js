@@ -2114,6 +2114,303 @@ ${table.comment}` : "",
   ];
 }
 
+// plugins/agents/src/remote.ts
+var HARNESSES = [
+  { id: "builtin", label: "Built-in", detail: "Fastest. Uses Buzz's tools and the tools you pick, and runs code in the Sandbox when it needs to." },
+  { id: "claude", label: "Claude Code", detail: "Anthropic's coding agent, running in the Sandbox with its own tools and the Databricks CLI signed in as you. Keeps its context between turns." },
+  { id: "codex", label: "Codex", detail: "OpenAI's coding agent, running in the Sandbox with its own tools and the Databricks CLI signed in as you. Keeps its context between turns." },
+  { id: "pi", label: "Pi", detail: "A small coding agent for Claude, GPT and Gemini models, running in the Sandbox with its own tools. Keeps its context between turns." }
+];
+var HARNESS_IDS = HARNESSES.map((harness) => harness.id);
+var isRemote = (harness) => harness !== "builtin";
+var harnessLabel = (harness) => HARNESSES.find((candidate) => candidate.id === harness)?.label ?? harness;
+var HARNESS_MODEL = {
+  claude: "system.ai.claude-sonnet-5-5",
+  codex: "system.ai.gpt-5-6-sol",
+  pi: "system.ai.claude-sonnet-5-5"
+};
+function harnessAccepts(harness, model) {
+  if (harness === "builtin") return true;
+  if (!model.startsWith("system.ai.")) return false;
+  const leaf = model.slice("system.ai.".length);
+  if (harness === "claude") return /^claude/.test(leaf);
+  if (harness === "codex") return /^gpt/.test(leaf);
+  return /^(claude|gpt|gemini)/.test(leaf);
+}
+var harnessModel = (harness, model) => harnessAccepts(harness, model) ? model : HARNESS_MODEL[harness];
+function permissionsHint(harness, permissions) {
+  if (permissions === "full")
+    return "Runs any command and changes any file in the Sandbox without asking. The Sandbox is separate from your computer, but it's signed in to Databricks as you and can reach the internet.";
+  if (harness === "claude") return "Claude Code's auto mode: a safety check approves or blocks each action, and nothing waits for you.";
+  if (harness === "codex") return "Codex can change files only in its work folder and /tmp, and can reach the internet.";
+  return "Pi has no approval step, so Standard gives it file tools only (read, search, edit, write) and no shell.";
+}
+var RUNS_DIR = `${SANDBOX_HOME}/.buzz/runs`;
+var WORK_DIR = `${SANDBOX_HOME}/work`;
+var runFiles = (dir) => ({
+  dir,
+  prompt: `${dir}/prompt.md`,
+  system: `${dir}/system.md`,
+  events: `${dir}/events.jsonl`,
+  stderr: `${dir}/stderr.log`,
+  exit: `${dir}/exit`,
+  pid: `${dir}/pid`,
+  script: `${dir}/run.sh`
+});
+var shellQuote = (text) => `'${text.replace(/'/g, `'\\''`)}'`;
+var PI_STANDARD_TOOLS = "read,grep,find,ls,edit,write";
+function harnessCommand(input) {
+  const { model, files, session } = input;
+  const full = input.permissions === "full";
+  switch (input.harness) {
+    case "claude": {
+      if (!session) throw new Error("Claude Code needs a session ID.");
+      return [
+        "claude",
+        "-p",
+        "--model",
+        shellQuote(model),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        full ? "bypassPermissions" : "auto",
+        "--append-system-prompt-file",
+        shellQuote(files.system),
+        session.resume ? "--resume" : "--session-id",
+        shellQuote(session.id),
+        "<",
+        shellQuote(files.prompt)
+      ].join(" ");
+    }
+    case "codex":
+      return [
+        "codex",
+        "exec",
+        ...session ? ["resume", shellQuote(session.id)] : [],
+        "--json",
+        "--skip-git-repo-check",
+        "-m",
+        shellQuote(model),
+        ...full ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", shellQuote('sandbox_mode="workspace-write"'), "-c", "sandbox_workspace_write.network_access=true"],
+        "-",
+        "<",
+        shellQuote(files.prompt)
+      ].join(" ");
+    case "pi":
+      if (!session) throw new Error("Pi needs a session ID.");
+      return [
+        "pi",
+        "-p",
+        "--mode",
+        "json",
+        "--model",
+        shellQuote(model),
+        "--session-id",
+        shellQuote(session.id),
+        "--append-system-prompt",
+        shellQuote(files.system),
+        ...full ? [] : ["--tools", PI_STANDARD_TOOLS],
+        shellQuote(`@${files.prompt}`),
+        "<",
+        "/dev/null"
+      ].join(" ");
+  }
+}
+function runScript(command, files) {
+  return ["#!/bin/bash", `cd ${shellQuote(WORK_DIR)} || exit 1`, `${command} > ${shellQuote(files.events)} 2> ${shellQuote(files.stderr)}`, `echo $? > ${shellQuote(files.exit)}`, ""].join("\n");
+}
+var launchCommand = (files) => `nohup setsid bash ${shellQuote(files.script)} > /dev/null 2>&1 < /dev/null & echo $! > ${shellQuote(files.pid)}; find ${shellQuote(RUNS_DIR)} -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} + 2>/dev/null; true`;
+var killCommand = (files) => `P=$(cat ${shellQuote(files.pid)} 2>/dev/null); [ -n "$P" ] && { kill -TERM -- -"$P" 2>/dev/null; sleep 2; kill -KILL -- -"$P" 2>/dev/null; }; true`;
+var POLL_SEPARATOR = "@@buzz-events@@";
+var pollCommand = (files, from) => `cat ${shellQuote(files.exit)} 2>/dev/null; echo; echo ${POLL_SEPARATOR}; tail -n +${from + 1} ${shellQuote(files.events)} 2>/dev/null | head -n 400 | cut -c1-262144`;
+function parsePoll(stdout) {
+  const at = stdout.indexOf(`
+${POLL_SEPARATOR}
+`);
+  const head = at === -1 ? "" : stdout.slice(0, at).trim();
+  const body = at === -1 ? "" : stdout.slice(at + POLL_SEPARATOR.length + 2);
+  const lines = body.split("\n");
+  lines.pop();
+  const exit = /^\d+$/.test(head) ? Number(head) : void 0;
+  return { ...exit !== void 0 && { exit }, lines };
+}
+var TARGET_KEYS = ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "prompt"];
+function targetOf(value) {
+  if (!value || typeof value !== "object") return void 0;
+  for (const key2 of TARGET_KEYS) {
+    const found = value[key2];
+    if (typeof found === "string" && found.trim()) return found.length > 80 ? `${found.slice(0, 77)}\u2026` : found;
+  }
+  return void 0;
+}
+var shellTarget = (command) => command.replace(/^\/bin\/(ba)?sh -lc '?/, "").replace(/'$/, "");
+var textOf = (content) => Array.isArray(content) ? content.filter((part) => !!part && typeof part === "object" && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("") : typeof content === "string" ? content : "";
+function parseEvent(harness, line) {
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return void 0;
+  }
+  if (!event || typeof event !== "object") return void 0;
+  if (harness === "claude") {
+    if (event.type === "system" && event.subtype === "init" && typeof event.session_id === "string") return { session: event.session_id };
+    if (event.type === "system" && event.subtype === "api_retry")
+      return { step: { tool: "model", target: `retrying after ${event.error_status ?? "an error"}${event.error ? ` (${event.error})` : ""}` } };
+    if (event.type === "assistant" && Array.isArray(event.message?.content)) {
+      const tool = event.message.content.find((part) => part?.type === "tool_use");
+      if (tool) return { step: { tool: String(tool.name ?? "tool"), ...targetOf(tool.input) && { target: targetOf(tool.input) } } };
+      const text = textOf(event.message.content);
+      return text ? { text } : void 0;
+    }
+    if (event.type === "result") {
+      const text = typeof event.result === "string" ? event.result : "";
+      if (event.is_error || event.subtype && event.subtype !== "success") return { error: text || String(event.subtype ?? "Claude Code failed") };
+      return { final: text };
+    }
+    return void 0;
+  }
+  if (harness === "codex") {
+    if (event.type === "thread.started" && typeof event.thread_id === "string") return { session: event.thread_id };
+    if (event.type === "turn.failed") return { error: String(event.error?.message ?? "Codex failed") };
+    const item = event.item;
+    if (!item || typeof item !== "object") return void 0;
+    if (event.type === "item.started") {
+      if (item.type === "command_execution" && typeof item.command === "string") return { step: { tool: "shell", target: targetOf({ command: shellTarget(item.command) }) } };
+      if (item.type === "file_change") return { step: { tool: "edit", ...item.changes?.[0]?.path && { target: String(item.changes[0].path) } } };
+      if (item.type === "mcp_tool_call") return { step: { tool: String(item.tool ?? "tool"), ...item.server && { target: String(item.server) } } };
+      if (item.type === "web_search") return { step: { tool: "web search", ...item.query && { target: String(item.query) } } };
+      return void 0;
+    }
+    if (event.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") return { text: item.text };
+    return void 0;
+  }
+  if (event.type === "session" && typeof event.id === "string") return { session: event.id };
+  if (event.type === "tool_execution_start") return { step: { tool: String(event.toolName ?? "tool"), ...targetOf(event.args) && { target: targetOf(event.args) } } };
+  if (event.type === "message_end" && event.message?.role === "assistant") {
+    if (event.message.stopReason === "error" && event.message.errorMessage) return { error: String(event.message.errorMessage) };
+    const text = textOf(event.message.content);
+    return text ? { text } : void 0;
+  }
+  return void 0;
+}
+var sleep2 = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => {
+    signal.removeEventListener("abort", stop);
+    resolve();
+  }, ms);
+  const stop = () => {
+    clearTimeout(timer);
+    reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  };
+  if (signal.aborted) return stop();
+  signal.addEventListener("abort", stop, { once: true });
+});
+var plain2 = (text) => text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").replace(/[│╭╮╰╯─✔•]/g, "").trim();
+function stderrSummary(stderr) {
+  return plain2(stderr).split("\n").map((line) => line.trim()).filter((line) => line && !/Unity Gateway|Databricks auth already|Launching |Starting |managed coding agent config|token refresh is managed|^is running\.?$/i.test(line)).slice(-4).join(" ").slice(0, 600);
+}
+var isLostSession = (error) => /no conversation found|no (saved )?session|session[^.]* not found|thread[^.]* not found|no rollout found/i.test(error?.message ?? "");
+async function runRemoteTurn(input) {
+  try {
+    return await runTurn(input);
+  } catch (error) {
+    if (!input.session || input.signal.aborted || !isLostSession(error)) throw error;
+    const { session: _lost, ...fresh } = input;
+    return runTurn(fresh);
+  }
+}
+async function runTurn(input) {
+  const { sandboxes, sandbox, harness, signal } = input;
+  const newId = input.newId ?? (() => crypto.randomUUID());
+  const files = runFiles(`${RUNS_DIR}/${Date.now().toString(36)}-${newId().slice(0, 8)}`);
+  const known = input.session?.harness === harness ? input.session : void 0;
+  let sessionId = known?.id ?? (harness === "codex" ? void 0 : newId());
+  const command = harnessCommand({
+    harness,
+    model: input.model,
+    permissions: input.permissions,
+    session: sessionId ? { id: sessionId, resume: Boolean(known) } : void 0,
+    files
+  });
+  const prompt = harness === "codex" && !known ? `<instructions>
+${input.system}
+</instructions>
+
+${input.prompt}` : input.prompt;
+  await sandboxes.writeFile(sandbox, files.prompt, prompt, signal);
+  await sandboxes.writeFile(sandbox, files.system, input.system, signal);
+  await sandboxes.writeFile(sandbox, files.script, runScript(command, files), signal);
+  const launched = await sandboxes.bash(sandbox, launchCommand(files), { timeoutSeconds: 30, signal });
+  if (launched.exit_code !== 0) throw new Error(`Couldn't start ${harnessLabel(harness)}: ${launched.stderr?.trim() || `exit ${launched.exit_code}`}`);
+  input.onLaunch?.();
+  let from = 0;
+  let exited = false;
+  let announced = false;
+  let text = "";
+  let final;
+  let error;
+  let failures = 0;
+  try {
+    for (; ; ) {
+      await sleep2(input.pollMs ?? 2e3, signal);
+      let poll;
+      try {
+        const result = await sandboxes.bash(sandbox, pollCommand(files, from), { timeoutSeconds: 30, signal });
+        poll = parsePoll(result.stdout ?? "");
+        failures = 0;
+      } catch (pollError) {
+        if (signal.aborted) throw pollError;
+        if (++failures >= 5) throw pollError;
+        continue;
+      }
+      from += poll.lines.length;
+      for (const line of poll.lines) {
+        const event = parseEvent(harness, line);
+        if (!event) continue;
+        if (event.session && (!announced || event.session !== sessionId)) {
+          sessionId = event.session;
+          announced = true;
+          input.onSession?.({ harness, id: sessionId });
+        }
+        if (event.step) input.onStep?.(event.step.tool, event.step.target);
+        if (event.text) text = event.text;
+        if (event.final !== void 0) final = event.final;
+        if (event.error) error = event.error;
+      }
+      if (poll.exit !== void 0) exited = true;
+      if (exited && poll.lines.length === 0) {
+        if (error) throw new Error(`${harnessLabel(harness)}: ${error}`);
+        const reply = (final ?? text).trim();
+        if (poll.exit !== 0 || !reply) {
+          const stderr = await sandboxes.readFile(sandbox, files.stderr, signal).catch(() => "");
+          throw new Error(`${harnessLabel(harness)} stopped (exit ${poll.exit})${stderrSummary(stderr) ? `: ${stderrSummary(stderr)}` : reply ? "" : " without a reply"}.`);
+        }
+        if (!sessionId) throw new Error(`${harnessLabel(harness)} didn't report its session.`);
+        return { text: reply, session: { harness, id: sessionId } };
+      }
+    }
+  } catch (failure) {
+    if (!exited) await sandboxes.bash(sandbox, killCommand(files), { timeoutSeconds: 30 }).catch(() => {
+    });
+    throw failure;
+  } finally {
+    void sandboxes.bash(sandbox, `rm -rf ${shellQuote(files.dir)}`, { timeoutSeconds: 30 }).catch(() => {
+    });
+  }
+}
+function remoteNote(harness, permissions) {
+  return [
+    `<databricks-sandbox>`,
+    `You are running as ${harnessLabel(harness)} inside your own Databricks Sandbox, a Linux machine in Databricks with Python, Node.js, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${WORK_DIR}; files under ${SANDBOX_HOME} persist across restarts.`,
+    "Your final message is posted to the Buzz conversation as your reply, so make it the answer itself, written for the people there. You don't have Buzz's own tools in this session.",
+    harness === "pi" && permissions === "standard" ? "You can read, search and edit files, but you have no shell in this session." : "",
+    "Never print secrets into the conversation.",
+    `</databricks-sandbox>`
+  ].filter(Boolean).join("\n");
+}
+
 // plugins/agents/src/sandbox.ts
 var sandboxFor = (pubkey) => sandboxId(`buzz-agent-${pubkey.slice(0, 12)}`);
 var SANDBOX_PROMPT = `<databricks-sandbox>
@@ -2122,20 +2419,25 @@ You have your own Databricks Sandbox: a Linux machine in Databricks with Python,
 var clip2 = (text, max = 2e4) => text.length > max ? `${text.slice(0, max / 2)}
 \u2026 (${text.length - max} characters cut) \u2026
 ${text.slice(-max / 2)}` : text;
+async function ensureAgentSandbox(service, pubkey, agentName, signal, onState) {
+  const client = await service.ready(signal);
+  const sandboxes = new Sandboxes(client);
+  const id = sandboxFor(pubkey);
+  await sandboxes.ensureRunning(id, {
+    displayName: `Buzz agent: ${agentName}`.slice(0, 60),
+    tags: { created_by: "buzz", buzz_agent: pubkey.slice(0, 16) },
+    signal,
+    ...onState && { onState }
+  });
+  await sandboxes.bash(id, `mkdir -p ${SANDBOX_HOME}/work`, { timeoutSeconds: 30, signal });
+  return sandboxes;
+}
 function sandboxTools(service, pubkey, agentName, onState) {
   const id = sandboxFor(pubkey);
   let ready;
   const ensure = async (signal) => {
-    ready ??= (async () => {
-      const client = await service.ready(signal);
-      await new Sandboxes(client).ensureRunning(id, {
-        displayName: `Buzz agent: ${agentName}`.slice(0, 60),
-        tags: { created_by: "buzz", buzz_agent: pubkey.slice(0, 16) },
-        signal,
-        ...onState && { onState }
-      });
-      await new Sandboxes(client).bash(id, `mkdir -p ${SANDBOX_HOME}/work`, { timeoutSeconds: 30, signal });
-    })().catch((error) => {
+    ready ??= ensureAgentSandbox(service, pubkey, agentName, signal, onState).then(() => {
+    }).catch((error) => {
       ready = void 0;
       throw error;
     });
@@ -2333,7 +2635,32 @@ function SandboxFields(props) {
   const { config, onChange, workspace } = props;
   const status = useConnection(workspace).status;
   const available = useAsync(() => cachedList(workspace, "sandbox", async () => new Sandboxes(await workspace.ready()).available()), [workspace, status]);
-  return /* @__PURE__ */ React.createElement(React.Fragment, null, available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, "Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview."), /* @__PURE__ */ React.createElement(ModelField, { service: workspace, value: config.model, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (model) => onChange({ ...config, model }) }), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...props.disabled !== void 0 && { disabled: props.disabled }, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
+  const harness = HARNESSES.find((candidate) => candidate.id === config.harness) ?? HARNESSES[0];
+  const remote = isRemote(harness.id) ? harness.id : void 0;
+  const disabled = props.disabled !== void 0 ? { disabled: props.disabled } : {};
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, remote ? `Databricks Sandbox isn't on in this workspace, and ${harness.label} runs there. An admin can turn on the preview.` : "Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview."), /* @__PURE__ */ React.createElement(Field, { label: "Harness", hint: harness.detail }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      ...disabled,
+      value: harness.id,
+      onChange: (event) => {
+        const next = event.target.value;
+        const model = isRemote(next) && !harnessAccepts(next, config.model) ? HARNESS_MODEL[next] : config.model;
+        onChange({ ...config, harness: next, model });
+      }
+    },
+    HARNESSES.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.id, value: candidate.id }, candidate.label))
+  )), /* @__PURE__ */ React.createElement(
+    ModelField,
+    {
+      service: workspace,
+      value: config.model,
+      ...disabled,
+      ...remote && { accepts: (id) => harnessAccepts(remote, id), hint: `Models ${harness.label} can use, from AI Gateway in this workspace.` },
+      onChange: (model) => onChange({ ...config, model })
+    }
+  ), remote ? /* @__PURE__ */ React.createElement(Field, { label: "Permissions", hint: permissionsHint(remote, config.permissions) }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.permissions, onChange: (event) => onChange({ ...config, permissions: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "standard" }, "Standard"), /* @__PURE__ */ React.createElement("option", { value: "full" }, "Full access"))) : /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
 }
 function SettingsTab(props) {
   const [draft, setDraft] = React.useState(props.config);
@@ -2567,12 +2894,12 @@ function modelOptions(models) {
 function ModelField(props) {
   const status = useConnection(props.service).status;
   const models = useAsync(() => cachedList(props.service, "models", async () => new Ai(await props.service.ready()).models()), [props.service, status]);
-  const options = modelOptions(models.data);
+  const options = modelOptions(models.data).filter((option) => !props.accepts || props.accepts(option.id));
   return /* @__PURE__ */ React.createElement(
     SinglePicker,
     {
       label: "Model",
-      hint: "From AI Gateway in this workspace.",
+      hint: props.hint ?? "From AI Gateway in this workspace.",
       value: props.value,
       valueLabel: props.value,
       placeholder: "Choose a model",
@@ -2884,6 +3211,8 @@ function normalizeDatabricks(config) {
   const kind = KIND_IDS.includes(value.kind) ? value.kind : typeof value.model === "string" && value.model ? "sandbox" : "genie-one";
   return {
     kind,
+    harness: HARNESS_IDS.includes(value.harness) ? value.harness : "builtin",
+    permissions: value.permissions === "full" ? "full" : "standard",
     model: typeof value.model === "string" && value.model ? value.model : DEFAULT_MODEL,
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
@@ -3014,6 +3343,41 @@ function registerTypes(agents, kit, service) {
       throw error;
     }
   }
+  async function remoteTurn(delivery, config, harness, conversation, signal) {
+    const workspace = agentService(service, config.profile);
+    const client = await workspace.ready(signal);
+    if (!await sandboxOn(workspace, signal))
+      throw new Error(`Databricks Sandbox isn't turned on in this workspace, and ${harnessLabel(harness)} runs there. A workspace admin can turn on the Sandbox preview.`);
+    const sandbox = await ensureAgentSandbox(workspace, delivery.agent.pubkey, delivery.agent.name, signal, (state) => delivery.step?.("sandbox", state));
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    const continued = session.remote?.harness === harness ? { harness, id: session.remote.id } : void 0;
+    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
+    const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: WORK_DIR, instructions, tools: false });
+    const prompt = await kit.turnPrompt(delivery, conversation, continued && session.cursor ? { cursor: session.cursor } : {});
+    let started = false;
+    try {
+      const result = await runRemoteTurn({
+        sandboxes: sandbox,
+        sandbox: sandboxFor(delivery.agent.pubkey),
+        harness,
+        model: harnessModel(harness, delivery.model ?? config.model),
+        permissions: config.permissions,
+        ...continued && { session: continued },
+        prompt: prompt.text,
+        system,
+        signal,
+        onLaunch: () => started = true,
+        onStep: (tool, target2) => delivery.step?.(tool, target2),
+        // Kept as soon as the harness has it, so a failed turn's context isn't lost.
+        onSession: (remote) => void sessions.set(delivery.agent.key, conversation.key, { ...sessions.get(delivery.agent.key, conversation.key), remote })
+      });
+      await kit.reply(delivery.agent, conversation, result.text);
+      await sessions.set(delivery.agent.key, conversation.key, { ...sessions.get(delivery.agent.key, conversation.key), cursor: prompt.cursor, remote: result.session });
+    } catch (error) {
+      if (!started) prompt.restore();
+      throw error;
+    }
+  }
   async function genieOneTurn(delivery, config, conversation, signal) {
     const question = deliveredText(delivery) || "What can I ask you about?";
     const session = sessions.get(delivery.agent.key, conversation.key);
@@ -3116,9 +3480,10 @@ ${answer.sql.trim()}
     models: (agent) => {
       const config = normalizeDatabricks(agent.config);
       if (config.kind !== "sandbox") return { current: "", models: [] };
-      const models = DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, efforts: [] }));
-      if (!models.some((model) => model.id === config.model)) models.unshift({ id: config.model, label: modelLabel(config.model), efforts: [] });
-      return { current: config.model, models };
+      const current = isRemote(config.harness) ? harnessModel(config.harness, config.model) : config.model;
+      const models = DEFAULT_MODELS.filter((model) => harnessAccepts(config.harness, model.id)).map((model) => ({ id: model.id, label: model.label, efforts: [] }));
+      if (!models.some((model) => model.id === current)) models.unshift({ id: current, label: modelLabel(current), efforts: [] });
+      return { current, models };
     },
     sessionControls: {
       scope: (agent) => scopeOf(normalizeDatabricks(agent.config)),
@@ -3128,7 +3493,7 @@ ${answer.sql.trim()}
         const key2 = conversationKey(scopeOf(config), place);
         if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
         if (action === "new") return sessions.clear(agent.key, key2);
-        if (config.kind !== "sandbox") return;
+        if (config.kind !== "sandbox" || isRemote(config.harness)) return;
         const session = sessions.get(agent.key, key2);
         await sessions.set(agent.key, key2, { ...session, messages: trimHistory(session.messages, 2e4, 12) });
       },
@@ -3142,15 +3507,18 @@ ${answer.sql.trim()}
         delivery.ignored?.();
         return;
       }
+      const harness = config.harness;
       turn(
         delivery,
         conversation,
-        (signal) => config.kind === "sandbox" ? sandboxTurn(delivery, config, conversation, signal) : config.kind === "custom" ? customTurn(delivery, config, conversation, signal) : genieOneTurn(delivery, config, conversation, signal)
+        (signal) => config.kind === "sandbox" ? isRemote(harness) ? remoteTurn(delivery, config, harness, conversation, signal) : sandboxTurn(delivery, config, conversation, signal) : config.kind === "custom" ? customTurn(delivery, config, conversation, signal) : genieOneTurn(delivery, config, conversation, signal)
       );
     },
     async runOnce(standalone) {
       const config = normalizeDatabricks(standalone.delivery.config);
       if (config.kind !== "sandbox") return { ok: false, error: "Watches and timers run on Sandbox agents; Genie One and custom agents answer mentions." };
+      if (isRemote(config.harness))
+        return { ok: false, error: `Watches and timers run on the Built-in harness for now; ${harnessLabel(config.harness)} answers mentions.` };
       try {
         const prompt = await standalone.prompt();
         if (!prompt) return { ok: true };
@@ -3183,6 +3551,11 @@ function summarize2(config) {
   const where = config.profile ? [config.profile] : [];
   if (config.kind === "genie-one") return ["Genie One", ...where].join(" \xB7 ");
   if (config.kind === "custom") return [config.custom?.label ?? "No agent chosen", ...where].join(" \xB7 ");
+  if (isRemote(config.harness)) {
+    const id = harnessModel(config.harness, config.model);
+    const model2 = DEFAULT_MODELS.find((candidate) => candidate.id === id)?.label ?? modelLabel(id);
+    return ["Sandbox", harnessLabel(config.harness), model2, ...config.permissions === "full" ? ["full access"] : [], ...where].join(" \xB7 ");
+  }
   const model = DEFAULT_MODELS.find((candidate) => candidate.id === config.model)?.label ?? modelLabel(config.model);
   const tools = config.tools.length ? [`${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}`] : [];
   return ["Sandbox", model, ...tools, ...where].join(" \xB7 ");

@@ -16,7 +16,8 @@ import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
-import { SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
+import { HARNESS_IDS, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
+import { ensureAgentSandbox, SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
 import { plainText, Sessions } from "./state";
 import { type AgentKind, AgentForm, type CustomAgent, type DatabricksConfig, SettingsTab } from "./ui";
 
@@ -109,6 +110,8 @@ export function normalizeDatabricks(config: unknown): DatabricksConfig {
   const kind = KIND_IDS.includes(value.kind as AgentKind) ? (value.kind as AgentKind) : typeof value.model === "string" && value.model ? "sandbox" : "genie-one";
   return {
     kind,
+    harness: HARNESS_IDS.includes(value.harness as HarnessId) ? (value.harness as HarnessId) : "builtin",
+    permissions: value.permissions === "full" ? "full" : "standard",
     model: typeof value.model === "string" && value.model ? value.model : DEFAULT_MODEL,
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
@@ -269,6 +272,44 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     }
   }
 
+  /** A Sandbox agent whose harness is Claude Code, Codex or Pi, running in its Sandbox. */
+  async function remoteTurn(delivery: Delivery, config: DatabricksConfig, harness: RemoteHarness, conversation: HarnessConversation, signal: AbortSignal) {
+    const workspace = agentService(service, config.profile);
+    const client = await workspace.ready(signal);
+    if (!(await sandboxOn(workspace, signal)))
+      throw new Error(`Databricks Sandbox isn't turned on in this workspace, and ${harnessLabel(harness)} runs there. A workspace admin can turn on the Sandbox preview.`);
+    const sandbox = await ensureAgentSandbox(workspace, delivery.agent.pubkey, delivery.agent.name, signal, (state) => delivery.step?.("sandbox", state));
+    const session = sessions.get(delivery.agent.key, conversation.key);
+    // A session of another harness (or the built-in loop) doesn't carry over: the new one is shown the conversation.
+    const continued = session.remote?.harness === harness ? { harness, id: session.remote.id } : undefined;
+    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
+    const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: WORK_DIR, instructions, tools: false });
+    const prompt = await kit.turnPrompt(delivery, conversation, continued && session.cursor ? { cursor: session.cursor } : {});
+    let started = false;
+    try {
+      const result = await runRemoteTurn({
+        sandboxes: sandbox,
+        sandbox: sandboxFor(delivery.agent.pubkey),
+        harness,
+        model: harnessModel(harness, delivery.model ?? config.model),
+        permissions: config.permissions,
+        ...(continued && { session: continued }),
+        prompt: prompt.text,
+        system,
+        signal,
+        onLaunch: () => (started = true),
+        onStep: (tool, target) => delivery.step?.(tool, target),
+        // Kept as soon as the harness has it, so a failed turn's context isn't lost.
+        onSession: (remote) => void sessions.set(delivery.agent.key, conversation.key, { ...sessions.get(delivery.agent.key, conversation.key), remote }),
+      });
+      await kit.reply(delivery.agent, conversation, result.text);
+      await sessions.set(delivery.agent.key, conversation.key, { ...sessions.get(delivery.agent.key, conversation.key), cursor: prompt.cursor, remote: result.session });
+    } catch (error) {
+      if (!started) prompt.restore();
+      throw error;
+    }
+  }
+
   async function genieOneTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal) {
     const question = deliveredText(delivery) || "What can I ask you about?";
     const session = sessions.get(delivery.agent.key, conversation.key);
@@ -374,9 +415,10 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     models: (agent) => {
       const config = normalizeDatabricks(agent.config);
       if (config.kind !== "sandbox") return { current: "", models: [] };
-      const models: { id: string; label: string; efforts: never[] }[] = DEFAULT_MODELS.map((model) => ({ id: model.id, label: model.label, efforts: [] }));
-      if (!models.some((model) => model.id === config.model)) models.unshift({ id: config.model, label: modelLabel(config.model), efforts: [] });
-      return { current: config.model, models };
+      const current = isRemote(config.harness) ? harnessModel(config.harness, config.model) : config.model;
+      const models: { id: string; label: string; efforts: never[] }[] = DEFAULT_MODELS.filter((model) => harnessAccepts(config.harness, model.id)).map((model) => ({ id: model.id, label: model.label, efforts: [] }));
+      if (!models.some((model) => model.id === current)) models.unshift({ id: current, label: modelLabel(current), efforts: [] });
+      return { current, models };
     },
     sessionControls: {
       scope: (agent) => scopeOf(normalizeDatabricks(agent.config)),
@@ -386,7 +428,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         const key = conversationKey(scopeOf(config), place);
         if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
         if (action === "new") return sessions.clear(agent.key, key);
-        if (config.kind !== "sandbox") return;
+        // Claude Code, Codex and Pi manage their own context.
+        if (config.kind !== "sandbox" || isRemote(config.harness)) return;
         const session = sessions.get(agent.key, key);
         await sessions.set(agent.key, key, { ...session, messages: trimHistory(session.messages, 20_000, 12) });
       },
@@ -400,9 +443,12 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         delivery.ignored?.();
         return;
       }
+      const harness = config.harness;
       turn(delivery, conversation, (signal) =>
         config.kind === "sandbox"
-          ? sandboxTurn(delivery, config, conversation, signal)
+          ? isRemote(harness)
+            ? remoteTurn(delivery, config, harness, conversation, signal)
+            : sandboxTurn(delivery, config, conversation, signal)
           : config.kind === "custom"
             ? customTurn(delivery, config, conversation, signal)
             : genieOneTurn(delivery, config, conversation, signal),
@@ -411,6 +457,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     async runOnce(standalone) {
       const config = normalizeDatabricks(standalone.delivery.config);
       if (config.kind !== "sandbox") return { ok: false, error: "Watches and timers run on Sandbox agents; Genie One and custom agents answer mentions." };
+      if (isRemote(config.harness))
+        return { ok: false, error: `Watches and timers run on the Built-in harness for now; ${harnessLabel(config.harness)} answers mentions.` };
       try {
         const prompt = await standalone.prompt();
         if (!prompt) return { ok: true };
@@ -446,6 +494,11 @@ export function summarize(config: DatabricksConfig): string {
   const where = config.profile ? [config.profile] : [];
   if (config.kind === "genie-one") return ["Genie One", ...where].join(" · ");
   if (config.kind === "custom") return [config.custom?.label ?? "No agent chosen", ...where].join(" · ");
+  if (isRemote(config.harness)) {
+    const id = harnessModel(config.harness, config.model);
+    const model = DEFAULT_MODELS.find((candidate) => candidate.id === id)?.label ?? modelLabel(id);
+    return ["Sandbox", harnessLabel(config.harness), model, ...(config.permissions === "full" ? ["full access"] : []), ...where].join(" · ");
+  }
   const model = DEFAULT_MODELS.find((candidate) => candidate.id === config.model)?.label ?? modelLabel(config.model);
   const tools = config.tools.length ? [`${config.tools.length} ${config.tools.length === 1 ? "tool" : "tools"}`] : [];
   return ["Sandbox", model, ...tools, ...where].join(" · ");

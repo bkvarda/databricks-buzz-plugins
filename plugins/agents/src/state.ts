@@ -9,6 +9,8 @@ export type Session = {
   /** Genie agents keep Genie's own conversation per Buzz conversation. */
   genieConversationId?: string;
   genieOneConversationId?: string;
+  /** A Sandbox agent's Claude Code, Codex or Pi session, kept on its Sandbox. */
+  remote?: { harness: string; id: string };
   updatedAt: number;
 };
 

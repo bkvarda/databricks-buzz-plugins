@@ -11,6 +11,7 @@ import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { Badge, Button, DbxRoot, Field, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GENIE_ONE_CHOICE, type ToolChoice } from "./capabilities";
+import { HARNESS_MODEL, HARNESSES, type HarnessId, harnessAccepts, isRemote, type Permissions, permissionsHint } from "./remote";
 
 export type AgentKind = "sandbox" | "genie-one" | "custom";
 
@@ -46,6 +47,10 @@ export type DatabricksConfig = {
   /** A CLI profile for another workspace; unset uses Buzz's connection. */
   profile?: string;
   // Sandbox agents
+  /** What thinks: the built-in loop, or Claude Code, Codex or Pi in the Sandbox. */
+  harness: HarnessId;
+  /** For Claude Code, Codex and Pi: their guarded mode, or full access. */
+  permissions: Permissions;
   model: string;
   instructions: string;
   scope: "thread" | "channel";
@@ -208,13 +213,54 @@ function SandboxFields(props: FormProps<DatabricksConfig> & { workspace: Databri
   const { config, onChange, workspace } = props;
   const status = useConnection(workspace).status;
   const available = useAsync(() => cachedList(workspace, "sandbox", async () => new Sandboxes(await workspace.ready()).available()), [workspace, status]);
+  const harness = HARNESSES.find((candidate) => candidate.id === config.harness) ?? HARNESSES[0]!;
+  const remote = isRemote(harness.id) ? harness.id : undefined;
+  const disabled = props.disabled !== undefined ? { disabled: props.disabled } : {};
   return (
     <>
       {available.data === false && (
-        <Notice tone="warning">Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview.</Notice>
+        <Notice tone="warning">
+          {remote
+            ? `Databricks Sandbox isn't on in this workspace, and ${harness.label} runs there. An admin can turn on the preview.`
+            : "Databricks Sandbox isn't on in this workspace, so this agent can't run code until an admin turns on the preview."}
+        </Notice>
       )}
-      <ModelField service={workspace} value={config.model} {...(props.disabled !== undefined && { disabled: props.disabled })} onChange={(model) => onChange({ ...config, model })} />
-      <ToolsField service={workspace} tools={config.tools} {...(props.disabled !== undefined && { disabled: props.disabled })} onChange={(tools) => onChange({ ...config, tools })} />
+      <Field label="Harness" hint={harness.detail}>
+        <select
+          className="dbx-select"
+          {...disabled}
+          value={harness.id}
+          onChange={(event) => {
+            const next = event.target.value as HarnessId;
+            // Each harness speaks one API; keep the model when it fits.
+            const model = isRemote(next) && !harnessAccepts(next, config.model) ? HARNESS_MODEL[next] : config.model;
+            onChange({ ...config, harness: next, model });
+          }}
+        >
+          {HARNESSES.map((candidate) => (
+            <option key={candidate.id} value={candidate.id}>
+              {candidate.label}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <ModelField
+        service={workspace}
+        value={config.model}
+        {...disabled}
+        {...(remote && { accepts: (id: string) => harnessAccepts(remote, id), hint: `Models ${harness.label} can use, from AI Gateway in this workspace.` })}
+        onChange={(model) => onChange({ ...config, model })}
+      />
+      {remote ? (
+        <Field label="Permissions" hint={permissionsHint(remote, config.permissions)}>
+          <select className="dbx-select" {...disabled} value={config.permissions} onChange={(event) => onChange({ ...config, permissions: event.target.value as Permissions })}>
+            <option value="standard">Standard</option>
+            <option value="full">Full access</option>
+          </select>
+        </Field>
+      ) : (
+        <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
+      )}
       <Field label="Conversation" hint="Thread: each thread is its own conversation. Channel: one conversation for the whole channel.">
         <select className="dbx-select" disabled={props.disabled} value={config.scope} onChange={(event) => onChange({ ...config, scope: event.target.value as DatabricksConfig["scope"] })}>
           <option value="thread">One per thread</option>
@@ -666,14 +712,14 @@ export function modelOptions(models: readonly ChatModel[] | undefined): PickOpti
   return [...recommended, ...rest];
 }
 
-function ModelField(props: { service: DatabricksService; value: string; onChange(model: string): void; disabled?: boolean }) {
+function ModelField(props: { service: DatabricksService; value: string; onChange(model: string): void; disabled?: boolean; accepts?(id: string): boolean; hint?: string }) {
   const status = useConnection(props.service).status;
   const models = useAsync(() => cachedList(props.service, "models", async () => new Ai(await props.service.ready()).models()), [props.service, status]);
-  const options = modelOptions(models.data);
+  const options = modelOptions(models.data).filter((option) => !props.accepts || props.accepts(option.id));
   return (
     <SinglePicker
       label="Model"
-      hint="From AI Gateway in this workspace."
+      hint={props.hint ?? "From AI Gateway in this workspace."}
       value={props.value}
       valueLabel={props.value}
       placeholder="Choose a model"

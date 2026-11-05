@@ -68,6 +68,32 @@ The agent types use `ctx.agents.harness` (block/buzz-app#2364), the same Buzz si
 
 When the host lacks the kit (Buzz builds before #2364), no types register and **Settings → Databricks Agents** says to update Buzz.
 
+### Sandbox harnesses: Claude Code, Codex, Pi
+
+A Sandbox agent's **Harness** is either **Built-in** (the loop above) or a coding agent that runs inside the agent's own Sandbox (`plugins/agents/src/remote.ts`). Every Sandbox image ships `claude`, `codex` and `pi` as launchers that configure themselves through Unity Gateway (`ug`) with the Sandbox's own credential (the owner's), so the plugin never passes a token.
+
+- **A turn.** Buzz's prompts come from `kit.systemPrompt(…, { tools: false })`, meant for a session whose final message the harness posts, and from `kit.turnPrompt` from the conversation's cursor. A new harness session is shown the whole conversation. The plugin writes the prompt, instructions and a run script under `~/.buzz/runs/<run>`, then starts the script detached (`nohup setsid`, holding none of the command's output). That matters because Databricks' command API waits for anything holding its output and stops a command after about five minutes. It then reads the harness's JSON event log every 2 seconds with `tail -n +N` (complete lines only), turning tool events into Buzz's working steps. The final message is posted with `kit.reply`. Stop and the turn timeout kill the run's process group. Measured end to end: 11–17 seconds a turn.
+- **Sessions.** There is one harness session per Buzz conversation, kept in `/home/sandbox-agent` so it survives Sandbox restarts:
+  - Claude Code: `--session-id <uuid>`, then `--resume <uuid>`.
+  - Pi: `--session-id <uuid>`, which creates or continues.
+  - Codex: the thread ID from `thread.started`, continued with `exec resume <id>`.
+
+  The ID is saved as soon as the harness reports it, so a failed turn keeps its context. A saved session the harness can't find any more starts over in a new one. Switching harness starts a new session.
+- **Instructions.** Claude Code gets them with `--append-system-prompt-file` and Pi with `--append-system-prompt <file>`. Codex has no such flag, so a new Codex thread gets them in its first message.
+- **Models.** Each harness speaks one API:
+  - Claude Code: `system.ai.claude-*`.
+  - Codex (Responses API at `/ai-gateway/codex/v1`): `system.ai.gpt-*`.
+  - Pi: `system.ai` Claude, GPT and Gemini models.
+
+  The form filters the model list to match, and a model that doesn't fit falls back to the harness default. Claude Code's preinstalled default (`databricks-claude-opus-4-6`) is retired, and the gateway answers it with a 403 that Claude Code retries for minutes, so the model is always passed explicitly.
+- **Permissions.** **Standard** is each harness's guarded mode:
+  - Claude Code: auto mode (`--permission-mode auto`), where a safety check approves or blocks each action.
+  - Codex: the `workspace-write` sandbox with network access (`-c sandbox_mode=…`, which `exec resume` also accepts).
+  - Pi: file tools only (`--tools read,grep,find,ls,edit,write`), since it has no approval step.
+
+  **Full access** is `bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`, or Pi's default tools.
+- **Limits.** These harnesses don't get Buzz's tools; they answer the conversation they're in. The Genie and MCP picks apply to Built-in only, and watches and timers run on Built-in. Prompt input must be closed (`< /dev/null`), or Pi waits on stdin.
+
 ### Hosted Sandbox agents (next step)
 
 Buzz also supports hosted agent types (`AgentType.remote`), where a provider holds the agent's key and runs it while Buzz is closed. The plan for a hosted Sandbox agent is: `provision` creates the Sandbox and generates the agent's Nostr key inside it, so the key never leaves Databricks; `activate` hands over the owner's NIP-OA attestation (`host.prepareRemoteAgentAuthorization`) and starts a small runner under `nohup` that subscribes to the community relay and runs the same loop with Buzz's standalone MCP tools; and `remove` deletes the Sandbox. This needs relay reachability from Databricks serverless egress, a restart policy for the Sandbox's 24-hour run limit, and a decision on where the Buzz tool server runs.

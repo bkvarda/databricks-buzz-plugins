@@ -322,3 +322,157 @@ describe("MCP service logins", () => {
     expect(isLoginRejection(new Error("Timed out"))).toBe(false);
   });
 });
+
+import { harnessAccepts, harnessCommand, harnessModel, parseEvent, parsePoll, runFiles, runRemoteTurn, stderrSummary } from "../plugins/agents/src/remote";
+
+describe("remote harnesses", () => {
+  const files = runFiles("/home/sandbox-agent/.buzz/runs/r1");
+  it("matches models to harnesses", () => {
+    expect(harnessAccepts("claude", "system.ai.claude-opus-5-5")).toBe(true);
+    expect(harnessAccepts("claude", "system.ai.gpt-5-6-sol")).toBe(false);
+    expect(harnessAccepts("codex", "system.ai.gpt-6-sol")).toBe(true);
+    expect(harnessAccepts("pi", "system.ai.gemini-3-8-flash")).toBe(true);
+    expect(harnessAccepts("pi", "main.team.my-model")).toBe(false);
+    expect(harnessAccepts("builtin", "main.team.my-model")).toBe(true);
+    expect(harnessModel("codex", "system.ai.claude-sonnet-5-5")).toBe("system.ai.gpt-5-6-sol");
+  });
+  it("builds each harness's command for Standard and Full access", () => {
+    const claude = (permissions: "standard" | "full", resume: boolean) =>
+      harnessCommand({ harness: "claude", model: "system.ai.claude-sonnet-5-5", permissions, session: { id: "s-1", resume }, files });
+    expect(claude("standard", false)).toContain("--permission-mode auto");
+    expect(claude("standard", false)).toContain("--session-id 's-1'");
+    expect(claude("full", true)).toContain("--permission-mode bypassPermissions");
+    expect(claude("full", true)).toContain("--resume 's-1'");
+    expect(claude("standard", false)).toMatch(/--append-system-prompt-file '.*system\.md' .* < '.*prompt\.md'$/);
+    const codex = harnessCommand({ harness: "codex", model: "system.ai.gpt-5-6-sol", permissions: "standard", session: undefined, files });
+    expect(codex).toMatch(/^codex exec --json /);
+    expect(codex).toContain(`-c 'sandbox_mode="workspace-write"' -c sandbox_workspace_write.network_access=true`);
+    expect(codex).not.toContain("dangerously");
+    const codexFull = harnessCommand({ harness: "codex", model: "system.ai.gpt-5-6-sol", permissions: "full", session: { id: "t-9", resume: true }, files });
+    expect(codexFull).toMatch(/^codex exec resume 't-9' --json .*--dangerously-bypass-approvals-and-sandbox - < /);
+    const pi = (permissions: "standard" | "full") => harnessCommand({ harness: "pi", model: "system.ai.claude-sonnet-5-5", permissions, session: { id: "p-1", resume: true }, files });
+    expect(pi("standard")).toContain("--tools read,grep,find,ls,edit,write");
+    expect(pi("full")).not.toContain("--tools");
+    expect(pi("full")).toMatch(/'@.*prompt\.md' < \/dev\/null$/);
+  });
+  it("reads complete lines and the exit code from a poll", () => {
+    expect(parsePoll("\n@@buzz-events@@\n{\"a\":1}\n{\"b\":")).toEqual({ lines: ['{"a":1}'] });
+    expect(parsePoll("0\n\n@@buzz-events@@\n")).toEqual({ exit: 0, lines: [] });
+  });
+  it("reads Claude Code, Codex and Pi events", () => {
+    expect(parseEvent("claude", '{"type":"system","subtype":"init","session_id":"c-1"}')).toEqual({ session: "c-1" });
+    expect(parseEvent("claude", '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -a"}}]}}')).toEqual({ step: { tool: "Bash", target: "ls -a" } });
+    expect(parseEvent("claude", '{"type":"result","subtype":"success","is_error":false,"result":"done"}')).toEqual({ final: "done" });
+    expect(parseEvent("claude", '{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}')).toEqual({ error: "error_max_turns" });
+    expect(parseEvent("claude", '{"type":"system","subtype":"api_retry","error_status":403,"error":"authentication_failed"}')?.step?.target).toMatch(/403/);
+    expect(parseEvent("codex", '{"type":"thread.started","thread_id":"t-1"}')).toEqual({ session: "t-1" });
+    expect(parseEvent("codex", `{"type":"item.started","item":{"type":"command_execution","command":"/bin/bash -lc 'echo hi'"}}`)).toEqual({ step: { tool: "shell", target: "echo hi" } });
+    expect(parseEvent("codex", '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}')).toEqual({ text: "hi" });
+    expect(parseEvent("codex", '{"type":"item.completed","item":{"type":"error","message":"Model metadata not found"}}')).toBeUndefined();
+    expect(parseEvent("codex", '{"type":"turn.failed","error":{"message":"rate limited"}}')).toEqual({ error: "rate limited" });
+    expect(parseEvent("pi", '{"type":"session","version":3,"id":"p-1"}')).toEqual({ session: "p-1" });
+    expect(parseEvent("pi", '{"type":"tool_execution_start","toolName":"ls","args":{"path":"."}}')).toEqual({ step: { tool: "ls", target: "." } });
+    expect(parseEvent("pi", '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"0 files"}]}}')).toEqual({ text: "0 files" });
+    expect(parseEvent("pi", '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"question"}]}}')).toBeUndefined();
+    expect(parseEvent("pi", "not json")).toBeUndefined();
+  });
+  it("keeps the useful end of stderr", () => {
+    expect(stderrSummary("✔ Databricks auth already available for\n✔ Unity Gateway connected\n✔ Starting Codex\nError: quota exceeded\n")).toBe("Error: quota exceeded");
+  });
+
+  /** A Sandbox whose polls answer from a script; records what ran. */
+  function fakeSandbox(polls: string[][], options: { exits?: (number | undefined)[]; stderr?: string } = {}) {
+    const ran: string[] = [];
+    const written = new Map<string, string>();
+    let poll = 0;
+    const sandboxes = {
+      async writeFile(_id: string, path: string, contents: string) {
+        written.set(path.split("/").pop()!, contents);
+      },
+      async readFile() {
+        return options.stderr ?? "";
+      },
+      async bash(_id: string, script: string) {
+        ran.push(script);
+        if (!script.startsWith("cat ")) return { exit_code: 0, stdout: "" };
+        const lines = polls[poll] ?? [];
+        const exit = options.exits?.[poll] ?? (poll >= polls.length - 1 ? 0 : undefined);
+        poll++;
+        return { exit_code: 0, stdout: `${exit ?? ""}\n\n@@buzz-events@@\n${lines.map((line) => `${line}\n`).join("")}` };
+      },
+    };
+    return { sandboxes: sandboxes as never, ran, written };
+  }
+  const base = { sandbox: "sb", model: "system.ai.claude-sonnet-5-5", permissions: "standard" as const, system: "Be brief.", pollMs: 1, newId: () => "11111111-2222-4333-8444-555555555555" };
+
+  it("runs a turn: launches detached, follows events, returns the reply and session", async () => {
+    const { sandboxes, ran, written } = fakeSandbox([
+      ['{"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"}', '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}'],
+      ['{"type":"result","subtype":"success","is_error":false,"result":"Two files."}'],
+      [],
+    ]);
+    const steps: string[] = [];
+    const saved: string[] = [];
+    const result = await runRemoteTurn({ ...base, sandboxes, harness: "claude", prompt: "How many files?", signal: new AbortController().signal, onStep: (tool, target) => steps.push(`${tool}:${target}`), onSession: (session) => saved.push(session.id) });
+    expect(result).toEqual({ text: "Two files.", session: { harness: "claude", id: "11111111-2222-4333-8444-555555555555" } });
+    expect(steps).toEqual(["Bash:ls"]);
+    expect(saved).toEqual(["11111111-2222-4333-8444-555555555555"]);
+    expect(written.get("run.sh")).toContain("--session-id '11111111-2222-4333-8444-555555555555'");
+    expect(ran.some((script) => /^nohup setsid bash /.test(script))).toBe(true);
+    expect(ran.some((script) => script.startsWith("P=$(cat"))).toBe(false); // finished: nothing to kill
+  });
+  it("gives a new Codex thread the instructions, and resumes a known one without them", async () => {
+    const first = fakeSandbox([['{"type":"thread.started","thread_id":"t-7"}', '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}'], []]);
+    const one = await runRemoteTurn({ ...base, sandboxes: first.sandboxes, harness: "codex", model: "system.ai.gpt-5-6-sol", prompt: "Hi", signal: new AbortController().signal });
+    expect(one.session).toEqual({ harness: "codex", id: "t-7" });
+    expect(first.written.get("prompt.md")).toBe("<instructions>\nBe brief.\n</instructions>\n\nHi");
+    const second = fakeSandbox([['{"type":"item.completed","item":{"type":"agent_message","text":"Again"}}'], []]);
+    await runRemoteTurn({ ...base, sandboxes: second.sandboxes, harness: "codex", model: "system.ai.gpt-5-6-sol", session: one.session, prompt: "Again?", signal: new AbortController().signal });
+    expect(second.written.get("prompt.md")).toBe("Again?");
+    expect(second.written.get("run.sh")).toContain("codex exec resume 't-7'");
+  });
+  it("stops the harness on Stop", async () => {
+    const { sandboxes, ran } = fakeSandbox([[], [], [], [], [], [], [], [], [], []], { exits: Array(10).fill(undefined) });
+    const controller = new AbortController();
+    const turn = runRemoteTurn({ ...base, sandboxes, harness: "pi", prompt: "Long job", signal: controller.signal, pollMs: 5 });
+    setTimeout(() => controller.abort(), 12);
+    await expect(turn).rejects.toMatchObject({ name: "AbortError" });
+    expect(ran.some((script) => script.startsWith("P=$(cat") && script.includes("kill -TERM"))).toBe(true);
+  });
+  it("reports a failed run with the end of its stderr", async () => {
+    const { sandboxes } = fakeSandbox([[]], { exits: [1], stderr: "✔ Starting Pi\nError: model not found\n" });
+    await expect(runRemoteTurn({ ...base, sandboxes, harness: "pi", prompt: "Hi", signal: new AbortController().signal })).rejects.toThrow("Pi stopped (exit 1): Error: model not found.");
+  });
+  it("starts over when a saved session is gone", async () => {
+    let calls = 0;
+    const lost = fakeSandbox([[]], { exits: [1], stderr: "No conversation found with session ID: old-1" });
+    const ok = fakeSandbox([['{"type":"result","subtype":"success","is_error":false,"result":"Fresh."}'], []]);
+    // The first run (resuming old-1) fails; its cleanup switches to the second.
+    const current = () => (calls < 1 ? lost : ok).sandboxes as any;
+    const result = await runRemoteTurn({
+      ...base,
+      sandboxes: {
+        writeFile: (...args: never[]) => current().writeFile(...args),
+        readFile: (...args: never[]) => current().readFile(...args),
+        bash: async (...args: never[]) => {
+          const value = await current().bash(...args);
+          if (String(args[1]).startsWith("rm -rf")) calls++;
+          return value;
+        },
+      } as never,
+      harness: "claude",
+      session: { harness: "claude", id: "old-1" },
+      prompt: "Hi",
+      signal: new AbortController().signal,
+    });
+    expect(result.text).toBe("Fresh.");
+    expect(lost.written.get("run.sh")).toContain("--resume 'old-1'");
+    expect(ok.written.get("run.sh")).toContain("--session-id '11111111-2222-4333-8444-555555555555'");
+  });
+  it("defaults to the Built-in harness with Standard permissions, and summarizes remote ones", () => {
+    const old = normalizeDatabricks({ kind: "sandbox", model: "system.ai.claude-opus-5-5" });
+    expect(old).toMatchObject({ harness: "builtin", permissions: "standard" });
+    expect(summarize({ ...old, harness: "codex", permissions: "full" })).toBe("Sandbox · Codex · GPT-5.6 Sol · full access");
+    expect(summarize({ ...old, harness: "claude" })).toBe("Sandbox · Claude Code · Claude Opus 5.5");
+  });
+});
