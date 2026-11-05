@@ -90,7 +90,7 @@ function BrowserWait(props: { service: DatabricksService; host?: string }) {
 }
 
 /** Buzz's own Databricks connection, with the same sign-in Settings offers. */
-function NeedsConnection(props: { service: DatabricksService }) {
+export function NeedsConnection(props: { service: DatabricksService }) {
   const { service } = props;
   const snapshot = useConnection(service);
   if (snapshot.status === "signing-in") return <BrowserWait service={service} {...(snapshot.host && { host: snapshot.host })} />;
@@ -333,7 +333,7 @@ const lists = new WeakMap<DatabricksService, Map<string, { at: number; value: Pr
  * A workspace list (models, Genie agents, MCP servers…) loaded at most once
  * every 5 minutes and shared by every form showing it. Failures aren't kept.
  */
-function cachedList<T>(service: DatabricksService, key: string, load: () => Promise<T>): Promise<T> {
+export function cachedList<T>(service: DatabricksService, key: string, load: () => Promise<T>): Promise<T> {
   let entries = lists.get(service);
   if (!entries) lists.set(service, (entries = new Map()));
   const found = entries.get(key);
@@ -712,7 +712,7 @@ export function modelOptions(models: readonly ChatModel[] | undefined): PickOpti
   return [...recommended, ...rest];
 }
 
-function ModelField(props: { service: DatabricksService; value: string; onChange(model: string): void; disabled?: boolean; accepts?(id: string): boolean; hint?: string }) {
+export function ModelField(props: { service: DatabricksService; value: string; onChange(model: string): void; disabled?: boolean; accepts?(id: string): boolean; hint?: string }) {
   const status = useConnection(props.service).status;
   const models = useAsync(() => cachedList(props.service, "models", async () => new Ai(await props.service.ready()).models()), [props.service, status]);
   const options = modelOptions(models.data).filter((option) => !props.accepts || props.accepts(option.id));
@@ -733,7 +733,7 @@ function ModelField(props: { service: DatabricksService; value: string; onChange
   );
 }
 
-const genieSpaces = (service: DatabricksService) => cachedList(service, "genie-spaces", async () => new Genie(await service.ready()).listSpaces());
+export const genieSpaces = (service: DatabricksService) => cachedList(service, "genie-spaces", async () => new Genie(await service.ready()).listSpaces());
 
 const asChoice = (server: McpServer): ToolChoice => ({ id: server.id, kind: server.kind, label: server.label, path: server.path });
 

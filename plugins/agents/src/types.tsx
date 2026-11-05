@@ -16,7 +16,7 @@ import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice } from "./capabilities";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
-import { HARNESS_IDS, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
+import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
 import { ensureAgentSandbox, SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
 import { plainText, Sessions } from "./state";
 import { type AgentKind, AgentForm, type CustomAgent, type DatabricksConfig, SettingsTab } from "./ui";
@@ -155,13 +155,7 @@ async function databricksTools(
   };
 }
 
-/** How a Databricks agent shows data: Buzz draws result blocks as charts. */
-export const RESULT_PROMPT = [
-  "To show a query result or other table, put it in a fenced code block with the language",
-  `\`${RESULT_LANGUAGE}\` whose body is CSV with a header row (up to 200 rows; quote values that contain commas).`,
-  "Buzz draws it as an interactive chart with a table view, so you can chart data; don't say you can't.",
-  "Put the label column (such as a date or category) first and the numeric columns after it, unformatted (no $ or thousands separators).",
-].join(" ");
+
 
 function toolsNote(workspace: DatabricksService, service: DatabricksService, problems: readonly string[]): string {
   const lines: string[] = [RESULT_PROMPT];

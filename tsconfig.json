@@ -19,5 +19,5 @@
     "baseUrl": ".",
     "paths": { "@dbx/core/*": ["packages/core/src/*"] }
   },
-  "include": ["packages/*/src", "plugins/*/src", "tests"]
+  "include": ["packages/*/src", "plugins/*/src", "plugins/*/runner", "tests"]
 }

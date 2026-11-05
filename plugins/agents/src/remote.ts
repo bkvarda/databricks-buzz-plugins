@@ -11,6 +11,7 @@
 // event log every couple of seconds for progress, its session ID and the
 // final message, which Buzz posts as the agent's reply.
 import { SANDBOX_HOME, type Sandboxes } from "@dbx/core/api/sandbox";
+import { RESULT_LANGUAGE } from "@dbx/core/result";
 
 export type HarnessId = "builtin" | "claude" | "codex" | "pi";
 export type RemoteHarness = Exclude<HarnessId, "builtin">;
@@ -60,6 +61,14 @@ export function permissionsHint(harness: RemoteHarness, permissions: Permissions
   if (harness === "codex") return "Codex can change files only in its work folder and /tmp, and can reach the internet.";
   return "Pi has no approval step, so Standard gives it file tools only (read, search, edit, write) and no shell.";
 }
+
+/** How a Databricks agent shows data: Buzz draws result blocks as charts. */
+export const RESULT_PROMPT = [
+  "To show a query result or other table, put it in a fenced code block with the language",
+  `\`${RESULT_LANGUAGE}\` whose body is CSV with a header row (up to 200 rows; quote values that contain commas).`,
+  "Buzz draws it as an interactive chart with a table view, so you can chart data; don't say you can't.",
+  "Put the label column (such as a date or category) first and the numeric columns after it, unformatted (no $ or thousands separators).",
+].join(" ");
 
 // ── Commands ──
 

@@ -68,9 +68,9 @@ The agent types use `ctx.agents.harness` (block/buzz-app#2364), the same Buzz si
 
 When the host lacks the kit (Buzz builds before #2364), no types register and **Settings → Databricks Agents** says to update Buzz.
 
-### Sandbox harnesses: Claude Code, Codex, Pi
+### Sandbox harnesses: Claude Code, Codex, Pi (hybrid; no longer registered)
 
-A Sandbox agent's **Harness** is either **Built-in** (the loop above) or a coding agent that runs inside the agent's own Sandbox (`plugins/agents/src/remote.ts`). Every Sandbox image ships `claude`, `codex` and `pi` as launchers that configure themselves through Unity Gateway (`ug`) with the Sandbox's own credential (the owner's), so the plugin never passes a token.
+The hybrid Sandbox agent (below) ran its turns from the owner's Buzz; it is superseded by the hosted type next. A Sandbox agent's **Harness** is either **Built-in** (the loop above) or a coding agent that runs inside the agent's own Sandbox (`plugins/agents/src/remote.ts`). Every Sandbox image ships `claude`, `codex` and `pi` as launchers that configure themselves through Unity Gateway (`ug`) with the Sandbox's own credential (the owner's), so the plugin never passes a token.
 
 - **A turn.** Buzz's prompts come from `kit.systemPrompt(…, { tools: false })`, meant for a session whose final message the harness posts, and from `kit.turnPrompt` from the conversation's cursor. A new harness session is shown the whole conversation. The plugin writes the prompt, instructions and a run script under `~/.buzz/runs/<run>`, then starts the script detached (`nohup setsid`, holding none of the command's output). That matters because Databricks' command API waits for anything holding its output and stops a command after about five minutes. It then reads the harness's JSON event log every 2 seconds with `tail -n +N` (complete lines only), turning tool events into Buzz's working steps. The final message is posted with `kit.reply`. Stop and the turn timeout kill the run's process group. Measured end to end: 11–17 seconds a turn.
 - **Sessions.** There is one harness session per Buzz conversation, kept in `/home/sandbox-agent` so it survives Sandbox restarts:
@@ -94,9 +94,27 @@ A Sandbox agent's **Harness** is either **Built-in** (the loop above) or a codin
   **Full access** is `bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`, or Pi's default tools.
 - **Limits.** These harnesses don't get Buzz's tools; they answer the conversation they're in. The Genie and MCP picks apply to Built-in only, and watches and timers run on Built-in. Prompt input must be closed (`< /dev/null`), or Pi waits on stdin.
 
-### Hosted Sandbox agents (next step)
+### Hosted Databricks agents (the registered type)
 
-Buzz also supports hosted agent types (`AgentType.remote`), where a provider holds the agent's key and runs it while Buzz is closed. The plan for a hosted Sandbox agent is: `provision` creates the Sandbox and generates the agent's Nostr key inside it, so the key never leaves Databricks; `activate` hands over the owner's NIP-OA attestation (`host.prepareRemoteAgentAuthorization`) and starts a small runner under `nohup` that subscribes to the community relay and runs the same loop with Buzz's standalone MCP tools; and `remove` deletes the Sandbox. This needs relay reachability from Databricks serverless egress, a restart policy for the Sandbox's 24-hour run limit, and a decision on where the Buzz tool server runs.
+The plugin registers one agent type, **Databricks** (`databricks-hosted`). It is a hosted type (`AgentType.remote`), so Buzz lists it as "Databricks (hosted)", and every agent runs fully remote in its own Databricks Sandbox. The agent answers with the owner's laptop off. Hosted-ness is per type, not per agent, so the earlier local types (the Built-in loop, hybrid harnesses, custom agents) are no longer registered. Agents made with them show "Harness unavailable".
+
+- **Kinds.** **Genie** answers with Genie One, or a chosen Genie agent, as charts and tables, keeping one Genie conversation per Buzz conversation. **Sandbox agent** runs Claude Code, Codex or Pi with the same command builder and event parser as the hybrid harnesses (`src/remote.ts`). The harness is spawned directly in the Sandbox and its output read live.
+- **Lifecycle** (`src/hosted.tsx`):
+  - `provision` creates the Sandbox (`buzz-hosted-<random>`) and turns off its idle auto-stop (`PATCH /api/2.0/lakebox/sandboxes/<id> {"no_autostop": true}`). It then uploads the runner and runs `keygen`, so the agent's key is made in the Sandbox and never leaves it. A retried creation reuses its pending Sandbox, so it never makes two keys.
+  - `activate` writes the runner's config with the owner's NIP-OA tag, starts the runner, and creates the keeper job.
+  - `profile` republishes the profile, `interrupt` stops a conversation's turn, and `remove` deletes the job and the Sandbox.
+  - Buzz refuses settings saves for hosted agents, so the Settings tab saves through the provider: it rewrites the config, restarts the runner and updates the keeper's schedule.
+- **The runner** (`runner/`, bundled for Node by `scripts/build.mjs` and embedded in the plugin as `virtual:agent-runner`):
+  - **Talking to the relay.** It uses the relay's HTTP API, as Buzz's own agent processes do (`src/buzz-mcp/node.ts`): `POST /events` and `POST /query`, each NIP-98 signed by the agent, with the owner's attestation in `x-auth-tag`. That header is how the relay admits an agent key. WebSocket sign-in with a fresh agent key was refused ("not a relay member").
+  - **Mentions.** It polls `/query` for kind 9 and 40002 messages tagging the agent every 3 seconds. It answers only the owner's own messages, or ones the owner attested (`attestedOwner`, BIP-340 over `nostr:agent-auth:<agent>:<conditions>`).
+  - **Conversations and context.** It finds the conversation as the kit does: a thread, or the whole channel for Solo chats (kind 39000 with `t=stream` and the `buzz.solo` label), DMs and channel scope. It reads the thread for context the harness session hasn't seen.
+  - **Replies.** It replies with kind 9 (`h`, `e root "" reply` except in Solo chats, `ms`, and the auth tag), split under the relay's frame limit.
+  - **Order and safety.** Each conversation's turns run one at a time. Harnesses always use **Standard** permissions, because these agents run unattended.
+  - **Profile.** The runner publishes the profile itself (kind 0, `bot: true`, attested), retrying until accepted, in case the relay admits the agent only once Buzz writes its listing after activation.
+- **Availability.** **Always on**: the runner never stops, and the keeper (every 30 minutes) restarts the Sandbox after its 24-hour limit or a crash. **Sleep when idle**: the runner stops its own Sandbox after 5 minutes without work, never mid-turn. The keeper wakes it every 15 minutes and it catches up on missed mentions. While the owner's Buzz is open, the plugin touches each sleeping agent's heartbeat every 4 minutes, so it stays awake and answers in seconds.
+- **The keeper** (`src/keeper.ts`) is a scheduled serverless job running as the owner (`spark_python_task` on `~/.buzz/agent_keeper.py`). It starts the Sandbox if stopped and runs `runner.mjs start`. It was verified that a serverless job can read and exec in its owner's Sandbox.
+- **Not yet.** The agent shows no "working" state or Stop button in Buzz: those come from encrypted observer frames (kind 24200), whose format isn't documented. Buzz's own tools (posting elsewhere, reading other channels) aren't available to these agents. One Sandbox per agent; a shared host Sandbox would be cheaper.
+- **Tested.** `tests/runner.test.ts` runs the real runner bundle against a local relay (`tests/fake-relay.ts`, HTTP with NIP-98 and `x-auth-tag`) to check sign-in, owner and attested admission, threads, Solo chats, context and profiles. Live against a workspace: Genie One and Claude Code answered through the runner inside a Sandbox, and the provider's provision, activate, status, wake and remove ran against real APIs.
 
 ## Genie One rendering
 
