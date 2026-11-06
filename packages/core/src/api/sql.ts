@@ -41,9 +41,14 @@ export class Sql {
 
   /** The best default: running serverless, any serverless, running, first. */
   static pick(warehouses: readonly Warehouse[]): Warehouse | undefined {
+    return Sql.rank(warehouses)[0];
+  }
+
+  /** Warehouses best first, in `pick`'s order. */
+  static rank(warehouses: readonly Warehouse[]): Warehouse[] {
     const score = (w: Warehouse) =>
       (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
-    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+    return [...warehouses].sort((a, b) => score(b) - score(a));
   }
 
   /** Runs a statement and waits for its first result chunk. */

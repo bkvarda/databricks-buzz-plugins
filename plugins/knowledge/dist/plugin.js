@@ -497,7 +497,7 @@ var StatementError = class extends Error {
 };
 var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
 var EXPIRED = "Databricks no longer keeps this result. Run the statement again to see it.";
-var Sql = class {
+var Sql = class _Sql {
   constructor(client) {
     this.client = client;
   }
@@ -507,8 +507,12 @@ var Sql = class {
   }
   /** The best default: running serverless, any serverless, running, first. */
   static pick(warehouses) {
+    return _Sql.rank(warehouses)[0];
+  }
+  /** Warehouses best first, in `pick`'s order. */
+  static rank(warehouses) {
     const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
-    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+    return [...warehouses].sort((a, b) => score(b) - score(a));
   }
   /** Runs a statement and waits for its first result chunk. */
   async execute(statement, options) {
@@ -724,17 +728,6 @@ function describeError(error) {
   return String(error);
 }
 
-// packages/core/src/warehouse.ts
-async function resolveWarehouse(service, explicit) {
-  const client = await service.ready();
-  const sql = new Sql(client);
-  const warehouses = await sql.warehouses();
-  const preferred = explicit || service.preferences.get("warehouseId");
-  const chosen = preferred && warehouses.find((w) => w.id === preferred || w.name === preferred) || Sql.pick(warehouses);
-  if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
-  return { id: chosen.id, name: chosen.name };
-}
-
 // packages/core/src/skill-catalog.ts
 var SKILL_LOCATIONS = "skillLocations";
 var FRESH_MS = 5 * 6e4;
@@ -744,14 +737,17 @@ var hostOf = (service) => {
   return snapshot.status === "connected" ? snapshot.profile.host : void 0;
 };
 var schemaOf = (fullName) => fullName.split(".").slice(0, 2).join(".");
+var refused = (error) => isApiError(error) && error.isPermission || /permission|not authorized|insufficient privileges|insufficient permissions/i.test(String(error?.message ?? error));
 var SkillCatalog = class {
-  constructor(service) {
+  constructor(service, options = {}) {
     this.service = service;
+    this.options = options;
     service.subscribe(() => {
       const host = hostOf(service);
       if (host === this.host) return;
       this.host = host;
       this.loading = void 0;
+      this.working = void 0;
       this.set(IDLE);
     });
     this.host = hostOf(service);
@@ -760,6 +756,44 @@ var SkillCatalog = class {
   host;
   loading;
   listeners = /* @__PURE__ */ new Set();
+  /** The warehouse that last worked on Automatic, per workspace. */
+  working;
+  /** The warehouse chosen for this catalog, or undefined for Automatic. */
+  chosenWarehouse() {
+    return this.options.warehousePref ? this.service.preferences.get(this.options.warehousePref) || void 0 : void 0;
+  }
+  /**
+   * Runs SQL work on a warehouse: the chosen one, or on Automatic the person's
+   * default and then the others best first, moving on from any that refuse
+   * the person. Tries at most four.
+   */
+  async withWarehouse(run) {
+    const warehouses = await new Sql(await this.service.ready()).warehouses();
+    const chosen = this.chosenWarehouse();
+    if (chosen) {
+      const warehouse = warehouses.find((w) => w.id === chosen || w.name === chosen);
+      if (!warehouse) throw new Error("The SQL warehouse chosen for skills isn't available to you any more. Choose another in Settings \u2192 Databricks Knowledge.");
+      return { result: await run(warehouse.id), warehouse: { id: warehouse.id, name: warehouse.name } };
+    }
+    const preferred = [this.working, this.service.preferences.get("warehouseId")].filter(Boolean);
+    const ordered = [
+      ...preferred.map((id) => warehouses.find((w) => w.id === id || w.name === id)).filter((w) => Boolean(w)),
+      ...Sql.rank(warehouses)
+    ].filter((w, index, all) => all.findIndex((other) => other.id === w.id) === index);
+    if (!ordered.length) throw new Error("No SQL warehouse is available to you in this workspace.");
+    let last;
+    for (const warehouse of ordered.slice(0, 4)) {
+      try {
+        const result = await run(warehouse.id);
+        this.working = warehouse.id;
+        return { result, warehouse: { id: warehouse.id, name: warehouse.name } };
+      } catch (error) {
+        if (!refused(error)) throw error;
+        last = error;
+      }
+    }
+    throw new Error(`None of the SQL warehouses tried let you run queries (${describeError(last)}). Choose one you can use in Settings \u2192 Databricks Knowledge.`);
+  }
   snapshot = () => this.state;
   subscribe = (listener) => {
     this.listeners.add(listener);
@@ -786,9 +820,11 @@ var SkillCatalog = class {
         const client = await this.service.ready();
         let tagged = [];
         let note;
+        let warehouse;
         try {
-          const warehouse = await resolveWarehouse(this.service);
-          tagged = await new Tags(client).schemas(warehouse.id, [SKILLS_TAG, CHANNEL_TAG, DOMAIN_TAG]);
+          const found = await this.withWarehouse((id) => new Tags(client).schemas(id, [SKILLS_TAG, CHANNEL_TAG, DOMAIN_TAG]));
+          tagged = found.result;
+          warehouse = found.warehouse;
         } catch (error) {
           note = `Couldn't look for tagged skills schemas: ${describeError(error)}`;
         }
@@ -803,7 +839,7 @@ var SkillCatalog = class {
         for (const location of this.locations()) if (!byName.has(location)) byName.set(location, { tags: {}, source: "added" });
         const schemas = [...byName].map(([schema2, entry]) => ({ schema: schema2, ...entry })).sort((a, b) => a.schema.localeCompare(b.schema));
         const skills = schemas.length ? await this.listSkills(schemas.map((entry) => entry.schema)) : [];
-        const next = { status: "ready", schemas, skills, at: Date.now(), ...note && { note } };
+        const next = { status: "ready", schemas, skills, at: Date.now(), ...note && { note }, ...warehouse && { warehouse } };
         if (host === this.host) this.set(next);
         return next;
       } catch (error) {
@@ -858,6 +894,69 @@ var SkillCatalog = class {
     for (const listener of [...this.listeners]) listener();
   }
 };
+
+// packages/core/src/workspace-choice.ts
+function followWorkspace(main, key) {
+  const chosen = () => main.preferences.get(key) || void 0;
+  const target = () => {
+    const profile = chosen();
+    return profile && main.forProfile ? main.forProfile(profile) : main;
+  };
+  const listeners = /* @__PURE__ */ new Set();
+  const preferenceListeners = /* @__PURE__ */ new Set();
+  const notify = () => {
+    for (const listener of [...listeners]) listener();
+  };
+  const notifyPreferences = () => {
+    for (const listener of [...preferenceListeners]) listener();
+  };
+  let current = target();
+  let stop = current.subscribe(notify);
+  let stopPreferences = current.preferences.subscribe(notifyPreferences);
+  const follow = () => {
+    const next = target();
+    if (next === current) return;
+    stop();
+    stopPreferences();
+    current = next;
+    stop = current.subscribe(notify);
+    stopPreferences = current.preferences.subscribe(notifyPreferences);
+    notify();
+    notifyPreferences();
+  };
+  main.preferences.subscribe(follow);
+  main.subscribe(follow);
+  const preferences = {
+    get: (name) => current.preferences.get(name),
+    set: (name, value) => current.preferences.set(name, value),
+    subscribe: (listener) => {
+      preferenceListeners.add(listener);
+      return () => preferenceListeners.delete(listener);
+    }
+  };
+  return {
+    version: 1,
+    snapshot: () => current.snapshot(),
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    client: () => current.client(),
+    ready: (signal) => current.ready(signal),
+    workspaceUrl: (path) => current.workspaceUrl(path),
+    profiles: () => main.profiles(),
+    openSettings: () => main.openSettings(),
+    signIn: () => current.signIn(),
+    reauthenticate: () => current.reauthenticate ? current.reauthenticate() : current.signIn(),
+    cancelSignIn: () => current.cancelSignIn?.(),
+    preferences,
+    ...main.announce && { announce: main.announce },
+    ...main.forProfile && { forProfile: main.forProfile },
+    ...main.addWorkspace && { addWorkspace: main.addWorkspace },
+    profile: chosen,
+    setProfile: (profile) => main.preferences.set(key, profile || void 0)
+  };
+}
 
 // packages/core/src/host-types.ts
 function optionalService(ctx, name) {
@@ -2822,9 +2921,8 @@ function SchemasSection(props) {
     setBusy(true);
     try {
       const client = await service.ready();
-      const warehouse = await resolveWarehouse(service);
       const [catalogName, schemaName] = schema2.split(".");
-      await new Tags(client).tagSchema(warehouse.id, catalogName, schemaName, { [SKILLS_TAG]: "true" });
+      await catalog.withWarehouse((warehouseId) => new Tags(client).tagSchema(warehouseId, catalogName, schemaName, { [SKILLS_TAG]: "true" }));
       setName("");
       setMessage({ tone: "success", text: `Marked ${schema2}. It can take a minute to show up here.` });
       void catalog.load(true);
@@ -2842,8 +2940,7 @@ function SchemasSection(props) {
     try {
       const client = await service.ready();
       await client.post("/api/2.1/unity-catalog/schemas", { name: schemaName, catalog_name: catalogName });
-      const warehouse = await resolveWarehouse(service);
-      await new Tags(client).tagSchema(warehouse.id, catalogName, schemaName, { [SKILLS_TAG]: "true" });
+      await catalog.withWarehouse((warehouseId) => new Tags(client).tagSchema(warehouseId, catalogName, schemaName, { [SKILLS_TAG]: "true" }));
       setName("");
       setMessage({ tone: "success", text: `Created ${schema2} as a skills schema. It can take a minute to show up here.` });
       void catalog.load(true);
@@ -2931,22 +3028,141 @@ function registerSkills(scope, service, catalog) {
   });
 }
 
+// packages/core/src/ui/workspace.tsx
+var hostname = (host) => new URL(host).hostname;
+var ADD = "__add__";
+function useWorkspaceService(service, profile) {
+  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+function BrowserWait(props) {
+  const { cancelSignIn } = props.service;
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser", props.host ? ` (${hostname(props.host)})` : "", ".")), cancelSignIn && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => cancelSignIn() }, "Cancel"));
+}
+function WorkspaceStatus(props) {
+  const { service, snapshot } = props;
+  const signIn = (label) => service.reauthenticate ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => void service.reauthenticate() }, label) : void 0;
+  switch (snapshot.status) {
+    case "checking":
+    case "connecting":
+      return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026"));
+    case "signing-in":
+      return /* @__PURE__ */ React.createElement(BrowserWait, { service, ...snapshot.host && { host: snapshot.host } });
+    case "connected":
+      return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", hostname(snapshot.profile.host), " as ", snapshot.user.userName, ".");
+    case "error":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn(snapshot.needsSignIn ? "Sign in again" : "Sign in") }, snapshot.needsSignIn ? "Your sign-in to this workspace has expired." : snapshot.message);
+    case "signed-out":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn("Sign in") }, snapshot.error ?? "You're not signed in to this workspace.");
+    default:
+      return null;
+  }
+}
+function WorkspaceField(props) {
+  const main = useConnection(props.service);
+  const workspace = useWorkspaceService(props.service, props.profile);
+  const current = useConnection(workspace);
+  const [adding, setAdding] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [state, setState] = React.useState({});
+  if (!props.service.forProfile) return null;
+  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
+  const profiles = props.service.profiles();
+  const mainName = main.status === "connected" ? main.profile.name : void 0;
+  const signIn = async () => {
+    setState({ busy: true });
+    try {
+      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
+      props.onChange(profile === mainName ? void 0 : profile);
+      setAdding(false);
+      setUrl("");
+      setState({});
+    } catch (error) {
+      setState({ error: describeError(error) });
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: adding ? ADD : props.profile ?? "",
+      onChange: (event) => {
+        const value = event.target.value;
+        if (value === ADD) return setAdding(true);
+        setAdding(false);
+        props.onChange(value && value !== mainName ? value : void 0);
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
+    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
+    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
+  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.busy && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser."), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && !adding && /* @__PURE__ */ React.createElement(WorkspaceStatus, { service: workspace, snapshot: current })));
+}
+
+// plugins/knowledge/src/workspace-settings.tsx
+var WORKSPACE_PREF = "knowledgeWorkspace";
+var WAREHOUSE_PREF = "knowledgeWarehouse";
+function WorkspaceSettings(props) {
+  const { main, service, catalog } = props;
+  const connection = useConnection(service);
+  const state = React.useSyncExternalStore(catalog.subscribe, catalog.snapshot);
+  const host = connection.status === "connected" ? connection.profile.host : void 0;
+  const [warehouseId, setWarehouseId] = usePreference(service, WAREHOUSE_PREF);
+  const warehouses = useAsync(async (signal) => host ? new Sql(await service.ready(signal)).warehouses(signal) : [], [host]);
+  const [, setProfile] = usePreference(main, WORKSPACE_PREF);
+  const profile = service.profile();
+  const used = state.warehouse && !warehouseId ? ` Last used: ${state.warehouse.name}.` : "";
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Workspace and warehouse", description: "Where skills, domains and Pages are read and published. Agents' skill tools use it too." }), /* @__PURE__ */ React.createElement(
+    WorkspaceField,
+    {
+      service: main,
+      ...profile && { profile },
+      onChange: (next) => {
+        setProfile(next);
+        void catalog.load(true);
+      }
+    }
+  ), /* @__PURE__ */ React.createElement(
+    Field,
+    {
+      label: "SQL warehouse for finding skills",
+      hint: `Runs one query on schema tags to find skills schemas across your catalogs. Automatic tries your default warehouse, then others you can use.${used}`
+    },
+    /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        className: "dbx-select",
+        value: warehouseId ?? "",
+        disabled: !host,
+        onChange: (event) => {
+          setWarehouseId(event.target.value || void 0);
+          void catalog.load(true);
+        }
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "" }, "Automatic"),
+      (warehouses.data ?? []).map((warehouse) => /* @__PURE__ */ React.createElement("option", { key: warehouse.id, value: warehouse.id }, warehouse.name, warehouse.state ? ` \xB7 ${warehouse.state.toLowerCase()}` : "")),
+      warehouseId && !(warehouses.data ?? []).some((warehouse) => warehouse.id === warehouseId) && /* @__PURE__ */ React.createElement("option", { value: warehouseId }, warehouseId)
+    )
+  ), warehouses.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, "Couldn't list SQL warehouses: ", warehouses.error.message));
+}
+
 // plugins/knowledge/src/index.tsx
 var inject = ["react", "conversation", "panels", "settingsCards"];
 function apply(ctx) {
   bindReact(ctx.react);
-  const live = attach(ctx, { id: "bkvarda.databricks-knowledge", name: "Databricks Knowledge" }, (scope, databricks) => {
-    const catalog = new SkillCatalog(databricks);
+  const live = attach(ctx, { id: "bkvarda.databricks-knowledge", name: "Databricks Knowledge" }, (scope, main) => {
+    const databricks = followWorkspace(main, WORKSPACE_PREF);
+    const catalog = new SkillCatalog(databricks, { warehousePref: WAREHOUSE_PREF });
     registerSkills(scope, databricks, catalog);
     registerChannels(scope, databricks, catalog);
-    return { databricks, catalog };
+    return { main, databricks, catalog };
   });
   ctx.settingsCards.register({
     id: "knowledge",
     title: "Databricks Knowledge",
     component: () => {
       const runtime = useLive(live);
-      return runtime ? /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 24 }, /* @__PURE__ */ React.createElement(SkillsSettings, { service: runtime.databricks, catalog: runtime.catalog }), /* @__PURE__ */ React.createElement(DomainSettings, { service: runtime.databricks, catalog: runtime.catalog }))) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Databricks Knowledge" });
+      return runtime ? /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 24 }, /* @__PURE__ */ React.createElement(WorkspaceSettings, { main: runtime.main, service: runtime.databricks, catalog: runtime.catalog }), /* @__PURE__ */ React.createElement(SkillsSettings, { service: runtime.databricks, catalog: runtime.catalog }), /* @__PURE__ */ React.createElement(DomainSettings, { service: runtime.databricks, catalog: runtime.catalog }))) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Databricks Knowledge" });
     }
   });
 }

@@ -9,7 +9,6 @@ import { type DatabricksService, describeError, isApiError, useAsync, useConnect
 import { type SkillSchema, type SkillCatalog, schemaOf } from "@dbx/core/skill-catalog";
 import { Button, DbxRoot, Disclosure, Field, Notice, SectionHeader, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { Markdown } from "@dbx/core/ui/markdown";
-import { resolveWarehouse } from "@dbx/core/warehouse";
 import { DEFAULT_SCHEMA_PREF, validSchemaName } from "./skill-draft";
 
 const LIST_LIMIT = 200;
@@ -101,9 +100,8 @@ function SchemasSection(props: { service: DatabricksService; catalog: SkillCatal
     setBusy(true);
     try {
       const client = await service.ready();
-      const warehouse = await resolveWarehouse(service);
       const [catalogName, schemaName] = schema.split(".") as [string, string];
-      await new Tags(client).tagSchema(warehouse.id, catalogName, schemaName, { [SKILLS_TAG]: "true" });
+      await catalog.withWarehouse((warehouseId) => new Tags(client).tagSchema(warehouseId, catalogName, schemaName, { [SKILLS_TAG]: "true" }));
       setName("");
       setMessage({ tone: "success", text: `Marked ${schema}. It can take a minute to show up here.` });
       void catalog.load(true);
@@ -122,8 +120,7 @@ function SchemasSection(props: { service: DatabricksService; catalog: SkillCatal
     try {
       const client = await service.ready();
       await client.post("/api/2.1/unity-catalog/schemas", { name: schemaName, catalog_name: catalogName });
-      const warehouse = await resolveWarehouse(service);
-      await new Tags(client).tagSchema(warehouse.id, catalogName, schemaName, { [SKILLS_TAG]: "true" });
+      await catalog.withWarehouse((warehouseId) => new Tags(client).tagSchema(warehouseId, catalogName, schemaName, { [SKILLS_TAG]: "true" }));
       setName("");
       setMessage({ tone: "success", text: `Created ${schema} as a skills schema. It can take a minute to show up here.` });
       void catalog.load(true);

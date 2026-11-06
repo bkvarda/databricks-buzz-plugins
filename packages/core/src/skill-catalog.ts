@@ -10,10 +10,14 @@
 //
 // Results are kept for a few minutes per workspace. Without a SQL warehouse
 // only the added schemas are searched, and the catalog says so.
+//
+// The warehouse: the one chosen for this (`warehousePref`), or, on
+// Automatic, the person's default and then the rest best first, skipping any
+// they may see but not use. The one that worked is remembered.
 import { type SkillRef, Skills, searchSkills } from "./api/skills";
+import { Sql } from "./api/sql";
 import { CHANNEL_TAG, DOMAIN_TAG, SKILLS_TAG, type SchemaTag, Tags } from "./api/tags";
-import { type DatabricksService, describeError } from "./service";
-import { resolveWarehouse } from "./warehouse";
+import { type DatabricksService, describeError, isApiError } from "./service";
 
 /** Schemas the person added by hand, as `catalog.schema`. */
 export const SKILL_LOCATIONS = "skillLocations";
@@ -37,6 +41,8 @@ export type CatalogState = Readonly<{
   skills: readonly SkillRef[];
   /** Why tag discovery didn't run (no warehouse, query failed); added schemas still work. */
   note?: string;
+  /** The SQL warehouse the tag query ran on. */
+  warehouse?: Readonly<{ id: string; name: string }>;
   error?: string;
   at?: number;
 }>;
@@ -50,21 +56,69 @@ const hostOf = (service: DatabricksService) => {
 
 export const schemaOf = (fullName: string) => fullName.split(".").slice(0, 2).join(".");
 
+/** A warehouse refused because the person may see it but not use it. */
+const refused = (error: unknown) =>
+  (isApiError(error) && error.isPermission) || /permission|not authorized|insufficient privileges|insufficient permissions/i.test(String((error as Error)?.message ?? error));
+
 export class SkillCatalog {
   private state: CatalogState = IDLE;
   private host: string | undefined;
   private loading: Promise<CatalogState> | undefined;
   private listeners = new Set<() => void>();
+  /** The warehouse that last worked on Automatic, per workspace. */
+  private working: string | undefined;
 
-  constructor(private readonly service: DatabricksService) {
+  constructor(
+    private readonly service: DatabricksService,
+    private readonly options: Readonly<{ warehousePref?: string }> = {},
+  ) {
     service.subscribe(() => {
       const host = hostOf(service);
       if (host === this.host) return;
       this.host = host;
       this.loading = undefined;
+      this.working = undefined;
       this.set(IDLE);
     });
     this.host = hostOf(service);
+  }
+
+  /** The warehouse chosen for this catalog, or undefined for Automatic. */
+  chosenWarehouse(): string | undefined {
+    return this.options.warehousePref ? this.service.preferences.get<string>(this.options.warehousePref) || undefined : undefined;
+  }
+
+  /**
+   * Runs SQL work on a warehouse: the chosen one, or on Automatic the person's
+   * default and then the others best first, moving on from any that refuse
+   * the person. Tries at most four.
+   */
+  async withWarehouse<T>(run: (warehouseId: string) => Promise<T>): Promise<{ result: T; warehouse: { id: string; name: string } }> {
+    const warehouses = await new Sql(await this.service.ready()).warehouses();
+    const chosen = this.chosenWarehouse();
+    if (chosen) {
+      const warehouse = warehouses.find((w) => w.id === chosen || w.name === chosen);
+      if (!warehouse) throw new Error("The SQL warehouse chosen for skills isn't available to you any more. Choose another in Settings → Databricks Knowledge.");
+      return { result: await run(warehouse.id), warehouse: { id: warehouse.id, name: warehouse.name } };
+    }
+    const preferred = [this.working, this.service.preferences.get<string>("warehouseId")].filter(Boolean);
+    const ordered = [
+      ...preferred.map((id) => warehouses.find((w) => w.id === id || w.name === id)).filter((w): w is NonNullable<typeof w> => Boolean(w)),
+      ...Sql.rank(warehouses),
+    ].filter((w, index, all) => all.findIndex((other) => other.id === w.id) === index);
+    if (!ordered.length) throw new Error("No SQL warehouse is available to you in this workspace.");
+    let last: unknown;
+    for (const warehouse of ordered.slice(0, 4)) {
+      try {
+        const result = await run(warehouse.id);
+        this.working = warehouse.id;
+        return { result, warehouse: { id: warehouse.id, name: warehouse.name } };
+      } catch (error) {
+        if (!refused(error)) throw error;
+        last = error;
+      }
+    }
+    throw new Error(`None of the SQL warehouses tried let you run queries (${describeError(last)}). Choose one you can use in Settings → Databricks Knowledge.`);
   }
 
   snapshot = () => this.state;
@@ -96,9 +150,11 @@ export class SkillCatalog {
         const client = await this.service.ready();
         let tagged: SchemaTag[] = [];
         let note: string | undefined;
+        let warehouse: { id: string; name: string } | undefined;
         try {
-          const warehouse = await resolveWarehouse(this.service);
-          tagged = await new Tags(client).schemas(warehouse.id, [SKILLS_TAG, CHANNEL_TAG, DOMAIN_TAG]);
+          const found = await this.withWarehouse((id) => new Tags(client).schemas(id, [SKILLS_TAG, CHANNEL_TAG, DOMAIN_TAG]));
+          tagged = found.result;
+          warehouse = found.warehouse;
         } catch (error) {
           note = `Couldn't look for tagged skills schemas: ${describeError(error)}`;
         }
@@ -114,7 +170,7 @@ export class SkillCatalog {
         for (const location of this.locations()) if (!byName.has(location)) byName.set(location, { tags: {}, source: "added" });
         const schemas = [...byName].map(([schema, entry]) => ({ schema, ...entry })).sort((a, b) => a.schema.localeCompare(b.schema));
         const skills = schemas.length ? await this.listSkills(schemas.map((entry) => entry.schema)) : [];
-        const next: CatalogState = { status: "ready", schemas, skills, at: Date.now(), ...(note && { note }) };
+        const next: CatalogState = { status: "ready", schemas, skills, at: Date.now(), ...(note && { note }), ...(warehouse && { warehouse }) };
         if (host === this.host) this.set(next);
         return next;
       } catch (error) {

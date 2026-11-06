@@ -12,6 +12,7 @@ Your team's know-how, kept and governed in Unity Catalog: turn messages into ski
 
 ## Good to know
 
+- It uses the workspace Buzz is signed in to and picks a SQL warehouse for you. Choose another workspace or warehouse in **Settings → Databricks Knowledge**.
 - Everything runs with your own Databricks access. A skill you publish is private until you **Share** it, which gives read access.
 - Agents can search, load and draft skills and pages, but only a person publishes them.
 - Unity Catalog skills, domains and Pages are in Beta; an admin turns them on under **Previews**.
