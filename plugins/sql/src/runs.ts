@@ -6,6 +6,7 @@
 import { isReadOnlySql, Sql } from "@dbx/core/api/sql";
 import type { ResultSet } from "@dbx/core/result";
 import { type DatabricksService, describeError } from "@dbx/core/service";
+import { resolveWarehouse } from "@dbx/core/warehouse";
 
 export type Run =
   | { status: "confirm" }
@@ -14,15 +15,7 @@ export type Run =
   | { status: "done"; result: ResultSet; statementId: string; ms?: number; warehouse: string }
   | { status: "error"; message: string };
 
-export async function resolveWarehouse(service: DatabricksService, explicit?: string): Promise<{ id: string; name: string }> {
-  const client = await service.ready();
-  const sql = new Sql(client);
-  const warehouses = await sql.warehouses();
-  const preferred = explicit || service.preferences.get<string>("warehouseId");
-  const chosen = (preferred && warehouses.find((w) => w.id === preferred || w.name === preferred)) || Sql.pick(warehouses);
-  if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
-  return { id: chosen.id, name: chosen.name };
-}
+export { resolveWarehouse };
 
 const hostOf = (service: DatabricksService) => {
   const snapshot = service.snapshot();

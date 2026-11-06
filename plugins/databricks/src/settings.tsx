@@ -29,6 +29,7 @@ export const SUITE = [
   { id: "bkvarda.databricks-agents", folder: "agents", name: "Databricks Agents", blurb: "Agents powered by Databricks: models, Genie agents, your custom agents and Sandboxes." },
   { id: "bkvarda.databricks-memory", folder: "memory", name: "Databricks Memory", blurb: "Long-term agent memory in Databricks managed memory, shared across your agents." },
   { id: "bkvarda.databricks-lakebase", folder: "lakebase", name: "Lakebase", blurb: "Let agents read operational data from Lakebase Postgres through the Data API." },
+  { id: "bkvarda.databricks-knowledge", folder: "knowledge", name: "Databricks Knowledge", blurb: "Unity Catalog skills, domains and Pages: make skills from messages and give every agent your team's skills." },
 ] as const;
 
 function hostLabel(host: string) {

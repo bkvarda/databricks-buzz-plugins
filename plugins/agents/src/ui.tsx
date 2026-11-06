@@ -12,6 +12,9 @@ import { type DatabricksService, describeError, useAsync, useConnection } from "
 import { Badge, Button, DbxRoot, Field, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { GENIE_ONE_CHOICE, type ToolChoice } from "./capabilities";
 import { HARNESS_MODEL, HARNESSES, type HarnessId, harnessAccepts, isRemote, type Permissions, permissionsHint } from "./remote";
+import { normalizeSkills, type SkillsChoice, skillCatalogFor } from "./skills";
+import type { SkillRef } from "@dbx/core/api/skills";
+import { schemaOf } from "@dbx/core/skill-catalog";
 
 export type AgentKind = "sandbox" | "genie-one" | "custom";
 
@@ -56,6 +59,8 @@ export type DatabricksConfig = {
   scope: "thread" | "channel";
   /** Genie and MCP servers it can use, beyond Buzz's tools. */
   tools: ToolChoice[];
+  /** Unity Catalog skills: picked names, whole schemas, and the channel's skills (on by default). */
+  skills?: SkillsChoice;
   // Custom agents
   custom?: CustomAgent;
 };
@@ -191,7 +196,15 @@ export function AgentForm(props: FormProps<DatabricksConfig> & { service: Databr
             onChange({ ...rest, ...(profile && { profile }), tools: config.tools.filter((tool) => tool.kind === "genie-one") });
           }}
         />
-        {kind.id === "sandbox" && <SandboxFields workspace={workspace} config={config} onChange={onChange} {...(props.disabled !== undefined && { disabled: props.disabled })} />}
+        {kind.id === "sandbox" && (
+          <SandboxFields
+            service={props.service}
+            workspace={workspace}
+            config={config}
+            onChange={onChange}
+            {...(props.disabled !== undefined && { disabled: props.disabled })}
+          />
+        )}
         {kind.id === "custom" && (
           <CustomAgentField
             service={workspace}
@@ -210,7 +223,7 @@ export function AgentForm(props: FormProps<DatabricksConfig> & { service: Databr
   );
 }
 
-function SandboxFields(props: FormProps<DatabricksConfig> & { workspace: DatabricksService }) {
+function SandboxFields(props: FormProps<DatabricksConfig> & { service: DatabricksService; workspace: DatabricksService }) {
   const { config, onChange, workspace } = props;
   const status = useConnection(workspace).status;
   const available = useAsync(() => cachedList(workspace, "sandbox", async () => new Sandboxes(await workspace.ready()).available()), [workspace, status]);
@@ -261,6 +274,7 @@ function SandboxFields(props: FormProps<DatabricksConfig> & { workspace: Databri
         </Field>
       )}
       <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
+      <SkillsField service={props.service} {...(config.profile && { profile: config.profile })} value={config.skills} {...disabled} onChange={(skills) => onChange({ ...config, skills })} />
       <Field label="Conversation" hint="Thread: each thread is its own conversation. Channel: one conversation for the whole channel.">
         <select className="dbx-select" disabled={props.disabled} value={config.scope} onChange={(event) => onChange({ ...config, scope: event.target.value as DatabricksConfig["scope"] })}>
           <option value="thread">One per thread</option>
@@ -941,6 +955,77 @@ export function ToolsField(props: { service: DatabricksService; tools: readonly 
             Add functions
           </Button>
         </Stack>
+      }
+    />
+  );
+}
+
+/**
+ * Unity Catalog skills: whole schemas ("All skills in …", always the latest)
+ * and single skills, grouped by schema, plus whether the channel's skills
+ * count. Skills are found in the agent's workspace.
+ */
+export function SkillsField(props: { service: DatabricksService; profile?: string; value?: SkillsChoice; onChange(skills: SkillsChoice): void; disabled?: boolean }) {
+  const { service, profile } = props;
+  const status = useConnection(service).status;
+  const catalog = React.useMemo(() => skillCatalogFor(service, profile), [service, profile]);
+  const state = React.useSyncExternalStore(catalog.subscribe, catalog.snapshot);
+  React.useEffect(() => {
+    if (status === "connected") void catalog.load();
+  }, [catalog, status]);
+  const value = normalizeSkills(props.value);
+  const chosenSchemas = new Set(value.schemas);
+  const chosenNames = new Set(value.names);
+  const bySchema = new Map<string, SkillRef[]>();
+  for (const skill of state.skills) bySchema.set(schemaOf(skill.fullName), [...(bySchema.get(schemaOf(skill.fullName)) ?? []), skill]);
+  const schemaNames = [...new Set([...state.schemas.map((entry) => entry.schema), ...bySchema.keys(), ...chosenSchemas])].sort((a, b) => a.localeCompare(b));
+  const options: PickOption[] = [];
+  const listed = new Set<string>();
+  for (const schema of schemaNames) {
+    if (!chosenSchemas.has(schema) && !bySchema.has(schema)) continue;
+    options.push({ id: `schema:${schema}`, label: `All skills in ${schema}`, group: schema, detail: "Always the latest skills in this schema", keywords: "schema" });
+    for (const skill of bySchema.get(schema) ?? []) {
+      listed.add(skill.fullName);
+      options.push({ id: `skill:${skill.fullName}`, label: skill.fullName.split(".").pop()!, group: schema, ...(skill.description && { detail: skill.description }), keywords: skill.fullName });
+    }
+  }
+  // Chosen things the catalog doesn't list right now (still loading, or gone).
+  for (const name of value.names) if (!listed.has(name)) options.push({ id: `skill:${name}`, label: name.split(".").pop()!, group: "Chosen", detail: name });
+  for (const schema of value.schemas) if (!schemaNames.includes(schema)) options.push({ id: `schema:${schema}`, label: `All skills in ${schema}`, group: "Chosen" });
+  const chosenIds = new Set([...value.schemas.map((schema) => `schema:${schema}`), ...value.names.map((name) => `skill:${name}`)]);
+  const selected = options.filter((option) => chosenIds.has(option.id));
+  const toggle = (option: PickOption, on: boolean) => {
+    const separator = option.id.indexOf(":");
+    const kind = option.id.slice(0, separator);
+    const id = option.id.slice(separator + 1);
+    if (kind === "schema") props.onChange({ ...value, schemas: on ? [...value.schemas.filter((item) => item !== id), id] : value.schemas.filter((item) => item !== id) });
+    else props.onChange({ ...value, names: on ? [...value.names.filter((item) => item !== id), id] : value.names.filter((item) => item !== id) });
+  };
+  const notes = [state.note, state.error].filter((note): note is string => Boolean(note));
+  return (
+    <MultiPicker
+      label="Skills"
+      hint="Skills come from schemas tagged agent_skills or added in Settings → Databricks Knowledge."
+      searchPlaceholder={(() => {
+        const skills = options.filter((option) => option.id.startsWith("skill:")).length;
+        return `Search ${skills} ${skills === 1 ? "skill" : "skills"}`;
+      })()}
+      selected={selected}
+      options={options}
+      loading={status !== "connected" ? false : state.status === "loading" ? "Finding skills…" : false}
+      notes={notes}
+      {...(props.disabled !== undefined && { disabled: props.disabled })}
+      onToggle={toggle}
+      footer={
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={value.channel}
+            {...(props.disabled !== undefined && { disabled: props.disabled })}
+            onChange={(event) => props.onChange({ ...value, channel: event.target.checked })}
+          />
+          <Text size="sm">Use the skills of the channel it's working in</Text>
+        </label>
       }
     />
   );

@@ -12,6 +12,7 @@ const PLUGINS = [
   ["agents", "bkvarda.databricks-agents"],
   ["memory", "bkvarda.databricks-memory"],
   ["lakebase", "bkvarda.databricks-lakebase"],
+  ["knowledge", "bkvarda.databricks-knowledge"],
 ] as const;
 
 // ── host.spawn over the local bridge ──
@@ -86,6 +87,7 @@ const registry = {
   agentTools: [] as Any[],
   agentTypes: [] as Any[],
   sources: [] as Any[],
+  messageActions: [] as Any[],
 };
 const registryListeners = new Set<() => void>();
 const bump = () => registryListeners.forEach((listener) => listener());
@@ -153,7 +155,7 @@ function makeCtx(pluginId: string): Any {
       registerCodeBlock: (block: Any) => (registry.codeBlocks.push({ ...block, pluginId }), bump()),
       registerTool: (tool: Any) => (registry.tools.push({ ...tool, pluginId }), bump()),
       registerMessage: () => {},
-      registerMessageAction: () => {},
+      registerMessageAction: (action: Any) => (registry.messageActions.push({ ...action, pluginId }), bump()),
       registerAccessory: () => {},
       registerCompletion: () => {},
       registerInline: () => {},
@@ -249,6 +251,7 @@ function Shell() {
   else if (kind === "tools") main = <ToolsDemo />;
   else if (kind === "agents") main = <AgentsDemo />;
   else if (kind === "panel") main = <PanelDemo />;
+  else if (kind === "channel") main = <ChannelDemo />;
   return (
     <div style={{ display: "grid", gridTemplateColumns: sidebar ? "200px 260px 1fr" : "200px 1fr", height: "100vh", background: "var(--surface-base)" }}>
       <nav style={{ padding: 10, borderRight: "1px solid var(--border-standard)", overflow: "auto", fontSize: 13 }}>
@@ -263,6 +266,7 @@ function Shell() {
         <div style={{ color: "var(--text-subtle)", padding: "8px 10px 2px", fontSize: 11 }}>CONTRIBUTIONS</div>
         {item("Conversation", "conversation:0")}
         {item("Panels", "panel:0")}
+        {item("Channel actions", "channel:0")}
         {item(`Agent tools (${registry.agentTools.length})`, "tools:0")}
         {item(`Agent types (${registry.agentTypes.length})`, "agents:0")}
       </nav>
@@ -354,6 +358,29 @@ function PanelDemo() {
   );
 }
 
+// Channel-menu panels, opened as Buzz's channel menu opens them, for a fake #playground channel.
+function ChannelDemo() {
+  const [open, setOpen] = React.useState<Any>();
+  const context = { scope: "playground", channelId: "playground", channelName: "playground", viewer: "playground-user", relayUrl: "" };
+  const actions = registry.panels.filter((panel) => panel.channelMenu);
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", height: "100%" }}>
+      <div style={{ padding: 24, fontSize: 13 }}>
+        <p>Channel menu for #playground:</p>
+        {actions.map((panel) => (
+          <button key={panel.pluginId + panel.id} type="button" onClick={() => setOpen(panel)} style={{ display: "block", marginBottom: 6 }}>
+            {panel.channelMenu.label}
+          </button>
+        ))}
+        {!actions.length && <p>No channel actions registered.</p>}
+      </div>
+      <div style={{ borderLeft: "1px solid var(--border-standard)", overflow: "auto" }}>
+        {open && <open.component channelContext={context} target="playground" close={() => setOpen(undefined)} />}
+      </div>
+    </div>
+  );
+}
+
 function ToolsDemo() {
   const [selected, setSelected] = React.useState(0);
   const [args, setArgs] = React.useState("{}");
@@ -397,6 +424,39 @@ function ToolsDemo() {
           </button>
           <pre id="tool-output" style={{ whiteSpace: "pre-wrap", fontSize: 12, background: "var(--surface-inset)", padding: 10, borderRadius: 6 }}>{output}</pre>
         </div>
+      )}
+    </div>
+  );
+}
+
+// A posted message with the ⋯ menu of registered message actions. The action
+// gets a stand-in message and session, as Buzz passes its own.
+function PostedMessage({ message }: { message: { at: number; text: string; via: string } }) {
+  const [menu, setMenu] = React.useState(false);
+  const [mounted, setMounted] = React.useState<Any>();
+  useRegistry();
+  const fake = { id: String(message.at), channelId: "playground", authorId: "playground-agent", createdAt: Math.floor(message.at / 1000), content: message.text };
+  const actions = registry.messageActions.filter((action: Any) => action.matches(fake, {}));
+  return (
+    <div style={{ border: "1px solid var(--border-standard)", borderRadius: 10, padding: 12, marginBottom: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-subtle)" }}>
+        <span>posted via {message.via}</span>
+        {actions.length > 0 && (
+          <button type="button" aria-label="Message actions" onClick={() => setMenu(!menu)}>⋯</button>
+        )}
+      </div>
+      {menu && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", margin: "6px 0" }}>
+          {actions.map((action: Any) => (
+            <button key={action.id} type="button" onClick={() => (setMenu(false), setMounted(action))}>
+              {action.title}
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={{ whiteSpace: "normal" }}>{messageParts(message.text)}</div>
+      {mounted && (
+        <mounted.component message={fake} session={{}} close={() => setMounted(undefined)} canOpen={() => false} open={() => false} />
       )}
     </div>
   );
@@ -452,10 +512,7 @@ function AgentsDemo() {
       <ol style={{ fontSize: 12, color: "var(--text-subtle)" }}>{steps.map((step, n) => <li key={n}>{step}</li>)}</ol>
       <div id="agent-posted">
         {posted.map((message) => (
-          <div key={message.at} style={{ border: "1px solid var(--border-standard)", borderRadius: 10, padding: 12, marginBottom: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
-            <div style={{ fontSize: 11, color: "var(--text-subtle)" }}>posted via {message.via}</div>
-            <div style={{ whiteSpace: "normal" }}>{messageParts(message.text)}</div>
-          </div>
+          <PostedMessage key={message.at} message={message} />
         ))}
       </div>
       {activityTab && (

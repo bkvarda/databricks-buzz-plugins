@@ -12,6 +12,7 @@ import { SANDBOX_HOME, Sandboxes } from "@dbx/core/api/sandbox";
 import { React } from "@dbx/core/react";
 import { databricksIcon, Text } from "@dbx/core/ui/components";
 import { RESULT_LANGUAGE, resultBlock } from "@dbx/core/result";
+import { Skills } from "@dbx/core/api/skills";
 import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice, toolLabels, workspaceIdOf } from "./capabilities";
 import { uploadRunner } from "./runner-upload";
@@ -22,6 +23,8 @@ import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
 import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
 import { ensureAgentSandbox, SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
+import { normalizeSkills, resolveSkills, type SkillApi, skillCatalogFor, skillsNote, skillsSection, skillTools } from "./skills";
+import { installSkills } from "./skills-sandbox";
 import { plainText, Sessions } from "./state";
 import { type AgentKind, AgentForm, type CustomAgent, type DatabricksConfig, SettingsTab } from "./ui";
 
@@ -120,6 +123,7 @@ export function normalizeDatabricks(config: unknown): DatabricksConfig {
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
     tools: normalizeChoices(value.tools),
+    skills: normalizeSkills(value.skills),
     ...(typeof value.profile === "string" && value.profile && { profile: value.profile }),
     ...(custom && { custom }),
   };
@@ -230,26 +234,34 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     delivery.workingUntil(done);
   }
 
+  /** The skills an agent has for a turn, in the channel the turn is in. */
+  const skillsFor = (config: DatabricksConfig, channelId: string | undefined) => resolveSkills(skillCatalogFor(service, config.profile), normalizeSkills(config.skills), channelId);
+
   /** A Sandbox agent's tools and instructions for one turn. */
-  async function sandboxSetup(delivery: Delivery, config: DatabricksConfig, workspace: DatabricksService, signal: AbortSignal, step?: (state: string) => void) {
+  async function sandboxSetup(delivery: Delivery, config: DatabricksConfig, workspace: DatabricksService, signal: AbortSignal, step?: (state: string) => void, channelId?: string) {
     const on = await sandboxOn(workspace, signal);
     const sandbox = on ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, step) : [];
     const tools = await databricksTools(service, workspace, config, sandbox, signal);
+    const skills = await skillsFor(config, channelId).catch((error: unknown) => ({ skills: [], problems: [describeError(error)] }));
+    const skillApi = async (skillSignal: AbortSignal): Promise<SkillApi> => new Skills(await workspace.ready(skillSignal));
+    const local = skills.skills.length ? [...tools.local, ...skillTools(skillApi, skills.skills)] : tools.local;
     const instructions = [
       config.instructions.trim(),
       on ? SANDBOX_PROMPT : "Databricks Sandbox isn't turned on in this workspace, so you can't run code or keep files this turn.",
+      skillsSection(skills.skills),
+      skills.problems.length ? `Skills that didn't load this turn: ${skills.problems.join("; ")}.` : "",
       toolsNote(workspace, service, tools.problems),
     ]
       .filter(Boolean)
       .join("\n\n");
-    return { tools, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
+    return { tools: { ...tools, local }, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
   }
 
   async function sandboxTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
-    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state));
+    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
     const ai = new Ai(client);
@@ -297,7 +309,17 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     const session = sessions.get(delivery.agent.key, conversation.key);
     // A session of another harness (or the built-in loop) doesn't carry over: the new one is shown the conversation.
     const continued = session.remote?.harness === harness ? { harness, id: session.remote.id } : undefined;
-    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions, config.tools), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
+    // Installed before the harness starts, so it finds them in its skill folders on its own.
+    const skills = await skillsFor(config, conversation.channel).catch((error: unknown) => ({ skills: [], problems: [describeError(error)] }));
+    const installed = await installSkills({ sandboxes: sandbox, sandbox: sandboxFor(delivery.agent.pubkey), api: new Skills(client), skills: skills.skills, signal }).catch((error: unknown) => ({
+      added: [],
+      updated: [],
+      removed: [],
+      unchanged: [],
+      problems: [`Couldn't install skills: ${describeError(error)}`],
+    }));
+    for (const problem of [...skills.problems, ...installed.problems]) report.tool("skills", problem);
+    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions, config.tools), skillsNote(skills.skills), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: WORK_DIR, instructions, tools: false });
     const prompt = await kit.turnPrompt(delivery, conversation, continued && session.cursor ? { cursor: session.cursor } : {});
     let started = false;
@@ -513,7 +535,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         }
         const workspace = agentService(service, config.profile);
         const client = await workspace.ready(standalone.signal);
-        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal, (state) => report.tool("sandbox", state));
+        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal, (state) => report.tool("sandbox", state), standalone.delivery.channelId);
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({

@@ -282,6 +282,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-dbx] .dbx-chip button { border: 0; background: transparent; color: var(--dbx-subtle); cursor: pointer; padding: 0 3px; font: inherit; line-height: 1; }
 [data-dbx] .dbx-card { background: var(--dbx-surface); border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius-card); }
+dialog.dbx-modal { padding: 0; border: 1px solid var(--border-standard, #E0E0E0); border-radius: 12px; background: var(--surface-panel, #FFFFFF); color: var(--text-standard, #161616); width: min(640px, calc(100vw - 32px)); max-height: 86vh; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.25); }
+dialog.dbx-modal::backdrop { background: rgba(0, 0, 0, 0.35); }
 [data-dbx] .dbx-row:hover { background: var(--affordance-row-hover, var(--affordance-subtle-hover, #F2F2F2)); }
 [data-dbx] .dbx-row[aria-selected="true"] { background: var(--affordance-selected, var(--affordance-subtle, #EDEDED)); }
 [data-dbx] .dbx-mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
@@ -793,6 +795,346 @@ function fromBase64(encoded) {
   return new TextDecoder().decode(bytes);
 }
 
+// packages/core/src/api/mcp.ts
+var PROTOCOL_VERSION = "2025-06-18";
+var McpError = class extends Error {
+  constructor(message, code, data) {
+    super(message);
+    this.code = code;
+    this.data = data;
+    this.name = "McpError";
+  }
+};
+var gatewayMcpPath = (fullName) => `/ai-gateway/mcp-services/${fullName}`;
+var McpClient = class {
+  constructor(client, path, query = {}) {
+    this.client = client;
+    this.path = path;
+    this.query = query;
+  }
+  session;
+  initializing;
+  nextId = 1;
+  toolsCache;
+  serverInfo;
+  instructions;
+  async listTools(signal) {
+    if (this.toolsCache && Date.now() - this.toolsCache.at < 5 * 6e4) return this.toolsCache.tools;
+    const tools = [];
+    let cursor;
+    do {
+      const page = await this.call("tools/list", cursor ? { cursor } : {}, signal);
+      tools.push(...page.tools ?? []);
+      cursor = page.nextCursor;
+    } while (cursor);
+    this.toolsCache = { at: Date.now(), tools };
+    return tools;
+  }
+  callTool(name, args, options = {}) {
+    return this.call(
+      "tools/call",
+      { name, arguments: args, ...options.meta && { _meta: options.meta } },
+      options.signal,
+      options.timeoutMs
+    );
+  }
+  async readResource(uri, signal) {
+    return await this.call("resources/read", { uri }, signal);
+  }
+  async ensureSession(signal) {
+    if (this.session) return;
+    this.initializing ??= (async () => {
+      const result = await this.send(
+        {
+          jsonrpc: "2.0",
+          id: this.nextId++,
+          method: "initialize",
+          params: {
+            protocolVersion: PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "databricks-buzz-plugins", version: "0.1.0" }
+          }
+        },
+        signal,
+        true
+      );
+      this.serverInfo = result?.serverInfo;
+      this.instructions = result?.instructions;
+      await this.send({ jsonrpc: "2.0", method: "notifications/initialized" }, signal).catch(() => {
+      });
+    })().finally(() => {
+      this.initializing = void 0;
+    });
+    await this.initializing;
+  }
+  async call(method, params, signal, timeoutMs) {
+    await this.ensureSession(signal);
+    try {
+      return await this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+    } catch (error) {
+      if (error.status === 404 && this.session) {
+        this.session = void 0;
+        await this.ensureSession(signal);
+        return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+      }
+      throw error;
+    }
+  }
+  async send(message, signal, initializing = false, timeoutMs = 12e4) {
+    const response = await this.client.request(this.path, {
+      method: "POST",
+      query: this.query,
+      body: message,
+      timeoutMs,
+      ...signal && { signal },
+      headers: {
+        Accept: "application/json, text/event-stream",
+        ...!initializing && { "MCP-Protocol-Version": PROTOCOL_VERSION },
+        ...this.session && { "Mcp-Session-Id": this.session }
+      }
+    });
+    const session = response.headers["mcp-session-id"];
+    if (session) this.session = session;
+    if (message.id === void 0) return void 0;
+    if (response.status === 202) return void 0;
+    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    const type = response.headers["content-type"] ?? "";
+    const payloads = type.includes("text/event-stream") ? parseSse(response.body).map((event) => event.data) : [response.body];
+    for (const payload of payloads) {
+      let parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (parsed.id !== message.id) continue;
+      if (parsed.error)
+        throw new McpError(parsed.error.message ?? "MCP error", parsed.error.code, parsed.error.data);
+      return parsed.result;
+    }
+    throw new McpError(`No response to ${message.method}`);
+  }
+};
+function resultText(result) {
+  return (result.content ?? []).map((item) => item.type === "text" ? String(item.text) : "").filter(Boolean).join("\n\n");
+}
+function resultJson(result) {
+  if (result.structuredContent !== void 0) return result.structuredContent;
+  for (const item of result.content ?? []) {
+    if (item.type !== "text") continue;
+    const text = String(item.text).trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) continue;
+    try {
+      return JSON.parse(text);
+    } catch {
+    }
+  }
+  return void 0;
+}
+
+// packages/core/src/api/skills.ts
+var skillFullName = (nameOrFull) => nameOrFull.replace(/^skills\//, "");
+function splitFullName(fullName) {
+  const parts = skillFullName(fullName).split(".");
+  if (parts.length !== 3 || parts.some((part) => !part)) throw new Error(`A skill's full name is catalog.schema.skill, not "${fullName}".`);
+  return { catalog: parts[0], schema: parts[1], skill: parts[2] };
+}
+var validSkillId = (id) => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id);
+function parseSkillMarkdown(text) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
+  if (!match) return { body: text };
+  const fields = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const field = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line);
+    if (!field) continue;
+    let value = field[2].trim();
+    if (/^".*"$/.test(value)) {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = value.slice(1, -1);
+      }
+    } else if (/^'.*'$/.test(value)) value = value.slice(1, -1).replace(/''/g, "'");
+    fields[field[1]] = value;
+  }
+  return { ...fields.name && { name: fields.name }, ...fields.description && { description: fields.description }, body: match[2].replace(/^\s*\n/, "") };
+}
+function skillFilesPath(fullName, path = "") {
+  const { catalog, schema: schema2, skill } = splitFullName(fullName);
+  const clean = path.replace(/^\/+/, "");
+  if (clean.split("/").some((part) => part === ".." || part === ".")) throw new Error("Skill file paths cannot contain . or ..");
+  return ["Skills", catalog, schema2, skill, ...clean.split("/").filter(Boolean)].map(encodeURIComponent).join("/");
+}
+var SkillExistsError = class extends Error {
+  constructor(fullName) {
+    super(`There's already a skill named ${fullName}. Pick another name, or choose to replace it.`);
+    this.fullName = fullName;
+  }
+  name = "SkillExistsError";
+};
+var SKILL_TOOL = /^skill_(.+\..+\..+)$/;
+var Skills = class {
+  constructor(client) {
+    this.client = client;
+  }
+  /** Every finalized and unfinalized skill in one schema. */
+  async list(catalog, schema2, signal) {
+    const skills = [];
+    let pageToken;
+    for (let page = 0; page < 50; page++) {
+      const response = await this.client.get("/api/2.1/unity-catalog/skills", {
+        query: { parent: `schemas/${catalog}.${schema2}`, page_token: pageToken },
+        ...signal && { signal }
+      });
+      skills.push(...response.skills ?? []);
+      pageToken = response.next_page_token;
+      if (!pageToken) break;
+    }
+    return skills;
+  }
+  get(fullName, signal) {
+    return this.client.get(`/api/2.1/unity-catalog/skills/${skillFullName(fullName)}`, signal ? { signal } : {});
+  }
+  /** An empty skill; it can't be used until its files are uploaded and it's finalized. */
+  create(catalog, schema2, id, comment) {
+    if (!validSkillId(id)) throw new Error(`"${id}" isn't a valid skill name: use lowercase letters, digits, hyphens and underscores.`);
+    return this.client.post("/api/2.1/unity-catalog/skills", comment ? { comment } : {}, { query: { parent: `schemas/${catalog}.${schema2}`, skill_id: id } });
+  }
+  async upload(fullName, file, signal) {
+    const response = await this.client.request(`/api/2.0/fs/files/${skillFilesPath(fullName, file.path)}`, {
+      method: "PUT",
+      body: file.content,
+      query: { overwrite: "true" },
+      headers: { "Content-Type": "application/octet-stream" },
+      timeoutMs: 6e4,
+      ...signal && { signal }
+    });
+    if (response.status < 200 || response.status >= 300) throw apiError(response);
+  }
+  /** Checks SKILL.md and sets bundle_name and description from it. */
+  finalize(fullName) {
+    return this.client.post(`/api/2.1/unity-catalog/skills/${skillFullName(fullName)}/finalize`, {});
+  }
+  /**
+   * Creates the skill (or reuses one with that name), uploads its files and
+   * finalizes it. SKILL.md is required. Files already there and not in
+   * `files` are left alone.
+   */
+  async publish(target2, files, options = {}) {
+    const markdown = files.find((file) => file.path.replace(/^\/+/, "") === "SKILL.md");
+    if (!markdown) throw new Error("A skill needs a SKILL.md.");
+    const parsed = parseSkillMarkdown(markdown.content);
+    if (!parsed.name || !parsed.description) throw new Error("SKILL.md must start with frontmatter that sets name and description.");
+    const fullName = `${target2.catalog}.${target2.schema}.${target2.id}`;
+    let created = false;
+    try {
+      await this.create(target2.catalog, target2.schema, target2.id, target2.comment);
+      created = true;
+    } catch (error) {
+      const code = error.errorCode;
+      if (code !== "ALREADY_EXISTS" && code !== "RESOURCE_ALREADY_EXISTS") throw error;
+      if (!options.replace) throw new SkillExistsError(fullName);
+    }
+    try {
+      for (const file of files) await this.upload(fullName, file, options.signal);
+      return { skill: await this.finalize(fullName), created };
+    } catch (error) {
+      if (created) await this.delete(fullName).catch(() => {
+      });
+      throw error;
+    }
+  }
+  delete(fullName) {
+    return this.client.json(`/api/2.1/unity-catalog/skills/${skillFullName(fullName)}`, { method: "DELETE" });
+  }
+  /** Every file's path, relative to the skill's folder. */
+  async files(fullName, signal) {
+    const root = `/${skillFilesPath(fullName)}/`;
+    const found = [];
+    const walk = async (relative, depth) => {
+      let pageToken;
+      do {
+        const response = await this.client.get(
+          `/api/2.0/fs/directories/${skillFilesPath(fullName, relative)}/`,
+          { query: { page_token: pageToken }, ...signal && { signal } }
+        );
+        for (const entry of response.contents ?? []) {
+          const path = decodeURIComponent(entry.path.replace(/\/$/, "")).replace(decodeURIComponent(root), "");
+          if (entry.is_directory) {
+            if (depth < 6) await walk(path, depth + 1);
+          } else found.push(path);
+        }
+        pageToken = response.next_page_token;
+      } while (pageToken && found.length < 500);
+    };
+    await walk("", 0);
+    return found.sort();
+  }
+  /** One file's text. */
+  async read(fullName, path, signal) {
+    const response = await this.client.request(`/api/2.0/fs/files/${skillFilesPath(fullName, path)}`, {
+      method: "GET",
+      headers: { Accept: "application/octet-stream" },
+      timeoutMs: 6e4,
+      ...signal && { signal }
+    });
+    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    return response.body;
+  }
+  /** Grants privileges on a skill, e.g. READ VOLUME to share it. */
+  grant(fullName, principal, privileges = ["READ_VOLUME"]) {
+    return this.client.json(`/api/2.1/unity-catalog/permissions/skill/${skillFullName(fullName)}`, {
+      method: "PATCH",
+      body: { changes: [{ principal, add: privileges }] }
+    });
+  }
+  /**
+   * Every finalized skill in these schemas, from one registry call (chunked
+   * for long lists). A schema that doesn't exist or isn't readable is skipped
+   * by the registry, not an error.
+   */
+  async registry(schemas, signal) {
+    const found = /* @__PURE__ */ new Map();
+    for (let start = 0; start < schemas.length; start += 40) {
+      const query = schemas.slice(start, start + 40).map((schema2) => `schema=${encodeURIComponent(schema2)}`).join("&");
+      const mcp = new McpClient(this.client, `/ai-gateway/skills/?${query}`, this.client.workspaceId ? { o: this.client.workspaceId } : {});
+      for (const tool of await mcp.listTools(signal)) {
+        const match = SKILL_TOOL.exec(tool.name);
+        if (!match) continue;
+        const fullName = match[1];
+        found.set(fullName, { fullName, description: (tool.description ?? "").replace(/^\[[^\]]*\]\s*/, "").trim() });
+      }
+    }
+    return [...found.values()].sort((a, b) => a.fullName.localeCompare(b.fullName));
+  }
+  /** SKILL.md as the registry serves it to agents, ready to follow. */
+  async load(fullName, signal) {
+    const mcp = new McpClient(this.client, "/ai-gateway/skills/", this.client.workspaceId ? { o: this.client.workspaceId } : {});
+    const result = await mcp.callTool("load_skill", { full_name: skillFullName(fullName) }, signal ? { signal } : {});
+    if (result.isError) throw new Error(resultText(result) || `Couldn't load ${fullName}.`);
+    return resultText(result);
+  }
+};
+function searchSkills(skills, query, limit = 20) {
+  const words = query.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 1);
+  if (!words.length) return skills.slice(0, limit);
+  const scored = skills.map((skill) => {
+    const leaf = skill.fullName.split(".").pop().toLowerCase();
+    const where = skill.fullName.toLowerCase();
+    const text = skill.description.toLowerCase();
+    let score = 0;
+    if (leaf === words.join("-")) score += 20;
+    for (const word of words) {
+      if (leaf.includes(word)) score += 6;
+      else if (where.includes(word)) score += 3;
+      if (new RegExp(`\\b${word}`).test(text)) score += 2;
+      else if (text.includes(word)) score += 1;
+    }
+    return { skill, score };
+  });
+  return scored.filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score || a.skill.fullName.localeCompare(b.skill.fullName)).slice(0, limit).map((entry) => entry.skill);
+}
+
 // virtual:agent-runner
 var RUNNER = '// Databricks Agents runner for Buzz (built by databricks-buzz-plugins). Apache-2.0.\nimport{execFile as Ua,spawn as Da}from"node:child_process";import{appendFileSync as Ma,existsSync as Ve,openSync as Pa,readFileSync as zt,rmSync as us,statSync as fs,truncateSync as qa,writeFileSync as Kn}from"node:fs";var bs=/^(tinyint|smallint|int|integer|bigint|long|short|byte|float|double|real|decimal|numeric)/i,Xn=/^(date|timestamp)/i,ws=/(^|_)(id|ids|zip|zipcode|zip_code|postal_code|postcode|code|key|year|fiscal_year|phone)$/i;function xs(t,e,n=""){if(ws.test(n)&&!Xn.test(t??"")&&!/^bool/i.test(t??""))return"text";if(t){if(bs.test(t))return"number";if(Xn.test(t))return"time";if(/^bool/i.test(t))return"boolean";if(/^(string|varchar|char|binary|array|map|struct|interval)/i.test(t))return"text"}let r=e.filter(o=>o!==null&&o!=="");return r.length?r.every(o=>/^-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?$/.test(o))?"number":r.every(o=>/^\\d{4}-\\d{2}(-\\d{2})?([T ]\\d{2}:\\d{2}(:\\d{2}(\\.\\d+)?)?(Z|[+-]\\d{2}:?\\d{2})?)?$/.test(o))?"time":"text":"text"}function lt(t,e,n={}){return{columns:t.map((r,o)=>({name:r.name,...r.type&&{type:r.type},kind:xs(r.type,e.slice(0,50).map(s=>s[o]??null),r.name)})),rows:e,...n}}function Kt(t){let e=(t.manifest?.schema?.columns??[]).map(o=>({name:o.name,type:o.type_text??o.type_name??""})),n=t.result?.data_array??[],r=t.manifest?.total_row_count;return lt(e,n,{...r!==void 0&&{totalRows:r},truncated:!!t.manifest?.truncated||r!==void 0&&r>n.length})}var Es=new Intl.NumberFormat(void 0,{notation:"compact",maximumFractionDigits:1}),Ss=new Intl.NumberFormat(void 0,{maximumFractionDigits:2});function vs(t,e="precise"){return Number.isFinite(t)?e==="compact"&&Math.abs(t)>=1e4?Es.format(t):Ss.format(t):String(t)}function _s(t,e){if(t===null)return"null";if(e==="number"){let n=Number(t);if(Number.isFinite(n)&&Math.abs(n)<1e15)return vs(n)}return e==="time"&&/T00:00:00(\\.000)?(Z)?$/.test(t)?t.slice(0,10):t}function dt(t,e=20){if(!t.columns.length)return"_No columns._";let n=c=>c.replace(/\\|/g,"\\\\|").replace(/\\n/g," "),r=`| ${t.columns.map(c=>n(c.name)).join(" | ")} |`,o=`| ${t.columns.map(c=>c.kind==="number"?"---:":"---").join(" | ")} |`,s=t.rows.slice(0,e).map(c=>`| ${t.columns.map((l,d)=>n(_s(c[d]??null,l.kind))).join(" | ")} |`),i=t.totalRows??t.rows.length,a=i>Math.min(e,t.rows.length)?`\n\n_Showing ${Math.min(e,t.rows.length)} of ${i} rows._`:"";return[r,o,...s].join(`\n`)+a}function ks(t){let e=n=>n===null?"":/[",\\n]/.test(n)?`"${n.replace(/"/g,\'""\')}"`:n;return[t.columns.map(n=>e(n.name)).join(","),...t.rows.map(n=>n.map(e).join(","))].join(`\n`)}var Vt="databricks-result";function We(t,e=200){let n={...t,rows:t.rows.slice(0,e)},r=ks(n),o=r.includes("```")?"````":"```",s=t.totalRows??t.rows.length,i=s>n.rows.length?`\n\n_Showing ${n.rows.length} of ${s} rows._`:"";return`${o}${Vt}\n${r}\n${o}${i}`}var Ts=new Set(["COMPLETED","FAILED","QUERY_RESULT_EXPIRED","CANCELLED"]);var Yn=t=>t.message_id??t.id??"";function As(t){let e=t.attachments??[],n=e.map(s=>s.text?.content).filter(s=>!!s).join(`\n\n`),r=e.find(s=>s.query?.query),o=e.flatMap(s=>s.suggested_questions?.questions??[]);return{text:n,sql:r?.query?.query,queryTitle:r?.query?.title,queryDescription:r?.query?.description,queryAttachmentId:r?.attachment_id,rowCount:r?.query?.query_result_metadata?.row_count,suggestions:o,error:t.error?.error}}var Ze=t=>`/api/2.0/genie/spaces/${encodeURIComponent(t)}`,fe=class{constructor(e){this.client=e}async listSpaces(e){let n=[],r;for(let o=0;o<20;o++){let s=await this.client.get("/api/2.0/genie/spaces",{query:{page_size:100,page_token:r},...e&&{signal:e}});if(n.push(...s.spaces??[]),r=s.next_page_token,!r)break}return n.sort((o,s)=>o.title.localeCompare(s.title))}getSpace(e,n){return this.client.get(Ze(e),n?{signal:n}:{})}async ask(e,n,r,o){if(r){let a=await this.client.post(`${Ze(e)}/conversations/${encodeURIComponent(r)}/messages`,{content:n},o?{signal:o}:{});return{...a,conversation_id:a.conversation_id??r}}let s=await this.client.post(`${Ze(e)}/start-conversation`,{content:n},o?{signal:o}:{}),i=s.conversation_id??s.conversation?.id??s.message?.conversation_id??"";return{content:n,status:"SUBMITTED",...s.message,conversation_id:i,message_id:s.message_id??s.message?.message_id??s.message?.id??""}}getMessage(e,n,r,o){return this.client.get(`${Ze(e)}/conversations/${encodeURIComponent(n)}/messages/${encodeURIComponent(r)}`,o?{signal:o}:{})}async wait(e,n,r,o){let s=n,i=1e3,a=Date.now()+10*6e4;for(;!Ts.has(s.status);){if(Date.now()>a)throw new Error("Genie did not answer within 10 minutes.");await new Promise(c=>setTimeout(c,i)),o?.throwIfAborted(),i=Math.min(5e3,Math.round(i*1.4)),s={...await this.getMessage(e,s.conversation_id,Yn(s),o),conversation_id:s.conversation_id},r?.(s)}return s}async result(e,n,r,o){let s=`${Ze(e)}/conversations/${encodeURIComponent(n.conversation_id)}/messages/${encodeURIComponent(Yn(n))}/attachments/${encodeURIComponent(r)}`;try{let a=await this.client.get(`${s}/query-result`,o?{signal:o}:{});if(a.statement_response?.result||a.statement_response?.manifest)return Kt(a.statement_response)}catch(a){if(a.status!==404&&a.status!==400)throw a}let i=await this.client.post(`${s}/execute-query`,{},o?{signal:o}:{});return Kt(i.statement_response??{})}async answer(e,n,r={}){let o=await this.ask(e,n,r.conversationId,r.signal);r.onUpdate?.(o);let s=await this.wait(e,o,r.onUpdate,r.signal),i=As(s),a;return s.status==="COMPLETED"&&i.queryAttachmentId&&(a=await this.result(e,s,i.queryAttachmentId,r.signal).catch(()=>{})),{message:s,...i,result:a}}static webPath(e,n){return`/genie/rooms/${encodeURIComponent(e)}${n?`/chats/${encodeURIComponent(n)}`:""}`}};function Fe(t){return t instanceof Uint8Array||ArrayBuffer.isView(t)&&t.constructor.name==="Uint8Array"}function ie(t,e=""){if(!Number.isSafeInteger(t)||t<0){let n=e&&`"${e}" `;throw new Error(`${n}expected integer >= 0, got ${t}`)}}function D(t,e,n=""){let r=Fe(t),o=t?.length,s=e!==void 0;if(!r||s&&o!==e){let i=n&&`"${n}" `,a=s?` of length ${e}`:"",c=r?`length=${o}`:`type=${typeof t}`;throw new Error(i+"expected Uint8Array"+a+", got "+c)}return t}function Te(t){if(typeof t!="function"||typeof t.create!="function")throw new Error("Hash must wrapped by utils.createHasher");ie(t.outputLen),ie(t.blockLen)}function Ce(t,e=!0){if(t.destroyed)throw new Error("Hash instance has been destroyed");if(e&&t.finished)throw new Error("Hash#digest() has already been called")}function Qn(t,e){D(t,void 0,"digestInto() output");let n=e.outputLen;if(t.length<n)throw new Error(\'"digestInto() output" expected to be of length >=\'+n)}function he(...t){for(let e=0;e<t.length;e++)t[e].fill(0)}function ut(t){return new DataView(t.buffer,t.byteOffset,t.byteLength)}function le(t,e){return t<<32-e|t>>>e}var er=typeof Uint8Array.from([]).toHex=="function"&&typeof Uint8Array.fromHex=="function",Rs=Array.from({length:256},(t,e)=>e.toString(16).padStart(2,"0"));function ae(t){if(D(t),er)return t.toHex();let e="";for(let n=0;n<t.length;n++)e+=Rs[t[n]];return e}var pe={_0:48,_9:57,A:65,F:70,a:97,f:102};function Jn(t){if(t>=pe._0&&t<=pe._9)return t-pe._0;if(t>=pe.A&&t<=pe.F)return t-(pe.A-10);if(t>=pe.a&&t<=pe.f)return t-(pe.a-10)}function re(t){if(typeof t!="string")throw new Error("hex string expected, got "+typeof t);if(er)return Uint8Array.fromHex(t);let e=t.length,n=e/2;if(e%2)throw new Error("hex string expected, got unpadded hex of length "+e);let r=new Uint8Array(n);for(let o=0,s=0;o<n;o++,s+=2){let i=Jn(t.charCodeAt(s)),a=Jn(t.charCodeAt(s+1));if(i===void 0||a===void 0){let c=t[s]+t[s+1];throw new Error(\'hex string expected, got non-hex character "\'+c+\'" at index \'+s)}r[o]=i*16+a}return r}function Z(...t){let e=0;for(let r=0;r<t.length;r++){let o=t[r];D(o),e+=o.length}let n=new Uint8Array(e);for(let r=0,o=0;r<t.length;r++){let s=t[r];n.set(s,o),o+=s.length}return n}function tr(t,e={}){let n=(o,s)=>t(s).update(o).digest(),r=t(void 0);return n.outputLen=r.outputLen,n.blockLen=r.blockLen,n.create=o=>t(o),Object.assign(n,e),Object.freeze(n)}function ge(t=32){let e=typeof globalThis=="object"?globalThis.crypto:null;if(typeof e?.getRandomValues!="function")throw new Error("crypto.getRandomValues must be defined");return e.getRandomValues(new Uint8Array(t))}var nr=t=>({oid:Uint8Array.from([6,9,96,134,72,1,101,3,4,2,t])});function rr(t,e,n){return t&e^~t&n}function or(t,e,n){return t&e^t&n^e&n}var ft=class{blockLen;outputLen;padOffset;isLE;buffer;view;finished=!1;length=0;pos=0;destroyed=!1;constructor(e,n,r,o){this.blockLen=e,this.outputLen=n,this.padOffset=r,this.isLE=o,this.buffer=new Uint8Array(e),this.view=ut(this.buffer)}update(e){Ce(this),D(e);let{view:n,buffer:r,blockLen:o}=this,s=e.length;for(let i=0;i<s;){let a=Math.min(o-this.pos,s-i);if(a===o){let c=ut(e);for(;o<=s-i;i+=o)this.process(c,i);continue}r.set(e.subarray(i,i+a),this.pos),this.pos+=a,i+=a,this.pos===o&&(this.process(n,0),this.pos=0)}return this.length+=e.length,this.roundClean(),this}digestInto(e){Ce(this),Qn(e,this),this.finished=!0;let{buffer:n,view:r,blockLen:o,isLE:s}=this,{pos:i}=this;n[i++]=128,he(this.buffer.subarray(i)),this.padOffset>o-i&&(this.process(r,0),i=0);for(let u=i;u<o;u++)n[u]=0;r.setBigUint64(o-8,BigInt(this.length*8),s),this.process(r,0);let a=ut(e),c=this.outputLen;if(c%4)throw new Error("_sha2: outputLen must be aligned to 32bit");let l=c/4,d=this.get();if(l>d.length)throw new Error("_sha2: outputLen bigger than state");for(let u=0;u<l;u++)a.setUint32(4*u,d[u],s)}digest(){let{buffer:e,outputLen:n}=this;this.digestInto(e);let r=e.slice(0,n);return this.destroy(),r}_cloneInto(e){e||=new this.constructor,e.set(...this.get());let{blockLen:n,buffer:r,length:o,finished:s,destroyed:i,pos:a}=this;return e.destroyed=i,e.finished=s,e.length=o,e.pos=a,o%n&&e.buffer.set(r),e}clone(){return this._cloneInto()}},me=Uint32Array.from([1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225]);var $s=Uint32Array.from([1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298]),xe=new Uint32Array(64),Wt=class extends ft{constructor(e){super(64,e,8,!1)}get(){let{A:e,B:n,C:r,D:o,E:s,F:i,G:a,H:c}=this;return[e,n,r,o,s,i,a,c]}set(e,n,r,o,s,i,a,c){this.A=e|0,this.B=n|0,this.C=r|0,this.D=o|0,this.E=s|0,this.F=i|0,this.G=a|0,this.H=c|0}process(e,n){for(let u=0;u<16;u++,n+=4)xe[u]=e.getUint32(n,!1);for(let u=16;u<64;u++){let y=xe[u-15],f=xe[u-2],p=le(y,7)^le(y,18)^y>>>3,b=le(f,17)^le(f,19)^f>>>10;xe[u]=b+xe[u-7]+p+xe[u-16]|0}let{A:r,B:o,C:s,D:i,E:a,F:c,G:l,H:d}=this;for(let u=0;u<64;u++){let y=le(a,6)^le(a,11)^le(a,25),f=d+y+rr(a,c,l)+$s[u]+xe[u]|0,b=(le(r,2)^le(r,13)^le(r,22))+or(r,o,s)|0;d=l,l=c,c=a,a=i+f|0,i=s,s=o,o=r,r=f+b|0}r=r+this.A|0,o=o+this.B|0,s=s+this.C|0,i=i+this.D|0,a=a+this.E|0,c=c+this.F|0,l=l+this.G|0,d=d+this.H|0,this.set(r,o,s,i,a,c,l,d)}roundClean(){he(xe)}destroy(){this.set(0,0,0,0,0,0,0,0),he(this.buffer)}},Zt=class extends Wt{A=me[0]|0;B=me[1]|0;C=me[2]|0;D=me[3]|0;E=me[4]|0;F=me[5]|0;G=me[6]|0;H=me[7]|0;constructor(){super(32)}};var ce=tr(()=>new Zt,nr(1));var Xt=BigInt(0),Ft=BigInt(1);function Xe(t,e=""){if(typeof t!="boolean"){let n=e&&`"${e}" `;throw new Error(n+"expected boolean, got type="+typeof t)}return t}function sr(t){if(typeof t=="bigint"){if(!pt(t))throw new Error("positive bigint expected, got "+t)}else ie(t);return t}function Ye(t){let e=sr(t).toString(16);return e.length&1?"0"+e:e}function ir(t){if(typeof t!="string")throw new Error("hex string expected, got "+typeof t);return t===""?Xt:BigInt("0x"+t)}function Ee(t){return ir(ae(t))}function Yt(t){return ir(ae(Bs(D(t)).reverse()))}function ht(t,e){ie(e),t=sr(t);let n=re(t.toString(16).padStart(e*2,"0"));if(n.length!==e)throw new Error("number too large");return n}function Jt(t,e){return ht(t,e).reverse()}function Bs(t){return Uint8Array.from(t)}function ar(t){return Uint8Array.from(t,(e,n)=>{let r=e.charCodeAt(0);if(e.length!==1||r>127)throw new Error(`string contains non-ASCII character "${t[n]}" with code ${r} at position ${n}`);return r})}var pt=t=>typeof t=="bigint"&&Xt<=t;function Is(t,e,n){return pt(t)&&pt(e)&&pt(n)&&e<=t&&t<n}function cr(t,e,n,r){if(!Is(e,n,r))throw new Error("expected valid "+t+": "+n+" <= n < "+r+", got "+e)}function Qt(t){let e;for(e=0;t>Xt;t>>=Ft,e+=1);return e}var Je=t=>(Ft<<BigInt(t))-Ft;function lr(t,e,n){if(ie(t,"hashLen"),ie(e,"qByteLen"),typeof n!="function")throw new Error("hmacFn must be a function");let r=x=>new Uint8Array(x),o=Uint8Array.of(),s=Uint8Array.of(0),i=Uint8Array.of(1),a=1e3,c=r(t),l=r(t),d=0,u=()=>{c.fill(1),l.fill(0),d=0},y=(...x)=>n(l,Z(c,...x)),f=(x=o)=>{l=y(s,x),c=y(),x.length!==0&&(l=y(i,x),c=y())},p=()=>{if(d++>=a)throw new Error("drbg: tried max amount of iterations");let x=0,R=[];for(;x<e;){c=y();let N=c.slice();R.push(N),x+=c.length}return Z(...R)};return(x,R)=>{u(),f(x);let N;for(;!(N=R(p()));)f();return u(),N}}function Qe(t,e={},n={}){if(!t||typeof t!="object")throw new Error("expected valid options object");function r(s,i,a){let c=t[s];if(a&&c===void 0)return;let l=typeof c;if(l!==i||c===null)throw new Error(`param "${s}" is invalid: expected ${i}, got ${l}`)}let o=(s,i)=>Object.entries(s).forEach(([a,c])=>r(a,c,i));o(e,!1),o(n,!0)}function en(t){let e=new WeakMap;return(n,...r)=>{let o=e.get(n);if(o!==void 0)return o;let s=t(n,...r);return e.set(n,s),s}}var te=BigInt(0),ee=BigInt(1),Ae=BigInt(2),fr=BigInt(3),pr=BigInt(4),hr=BigInt(5),Ls=BigInt(7),gr=BigInt(8),Os=BigInt(9),mr=BigInt(16);function de(t,e){let n=t%e;return n>=te?n:e+n}function se(t,e,n){let r=t;for(;e-- >te;)r*=r,r%=n;return r}function dr(t,e){if(t===te)throw new Error("invert: expected non-zero number");if(e<=te)throw new Error("invert: expected positive modulus, got "+e);let n=de(t,e),r=e,o=te,s=ee,i=ee,a=te;for(;n!==te;){let l=r/n,d=r%n,u=o-i*l,y=s-a*l;r=n,n=d,o=i,s=a,i=u,a=y}if(r!==ee)throw new Error("invert: does not exist");return de(o,e)}function nn(t,e,n){if(!t.eql(t.sqr(e),n))throw new Error("Cannot find square root")}function yr(t,e){let n=(t.ORDER+ee)/pr,r=t.pow(e,n);return nn(t,r,e),r}function Ns(t,e){let n=(t.ORDER-hr)/gr,r=t.mul(e,Ae),o=t.pow(r,n),s=t.mul(e,o),i=t.mul(t.mul(s,Ae),o),a=t.mul(s,t.sub(i,t.ONE));return nn(t,a,e),a}function Cs(t){let e=Ue(t),n=br(t),r=n(e,e.neg(e.ONE)),o=n(e,r),s=n(e,e.neg(r)),i=(t+Ls)/mr;return(a,c)=>{let l=a.pow(c,i),d=a.mul(l,r),u=a.mul(l,o),y=a.mul(l,s),f=a.eql(a.sqr(d),c),p=a.eql(a.sqr(u),c);l=a.cmov(l,d,f),d=a.cmov(y,u,p);let b=a.eql(a.sqr(d),c),x=a.cmov(l,d,b);return nn(a,x,c),x}}function br(t){if(t<fr)throw new Error("sqrt is not defined for small field");let e=t-ee,n=0;for(;e%Ae===te;)e/=Ae,n++;let r=Ae,o=Ue(t);for(;ur(o,r)===1;)if(r++>1e3)throw new Error("Cannot find square root: probably non-prime P");if(n===1)return yr;let s=o.pow(r,e),i=(e+ee)/Ae;return function(c,l){if(c.is0(l))return l;if(ur(c,l)!==1)throw new Error("Cannot find square root");let d=n,u=c.mul(c.ONE,s),y=c.pow(l,e),f=c.pow(l,i);for(;!c.eql(y,c.ONE);){if(c.is0(y))return c.ZERO;let p=1,b=c.sqr(y);for(;!c.eql(b,c.ONE);)if(p++,b=c.sqr(b),p===d)throw new Error("Cannot find square root");let x=ee<<BigInt(d-p-1),R=c.pow(u,x);d=p,u=c.sqr(R),y=c.mul(y,u),f=c.mul(f,R)}return f}}function Us(t){return t%pr===fr?yr:t%gr===hr?Ns:t%mr===Os?Cs(t):br(t)}var Ds=["create","isValid","is0","neg","inv","sqrt","sqr","eql","add","sub","mul","pow","div","addN","subN","mulN","sqrN"];function rn(t){let e={ORDER:"bigint",BYTES:"number",BITS:"number"},n=Ds.reduce((r,o)=>(r[o]="function",r),e);return Qe(t,n),t}function Ms(t,e,n){if(n<te)throw new Error("invalid exponent, negatives unsupported");if(n===te)return t.ONE;if(n===ee)return e;let r=t.ONE,o=e;for(;n>te;)n&ee&&(r=t.mul(r,o)),o=t.sqr(o),n>>=ee;return r}function gt(t,e,n=!1){let r=new Array(e.length).fill(n?t.ZERO:void 0),o=e.reduce((i,a,c)=>t.is0(a)?i:(r[c]=i,t.mul(i,a)),t.ONE),s=t.inv(o);return e.reduceRight((i,a,c)=>t.is0(a)?i:(r[c]=t.mul(i,r[c]),t.mul(i,a)),s),r}function ur(t,e){let n=(t.ORDER-ee)/Ae,r=t.pow(e,n),o=t.eql(r,t.ONE),s=t.eql(r,t.ZERO),i=t.eql(r,t.neg(t.ONE));if(!o&&!s&&!i)throw new Error("invalid Legendre symbol result");return o?1:s?0:-1}function Ps(t,e){e!==void 0&&ie(e);let n=e!==void 0?e:t.toString(2).length,r=Math.ceil(n/8);return{nBitLength:n,nByteLength:r}}var tn=class{ORDER;BITS;BYTES;isLE;ZERO=te;ONE=ee;_lengths;_sqrt;_mod;constructor(e,n={}){if(e<=te)throw new Error("invalid field: expected ORDER > 0, got "+e);let r;this.isLE=!1,n!=null&&typeof n=="object"&&(typeof n.BITS=="number"&&(r=n.BITS),typeof n.sqrt=="function"&&(this.sqrt=n.sqrt),typeof n.isLE=="boolean"&&(this.isLE=n.isLE),n.allowedLengths&&(this._lengths=n.allowedLengths?.slice()),typeof n.modFromBytes=="boolean"&&(this._mod=n.modFromBytes));let{nBitLength:o,nByteLength:s}=Ps(e,r);if(s>2048)throw new Error("invalid field: expected ORDER of <= 2048 bytes");this.ORDER=e,this.BITS=o,this.BYTES=s,this._sqrt=void 0,Object.preventExtensions(this)}create(e){return de(e,this.ORDER)}isValid(e){if(typeof e!="bigint")throw new Error("invalid field element: expected bigint, got "+typeof e);return te<=e&&e<this.ORDER}is0(e){return e===te}isValidNot0(e){return!this.is0(e)&&this.isValid(e)}isOdd(e){return(e&ee)===ee}neg(e){return de(-e,this.ORDER)}eql(e,n){return e===n}sqr(e){return de(e*e,this.ORDER)}add(e,n){return de(e+n,this.ORDER)}sub(e,n){return de(e-n,this.ORDER)}mul(e,n){return de(e*n,this.ORDER)}pow(e,n){return Ms(this,e,n)}div(e,n){return de(e*dr(n,this.ORDER),this.ORDER)}sqrN(e){return e*e}addN(e,n){return e+n}subN(e,n){return e-n}mulN(e,n){return e*n}inv(e){return dr(e,this.ORDER)}sqrt(e){return this._sqrt||(this._sqrt=Us(this.ORDER)),this._sqrt(this,e)}toBytes(e){return this.isLE?Jt(e,this.BYTES):ht(e,this.BYTES)}fromBytes(e,n=!1){D(e);let{_lengths:r,BYTES:o,isLE:s,ORDER:i,_mod:a}=this;if(r){if(!r.includes(e.length)||e.length>o)throw new Error("Field.fromBytes: expected "+r+" bytes, got "+e.length);let l=new Uint8Array(o);l.set(e,s?0:l.length-e.length),e=l}if(e.length!==o)throw new Error("Field.fromBytes: expected "+o+" bytes, got "+e.length);let c=s?Yt(e):Ee(e);if(a&&(c=de(c,i)),!n&&!this.isValid(c))throw new Error("invalid field element: outside of range 0..ORDER");return c}invertBatch(e){return gt(this,e)}cmov(e,n,r){return r?n:e}};function Ue(t,e={}){return new tn(t,e)}function wr(t){if(typeof t!="bigint")throw new Error("field order must be bigint");let e=t.toString(2).length;return Math.ceil(e/8)}function on(t){let e=wr(t);return e+Math.ceil(e/2)}function mt(t,e,n=!1){D(t);let r=t.length,o=wr(e),s=on(e);if(r<16||r<s||r>1024)throw new Error("expected "+s+"-1024 bytes of input, got "+r);let i=n?Yt(t):Ee(t),a=de(i,e-ee)+ee;return n?Jt(a,o):ht(a,o)}var De=BigInt(0),Re=BigInt(1);function et(t,e){let n=e.negate();return t?n:e}function ln(t,e){let n=gt(t.Fp,e.map(r=>r.Z));return e.map((r,o)=>t.fromAffine(r.toAffine(n[o])))}function vr(t,e){if(!Number.isSafeInteger(t)||t<=0||t>e)throw new Error("invalid window size, expected [1.."+e+"], got W="+t)}function sn(t,e){vr(t,e);let n=Math.ceil(e/t)+1,r=2**(t-1),o=2**t,s=Je(t),i=BigInt(t);return{windows:n,windowSize:r,mask:s,maxNumber:o,shiftBy:i}}function xr(t,e,n){let{windowSize:r,mask:o,maxNumber:s,shiftBy:i}=n,a=Number(t&o),c=t>>i;a>r&&(a-=s,c+=Re);let l=e*r,d=l+Math.abs(a)-1,u=a===0,y=a<0,f=e%2!==0;return{nextN:c,offset:d,isZero:u,isNeg:y,isNegF:f,offsetF:l}}var an=new WeakMap,_r=new WeakMap;function cn(t){return _r.get(t)||1}function Er(t){if(t!==De)throw new Error("invalid wNAF")}var yt=class{BASE;ZERO;Fn;bits;constructor(e,n){this.BASE=e.BASE,this.ZERO=e.ZERO,this.Fn=e.Fn,this.bits=n}_unsafeLadder(e,n,r=this.ZERO){let o=e;for(;n>De;)n&Re&&(r=r.add(o)),o=o.double(),n>>=Re;return r}precomputeWindow(e,n){let{windows:r,windowSize:o}=sn(n,this.bits),s=[],i=e,a=i;for(let c=0;c<r;c++){a=i,s.push(a);for(let l=1;l<o;l++)a=a.add(i),s.push(a);i=a.double()}return s}wNAF(e,n,r){if(!this.Fn.isValid(r))throw new Error("invalid scalar");let o=this.ZERO,s=this.BASE,i=sn(e,this.bits);for(let a=0;a<i.windows;a++){let{nextN:c,offset:l,isZero:d,isNeg:u,isNegF:y,offsetF:f}=xr(r,a,i);r=c,d?s=s.add(et(y,n[f])):o=o.add(et(u,n[l]))}return Er(r),{p:o,f:s}}wNAFUnsafe(e,n,r,o=this.ZERO){let s=sn(e,this.bits);for(let i=0;i<s.windows&&r!==De;i++){let{nextN:a,offset:c,isZero:l,isNeg:d}=xr(r,i,s);if(r=a,!l){let u=n[c];o=o.add(d?u.negate():u)}}return Er(r),o}getPrecomputes(e,n,r){let o=an.get(n);return o||(o=this.precomputeWindow(n,e),e!==1&&(typeof r=="function"&&(o=r(o)),an.set(n,o))),o}cached(e,n,r){let o=cn(e);return this.wNAF(o,this.getPrecomputes(o,e,r),n)}unsafe(e,n,r,o){let s=cn(e);return s===1?this._unsafeLadder(e,n,o):this.wNAFUnsafe(s,this.getPrecomputes(s,e,r),n,o)}createCache(e,n){vr(n,this.bits),_r.set(e,n),an.delete(e)}hasCache(e){return cn(e)!==1}};function kr(t,e,n,r){let o=e,s=t.ZERO,i=t.ZERO;for(;n>De||r>De;)n&Re&&(s=s.add(o)),r&Re&&(i=i.add(o)),o=o.double(),n>>=Re,r>>=Re;return{p1:s,p2:i}}function Sr(t,e,n){if(e){if(e.ORDER!==t)throw new Error("Field.ORDER must match order: Fp == p, Fn == n");return rn(e),e}else return Ue(t,{isLE:n})}function Tr(t,e,n={},r){if(r===void 0&&(r=t==="edwards"),!e||typeof e!="object")throw new Error(`expected valid ${t} CURVE object`);for(let c of["p","n","h"]){let l=e[c];if(!(typeof l=="bigint"&&l>De))throw new Error(`CURVE.${c} must be positive bigint`)}let o=Sr(e.p,n.Fp,r),s=Sr(e.n,n.Fn,r),a=["Gx","Gy","a",t==="weierstrass"?"b":"d"];for(let c of a)if(!o.isValid(e[c]))throw new Error(`CURVE.${c} must be valid field element of CURVE.Fp`);return e=Object.freeze(Object.assign({},e)),{CURVE:e,Fp:o,Fn:s}}function bt(t,e){return function(r){let o=t(r);return{secretKey:o,publicKey:e(o)}}}var wt=class{oHash;iHash;blockLen;outputLen;finished=!1;destroyed=!1;constructor(e,n){if(Te(e),D(n,void 0,"key"),this.iHash=e.create(),typeof this.iHash.update!="function")throw new Error("Expected instance of class which extends utils.Hash");this.blockLen=this.iHash.blockLen,this.outputLen=this.iHash.outputLen;let r=this.blockLen,o=new Uint8Array(r);o.set(n.length>r?e.create().update(n).digest():n);for(let s=0;s<o.length;s++)o[s]^=54;this.iHash.update(o),this.oHash=e.create();for(let s=0;s<o.length;s++)o[s]^=106;this.oHash.update(o),he(o)}update(e){return Ce(this),this.iHash.update(e),this}digestInto(e){Ce(this),D(e,this.outputLen,"output"),this.finished=!0,this.iHash.digestInto(e),this.oHash.update(e),this.oHash.digestInto(e),this.destroy()}digest(){let e=new Uint8Array(this.oHash.outputLen);return this.digestInto(e),e}_cloneInto(e){e||=Object.create(Object.getPrototypeOf(this),{});let{oHash:n,iHash:r,finished:o,destroyed:s,blockLen:i,outputLen:a}=this;return e=e,e.finished=o,e.destroyed=s,e.blockLen=i,e.outputLen=a,e.oHash=n._cloneInto(e.oHash),e.iHash=r._cloneInto(e.iHash),e}clone(){return this._cloneInto()}destroy(){this.destroyed=!0,this.oHash.destroy(),this.iHash.destroy()}},Se=(t,e,n)=>new wt(t,e).update(n).digest();Se.create=(t,e)=>new wt(t,e);var Ar=(t,e)=>(t+(t>=0?e:-e)/Rr)/e;function qs(t,e,n){let[[r,o],[s,i]]=e,a=Ar(i*t,n),c=Ar(-o*t,n),l=t-a*r-c*s,d=-a*o-c*i,u=l<ye,y=d<ye;u&&(l=-l),y&&(d=-d);let f=Je(Math.ceil(Qt(n)/2))+Me;if(l<ye||l>=f||d<ye||d>=f)throw new Error("splitScalar (endomorphism): failed, k="+t);return{k1neg:u,k1:l,k2neg:y,k2:d}}function un(t){if(!["compact","recovered","der"].includes(t))throw new Error(\'Signature format must be "compact", "recovered", or "der"\');return t}function dn(t,e){let n={};for(let r of Object.keys(e))n[r]=t[r]===void 0?e[r]:t[r];return Xe(n.lowS,"lowS"),Xe(n.prehash,"prehash"),n.format!==void 0&&un(n.format),n}var fn=class extends Error{constructor(e=""){super(e)}},ve={Err:fn,_tlv:{encode:(t,e)=>{let{Err:n}=ve;if(t<0||t>256)throw new n("tlv.encode: wrong tag");if(e.length&1)throw new n("tlv.encode: unpadded data");let r=e.length/2,o=Ye(r);if(o.length/2&128)throw new n("tlv.encode: long form length too big");let s=r>127?Ye(o.length/2|128):"";return Ye(t)+s+o+e},decode(t,e){let{Err:n}=ve,r=0;if(t<0||t>256)throw new n("tlv.encode: wrong tag");if(e.length<2||e[r++]!==t)throw new n("tlv.decode: wrong tlv");let o=e[r++],s=!!(o&128),i=0;if(!s)i=o;else{let c=o&127;if(!c)throw new n("tlv.decode(long): indefinite length not supported");if(c>4)throw new n("tlv.decode(long): byte length is too big");let l=e.subarray(r,r+c);if(l.length!==c)throw new n("tlv.decode: length bytes not complete");if(l[0]===0)throw new n("tlv.decode(long): zero leftmost byte");for(let d of l)i=i<<8|d;if(r+=c,i<128)throw new n("tlv.decode(long): not minimal encoding")}let a=e.subarray(r,r+i);if(a.length!==i)throw new n("tlv.decode: wrong value length");return{v:a,l:e.subarray(r+i)}}},_int:{encode(t){let{Err:e}=ve;if(t<ye)throw new e("integer: negative integers are not allowed");let n=Ye(t);if(Number.parseInt(n[0],16)&8&&(n="00"+n),n.length&1)throw new e("unexpected DER parsing assertion: unpadded hex");return n},decode(t){let{Err:e}=ve;if(t[0]&128)throw new e("invalid signature integer: negative");if(t[0]===0&&!(t[1]&128))throw new e("invalid signature integer: unnecessary leading zero");return Ee(t)}},toSig(t){let{Err:e,_int:n,_tlv:r}=ve,o=D(t,void 0,"signature"),{v:s,l:i}=r.decode(48,o);if(i.length)throw new e("invalid signature: left bytes after parsing");let{v:a,l:c}=r.decode(2,s),{v:l,l:d}=r.decode(2,c);if(d.length)throw new e("invalid signature: left bytes after parsing");return{r:n.decode(a),s:n.decode(l)}},hexFromSig(t){let{_tlv:e,_int:n}=ve,r=e.encode(2,n.encode(t.r)),o=e.encode(2,n.encode(t.s)),s=r+o;return e.encode(48,s)}},ye=BigInt(0),Me=BigInt(1),Rr=BigInt(2),xt=BigInt(3),Hs=BigInt(4);function $r(t,e={}){let n=Tr("weierstrass",t,e),{Fp:r,Fn:o}=n,s=n.CURVE,{h:i,n:a}=s;Qe(e,{},{allowInfinityPoint:"boolean",clearCofactor:"function",isTorsionFree:"function",fromBytes:"function",toBytes:"function",endo:"object"});let{endo:c}=e;if(c&&(!r.is0(s.a)||typeof c.beta!="bigint"||!Array.isArray(c.basises)))throw new Error(\'invalid endo: expected "beta": bigint and "basises": array\');let l=Ir(r,o);function d(){if(!r.isOdd)throw new Error("compression is not supported: Field does not have .isOdd()")}function u($,m,g){let{x:h,y:v}=m.toAffine(),k=r.toBytes(h);if(Xe(g,"isCompressed"),g){d();let T=!r.isOdd(v);return Z(Br(T),k)}else return Z(Uint8Array.of(4),k,r.toBytes(v))}function y($){D($,void 0,"Point");let{publicKey:m,publicKeyUncompressed:g}=l,h=$.length,v=$[0],k=$.subarray(1);if(h===m&&(v===2||v===3)){let T=r.fromBytes(k);if(!r.isValid(T))throw new Error("bad point: is not on curve, wrong x");let w=b(T),_;try{_=r.sqrt(w)}catch(M){let P=M instanceof Error?": "+M.message:"";throw new Error("bad point: is not on curve, sqrt error"+P)}d();let E=r.isOdd(_);return(v&1)===1!==E&&(_=r.neg(_)),{x:T,y:_}}else if(h===g&&v===4){let T=r.BYTES,w=r.fromBytes(k.subarray(0,T)),_=r.fromBytes(k.subarray(T,T*2));if(!x(w,_))throw new Error("bad point: is not on curve");return{x:w,y:_}}else throw new Error(`bad point: got length ${h}, expected compressed=${m} or uncompressed=${g}`)}let f=e.toBytes||u,p=e.fromBytes||y;function b($){let m=r.sqr($),g=r.mul(m,$);return r.add(r.add(g,r.mul($,s.a)),s.b)}function x($,m){let g=r.sqr(m),h=b($);return r.eql(g,h)}if(!x(s.Gx,s.Gy))throw new Error("bad curve params: generator point");let R=r.mul(r.pow(s.a,xt),Hs),N=r.mul(r.sqr(s.b),BigInt(27));if(r.is0(r.add(R,N)))throw new Error("bad curve params: a or b");function C($,m,g=!1){if(!r.isValid(m)||g&&r.is0(m))throw new Error(`bad point coordinate ${$}`);return m}function L($){if(!($ instanceof S))throw new Error("Weierstrass Point expected")}function V($){if(!c||!c.basises)throw new Error("no endo");return qs($,c.basises,o.ORDER)}let j=en(($,m)=>{let{X:g,Y:h,Z:v}=$;if(r.eql(v,r.ONE))return{x:g,y:h};let k=$.is0();m==null&&(m=k?r.ONE:r.inv(v));let T=r.mul(g,m),w=r.mul(h,m),_=r.mul(v,m);if(k)return{x:r.ZERO,y:r.ZERO};if(!r.eql(_,r.ONE))throw new Error("invZ was invalid");return{x:T,y:w}}),W=en($=>{if($.is0()){if(e.allowInfinityPoint&&!r.is0($.Y))return;throw new Error("bad point: ZERO")}let{x:m,y:g}=$.toAffine();if(!r.isValid(m)||!r.isValid(g))throw new Error("bad point: x or y not field elements");if(!x(m,g))throw new Error("bad point: equation left != right");if(!$.isTorsionFree())throw new Error("bad point: not in prime-order subgroup");return!0});function z($,m,g,h,v){return g=new S(r.mul(g.X,$),g.Y,g.Z),m=et(h,m),g=et(v,g),m.add(g)}class S{static BASE=new S(s.Gx,s.Gy,r.ONE);static ZERO=new S(r.ZERO,r.ONE,r.ZERO);static Fp=r;static Fn=o;X;Y;Z;constructor(m,g,h){this.X=C("x",m),this.Y=C("y",g,!0),this.Z=C("z",h),Object.freeze(this)}static CURVE(){return s}static fromAffine(m){let{x:g,y:h}=m||{};if(!m||!r.isValid(g)||!r.isValid(h))throw new Error("invalid affine point");if(m instanceof S)throw new Error("projective point not allowed");return r.is0(g)&&r.is0(h)?S.ZERO:new S(g,h,r.ONE)}static fromBytes(m){let g=S.fromAffine(p(D(m,void 0,"point")));return g.assertValidity(),g}static fromHex(m){return S.fromBytes(re(m))}get x(){return this.toAffine().x}get y(){return this.toAffine().y}precompute(m=8,g=!0){return O.createCache(this,m),g||this.multiply(xt),this}assertValidity(){W(this)}hasEvenY(){let{y:m}=this.toAffine();if(!r.isOdd)throw new Error("Field doesn\'t support isOdd");return!r.isOdd(m)}equals(m){L(m);let{X:g,Y:h,Z:v}=this,{X:k,Y:T,Z:w}=m,_=r.eql(r.mul(g,w),r.mul(k,v)),E=r.eql(r.mul(h,w),r.mul(T,v));return _&&E}negate(){return new S(this.X,r.neg(this.Y),this.Z)}double(){let{a:m,b:g}=s,h=r.mul(g,xt),{X:v,Y:k,Z:T}=this,w=r.ZERO,_=r.ZERO,E=r.ZERO,A=r.mul(v,v),M=r.mul(k,k),P=r.mul(T,T),U=r.mul(v,k);return U=r.add(U,U),E=r.mul(v,T),E=r.add(E,E),w=r.mul(m,E),_=r.mul(h,P),_=r.add(w,_),w=r.sub(M,_),_=r.add(M,_),_=r.mul(w,_),w=r.mul(U,w),E=r.mul(h,E),P=r.mul(m,P),U=r.sub(A,P),U=r.mul(m,U),U=r.add(U,E),E=r.add(A,A),A=r.add(E,A),A=r.add(A,P),A=r.mul(A,U),_=r.add(_,A),P=r.mul(k,T),P=r.add(P,P),A=r.mul(P,U),w=r.sub(w,A),E=r.mul(P,M),E=r.add(E,E),E=r.add(E,E),new S(w,_,E)}add(m){L(m);let{X:g,Y:h,Z:v}=this,{X:k,Y:T,Z:w}=m,_=r.ZERO,E=r.ZERO,A=r.ZERO,M=s.a,P=r.mul(s.b,xt),U=r.mul(g,k),H=r.mul(h,T),K=r.mul(v,w),Y=r.add(g,h),G=r.add(k,T);Y=r.mul(Y,G),G=r.add(U,H),Y=r.sub(Y,G),G=r.add(g,v);let Q=r.add(k,w);return G=r.mul(G,Q),Q=r.add(U,K),G=r.sub(G,Q),Q=r.add(h,v),_=r.add(T,w),Q=r.mul(Q,_),_=r.add(H,K),Q=r.sub(Q,_),A=r.mul(M,G),_=r.mul(P,K),A=r.add(_,A),_=r.sub(H,A),A=r.add(H,A),E=r.mul(_,A),H=r.add(U,U),H=r.add(H,U),K=r.mul(M,K),G=r.mul(P,G),H=r.add(H,K),K=r.sub(U,K),K=r.mul(M,K),G=r.add(G,K),U=r.mul(H,G),E=r.add(E,U),U=r.mul(Q,G),_=r.mul(Y,_),_=r.sub(_,U),U=r.mul(Y,H),A=r.mul(Q,A),A=r.add(A,U),new S(_,E,A)}subtract(m){return this.add(m.negate())}is0(){return this.equals(S.ZERO)}multiply(m){let{endo:g}=e;if(!o.isValidNot0(m))throw new Error("invalid scalar: out of range");let h,v,k=T=>O.cached(this,T,w=>ln(S,w));if(g){let{k1neg:T,k1:w,k2neg:_,k2:E}=V(m),{p:A,f:M}=k(w),{p:P,f:U}=k(E);v=M.add(U),h=z(g.beta,A,P,T,_)}else{let{p:T,f:w}=k(m);h=T,v=w}return ln(S,[h,v])[0]}multiplyUnsafe(m){let{endo:g}=e,h=this;if(!o.isValid(m))throw new Error("invalid scalar: out of range");if(m===ye||h.is0())return S.ZERO;if(m===Me)return h;if(O.hasCache(this))return this.multiply(m);if(g){let{k1neg:v,k1:k,k2neg:T,k2:w}=V(m),{p1:_,p2:E}=kr(S,h,k,w);return z(g.beta,_,E,v,T)}else return O.unsafe(h,m)}toAffine(m){return j(this,m)}isTorsionFree(){let{isTorsionFree:m}=e;return i===Me?!0:m?m(S,this):O.unsafe(this,a).is0()}clearCofactor(){let{clearCofactor:m}=e;return i===Me?this:m?m(S,this):this.multiplyUnsafe(i)}isSmallOrder(){return this.multiplyUnsafe(i).is0()}toBytes(m=!0){return Xe(m,"isCompressed"),this.assertValidity(),f(S,this,m)}toHex(m=!0){return ae(this.toBytes(m))}toString(){return`<Point ${this.is0()?"ZERO":this.toHex()}>`}}let I=o.BITS,O=new yt(S,e.endo?Math.ceil(I/2):I);return S.BASE.precompute(8),S}function Br(t){return Uint8Array.of(t?2:3)}function Ir(t,e){return{secretKey:e.BYTES,publicKey:1+t.BYTES,publicKeyUncompressed:1+2*t.BYTES,publicKeyHasPrefix:!0,signature:2*e.BYTES}}function Gs(t,e={}){let{Fn:n}=t,r=e.randomBytes||ge,o=Object.assign(Ir(t.Fp,n),{seed:on(n.ORDER)});function s(f){try{let p=n.fromBytes(f);return n.isValidNot0(p)}catch{return!1}}function i(f,p){let{publicKey:b,publicKeyUncompressed:x}=o;try{let R=f.length;return p===!0&&R!==b||p===!1&&R!==x?!1:!!t.fromBytes(f)}catch{return!1}}function a(f=r(o.seed)){return mt(D(f,o.seed,"seed"),n.ORDER)}function c(f,p=!0){return t.BASE.multiply(n.fromBytes(f)).toBytes(p)}function l(f){let{secretKey:p,publicKey:b,publicKeyUncompressed:x}=o;if(!Fe(f)||"_lengths"in n&&n._lengths||p===b)return;let R=D(f,void 0,"key").length;return R===b||R===x}function d(f,p,b=!0){if(l(f)===!0)throw new Error("first arg must be private key");if(l(p)===!1)throw new Error("second arg must be public key");let x=n.fromBytes(f);return t.fromBytes(p).multiply(x).toBytes(b)}let u={isValidSecretKey:s,isValidPublicKey:i,randomSecretKey:a},y=bt(a,c);return Object.freeze({getPublicKey:c,getSharedSecret:d,keygen:y,Point:t,utils:u,lengths:o})}function Lr(t,e,n={}){Te(e),Qe(n,{},{hmac:"function",lowS:"boolean",randomBytes:"function",bits2int:"function",bits2int_modN:"function"}),n=Object.assign({},n);let r=n.randomBytes||ge,o=n.hmac||((g,h)=>Se(e,g,h)),{Fp:s,Fn:i}=t,{ORDER:a,BITS:c}=i,{keygen:l,getPublicKey:d,getSharedSecret:u,utils:y,lengths:f}=Gs(t,n),p={prehash:!0,lowS:typeof n.lowS=="boolean"?n.lowS:!0,format:"compact",extraEntropy:!1},b=a*Rr<s.ORDER;function x(g){let h=a>>Me;return g>h}function R(g,h){if(!i.isValidNot0(h))throw new Error(`invalid signature ${g}: out of range 1..Point.Fn.ORDER`);return h}function N(){if(b)throw new Error(\'"recovered" sig type is not supported for cofactor >2 curves\')}function C(g,h){un(h);let v=f.signature,k=h==="compact"?v:h==="recovered"?v+1:void 0;return D(g,k)}class L{r;s;recovery;constructor(h,v,k){if(this.r=R("r",h),this.s=R("s",v),k!=null){if(N(),![0,1,2,3].includes(k))throw new Error("invalid recovery id");this.recovery=k}Object.freeze(this)}static fromBytes(h,v=p.format){C(h,v);let k;if(v==="der"){let{r:E,s:A}=ve.toSig(D(h));return new L(E,A)}v==="recovered"&&(k=h[0],v="compact",h=h.subarray(1));let T=f.signature/2,w=h.subarray(0,T),_=h.subarray(T,T*2);return new L(i.fromBytes(w),i.fromBytes(_),k)}static fromHex(h,v){return this.fromBytes(re(h),v)}assertRecovery(){let{recovery:h}=this;if(h==null)throw new Error("invalid recovery id: must be present");return h}addRecoveryBit(h){return new L(this.r,this.s,h)}recoverPublicKey(h){let{r:v,s:k}=this,T=this.assertRecovery(),w=T===2||T===3?v+a:v;if(!s.isValid(w))throw new Error("invalid recovery id: sig.r+curve.n != R.x");let _=s.toBytes(w),E=t.fromBytes(Z(Br((T&1)===0),_)),A=i.inv(w),M=j(D(h,void 0,"msgHash")),P=i.create(-M*A),U=i.create(k*A),H=t.BASE.multiplyUnsafe(P).add(E.multiplyUnsafe(U));if(H.is0())throw new Error("invalid recovery: point at infinify");return H.assertValidity(),H}hasHighS(){return x(this.s)}toBytes(h=p.format){if(un(h),h==="der")return re(ve.hexFromSig(this));let{r:v,s:k}=this,T=i.toBytes(v),w=i.toBytes(k);return h==="recovered"?(N(),Z(Uint8Array.of(this.assertRecovery()),T,w)):Z(T,w)}toHex(h){return ae(this.toBytes(h))}}let V=n.bits2int||function(h){if(h.length>8192)throw new Error("input is too large");let v=Ee(h),k=h.length*8-c;return k>0?v>>BigInt(k):v},j=n.bits2int_modN||function(h){return i.create(V(h))},W=Je(c);function z(g){return cr("num < 2^"+c,g,ye,W),i.toBytes(g)}function S(g,h){return D(g,void 0,"message"),h?D(e(g),void 0,"prehashed message"):g}function I(g,h,v){let{lowS:k,prehash:T,extraEntropy:w}=dn(v,p);g=S(g,T);let _=j(g),E=i.fromBytes(h);if(!i.isValidNot0(E))throw new Error("invalid private key");let A=[z(E),z(_)];if(w!=null&&w!==!1){let H=w===!0?r(f.secretKey):w;A.push(D(H,void 0,"extraEntropy"))}let M=Z(...A),P=_;function U(H){let K=V(H);if(!i.isValidNot0(K))return;let Y=i.inv(K),G=t.BASE.multiply(K).toAffine(),Q=i.create(G.x);if(Q===ye)return;let ct=i.create(Y*i.create(P+Q*E));if(ct===ye)return;let Zn=(G.x===Q?0:2)|Number(G.y&Me),Fn=ct;return k&&x(ct)&&(Fn=i.neg(ct),Zn^=1),new L(Q,Fn,b?void 0:Zn)}return{seed:M,k2sig:U}}function O(g,h,v={}){let{seed:k,k2sig:T}=I(g,h,v);return lr(e.outputLen,i.BYTES,o)(k,T).toBytes(v.format)}function $(g,h,v,k={}){let{lowS:T,prehash:w,format:_}=dn(k,p);if(v=D(v,void 0,"publicKey"),h=S(h,w),!Fe(g)){let E=g instanceof L?", use sig.toBytes()":"";throw new Error("verify expects Uint8Array signature"+E)}C(g,_);try{let E=L.fromBytes(g,_),A=t.fromBytes(v);if(T&&E.hasHighS())return!1;let{r:M,s:P}=E,U=j(h),H=i.inv(P),K=i.create(U*H),Y=i.create(M*H),G=t.BASE.multiplyUnsafe(K).add(A.multiplyUnsafe(Y));return G.is0()?!1:i.create(G.x)===M}catch{return!1}}function m(g,h,v={}){let{prehash:k}=dn(v,p);return h=S(h,k),L.fromBytes(g,"recovered").recoverPublicKey(h).toBytes()}return Object.freeze({keygen:l,getPublicKey:d,getSharedSecret:u,utils:y,lengths:f,Point:t,sign:O,verify:$,recoverPublicKey:m,Signature:L,hash:e})}var vt={p:BigInt("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"),n:BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"),h:BigInt(1),a:BigInt(0),b:BigInt(7),Gx:BigInt("0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),Gy:BigInt("0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")},js={beta:BigInt("0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee"),basises:[[BigInt("0x3086d221a7d46bcde86c90e49284eb15"),-BigInt("0xe4437ed6010e88286f547fa90abfe4c3")],[BigInt("0x114ca50f7a8e2f3f657c1108d9d44cfd8"),BigInt("0x3086d221a7d46bcde86c90e49284eb15")]]},zs=BigInt(0),pn=BigInt(2);function Ks(t){let e=vt.p,n=BigInt(3),r=BigInt(6),o=BigInt(11),s=BigInt(22),i=BigInt(23),a=BigInt(44),c=BigInt(88),l=t*t*t%e,d=l*l*t%e,u=se(d,n,e)*d%e,y=se(u,n,e)*d%e,f=se(y,pn,e)*l%e,p=se(f,o,e)*f%e,b=se(p,s,e)*p%e,x=se(b,a,e)*b%e,R=se(x,c,e)*x%e,N=se(R,a,e)*b%e,C=se(N,n,e)*d%e,L=se(C,i,e)*p%e,V=se(L,r,e)*l%e,j=se(V,pn,e);if(!Et.eql(Et.sqr(j),t))throw new Error("Cannot find square root");return j}var Et=Ue(vt.p,{sqrt:Ks}),$e=$r(vt,{Fp:Et,endo:js}),Cr=Lr($e,ce),Or={};function St(t,...e){let n=Or[t];if(n===void 0){let r=ce(ar(t));n=Z(r,r),Or[t]=n}return ce(Z(n,...e))}var gn=t=>t.toBytes(!0).slice(1),mn=t=>t%pn===zs;function hn(t){let{Fn:e,BASE:n}=$e,r=e.fromBytes(t),o=n.multiply(r);return{scalar:mn(o.y)?r:e.neg(r),bytes:gn(o)}}function Ur(t){let e=Et;if(!e.isValidNot0(t))throw new Error("invalid x: Fail if x \\u2265 p");let n=e.create(t*t),r=e.create(n*t+BigInt(7)),o=e.sqrt(r);mn(o)||(o=e.neg(o));let s=$e.fromAffine({x:t,y:o});return s.assertValidity(),s}var tt=Ee;function Dr(...t){return $e.Fn.create(tt(St("BIP0340/challenge",...t)))}function Nr(t){return hn(t).bytes}function Vs(t,e,n=ge(32)){let{Fn:r}=$e,o=D(t,void 0,"message"),{bytes:s,scalar:i}=hn(e),a=D(n,32,"auxRand"),c=r.toBytes(i^tt(St("BIP0340/aux",a))),l=St("BIP0340/nonce",c,s,o),{bytes:d,scalar:u}=hn(l),y=Dr(d,s,o),f=new Uint8Array(64);if(f.set(d,0),f.set(r.toBytes(r.create(u+y*i)),32),!Mr(f,o,s))throw new Error("sign: Invalid signature produced");return f}function Mr(t,e,n){let{Fp:r,Fn:o,BASE:s}=$e,i=D(t,64,"signature"),a=D(e,void 0,"message"),c=D(n,32,"publicKey");try{let l=Ur(tt(c)),d=tt(i.subarray(0,32));if(!r.isValidNot0(d))return!1;let u=tt(i.subarray(32,64));if(!o.isValidNot0(u))return!1;let y=Dr(o.toBytes(d),gn(l),a),f=s.multiplyUnsafe(u).add(l.multiplyUnsafe(o.neg(y))),{x:p,y:b}=f.toAffine();return!(f.is0()||!mn(b)||p!==d)}catch{return!1}}var _e=(()=>{let n=(r=ge(48))=>mt(r,vt.n);return{keygen:bt(n,Nr),getPublicKey:Nr,sign:Vs,verify:Mr,Point:$e,utils:{randomSecretKey:n,taggedHash:St,lift_x:Ur,pointToBytes:gn},lengths:{secretKey:32,publicKey:32,publicKeyHasPrefix:!1,signature:64,seed:48}}})();var Rc=new TextDecoder("utf-8"),Ws=new TextEncoder;function Zs(t){if(t.length!==64)return!1;for(let e=0;e<64;e++){let n=t.charCodeAt(e);if(isNaN(n)||n<48||n>102||n>57&&n<97)return!1}return!0}var Pe=Symbol("verified"),Fs=t=>t instanceof Object;function Xs(t){if(!Fs(t)||typeof t.kind!="number"||typeof t.content!="string"||typeof t.created_at!="number"||typeof t.pubkey!="string"||!Zs(t.pubkey)||!Array.isArray(t.tags))return!1;for(let e=0;e<t.tags.length;e++){let n=t.tags[e];if(!Array.isArray(n))return!1;for(let r=0;r<n.length;r++)if(typeof n[r]!="string")return!1}return!0}var Ys=class{generateSecretKey(){return _e.utils.randomSecretKey()}getPublicKey(t){return ae(_e.getPublicKey(t))}finalizeEvent(t,e){let n=t;return n.pubkey=ae(_e.getPublicKey(e)),n.id=yn(n),n.sig=ae(_e.sign(re(yn(n)),e)),n[Pe]=!0,n}verifyEvent(t){if(typeof t[Pe]=="boolean")return t[Pe];try{let e=yn(t);if(e!==t.id)return t[Pe]=!1,!1;let n=_e.verify(re(t.sig),re(e),re(t.pubkey));return t[Pe]=n,n}catch{return t[Pe]=!1,!1}}};function Js(t){if(!Xs(t))throw new Error("can\'t serialize event with wrong or missing properties");return JSON.stringify([0,t.pubkey,t.created_at,t.kind,t.tags,t.content])}function yn(t){let e=ce(Ws.encode(Js(t)));return ae(e)}var _t=new Ys,Pr=_t.generateSecretKey,nt=_t.getPublicKey,qr=_t.finalizeEvent,Hr=_t.verifyEvent;var rt=class{constructor(e){this.onEvent=e}buffer="";data=[];event="";id;push(e){this.buffer+=e;let n=this.buffer.search(/\\r\\n|\\r|\\n/);for(;n!==-1;){let r=this.buffer.slice(0,n),o=this.buffer.startsWith(`\\r\n`,n)?2:1;this.buffer=this.buffer.slice(n+o),this.line(r),n=this.buffer.search(/\\r\\n|\\r|\\n/)}}end(){this.buffer&&this.line(this.buffer),this.buffer="",this.line("")}line(e){if(e===""){this.data.length&&this.onEvent({event:this.event||"message",data:this.data.join(`\n`),...this.id!==void 0&&{id:this.id}}),this.data=[],this.event="";return}if(e.startsWith(":"))return;let n=e.indexOf(":"),r=n===-1?e:e.slice(0,n),o=n===-1?"":e.slice(n+1);o.startsWith(" ")&&(o=o.slice(1)),r==="data"?this.data.push(o):r==="event"?this.event=o:r==="id"&&(this.id=o)}};function Gr(t){let e=[],n=new rt(r=>e.push(r));return n.push(t),n.end(),e}var Qs="databricks-buzz-plugins/0.1.0",bn=class extends Error{constructor(n,r,o,s){super(o);this.status=n;this.errorCode=r;this.body=s;this.name="DatabricksApiError"}get isPermission(){return this.status===403||this.errorCode==="PERMISSION_DENIED"}get isNotFound(){return this.status===404||this.errorCode==="RESOURCE_DOES_NOT_EXIST"||this.errorCode==="NOT_FOUND"}get isFeatureDisabled(){return this.errorCode==="FEATURE_DISABLED"||this.errorCode==="NOT_IMPLEMENTED"||/not enabled|feature.*disabled|preview/i.test(this.message)}};function kt(t){let e,n=`Databricks returned HTTP ${t.status}`;try{let r=JSON.parse(t.body);e=r.error_code??(typeof r.error=="object"?r.error?.code:void 0),n=r.message??(typeof r.error=="object"?r.error?.message:r.error)??r.error_description??n}catch{let r=t.body.trim();r&&r.length<400&&!r.startsWith("<")&&(n=r)}return new bn(t.status,e,n,t.body)}var ei=new Set(["GET","HEAD","PUT","DELETE"]),ti=(t,e)=>new Promise((n,r)=>{let o=setTimeout(n,t);e?.addEventListener("abort",()=>{clearTimeout(o),r(e.reason)},{once:!0})}),Tt=class{constructor(e){this.options=e;this.host=e.host.replace(/\\/+$/,""),this.workspaceId=e.workspaceId}host;workspaceId;url(e,n){let r=new URL(/^https:\\/\\//.test(e)?e:`${this.host}${e.startsWith("/")?"":"/"}${e}`);for(let[o,s]of Object.entries(n??{}))s!==void 0&&r.searchParams.set(o,String(s));return r.toString()}async request(e,n={},r){let o=n.method??(n.body===void 0?"GET":"POST"),s=n.body===void 0?void 0:typeof n.body=="string"?n.body:JSON.stringify(n.body),i=async c=>{let l=await this.options.token({force:c});return this.options.transport({url:this.url(e,n.query),method:o,headers:{Authorization:`Bearer ${l}`,"User-Agent":this.options.userAgent??Qs,Accept:"application/json",...s!==void 0&&{"Content-Type":"application/json"},...this.workspaceId&&{"X-Databricks-Workspace-Id":this.workspaceId},...n.headers},...s!==void 0&&{body:s},...n.timeoutMs!==void 0&&{timeoutMs:n.timeoutMs},...n.signal&&{signal:n.signal},...r&&{onBody:r}})},a=await i(!1);a.status===401&&(a=await i(!0));for(let c=0;c<3&&(a.status===429||a.status===503)&&ei.has(o)&&!r;c++){let l=Number(a.headers["retry-after"]);await ti(Number.isFinite(l)&&l>0?Math.min(l*1e3,2e4):500*2**c+Math.random()*250,n.signal),a=await i(!1)}return a}async json(e,n={}){let r=await this.request(e,n);if(r.status<200||r.status>=300)throw kt(r);return r.body.trim()?JSON.parse(r.body):{}}get(e,n={}){return this.json(e,{...n,method:"GET"})}post(e,n,r={}){return this.json(e,{...r,method:"POST",body:n??{}})}async stream(e,n,r){let o=new rt(r),s=!0,i=await this.request(e,{...n,headers:{Accept:"text/event-stream",...n.headers}},a=>{s&&o.push(a)});if(i.status<200||i.status>=300)throw s=!1,kt(i);return o.end(),i}};var jr="2025-06-18",At=class extends Error{constructor(n,r,o){super(n);this.code=r;this.data=o;this.name="McpError"}},wn=t=>`/ai-gateway/mcp-services/${t}`,qe=class{constructor(e,n,r={}){this.client=e;this.path=n;this.query=r}session;initializing;nextId=1;toolsCache;serverInfo;instructions;async listTools(e){if(this.toolsCache&&Date.now()-this.toolsCache.at<5*6e4)return this.toolsCache.tools;let n=[],r;do{let o=await this.call("tools/list",r?{cursor:r}:{},e);n.push(...o.tools??[]),r=o.nextCursor}while(r);return this.toolsCache={at:Date.now(),tools:n},n}callTool(e,n,r={}){return this.call("tools/call",{name:e,arguments:n,...r.meta&&{_meta:r.meta}},r.signal,r.timeoutMs)}async readResource(e,n){return await this.call("resources/read",{uri:e},n)}async ensureSession(e){this.session||(this.initializing??=(async()=>{let n=await this.send({jsonrpc:"2.0",id:this.nextId++,method:"initialize",params:{protocolVersion:jr,capabilities:{},clientInfo:{name:"databricks-buzz-plugins",version:"0.1.0"}}},e,!0);this.serverInfo=n?.serverInfo,this.instructions=n?.instructions,await this.send({jsonrpc:"2.0",method:"notifications/initialized"},e).catch(()=>{})})().finally(()=>{this.initializing=void 0}),await this.initializing)}async call(e,n,r,o){await this.ensureSession(r);try{return await this.send({jsonrpc:"2.0",id:this.nextId++,method:e,params:n},r,!1,o)}catch(s){if(s.status===404&&this.session)return this.session=void 0,await this.ensureSession(r),this.send({jsonrpc:"2.0",id:this.nextId++,method:e,params:n},r,!1,o);throw s}}async send(e,n,r=!1,o=12e4){let s=await this.client.request(this.path,{method:"POST",query:this.query,body:e,timeoutMs:o,...n&&{signal:n},headers:{Accept:"application/json, text/event-stream",...!r&&{"MCP-Protocol-Version":jr},...this.session&&{"Mcp-Session-Id":this.session}}}),i=s.headers["mcp-session-id"];if(i&&(this.session=i),e.id===void 0||s.status===202)return;if(s.status<200||s.status>=300)throw kt(s);let c=(s.headers["content-type"]??"").includes("text/event-stream")?Gr(s.body).map(l=>l.data):[s.body];for(let l of c){let d;try{d=JSON.parse(l)}catch{continue}if(d.id===e.id){if(d.error)throw new At(d.error.message??"MCP error",d.error.code,d.error.data);return d.result}}throw new At(`No response to ${e.method}`)}};function Be(t){return(t.content??[]).map(e=>e.type==="text"?String(e.text):"").filter(Boolean).join(`\n\n`)}function He(t){if(t.structuredContent!==void 0)return t.structuredContent;for(let e of t.content??[]){if(e.type!=="text")continue;let n=String(e.text).trim();if(!(!n.startsWith("{")&&!n.startsWith("[")))try{return JSON.parse(n)}catch{}}}var ni="system.ai.genie_one_mcp",ri=3e3,oi=3,si=t=>t==null?null:typeof t=="object"?JSON.stringify(t):String(t);function ii(t){if(!t.ready||!t.columns?.length)return;let e=(t.rows??[]).map(r=>r.map(si)),n=t.total_row_count??void 0;return lt(t.columns.map(r=>({name:r.name,...r.type_text&&{type:r.type_text}})),e,{...n!==void 0&&{totalRows:n},truncated:!!t.truncated||n!==void 0&&n>e.length})}var ai=t=>t.replace(/<!--[\\s\\S]*?--\\s*>/g,"").replace(/\\n{3,}/g,`\n\n`).trim();function Vr(t){return ai(t).replace(/\\s*:citation\\[[^\\]]*\\]/g,"").replace(/\\s*\\[Query Result\\]\\([^)\\s]*#embed-[^)\\s]*\\)/g,"").replace(/\\s*\\[Knowledge snippets?\\]\\([^)]*\\)/gi,"").replace(/([.!?)])[ \\t]+Knowledge snippets?(?=[ \\t]*(\\n|$))/gi,"$1").replace(/`([^`]+)`\\s*\\[\\1\\]\\(/g,"[$1](").replace(/[ \\t]+$/gm,"").trim()}function ci(t){let e=String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`,n=r=>/^[ \\t]*/.exec(r)?.[0]??"";return t.replace(new RegExp(String.raw`[^.!?\\n]*\\b(?:can(?:\'|\u2019)?t|cannot|can not|unable to|not able to)\\b[^.!?\\n]*\\b${e}\\b[^.!?\\n]*[.!?][ \\t]*`,"gi"),n).replace(new RegExp(String.raw`[^.!?\\n]*\\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${e}|you can (?:chart|plot|graph) (?:this|it|them|directly))\\b[^.!?\\n]*[.!?][ \\t]*`,"gi"),n).replace(/[ \\t]+$/gm,"").replace(/\\n{3,}/g,`\n\n`).trim()}var zr=t=>t.trim().replace(/^\\|/,"").replace(/\\|$/,"").split("|").map(e=>e.replace(/\\*\\*|__|`/g,"").trim()),Kr=t=>t.toLowerCase().replace(/[^a-z0-9]/g,"");function Wr(t,e=200){let n=Vr(t.text).split(`\n`),r=[...t.results],o=(l,d)=>{let u=l.map(Kr).join("|"),y=r.findIndex(f=>f.columns.map(p=>Kr(p.name)).join("|")===u);return y<0&&(y=r.findIndex(f=>f.columns.length===l.length&&f.rows.length===d)),y<0?void 0:r.splice(y,1)[0]},s=[],i=0,a=/^\\s*\\|.*\\|\\s*$/;for(let l=0;l<n.length;l++){if(a.test(n[l]??"")&&/^\\s*\\|?\\s*:?-{2,}/.test(n[l+1]??"")){let d=zr(n[l]??""),u=[];for(l+=2;l<n.length&&a.test(n[l]??"");l++)u.push(zr(n[l]??"").map(f=>f||null));l--;let y=o(d,u.length)??lt(d.map(f=>({name:f})),u);s.push("",We(y,e),""),i++;continue}s.push(n[l]??"")}let c=s.join(`\n`).replace(/\\n{3,}/g,`\n\n`).trim();if(!i){let l=t.results[t.results.length-1];l?.columns.length&&(l.rows.length>1||!c)&&(c=[c,We(l,e)].filter(Boolean).join(`\n\n`),i++)}return i?ci(c):c}var li=(t,e)=>new Promise((n,r)=>{let o=setTimeout(n,t);e?.addEventListener("abort",()=>{clearTimeout(o),r(e.reason)},{once:!0})}),Ge=class{constructor(e){this.service=e}clients=new Map;availability=new Map;async mcp(){let e=await this.service.ready(),n=this.service.snapshot(),r=n.status==="connected"?n.workspaceId??n.profile.workspaceId:void 0,o=`${e.host}|${r??""}`,s=this.clients.get(o);return s||(s=new qe(e,wn(ni),r?{o:r}:{}),this.clients.set(o,s)),s}available(){let e=this.service.snapshot(),n=e.status==="connected"?e.profile.host:"none",r=this.availability.get(n);return r||(r=this.mcp().then(o=>o.listTools()).then(o=>o.some(s=>s.name==="genie_ask")).catch(()=>!1).then(o=>(o||this.availability.delete(n),o)),this.availability.set(n,r)),r}async ask(e,n={}){let{signal:r}=n,o=await this.mcp(),s=await o.callTool("genie_ask",{question:e,...n.conversationId&&{conversation_id:n.conversationId}},{...r&&{signal:r},timeoutMs:17e4});if(s.isError)throw new Error(Be(s)||"Genie One couldn\'t take the question.");let i=He(s)??{},a=i.conversation_id??n.conversationId??"",c=i.response_id??"";if(!a||!c)throw new Error("Genie One didn\'t return a conversation.");return n.onStarted?.({conversationId:a,responseId:c}),this.follow(o,a,c,i,Be(s),n)}async response(e,n,r={}){return this.follow(await this.mcp(),e,n,{},"",r)}async follow(e,n,r,o,s,i){let{signal:a}=i,c=o,l=s,d=0,u=[],y=Date.now()+10*6e4;try{for(;!c.status||c.status==="in_progress"||c.status==="unknown"&&d<5;){if(Date.now()>y)throw new Error("Genie One didn\'t finish within 10 minutes.");c.status&&await li(ri,a);let b=await e.callTool("genie_poll_response",{conversation_id:n,response_id:r},{...a&&{signal:a},timeoutMs:6e4});if(b.isError)throw new Error(Be(b)||"Genie One failed.");c=He(b)??{status:"unknown"},l=Be(b),d=c.status==="unknown"?d+1:0,c.progress_steps?.length&&(u=c.progress_steps,i.onProgress?.(u))}}catch(b){throw a?.aborted&&e.callTool("genie_cancel_response",{conversation_id:n}).catch(()=>{}),b}if(c.status==="failed")throw new Error(l.trim()||"Genie One couldn\'t answer that.");let f=(c.query_items??[]).slice(0,oi),p=(await Promise.all(f.map(b=>e.callTool("genie_get_query_result",{conversation_id:n,response_id:r,item_id:b.item_id},{...a&&{signal:a},timeoutMs:6e4}).then(x=>x.isError?void 0:ii(He(x)??{})).catch(()=>{})))).filter(b=>b!==void 0);return{conversationId:n,responseId:r,status:c.status??"completed",text:(c.final_answer??"").trim(),markdown:l.trim(),steps:u,results:p,sql:f.flatMap(b=>b.sql?[b.sql]:[]),...c.deep_link&&{deepLink:c.deep_link}}}format(e){let n=["Genie One",`conversation_id: ${e.conversationId}`];e.status==="incomplete"&&n.push("(Genie One stopped before finishing; the answer may be partial.)");let r=Vr(e.text);if(r)n.push("",r);else for(let o of e.results)n.push("",dt(o,20));for(let o of e.sql.slice(0,2))n.push("","SQL Genie One ran:","```sql",o.trim(),"```");return e.deepLink&&n.push("",`[Explore in Databricks](${e.deepLink})`),n.join(`\n`)}};var je="/home/sandbox-agent";var di=`${je}/.buzz/agent/runner.mjs`,ke="dbx",xn=54,En=(t,e)=>["node",t,"mcp",e],ui=`// Databricks tools for Pi, written by the Databricks Agents plugin for Buzz.\nimport { spawn } from "node:child_process";\nimport { createInterface } from "node:readline";\n\nexport default async function (pi) {\n  let command = [];\n  try {\n    command = JSON.parse(process.env.BUZZ_TOOLS_BRIDGE || "[]");\n  } catch {}\n  if (!command.length) return;\n  const child = spawn(command[0], command.slice(1), { stdio: ["pipe", "pipe", "inherit"] });\n  const pending = new Map();\n  let next = 1;\n  // The bridge keeps Pi running only while a request waits on it, so Pi can exit when it\'s done.\n  const hold = (on) => {\n    for (const handle of [child, child.stdin, child.stdout]) on ? handle.ref?.() : handle.unref?.();\n  };\n  const settle = () => pending.size || hold(false);\n  const fail = (error) => {\n    for (const waiting of pending.values()) waiting.reject(error);\n    pending.clear();\n    settle();\n  };\n  child.on("error", fail);\n  child.on("exit", () => fail(new Error("The Databricks tools stopped.")));\n  createInterface({ input: child.stdout }).on("line", (line) => {\n    let message;\n    try {\n      message = JSON.parse(line);\n    } catch {\n      return;\n    }\n    const waiting = pending.get(message.id);\n    if (!waiting) return;\n    pending.delete(message.id);\n    settle();\n    if (message.error) waiting.reject(new Error(message.error.message || "The tool failed."));\n    else waiting.resolve(message.result);\n  });\n  const send = (message) => child.stdin.write(JSON.stringify(message) + "\\\\n");\n  const request = (method, params, signal) =>\n    new Promise((resolve, reject) => {\n      const id = next++;\n      pending.set(id, { resolve, reject });\n      hold(true);\n      send({ jsonrpc: "2.0", id, method, params });\n      signal?.addEventListener(\n        "abort",\n        () => {\n          if (!pending.delete(id)) return;\n          settle();\n          send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } });\n          reject(new Error("Stopped."));\n        },\n        { once: true },\n      );\n    });\n  const stop = () => child.kill();\n  pi.on("session_shutdown", stop);\n  process.on("exit", stop);\n  try {\n    await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "pi", version: "1" } });\n    send({ jsonrpc: "2.0", method: "notifications/initialized" });\n    const { tools = [] } = await request("tools/list", {});\n    for (const tool of tools)\n      pi.registerTool({\n        name: tool.name,\n        label: tool.title || tool.name,\n        description: tool.description || tool.name,\n        parameters: tool.inputSchema || { type: "object", properties: {} },\n        async execute(_id, params, signal) {\n          const result = await request("tools/call", { name: tool.name, arguments: params ?? {} }, signal);\n          const text = (result?.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join("\\\\n") || JSON.stringify(result?.structuredContent ?? {});\n          if (result?.isError) throw new Error(text);\n          return { content: [{ type: "text", text }], details: {} };\n        },\n      });\n  } catch (error) {\n    console.error("Databricks tools unavailable: " + (error?.message ?? error));\n  }\n}\n`;function Sn(t,e,n,r){let o=[{path:e.tools,content:`${JSON.stringify(r)}\n`}],[s,...i]=En(n,e.tools);return t==="claude"&&o.push({path:e.mcp,content:`${JSON.stringify({mcpServers:{[ke]:{type:"stdio",command:s,args:i}}})}\n`}),t==="pi"&&o.push({path:e.piTools,content:ui}),o}var vn=t=>!!t?.length;var Xr=[{id:"builtin",label:"Built-in",detail:"Fastest. Uses Buzz\'s tools and the tools you pick, and runs code in the Sandbox when it needs to."},{id:"claude",label:"Claude Code",detail:"Anthropic\'s coding agent, running in the Sandbox with its own tools and the Databricks CLI signed in as you. Keeps its context between turns."},{id:"codex",label:"Codex",detail:"OpenAI\'s coding agent, running in the Sandbox with its own tools and the Databricks CLI signed in as you. Keeps its context between turns."},{id:"pi",label:"Pi",detail:"A small coding agent for Claude, GPT and Gemini models, running in the Sandbox with its own tools. Keeps its context between turns."}],Wc=Xr.map(t=>t.id);var Le=t=>Xr.find(e=>e.id===t)?.label??t;var Yr=["To show a query result or other table, put it in a fenced code block with the language",`\\`${Vt}\\` whose body is CSV with a header row (up to 200 rows; quote values that contain commas).`,"Buzz draws it as an interactive chart with a table view, so you can chart data; don\'t say you can\'t.","Put the label column (such as a date or category) first and the numeric columns after it, unformatted (no $ or thousands separators)."].join(" "),Zc=`${je}/.buzz/runs`,Rt=`${je}/work`,Jr=t=>({dir:t,prompt:`${t}/prompt.md`,system:`${t}/system.md`,events:`${t}/events.jsonl`,stderr:`${t}/stderr.log`,exit:`${t}/exit`,pid:`${t}/pid`,script:`${t}/run.sh`,tools:`${t}/tools.json`,mcp:`${t}/mcp.json`,piTools:`${t}/databricks-tools.mjs`}),F=t=>`\'${t.replace(/\'/g,"\'\\\\\'\'")}\'`,fi="read,grep,find,ls,edit,write";function Qr(t){let{model:e,files:n,session:r,tools:o}=t,s=t.permissions==="full",i=o?En(o.runner,n.tools):void 0;switch(t.harness){case"claude":{if(!r)throw new Error("Claude Code needs a session ID.");return[...i?["MCP_TIMEOUT=120000","MCP_TOOL_TIMEOUT=600000"]:[],"claude","-p","--model",F(e),"--output-format","stream-json","--verbose","--permission-mode",s?"bypassPermissions":"auto",...i?["--mcp-config",F(n.mcp),"--strict-mcp-config",...s?[]:["--allowedTools",`mcp__${ke}`]]:[],"--append-system-prompt-file",F(n.system),r.resume?"--resume":"--session-id",F(r.id),"<",F(n.prompt)].join(" ")}case"codex":return["codex","exec",...r?["resume",F(r.id)]:[],"--json","--skip-git-repo-check","-m",F(e),...s?["--dangerously-bypass-approvals-and-sandbox"]:["-c",F(\'sandbox_mode="workspace-write"\'),"-c","sandbox_workspace_write.network_access=true"],...i?["-c",F(`mcp_servers.${ke}.command=${JSON.stringify(i[0])}`),"-c",F(`mcp_servers.${ke}.args=${JSON.stringify(i.slice(1))}`),"-c",`mcp_servers.${ke}.startup_timeout_sec=120`,"-c",`mcp_servers.${ke}.tool_timeout_sec=600`,"-c",F(`mcp_servers.${ke}.default_tools_approval_mode="approve"`)]:[],"-","<",F(n.prompt)].join(" ");case"pi":{if(!r)throw new Error("Pi needs a session ID.");let a=i?`$(${[...i.slice(0,2),"mcp-names",n.tools].map(F).join(" ")} 2>/dev/null)`:"";return[...i?[`BUZZ_TOOLS_BRIDGE=${F(JSON.stringify(i))}`]:[],"pi","-p","--mode","json","--model",F(e),"--session-id",F(r.id),"--append-system-prompt",F(n.system),...i?["-e",F(n.piTools)]:[],...s?[]:["--tools",`"${fi}${a}"`],F(`@${n.prompt}`),"<","/dev/null"].join(" ")}}}var pi=["command","cmd","file_path","path","pattern","query","question","statement","url","description","prompt"];function Ie(t){if(!(!t||typeof t!="object"))for(let e of pi){let n=t[e];if(typeof n=="string"&&n.trim())return n.length>80?`${n.slice(0,77)}\\u2026`:n}}var hi=t=>{let e=/^\\/bin\\/(?:ba)?sh -lc ([\'"])([\\s\\S]*)\\1$/.exec(t);return e?e[1]===\'"\'?e[2].replace(/\\\\(["\\\\$`])/g,"$1"):e[2]:t},Zr=t=>Array.isArray(t)?t.filter(e=>!!e&&typeof e=="object"&&e.type==="thinking"&&typeof e.thinking=="string").map(e=>e.thinking.trim()).filter(Boolean).join(`\n\n`):"",Fr=t=>Array.isArray(t)?t.filter(e=>!!e&&typeof e=="object"&&e.type==="text"&&typeof e.text=="string").map(e=>e.text).join(""):typeof t=="string"?t:"";function eo(t,e){let n;try{n=JSON.parse(e)}catch{return}if(!(!n||typeof n!="object")){if(t==="claude"){if(n.type==="system"&&n.subtype==="init"&&typeof n.session_id=="string")return{session:n.session_id};if(n.type==="system"&&n.subtype==="api_retry")return{step:{tool:"model",target:`retrying after ${n.error_status??"an error"}${n.error?` (${n.error})`:""}`}};if(n.type==="assistant"&&Array.isArray(n.message?.content)){let r=Zr(n.message.content),o=n.message.content.find(i=>i?.type==="tool_use");if(o)return{...r&&{thought:r},step:{tool:String(o.name??"tool"),...Ie(o.input)&&{target:Ie(o.input)}}};let s=Fr(n.message.content);return s||r?{...s&&{text:s},...r&&{thought:r}}:void 0}if(n.type==="result"){let r=typeof n.result=="string"?n.result:"";return n.is_error||n.subtype&&n.subtype!=="success"?{error:r||String(n.subtype??"Claude Code failed")}:{final:r}}return}if(t==="codex"){if(n.type==="thread.started"&&typeof n.thread_id=="string")return{session:n.thread_id};if(n.type==="turn.failed")return{error:String(n.error?.message??"Codex failed")};let r=n.item;return!r||typeof r!="object"?void 0:n.type==="item.started"?r.type==="command_execution"&&typeof r.command=="string"?{step:{tool:"shell",target:Ie({command:hi(r.command)})}}:r.type==="file_change"?{step:{tool:"edit",...r.changes?.[0]?.path&&{target:String(r.changes[0].path)}}}:r.type==="mcp_tool_call"?{step:{tool:String(r.tool??"tool"),...Ie(r.arguments)&&{target:Ie(r.arguments)}}}:r.type==="web_search"?{step:{tool:"web search",...r.query&&{target:String(r.query)}}}:void 0:n.type==="item.completed"&&r.type==="agent_message"&&typeof r.text=="string"?{text:r.text}:n.type==="item.completed"&&r.type==="reasoning"&&typeof r.text=="string"&&r.text.trim()?{thought:r.text}:void 0}if(n.type==="session"&&typeof n.id=="string")return{session:n.id};if(n.type==="tool_execution_start")return{step:{tool:String(n.toolName??"tool"),...Ie(n.args)&&{target:Ie(n.args)}}};if(n.type==="message_end"&&n.message?.role==="assistant"){if(n.message.stopReason==="error"&&n.message.errorMessage)return{error:String(n.message.errorMessage)};let r=Fr(n.message.content),o=Zr(n.message.content);return r||o?{...r&&{text:r},...o&&{thought:o}}:void 0}}}var gi=t=>t.replace(/\\x1b\\[[0-9;]*[A-Za-z]/g,"").replace(/[\u2502\u256D\u256E\u2570\u256F\u2500\u2714\u2022]/g,"").trim();function _n(t){return gi(t).split(`\n`).map(e=>e.trim()).filter(e=>e&&!/Unity Gateway|Databricks auth already|Launching |Starting |managed coding agent config|token refresh is managed|^is running\\.?$/i.test(e)).slice(-4).join(" ").slice(0,600)}function to(t,e,n=[]){return["<databricks-sandbox>",`You are running as ${Le(t)} inside your own Databricks Sandbox, a Linux machine in Databricks with Python, Node.js, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${Rt}; files under ${je} persist across restarts.`,"Your final message is posted to the Buzz conversation as your reply, so make it the answer itself, written for the people there. You don\'t have Buzz\'s own tools in this session.",t==="pi"&&e==="standard"?"You can read, search and edit files, but you have no shell in this session.":"",n.length?`Your owner gave you these Databricks tools, which run with their access: ${n.map(r=>r.label).join(", ")}. Use them for questions about data (Genie One finds the right tables and runs the SQL). If a tool says your owner hasn\'t logged in yet, give them its login link.`:"","Never print secrets into the conversation.","</databricks-sandbox>"].filter(Boolean).join(`\n`)}var ze=[9,40002],mi="buzz.solo",yi=48e3,oo=/^[0-9a-f]{64}$/,bi=/^[0-9a-f]{128}$/,wi=/^(kind=|created_at<|created_at>)(0|[1-9][0-9]*)$/,xi=(t,e)=>t.tags.find(n=>n[0]===e)?.[1],Ei=t=>{let e=xi(t,"h");return e&&/^[a-zA-Z0-9_-]{1,128}$/.test(e)?e:void 0};function Si(t){let e,n;for(let r of t.tags)r[0]!=="e"||!oo.test(r[1]??"")||(r[3]==="root"?e=r[1]:r[3]==="reply"&&(n=r[1]));return e??n}var so=(t,e)=>ze.includes(t.kind)&&t.pubkey!==e&&t.tags.some(n=>n[0]==="p"&&n[1]===e);function vi(t){let e=t.tags.filter(a=>a[0]==="auth");if(e.length!==1)return;let[,n="",r="",o=""]=e[0];if(e[0].length!==4||!oo.test(n)||!bi.test(o)||n===t.pubkey)return;let s=r?r.split("&"):[];if(!s.every(a=>wi.test(a)))return;for(let a of s){let c=Number(a.replace(/^[^0-9]+/,""));if(a.startsWith("kind=")&&t.kind!==c||a.startsWith("created_at<")&&!(t.created_at<c)||a.startsWith("created_at>")&&!(t.created_at>c))return}let i=ce(new TextEncoder().encode(`nostr:agent-auth:${t.pubkey}:${r}`));try{return _e.verify(Buffer.from(o,"hex"),i,Buffer.from(n,"hex"))?n:void 0}catch{return}}var io=(t,e)=>t.pubkey===e||vi(t)===e;function ao(t){if(!t)return{solo:!1};let[e,...n]=t.tags.flatMap(r=>r[0]==="t"&&typeof r[1]=="string"?[r[1]]:[]);return{...e&&{type:e},solo:e==="stream"&&n.includes(mi)}}function co(t,e,n){let r=Ei(t);if(!r)return;let o=Si(t),s=o??t.id,i=n.type==="dm",a=n.solo,c=a||i||e==="channel";return{key:c?r:`${r}/${s}`,channel:r,root:s,topLevel:a,dm:i,fresh:!o&&!c}}function lo(t){return t.fresh?[]:!t.topLevel&&!t.dm&&t.key!==t.channel?[{ids:[t.root],"#h":[t.channel],limit:1},{kinds:ze,"#h":[t.channel],"#e":[t.root],limit:200}]:[{kinds:ze,"#h":[t.channel],limit:13}]}var no=t=>JSON.stringify(t).replace(/</g,"\\\\u003c").replace(/>/g,"\\\\u003e").replace(/&/g,"\\\\u0026"),ro=(t,e)=>({id:t.id,pubkey:t.pubkey,...e.get(t.pubkey)&&{author:e.get(t.pubkey)},time:new Date(t.created_at*1e3).toISOString(),content:t.content});function uo(t){let{event:e,conversation:n,names:r}=t,o=n.dm?"dm":n.key===n.channel?"channel":"thread",s=[`Scope: ${o}`,`Session scope: ${t.scope==="channel"||n.key===n.channel?"channel":"thread"} conversation`,`Channel: #${n.channel}`,...o==="thread"?[`Thread root: ${n.root}`]:[],`Agent: ${t.agent}`,"Your final message is posted as your reply in this conversation."].join(`\n`),i=o==="thread"?"thread-context":"conversation-context",a=[`<context>\n${s}\n</context>`];t.context.length&&a.push(`<${i} included="${t.context.length}" total="${t.total}" truncated="${t.total>t.context.length}">\n${no(t.context.map(l=>ro(l,r)))}\n</${i}>`);let c=e.tags.filter(l=>l[0]==="p").map(l=>l[1]);return a.push(`<buzz-event type="@mention">\n${no({...ro(e,r),channel:n.channel,kind:e.kind,...n.root!==e.id&&{thread:n.root},...c.length&&{mentions:c}})}\n</buzz-event>`),a.join(`\n\n`)}var $t=t=>t.replace(/\\[([^\\]]*)\\]\\(nostr:[^)]+\\)/g,"").replace(/nostr:(npub|nprofile|note|nevent)1[0-9a-z]+/g,"").replace(/^\\s*@\\S+\\s*/,"").replace(/[ \\t]+/g," ").trim();function fo(t,e=yi){let n=s=>Buffer.byteLength(s);if(n(t)<=e)return[t];let r=[],o=t;for(;n(o)>e;){let s=e;for(;n(o.slice(0,s))>e;)s=Math.floor(s*.9);let i=o.slice(0,s),a=Math.max(i.lastIndexOf(`\n\n`),i.lastIndexOf(`\n`)),c=a>s/2?a:s;r.push(o.slice(0,c).trimEnd()),o=o.slice(c).trimStart()}return o&&r.push(o),r}function po(t){return{kind:9,created_at:Math.floor(Date.now()/1e3),content:t.content,tags:[["h",t.conversation.channel],...t.conversation.topLevel?[]:[["e",t.conversation.root,"","reply"]],...t.notify?[["p",t.notify]]:[],[...t.authTag]]}}function kn(t){return{kind:0,created_at:Math.floor(Date.now()/1e3),content:JSON.stringify({name:t.name,display_name:t.name,bot:!0,...t.picture&&{picture:t.picture},...t.about&&{about:t.about}}),tags:[[...t.authTag]]}}var _i=new Set(["Bash","Read","Write","Edit","MultiEdit","NotebookEdit","Grep","Glob","ListFiles","WebFetch","WebSearch","Task","Agent","TodoWrite","send","send_message","read"]),ho={shell:"Bash",bash:"Bash",exec_command:"Bash",sandbox_exec:"Bash",read_file:"Read",sandbox_read_file:"Read",write:"Write",write_file:"Write",sandbox_write_file:"Write",edit:"Edit",apply_patch:"Edit",grep:"Grep",find:"Glob",glob:"Glob",ls:"ListFiles",sandbox_list:"ListFiles","web search":"WebSearch",web_search:"WebSearch",fetch:"WebFetch",web_fetch:"WebFetch",update_plan:"TodoWrite"},ki={genie_one_ask:"Asking Genie One",databricks_genie_one_ask:"Asking Genie One",databricks_genie_ask:"Asking Genie",databricks_genie_list:"Listing Genie agents",databricks_sql_query:"Running SQL",databricks_sql_warehouses:"Finding a SQL warehouse",databricks_catalog_list:"Browsing the catalog",databricks_table_describe:"Reading a table",model:"Waiting for the model"},Ti={"Creating sandbox":"Creating its Sandbox","Starting sandbox":"Starting its Sandbox","Waiting for sandbox to stop":"Waiting for its Sandbox"},ot=t=>t.replace(/[_-]+/g," ").replace(/\\s+/g," ").trim();function Oe(t,e=100){let n=t.replace(/\\s+/g," ").trim();return n.length>e?`${n.slice(0,e-1).trimEnd()}\\u2026`:n}function go(t,e,n){let r=(l,d=e)=>d?{tool:l,target:Oe(d,120)}:{tool:l},o=t.replace(/^mcp__[a-zA-Z0-9_-]+?__/,"");if(_i.has(o))return r(o);let s=ho[o]??ho[o.toLowerCase()];if(s)return r(s);if(o==="sandbox")return{tool:Ti[e??""]??"Starting its Sandbox"};if(o==="databricks_sql_query")return r("Running SQL",e?.split(`\n`).find(l=>l.trim()));let i=ki[o];if(i)return r(i);let a=n?.get(o);if(/^genie_.+_ask$/.test(o))return r(`Asking ${a??`Genie (${ot(o.slice(6,-4))})`}`);let c=/^(.+?)__(.+)$/.exec(o);if(c){let l=n?.get(c[1])??ot(c[1]);return c[2]==="log_in"?{tool:`Checking the ${l} login`}:c[2]==="unavailable"?{tool:`${l} isn\'t available`}:r(`Using ${l}`,[ot(c[2]),e].filter(Boolean).join(": "))}return r(ot(o)||"Working")}function mo(t){let n=/^\\s*\\*\\*(.+?)\\*\\*/.exec(t)?.[1]??t.split(`\n`).find(r=>r.trim())??"";return n.trim()?{tool:"Thinking",target:Oe(n,110)}:{tool:"Thinking"}}var yo=t=>t.trim()?{tool:"Genie One",target:Oe(t,120)}:{tool:"Asking Genie One"};function bo(t,e){let n={SUBMITTED:"sent the question",FILTERING_CONTEXT:"finding the right data",FETCHING_METADATA:"reading the tables",ASKING_AI:"writing the SQL",PENDING_WAREHOUSE:"waiting for the SQL warehouse",EXECUTING_QUERY:"running the query",COMPLETED:"answered"};return{tool:`Asking ${t}`,target:n[e]??ot(e.toLowerCase())}}function Tn(t){let e=t.target;return e?{Bash:`Running ${e}`,Read:`Reading ${e}`,Write:`Writing ${e}`,Edit:`Editing ${e}`,MultiEdit:`Editing ${e}`,Grep:`Searching for ${e}`,Glob:`Finding ${e}`,ListFiles:`Listing ${e}`,WebFetch:`Reading ${e}`,WebSearch:`Searching the web for ${e}`}[t.tool]??`${t.tool} \\xB7 ${e}`:{Bash:"Running a command",Read:"Reading a file",Write:"Writing a file",Edit:"Editing a file",Grep:"Searching files",Glob:"Finding files",ListFiles:"Listing files",WebSearch:"Searching the web",TodoWrite:"Updating its plan",send:"Sending a message",send_message:"Sending a message",read:"Reading the conversation"}[t.tool]??t.tool}function wo(t){let e={Bash:"execute",Read:"read",Write:"edit",Edit:"edit",MultiEdit:"edit",Grep:"search",Glob:"search",ListFiles:"search",WebFetch:"fetch",WebSearch:"fetch",Thinking:"think"};return e[t.tool]?e[t.tool]:/^(Asking|Running SQL|Reading a table|Browsing|Listing|Genie One)/.test(t.tool)?"search":"other"}var xo=t=>`/mcp-service-login?name=${encodeURIComponent(t)}`,Eo=t=>/HTTP 401|requires authentication|not logged in|login first|Credential for user identity/i.test(t?.message??String(t));function st(t){return((t.label||t.id).toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"")||"mcp").slice(0,20).replace(/_+$/,"")}var Ai="Note: these results came from the owner\'s Databricks access. Everyone in this conversation can read what you post, so share only what this audience should see.";function So(t,e,n,r){let o=[`Genie agent: ${t.title} (${t.space_id})`,`conversation_id: ${e.message.conversation_id}`,`status: ${e.message.status}`];return e.error&&o.push(`error: ${e.error}`),e.text&&o.push("",e.text),e.result?o.push("",dt(e.result,r)):e.rowCount!==void 0&&o.push("",`(The query returned ${e.rowCount} rows; the result could not be fetched.)`),e.sql&&o.push("","SQL:","```sql",e.sql.trim(),"```"),e.suggestions.length&&o.push("",`Follow-ups Genie suggests: ${e.suggestions.slice(0,3).join(" | ")}`),n&&o.push("",`Open in Genie: ${n}`),o.push("",Ai),o.join(`\n`)}var Ri=/^[a-zA-Z0-9_-]{1,64}$/;function _o(t){return Array.isArray(t)?t.flatMap(e=>{let n=e;return typeof n?.id!="string"||typeof n.label!="string"||typeof n.kind!="string"?[]:["service","connection","functions"].includes(n.kind)&&!(typeof n.path=="string"&&n.path.startsWith("/"))?[]:[{id:n.id,kind:n.kind,label:n.label,...n.path&&{path:n.path}}]}):[]}var vo=(t,e)=>(t.toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"")||"x").slice(0,e).replace(/_+$/,""),$i=t=>{let e=t.snapshot();return e.status==="connected"?e.workspaceId??e.profile.workspaceId:void 0};function Bi(t,e){let n=new AbortController,r=setTimeout(()=>n.abort(new Error(`No answer within ${e/1e3} seconds`)),e),o=()=>n.abort(t.reason);return t.aborted?o():t.addEventListener("abort",o,{once:!0}),n.signal.addEventListener("abort",()=>clearTimeout(r),{once:!0}),n.signal}function ko(t){let e=new Map,n=new Set;for(let r of t)r.kind==="genie"?e.set(To(r.label,n),r.label):r.path&&e.set(st(r),r.label);return e}function To(t,e){let n=`genie_${vo(t,40)}_ask`;for(let r=2;e.has(n);r++)n=`genie_${vo(t,36)}_${r}_ask`;return e.add(n),n}function Ao(t,e){let n=[],r=new Set;for(let o of e)if(o.kind==="genie-one"){let s=new Ge(t);n.push({name:"genie_one_ask",description:"Asks Genie One, Databricks\' assistant for questions about any data the owner can access in this agent\'s workspace. It finds the tables, writes and runs the SQL, and answers with numbers, a table and a link. Pass conversation_id from an earlier answer to follow up. Answers can take a minute.",parameters:{type:"object",properties:{question:{type:"string",description:"The question, in plain language."},conversation_id:{type:"string"}},required:["question"]},run:async(i,a)=>{let c=typeof i.conversation_id=="string"&&i.conversation_id?i.conversation_id:void 0;return s.format(await s.ask(String(i.question??""),{signal:a,...c&&{conversationId:c}}))}})}else if(o.kind==="genie"){let s=o.id.replace(/^genie:/,""),i=To(o.label,r);n.push({name:i,description:`Asks the "${o.label}" Genie agent, curated by the owner\'s data team, a question about its data. It answers with an explanation, a table and the SQL. Pass conversation_id to follow up.`,parameters:{type:"object",properties:{question:{type:"string",description:"The question, in plain language."},conversation_id:{type:"string"}},required:["question"]},run:async(a,c)=>{let l=await t.ready(c),d=typeof a.conversation_id=="string"&&a.conversation_id?a.conversation_id:void 0,u=await new fe(l).answer(s,String(a.question??""),{signal:c,...d&&{conversationId:d}});return So({title:o.label,space_id:s},u,t.workspaceUrl(fe.webPath(s,u.message.conversation_id)),30)}})}return n}async function Ro(t,e,n){let r=e.filter(u=>u.path);if(!r.length)return{tools:[],problems:[],failures:[]};let o=await t.ready(n),s=$i(t),i=[],a=[],c=await Promise.all(r.map(async u=>{let y=u.path.startsWith("/ai-gateway/")&&s?{o:s}:{},f=new qe(o,u.path,y);try{let p=await f.listTools(Bi(n,3e4));return{server:u,mcp:f,tools:p}}catch(p){let b=u.kind==="service"&&Eo(p)?t.workspaceUrl(xo(u.id.replace(/^service:/,""))):void 0;return a.push({server:u,message:p.message??String(p),...b&&{login:b}}),i.push(b?`${u.label}: your owner isn\'t logged in to ${u.label} yet. Ask them to log in at ${b}, then try again`:`${u.label}: ${p.message??p}`),{server:u,mcp:f,tools:[]}}})),l=[],d=new Set;for(let{server:u,mcp:y,tools:f}of c){let p=st(u);for(let b of f){let x=`${p}__${b.name}`.replace(/[^a-zA-Z0-9_-]/g,"_").slice(0,64);for(let R=2;d.has(x);R++)x=`${x.slice(0,60)}_${R}`;Ri.test(x)&&(d.add(x),l.push({name:x,description:`[${u.label}] ${b.description??b.title??b.name}`.slice(0,4e3),parameters:b.inputSchema??{type:"object",properties:{}},run:async(R,N)=>{let C=await y.callTool(b.name,R,{signal:N,timeoutMs:17e4}),V=Be(C)||(C.structuredContent!==void 0?JSON.stringify(He(C)):"OK");return C.isError?`Error from ${u.label}: ${V}`:V}}))}}return{tools:l,problems:i,failures:a}}import{appendFileSync as aa,existsSync as ca,readFileSync as la,statSync as da,writeFileSync as ua}from"node:fs";function Ii(t){return t instanceof Uint8Array||ArrayBuffer.isView(t)&&t.constructor.name==="Uint8Array"}function Bt(t){if(typeof t!="boolean")throw new Error(`boolean expected, not ${t}`)}function It(t){if(!Number.isSafeInteger(t)||t<0)throw new Error("positive integer expected, got "+t)}function X(t,e,n=""){let r=Ii(t),o=t?.length,s=e!==void 0;if(!r||s&&o!==e){let i=n&&`"${n}" `,a=s?` of length ${e}`:"",c=r?`length=${o}`:`type=${typeof t}`;throw new Error(i+"expected Uint8Array"+a+", got "+c)}return t}function An(t,e=!0){if(t.destroyed)throw new Error("Hash instance has been destroyed");if(e&&t.finished)throw new Error("Hash#digest() has already been called")}function $o(t,e){X(t,void 0,"output");let n=e.outputLen;if(t.length<n)throw new Error("digestInto() expects output buffer of length at least "+n)}function be(t){return new Uint32Array(t.buffer,t.byteOffset,Math.floor(t.byteLength/4))}function we(...t){for(let e=0;e<t.length;e++)t[e].fill(0)}function Li(t){return new DataView(t.buffer,t.byteOffset,t.byteLength)}var Oi=new Uint8Array(new Uint32Array([287454020]).buffer)[0]===68;function Bo(t,e){if(e==null||typeof e!="object")throw new Error("options must be defined");return Object.assign(t,e)}function Io(t,e){if(t.length!==e.length)return!1;let n=0;for(let r=0;r<t.length;r++)n|=t[r]^e[r];return n===0}var Rn=(t,e)=>{function n(r,...o){if(X(r,void 0,"key"),!Oi)throw new Error("Non little-endian hardware is not yet supported");if(t.nonceLength!==void 0){let d=o[0];X(d,t.varSizeNonce?void 0:t.nonceLength,"nonce")}let s=t.tagLength;s&&o[1]!==void 0&&X(o[1],void 0,"AAD");let i=e(r,...o),a=(d,u)=>{if(u!==void 0){if(d!==2)throw new Error("cipher output not supported");X(u,void 0,"output")}},c=!1;return{encrypt(d,u){if(c)throw new Error("cannot encrypt() twice with same key + nonce");return c=!0,X(d),a(i.encrypt.length,u),i.encrypt(d,u)},decrypt(d,u){if(X(d),s&&d.length<s)throw new Error(\'"ciphertext" expected length bigger than tagLength=\'+s);return a(i.decrypt.length,u),i.decrypt(d,u)}}}return Object.assign(n,t),n};function $n(t,e,n=!0){if(e===void 0)return new Uint8Array(t);if(e.length!==t)throw new Error(\'"output" expected Uint8Array of length \'+t+", got: "+e.length);if(n&&!Ni(e))throw new Error("invalid output, must be aligned");return e}function Lo(t,e,n){Bt(n);let r=new Uint8Array(16),o=Li(r);return o.setBigUint64(0,BigInt(e),n),o.setBigUint64(8,BigInt(t),n),r}function Ni(t){return t.byteOffset%4===0}function Ke(t){return Uint8Array.from(t)}var No=t=>Uint8Array.from(t.split(""),e=>e.charCodeAt(0)),Ci=No("expand 16-byte k"),Ui=No("expand 32-byte k"),Di=be(Ci),Mi=be(Ui);function B(t,e){return t<<e|t>>>32-e}function Bn(t){return t.byteOffset%4===0}var Lt=64,Pi=16,Co=2**32-1,Oo=Uint32Array.of();function qi(t,e,n,r,o,s,i,a){let c=o.length,l=new Uint8Array(Lt),d=be(l),u=Bn(o)&&Bn(s),y=u?be(o):Oo,f=u?be(s):Oo;for(let p=0;p<c;i++){if(t(e,n,r,d,i,a),i>=Co)throw new Error("arx: counter overflow");let b=Math.min(Lt,c-p);if(u&&b===Lt){let x=p/4;if(p%4!==0)throw new Error("arx: invalid block position");for(let R=0,N;R<Pi;R++)N=x+R,f[N]=y[N]^d[R];p+=Lt;continue}for(let x=0,R;x<b;x++)R=p+x,s[R]=o[R]^l[x];p+=b}}function In(t,e){let{allowShortKeys:n,extendNonceFn:r,counterLength:o,counterRight:s,rounds:i}=Bo({allowShortKeys:!1,counterLength:8,counterRight:!1,rounds:20},e);if(typeof t!="function")throw new Error("core must be a function");return It(o),It(i),Bt(s),Bt(n),(a,c,l,d,u=0)=>{X(a,void 0,"key"),X(c,void 0,"nonce"),X(l,void 0,"data");let y=l.length;if(d===void 0&&(d=new Uint8Array(y)),X(d,void 0,"output"),It(u),u<0||u>=Co)throw new Error("arx: counter overflow");if(d.length<y)throw new Error(`arx: output (${d.length}) is shorter than data (${y})`);let f=[],p=a.length,b,x;if(p===32)f.push(b=Ke(a)),x=Mi;else if(p===16&&n)b=new Uint8Array(32),b.set(a),b.set(a,16),x=Di,f.push(b);else throw X(a,32,"arx key"),new Error("invalid key size");Bn(c)||f.push(c=Ke(c));let R=be(b);if(r){if(c.length!==24)throw new Error("arx: extended nonce must be 24 bytes");r(x,R,be(c.subarray(0,16)),R),c=c.subarray(16)}let N=16-o;if(N!==c.length)throw new Error(`arx: nonce must be ${N} or 16 bytes`);if(N!==12){let L=new Uint8Array(12);L.set(c,s?0:12-c.length),c=L,f.push(c)}let C=be(c);return qi(t,x,R,C,l,d,u,i),we(...f),d}}function J(t,e){return t[e++]&255|(t[e++]&255)<<8}var Ln=class{blockLen=16;outputLen=16;buffer=new Uint8Array(16);r=new Uint16Array(10);h=new Uint16Array(10);pad=new Uint16Array(8);pos=0;finished=!1;constructor(e){e=Ke(X(e,32,"key"));let n=J(e,0),r=J(e,2),o=J(e,4),s=J(e,6),i=J(e,8),a=J(e,10),c=J(e,12),l=J(e,14);this.r[0]=n&8191,this.r[1]=(n>>>13|r<<3)&8191,this.r[2]=(r>>>10|o<<6)&7939,this.r[3]=(o>>>7|s<<9)&8191,this.r[4]=(s>>>4|i<<12)&255,this.r[5]=i>>>1&8190,this.r[6]=(i>>>14|a<<2)&8191,this.r[7]=(a>>>11|c<<5)&8065,this.r[8]=(c>>>8|l<<8)&8191,this.r[9]=l>>>5&127;for(let d=0;d<8;d++)this.pad[d]=J(e,16+2*d)}process(e,n,r=!1){let o=r?0:2048,{h:s,r:i}=this,a=i[0],c=i[1],l=i[2],d=i[3],u=i[4],y=i[5],f=i[6],p=i[7],b=i[8],x=i[9],R=J(e,n+0),N=J(e,n+2),C=J(e,n+4),L=J(e,n+6),V=J(e,n+8),j=J(e,n+10),W=J(e,n+12),z=J(e,n+14),S=s[0]+(R&8191),I=s[1]+((R>>>13|N<<3)&8191),O=s[2]+((N>>>10|C<<6)&8191),$=s[3]+((C>>>7|L<<9)&8191),m=s[4]+((L>>>4|V<<12)&8191),g=s[5]+(V>>>1&8191),h=s[6]+((V>>>14|j<<2)&8191),v=s[7]+((j>>>11|W<<5)&8191),k=s[8]+((W>>>8|z<<8)&8191),T=s[9]+(z>>>5|o),w=0,_=w+S*a+I*(5*x)+O*(5*b)+$*(5*p)+m*(5*f);w=_>>>13,_&=8191,_+=g*(5*y)+h*(5*u)+v*(5*d)+k*(5*l)+T*(5*c),w+=_>>>13,_&=8191;let E=w+S*c+I*a+O*(5*x)+$*(5*b)+m*(5*p);w=E>>>13,E&=8191,E+=g*(5*f)+h*(5*y)+v*(5*u)+k*(5*d)+T*(5*l),w+=E>>>13,E&=8191;let A=w+S*l+I*c+O*a+$*(5*x)+m*(5*b);w=A>>>13,A&=8191,A+=g*(5*p)+h*(5*f)+v*(5*y)+k*(5*u)+T*(5*d),w+=A>>>13,A&=8191;let M=w+S*d+I*l+O*c+$*a+m*(5*x);w=M>>>13,M&=8191,M+=g*(5*b)+h*(5*p)+v*(5*f)+k*(5*y)+T*(5*u),w+=M>>>13,M&=8191;let P=w+S*u+I*d+O*l+$*c+m*a;w=P>>>13,P&=8191,P+=g*(5*x)+h*(5*b)+v*(5*p)+k*(5*f)+T*(5*y),w+=P>>>13,P&=8191;let U=w+S*y+I*u+O*d+$*l+m*c;w=U>>>13,U&=8191,U+=g*a+h*(5*x)+v*(5*b)+k*(5*p)+T*(5*f),w+=U>>>13,U&=8191;let H=w+S*f+I*y+O*u+$*d+m*l;w=H>>>13,H&=8191,H+=g*c+h*a+v*(5*x)+k*(5*b)+T*(5*p),w+=H>>>13,H&=8191;let K=w+S*p+I*f+O*y+$*u+m*d;w=K>>>13,K&=8191,K+=g*l+h*c+v*a+k*(5*x)+T*(5*b),w+=K>>>13,K&=8191;let Y=w+S*b+I*p+O*f+$*y+m*u;w=Y>>>13,Y&=8191,Y+=g*d+h*l+v*c+k*a+T*(5*x),w+=Y>>>13,Y&=8191;let G=w+S*x+I*b+O*p+$*f+m*y;w=G>>>13,G&=8191,G+=g*u+h*d+v*l+k*c+T*a,w+=G>>>13,G&=8191,w=(w<<2)+w|0,w=w+_|0,_=w&8191,w=w>>>13,E+=w,s[0]=_,s[1]=E,s[2]=A,s[3]=M,s[4]=P,s[5]=U,s[6]=H,s[7]=K,s[8]=Y,s[9]=G}finalize(){let{h:e,pad:n}=this,r=new Uint16Array(10),o=e[1]>>>13;e[1]&=8191;for(let a=2;a<10;a++)e[a]+=o,o=e[a]>>>13,e[a]&=8191;e[0]+=o*5,o=e[0]>>>13,e[0]&=8191,e[1]+=o,o=e[1]>>>13,e[1]&=8191,e[2]+=o,r[0]=e[0]+5,o=r[0]>>>13,r[0]&=8191;for(let a=1;a<10;a++)r[a]=e[a]+o,o=r[a]>>>13,r[a]&=8191;r[9]-=8192;let s=(o^1)-1;for(let a=0;a<10;a++)r[a]&=s;s=~s;for(let a=0;a<10;a++)e[a]=e[a]&s|r[a];e[0]=(e[0]|e[1]<<13)&65535,e[1]=(e[1]>>>3|e[2]<<10)&65535,e[2]=(e[2]>>>6|e[3]<<7)&65535,e[3]=(e[3]>>>9|e[4]<<4)&65535,e[4]=(e[4]>>>12|e[5]<<1|e[6]<<14)&65535,e[5]=(e[6]>>>2|e[7]<<11)&65535,e[6]=(e[7]>>>5|e[8]<<8)&65535,e[7]=(e[8]>>>8|e[9]<<5)&65535;let i=e[0]+n[0];e[0]=i&65535;for(let a=1;a<8;a++)i=(e[a]+n[a]|0)+(i>>>16)|0,e[a]=i&65535;we(r)}update(e){An(this),X(e),e=Ke(e);let{buffer:n,blockLen:r}=this,o=e.length;for(let s=0;s<o;){let i=Math.min(r-this.pos,o-s);if(i===r){for(;r<=o-s;s+=r)this.process(e,s);continue}n.set(e.subarray(s,s+i),this.pos),this.pos+=i,s+=i,this.pos===r&&(this.process(n,0,!1),this.pos=0)}return this}destroy(){we(this.h,this.r,this.buffer,this.pad)}digestInto(e){An(this),$o(e,this),this.finished=!0;let{buffer:n,h:r}=this,{pos:o}=this;if(o){for(n[o++]=1;o<16;o++)n[o]=0;this.process(n,0,!0)}this.finalize();let s=0;for(let i=0;i<8;i++)e[s++]=r[i]>>>0,e[s++]=r[i]>>>8;return e}digest(){let{buffer:e,outputLen:n}=this;this.digestInto(e);let r=e.slice(0,n);return this.destroy(),r}};function Hi(t){let e=(r,o)=>t(o).update(r).digest(),n=t(new Uint8Array(32));return e.outputLen=n.outputLen,e.blockLen=n.blockLen,e.create=r=>t(r),e}var Uo=Hi(t=>new Ln(t));function Po(t,e,n,r,o,s=20){let i=t[0],a=t[1],c=t[2],l=t[3],d=e[0],u=e[1],y=e[2],f=e[3],p=e[4],b=e[5],x=e[6],R=e[7],N=o,C=n[0],L=n[1],V=n[2],j=i,W=a,z=c,S=l,I=d,O=u,$=y,m=f,g=p,h=b,v=x,k=R,T=N,w=C,_=L,E=V;for(let M=0;M<s;M+=2)j=j+I|0,T=B(T^j,16),g=g+T|0,I=B(I^g,12),j=j+I|0,T=B(T^j,8),g=g+T|0,I=B(I^g,7),W=W+O|0,w=B(w^W,16),h=h+w|0,O=B(O^h,12),W=W+O|0,w=B(w^W,8),h=h+w|0,O=B(O^h,7),z=z+$|0,_=B(_^z,16),v=v+_|0,$=B($^v,12),z=z+$|0,_=B(_^z,8),v=v+_|0,$=B($^v,7),S=S+m|0,E=B(E^S,16),k=k+E|0,m=B(m^k,12),S=S+m|0,E=B(E^S,8),k=k+E|0,m=B(m^k,7),j=j+O|0,E=B(E^j,16),v=v+E|0,O=B(O^v,12),j=j+O|0,E=B(E^j,8),v=v+E|0,O=B(O^v,7),W=W+$|0,T=B(T^W,16),k=k+T|0,$=B($^k,12),W=W+$|0,T=B(T^W,8),k=k+T|0,$=B($^k,7),z=z+m|0,w=B(w^z,16),g=g+w|0,m=B(m^g,12),z=z+m|0,w=B(w^z,8),g=g+w|0,m=B(m^g,7),S=S+I|0,_=B(_^S,16),h=h+_|0,I=B(I^h,12),S=S+I|0,_=B(_^S,8),h=h+_|0,I=B(I^h,7);let A=0;r[A++]=i+j|0,r[A++]=a+W|0,r[A++]=c+z|0,r[A++]=l+S|0,r[A++]=d+I|0,r[A++]=u+O|0,r[A++]=y+$|0,r[A++]=f+m|0,r[A++]=p+g|0,r[A++]=b+h|0,r[A++]=x+v|0,r[A++]=R+k|0,r[A++]=N+T|0,r[A++]=C+w|0,r[A++]=L+_|0,r[A++]=V+E|0}function Gi(t,e,n,r){let o=t[0],s=t[1],i=t[2],a=t[3],c=e[0],l=e[1],d=e[2],u=e[3],y=e[4],f=e[5],p=e[6],b=e[7],x=n[0],R=n[1],N=n[2],C=n[3];for(let V=0;V<20;V+=2)o=o+c|0,x=B(x^o,16),y=y+x|0,c=B(c^y,12),o=o+c|0,x=B(x^o,8),y=y+x|0,c=B(c^y,7),s=s+l|0,R=B(R^s,16),f=f+R|0,l=B(l^f,12),s=s+l|0,R=B(R^s,8),f=f+R|0,l=B(l^f,7),i=i+d|0,N=B(N^i,16),p=p+N|0,d=B(d^p,12),i=i+d|0,N=B(N^i,8),p=p+N|0,d=B(d^p,7),a=a+u|0,C=B(C^a,16),b=b+C|0,u=B(u^b,12),a=a+u|0,C=B(C^a,8),b=b+C|0,u=B(u^b,7),o=o+l|0,C=B(C^o,16),p=p+C|0,l=B(l^p,12),o=o+l|0,C=B(C^o,8),p=p+C|0,l=B(l^p,7),s=s+d|0,x=B(x^s,16),b=b+x|0,d=B(d^b,12),s=s+d|0,x=B(x^s,8),b=b+x|0,d=B(d^b,7),i=i+u|0,R=B(R^i,16),y=y+R|0,u=B(u^y,12),i=i+u|0,R=B(R^i,8),y=y+R|0,u=B(u^y,7),a=a+c|0,N=B(N^a,16),f=f+N|0,c=B(c^f,12),a=a+c|0,N=B(N^a,8),f=f+N|0,c=B(c^f,7);let L=0;r[L++]=o,r[L++]=s,r[L++]=i,r[L++]=a,r[L++]=x,r[L++]=R,r[L++]=N,r[L++]=C}var On=In(Po,{counterRight:!1,counterLength:4,allowShortKeys:!1}),ji=In(Po,{counterRight:!1,counterLength:8,extendNonceFn:Gi,allowShortKeys:!1});var zi=new Uint8Array(16),Do=(t,e)=>{t.update(e);let n=e.length%16;n&&t.update(zi.subarray(n))},Ki=new Uint8Array(32);function Mo(t,e,n,r,o){o!==void 0&&X(o,void 0,"AAD");let s=t(e,n,Ki),i=Lo(r.length,o?o.length:0,!0),a=Uo.create(s);o&&Do(a,o),Do(a,r),a.update(i);let c=a.digest();return we(s,i),c}var qo=t=>(e,n,r)=>({encrypt(s,i){let a=s.length;i=$n(a+16,i,!1),i.set(s);let c=i.subarray(0,-16);t(e,n,c,c,1);let l=Mo(t,e,n,c,r);return i.set(l,a),we(l),i},decrypt(s,i){i=$n(s.length-16,i,!1);let a=s.subarray(0,-16),c=s.subarray(-16),l=Mo(t,e,n,a,r);if(!Io(c,l))throw new Error("invalid tag");return i.set(s.subarray(0,-16)),t(e,n,i,i,1),we(l),i}}),Bl=Rn({blockSize:64,nonceLength:12,tagLength:16},qo(On)),Il=Rn({blockSize:64,nonceLength:24,tagLength:16},qo(ji));function Go(t,e,n){return Te(t),n===void 0&&(n=new Uint8Array(t.outputLen)),Se(t,n,e)}var Nn=Uint8Array.of(0),Ho=Uint8Array.of();function jo(t,e,n,r=32){Te(t),ie(r,"length");let o=t.outputLen;if(r>255*o)throw new Error("Length must be <= 255*HashLen");let s=Math.ceil(r/o);n===void 0?n=Ho:D(n,void 0,"info");let i=new Uint8Array(s*o),a=Se.create(t,e),c=a._cloneInto(),l=new Uint8Array(a.outputLen);for(let d=0;d<s;d++)Nn[0]=d+1,c.update(d===0?Ho:l).update(n).update(Nn).digestInto(l),i.set(l,o*d),a._cloneInto(c);return a.destroy(),c.destroy(),he(l,Nn),i.slice(0,r)}function Ko(t){return t instanceof Uint8Array||ArrayBuffer.isView(t)&&t.constructor.name==="Uint8Array"}function Vi(t){if(!Ko(t))throw new Error("Uint8Array expected")}function Vo(t,e){return Array.isArray(e)?e.length===0?!0:t?e.every(n=>typeof n=="string"):e.every(n=>Number.isSafeInteger(n)):!1}function it(t,e){if(typeof e!="string")throw new Error(`${t}: string expected`);return!0}function Dn(t){if(!Number.isSafeInteger(t))throw new Error(`invalid integer: ${t}`)}function Un(t){if(!Array.isArray(t))throw new Error("array expected")}function Ot(t,e){if(!Vo(!0,e))throw new Error(`${t}: array of strings expected`)}function Wi(t,e){if(!Vo(!1,e))throw new Error(`${t}: array of numbers expected`)}function Zi(...t){let e=s=>s,n=(s,i)=>a=>s(i(a)),r=t.map(s=>s.encode).reduceRight(n,e),o=t.map(s=>s.decode).reduce(n,e);return{encode:r,decode:o}}function Fi(t){let e=typeof t=="string"?t.split(""):t,n=e.length;Ot("alphabet",e);let r=new Map(e.map((o,s)=>[o,s]));return{encode:o=>(Un(o),o.map(s=>{if(!Number.isSafeInteger(s)||s<0||s>=n)throw new Error(`alphabet.encode: digit index outside alphabet "${s}". Allowed: ${t}`);return e[s]})),decode:o=>(Un(o),o.map(s=>{it("alphabet.decode",s);let i=r.get(s);if(i===void 0)throw new Error(`Unknown letter: "${s}". Allowed: ${t}`);return i}))}}function Xi(t=""){return it("join",t),{encode:e=>(Ot("join.decode",e),e.join(t)),decode:e=>(it("join.decode",e),e.split(t))}}function Yi(t,e="="){return Dn(t),it("padding",e),{encode(n){for(Ot("padding.encode",n);n.length*t%8;)n.push(e);return n},decode(n){Ot("padding.decode",n);let r=n.length;if(r*t%8)throw new Error("padding: invalid, string should have whole number of bytes");for(;r>0&&n[r-1]===e;r--)if((r-1)*t%8===0)throw new Error("padding: invalid, string has too much padding");return n.slice(0,r)}}}var Wo=(t,e)=>e===0?t:Wo(e,t%e),Nt=(t,e)=>t+(e-Wo(t,e)),Cn=(()=>{let t=[];for(let e=0;e<40;e++)t.push(2**e);return t})();function zo(t,e,n,r){if(Un(t),e<=0||e>32)throw new Error(`convertRadix2: wrong from=${e}`);if(n<=0||n>32)throw new Error(`convertRadix2: wrong to=${n}`);if(Nt(e,n)>32)throw new Error(`convertRadix2: carry overflow from=${e} to=${n} carryBits=${Nt(e,n)}`);let o=0,s=0,i=Cn[e],a=Cn[n]-1,c=[];for(let l of t){if(Dn(l),l>=i)throw new Error(`convertRadix2: invalid data word=${l} from=${e}`);if(o=o<<e|l,s+e>32)throw new Error(`convertRadix2: carry overflow pos=${s} from=${e}`);for(s+=e;s>=n;s-=n)c.push((o>>s-n&a)>>>0);let d=Cn[s];if(d===void 0)throw new Error("invalid carry");o&=d-1}if(o=o<<n-s&a,!r&&s>=e)throw new Error("Excess padding");if(!r&&o>0)throw new Error(`Non-zero padding: ${o}`);return r&&s>0&&c.push(o>>>0),c}function Ji(t,e=!1){if(Dn(t),t<=0||t>32)throw new Error("radix2: bits should be in (0..32]");if(Nt(8,t)>32||Nt(t,8)>32)throw new Error("radix2: carry overflow");return{encode:n=>{if(!Ko(n))throw new Error("radix2.encode input should be Uint8Array");return zo(Array.from(n),8,t,!e)},decode:n=>(Wi("radix2.decode",n),Uint8Array.from(zo(n,t,8,e)))}}var Qi=typeof Uint8Array.from([]).toBase64=="function"&&typeof Uint8Array.fromBase64=="function",ea=(t,e)=>{it("base64",t);let n=e?/^[A-Za-z0-9=_-]+$/:/^[A-Za-z0-9=+/]+$/,r=e?"base64url":"base64";if(t.length>0&&!n.test(t))throw new Error("invalid base64");return Uint8Array.fromBase64(t,{alphabet:r,lastChunkHandling:"strict"})},Zo=Qi?{encode(t){return Vi(t),t.toBase64()},decode(t){return ea(t,!1)}}:Zi(Ji(6),Fi("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),Yi(6),Xi(""));var zl=new TextDecoder("utf-8"),Fo=new TextEncoder,Xo=1,Yo=4294967295,Jo=65536;function Qo(t,e){let n=Cr.getSharedSecret(t,re("02"+e)).subarray(1,33);return Go(ce,n,Fo.encode("nip44-v2"))}function ta(t,e){let n=jo(ce,t,e,76);return{chacha_key:n.subarray(0,32),chacha_nonce:n.subarray(32,44),hmac_key:n.subarray(44,76)}}function na(t){if(!Number.isSafeInteger(t)||t<1)throw new Error("expected positive integer");if(t<=32)return 32;let e=2**(Math.floor(Math.log2(t-1))+1),n=e<=256?32:e/8;return n*(Math.floor((t-1)/n)+1)}function ra(t){if(!Number.isSafeInteger(t)||t<Xo||t>65535)throw new Error("invalid plaintext size: must be between 1 and 65535 bytes");let e=new Uint8Array(2);return new DataView(e.buffer).setUint16(0,t,!1),e}function oa(t){if(!Number.isSafeInteger(t)||t<Jo||t>Yo)throw new Error("invalid plaintext size: must be between 65536 and 4294967295 bytes");let e=new Uint8Array(4);return new DataView(e.buffer).setUint32(0,t,!1),e}function sa(t){let e=Fo.encode(t),n=e.length;if(n<Xo||n>Yo)throw new Error("invalid plaintext size: must be between 1 and 4294967295 bytes");let r=n>=Jo?Z(new Uint8Array([0,0]),oa(n)):ra(n),o=new Uint8Array(na(n)-n);return Z(r,e,o)}function ia(t,e,n){if(n.length!==32)throw new Error("AAD associated data must be 32 bytes");let r=Z(n,e);return Se(ce,t,r)}function es(t,e,n=ge(32)){let{chacha_key:r,chacha_nonce:o,hmac_key:s}=ta(e,n),i=sa(t),a=On(r,o,i),c=ia(s,a,n);return Zo.encode(Z(new Uint8Array([2]),n,a,c))}var fa=3e3,pa=1e4,ha=1200,ga=8e3,Ct=class{constructor(e,n,r,o){this.relay=e;this.owner=r;this.log=o;this.key=Qo(n,r),this.agent=nt(n)}key;agent;queue=[];timer;refused=!1;send(e){this.queue.push(e),this.timer??=setTimeout(()=>void this.flush(),ha)}async flush(){this.timer&&clearTimeout(this.timer),this.timer=void 0;let e=this.queue.splice(0);if(!e.length)return;let n=JSON.stringify(e.length===1?e[0]:{kind:"batch",payload:{events:e}});try{await this.relay.publish({kind:24200,created_at:Math.floor(Date.now()/1e3),content:es(n,this.key),tags:[["p",this.owner],["agent",this.agent],["frame","telemetry"]]}),this.refused&&this.log("activity frames are getting through again"),this.refused=!1}catch(r){this.refused||this.log(`couldn\'t send an activity frame: ${r.message}`),this.refused=!0}}},Ut=class{constructor(e,n){this.path=e;this.observer=n;try{ca(e)&&da(e).size>2*1024*1024&&ua(e,`${la(e,"utf8").split(`\n`).slice(-fa).join(`\n`)}`)}catch{}}write(e){try{aa(this.path,`${JSON.stringify(e)}\n`)}catch{}}start(e){let n=`${Date.now().toString(36)}-${e.eventId.slice(0,8)}`,r=this.observer,o=()=>new Date().toISOString(),s=(f,p)=>r?.send({kind:f,turnId:n,channelId:e.channel,timestamp:o(),...p&&{payload:p}}),i=f=>s("acp_read",{jsonrpc:"2.0",method:"session/update",params:{sessionId:n,update:f}}),a,c=0,l=f=>{a&&i({sessionUpdate:"tool_call_update",toolCallId:a,status:f}),a=void 0};this.write({turn:n,at:Date.now(),type:"start",channel:e.channel,...e.root&&{root:e.root},text:Oe(e.request,300)}),r?.send({kind:"turn_started",turnId:n,channelId:e.channel,timestamp:o(),startedAt:o(),payload:{source:"mention",triggeringEventIds:[e.eventId],...e.root&&{threadRootEventId:e.root}}});let d=setInterval(()=>s("turn_liveness"),pa);d.unref();let u=f=>{let p=Tn(f);l("completed"),a=`${n}-${++c}`;let b=wo(f);i({sessionUpdate:"tool_call",toolCallId:a,title:p.slice(0,200),kind:b,status:"in_progress",...f.target&&{rawInput:{target:f.target}},...(b==="read"||b==="edit")&&f.target&&{locations:[{path:f.target}]}})},y=f=>{this.write({turn:n,at:Date.now(),type:"step",text:Tn(f)}),u(f)};return{tool:(f,p)=>y(go(f,p,e.labels)),step:y,thought:f=>{f.trim()&&(this.write({turn:n,at:Date.now(),type:"thought",text:f.slice(0,4e3)}),u(mo(f)),i({sessionUpdate:"agent_thought_chunk",content:{type:"text",text:f.slice(0,ga)}}))},end:async(f,p)=>{clearInterval(d),l(f==="done"?"completed":"failed"),this.write({turn:n,at:Date.now(),type:"end",outcome:f,...p&&{error:Oe(p,500)}}),s(f==="error"?"turn_error":"turn_completed",f==="error"?{error:Oe(p??"failed",2e3)}:f==="stopped"?{outcome:"stopped"}:void 0),await r?.flush()}}}};import{readFileSync as xa}from"node:fs";import{createInterface as Ea}from"node:readline";import{readFileSync as ma}from"node:fs";import{homedir as ya}from"node:os";import{join as ba}from"node:path";function ts(){let t=ma(ba(ya(),".databrickscfg"),"utf8"),e="",n={};for(let r of t.split(`\n`)){let o=r.trim(),s=/^\\[(.+)\\]$/.exec(o);if(s){e=s[1];continue}let i=/^([a-z_]+)\\s*=\\s*(.*)$/.exec(o);i&&e==="DEFAULT"&&(n[i[1]]=i[2])}if(!n.host||!n.token)throw new Error("The Sandbox has no Databricks credential.");return{host:n.host.replace(/\\/+$/,""),token:n.token}}async function wa(t){let e=new AbortController,n=setTimeout(()=>e.abort(new DOMException("Timed out","TimeoutError")),t.timeoutMs??6e4),r=()=>e.abort(t.signal?.reason);t.signal?.addEventListener("abort",r,{once:!0});try{let o=await fetch(t.url,{method:t.method??"GET",...t.headers&&{headers:t.headers},...t.body!==void 0&&{body:t.body},signal:e.signal}),s={};o.headers.forEach((a,c)=>s[c.toLowerCase()]=a);let i="";if(o.body){let a=new TextDecoder,c=o.body.getReader();for(;;){let{done:d,value:u}=await c.read();if(d)break;let y=a.decode(u,{stream:!0});i+=y,t.onBody?.(y)}let l=a.decode();l&&(i+=l,t.onBody?.(l))}return{status:o.status,headers:s,body:i}}finally{clearTimeout(n),t.signal?.removeEventListener("abort",r)}}function Dt(t){let{host:e}=ts(),n=new Tt({host:e,transport:wa,token:async()=>ts().token}),r={status:"connected",...t&&{workspaceId:t},profile:{name:"DEFAULT",host:e,...t&&{workspaceId:t}},user:{userName:""},profiles:[]};return{version:1,snapshot:()=>r,subscribe:()=>()=>{},client:()=>n,ready:async()=>n,workspaceUrl:s=>new URL(s,e).toString(),profiles:()=>[],openSettings:()=>{},signIn:async()=>{},preferences:{get:()=>{},set:()=>{},subscribe:()=>()=>{}}}}var ns={type:"object",properties:{}};function Sa(t){let{server:e}=t,n=st(e);return t.login?{name:`${n}__log_in`,description:`[${e.label}] Not available yet: your owner hasn\'t logged in to ${e.label}. If you need it, give them this link to log in, then try again: ${t.login}`,parameters:ns,run:async()=>`Ask your owner to log in to ${e.label} at ${t.login}, then try again.`}:{name:`${n}__unavailable`,description:`[${e.label}] Didn\'t start this time: ${t.message.slice(0,300)}`,parameters:ns,run:async()=>`${e.label} isn\'t available right now: ${t.message}`}}async function Mn(t,e){let n=JSON.parse(xa(t,"utf8")),r=_o(n.tools),o=Dt(n.workspaceId),s=await Ro(o,r,e),i=new Set;return[...Ao(o,r),...s.tools,...s.failures.map(Sa)].map(a=>{let c=a.name.slice(0,xn);for(let l=2;i.has(c);l++)c=`${a.name.slice(0,xn-4)}_${l}`;return i.add(c),c===a.name?a:{...a,name:c}})}function rs(t,e=n=>console.error(n)){let n=Mn(t,AbortSignal.timeout(12e4)).catch(a=>(e(`tools bridge: couldn\'t list the tools: ${a.message??a}`),[])),r=new Map,o=a=>process.stdout.write(`${JSON.stringify({jsonrpc:"2.0",...a})}\n`),s=(a,c=!1)=>({content:[{type:"text",text:a}],...c&&{isError:c}});async function i(a){let{id:c,method:l,params:d}=a;if(l==="notifications/cancelled")return r.get(d?.requestId)?.abort();if(c!==void 0)switch(l){case"initialize":return o({id:c,result:{protocolVersion:d?.protocolVersion??"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"databricks",version:"1"}}});case"ping":return o({id:c,result:{}});case"tools/list":return o({id:c,result:{tools:(await n).map(u=>({name:u.name,description:u.description,inputSchema:u.parameters}))}});case"tools/call":{let u=(await n).find(f=>f.name===d?.name);if(!u)return o({id:c,result:s(`There\'s no Databricks tool named ${String(d?.name)}.`,!0)});let y=new AbortController;r.set(c,y);try{return o({id:c,result:s(await u.run(d?.arguments??{},y.signal))})}catch(f){return o({id:c,result:s(`Error: ${f.message??f}`,!0)})}finally{r.delete(c)}}default:return o({id:c,error:{code:-32601,message:`Unknown method: ${l}`}})}}return new Promise(a=>{let c=Ea({input:process.stdin});c.on("line",l=>{let d;try{d=JSON.parse(l)}catch{return}i(d).catch(u=>d.id!==void 0&&o({id:d.id,error:{code:-32603,message:u.message??String(u)}}))}),c.on("close",()=>{for(let l of r.values())l.abort();a()})})}import{spawn as $a}from"node:child_process";import{mkdirSync as cs,rmSync as ls,writeFileSync as Gt}from"node:fs";import{join as Ba}from"node:path";import{createInterface as Ia}from"node:readline";import{chmodSync as va,existsSync as os,mkdirSync as _a,readFileSync as ka,renameSync as Ta,rmSync as dd,statSync as Aa,writeFileSync as ss}from"node:fs";import{homedir as Ra}from"node:os";import{join as oe}from"node:path";var ue=process.env.BUZZ_AGENT_DIR??oe(Ra(),".buzz","agent"),Mt=process.env.BUZZ_AGENT_RUN_DIR??(process.env.BUZZ_AGENT_DIR?oe(ue,"run"):"/tmp/buzz-agent"),q={key:oe(ue,"key.json"),config:oe(ue,"config.json"),state:oe(ue,"state.json"),turns:oe(Mt,"turns"),pid:oe(Mt,"runner.pid"),started:oe(Mt,"started"),log:oe(ue,"runner.log"),status:oe(ue,"status.json"),activity:oe(ue,"activity.jsonl"),awake:oe(ue,"awake"),runs:oe(ue,"runs")};function Pn(){for(let t of[ue,Mt,q.turns,q.runs])_a(t,{recursive:!0,mode:448});os(q.started)||ss(q.started,"")}function is(){try{return new Date(Aa(q.started).mtimeMs).toISOString()}catch{return}}function qn(t,e){try{return JSON.parse(ka(t,"utf8"))}catch{return e}}function Pt(t,e,n=384){let r=`${t}.tmp`;ss(r,`${JSON.stringify(e,null,2)}\n`,{mode:n}),Ta(r,t),va(t,n)}var qt=()=>qn(q.config,void 0),Hn=()=>({sessions:{},since:0,handled:[],...qn(q.state,{})}),Gn=t=>Pt(q.state,{...t,handled:t.handled.slice(-500)});function Ht(){let t=qn(q.key,void 0);return t?.secret&&/^[0-9a-f]{64}$/.test(t.secret)?Uint8Array.from(Buffer.from(t.secret,"hex")):void 0}function as(t){if(os(q.key))throw new Error("This Sandbox already has an agent key.");Pt(q.key,{secret:Buffer.from(t).toString("hex")})}var at=t=>oe(q.turns,Buffer.from(t).toString("base64url"));var La=t=>/no conversation found|no (saved )?session|session[^.]* not found|thread[^.]* not found|no rollout found/i.test(t);async function jn(t){try{return await ds(t)}catch(e){if(!t.session||t.signal.aborted||!La(e.message))throw e;let{session:n,...r}=t;return ds(r)}}function ds(t){let{harness:e}=t,n=crypto.randomUUID(),r=Ba(q.runs,`${Date.now().toString(36)}-${n.slice(0,8)}`);cs(r,{recursive:!0,mode:448});let o=Jr(r),s=t.session?.id??(e==="codex"?void 0:crypto.randomUUID()),i=e==="codex"&&!t.session?`<instructions>\n${t.system}\n</instructions>\n\n${t.prompt}`:t.prompt;Gt(o.prompt,i,{mode:384}),Gt(o.system,t.system,{mode:384});let a=vn(t.tools?.tools)?{runner:process.argv[1]}:void 0;if(a)for(let l of Sn(e,o,a.runner,t.tools))Gt(l.path,l.content,{mode:384});let c=Qr({harness:e,model:t.model,permissions:t.permissions,session:s?{id:s,resume:!!t.session}:void 0,files:o,...a&&{tools:a}});return cs(Rt,{recursive:!0}),new Promise((l,d)=>{let u=$a("bash",["-lc",`cd \'${Rt}\' && ${c}`],{detached:!0,stdio:["ignore","pipe","pipe"]});Gt(t.pidFile,String(u.pid??""),{mode:384});let y="",f,p,b,x="",R=!1,N=()=>{if(u.pid){try{process.kill(-u.pid,"SIGTERM")}catch{}setTimeout(()=>{try{process.kill(-u.pid,"SIGKILL")}catch{}},3e3).unref()}};t.signal.addEventListener("abort",N,{once:!0}),Ia({input:u.stdout}).on("line",C=>{let L=eo(e,C);L&&(L.session&&(!R||L.session!==s)&&(s=L.session,R=!0,t.onSession?.(s)),L.thought&&t.onThought?.(L.thought),L.step&&(f&&t.onThought?.(f),f=void 0,t.onStep?.(L.step.tool,L.step.target)),L.text&&(y=f=L.text),L.final!==void 0&&(p=L.final),L.error&&(b=L.error))}),u.stderr.on("data",C=>x=`${x}${C}`.slice(-8e3)),u.on("close",C=>{if(t.signal.removeEventListener("abort",N),ls(t.pidFile,{force:!0}),ls(r,{recursive:!0,force:!0}),t.signal.aborted)return d(t.signal.reason??new DOMException("Aborted","AbortError"));if(b)return d(new Error(`${Le(e)}: ${b}`));let L=(p??y).trim();if(C!==0||!L)return d(new Error(`${Le(e)} stopped (exit ${C})${_n(x)?`: ${_n(x)}`:""}.`));if(!s)return d(new Error(`${Le(e)} didn\'t report its session.`));l({text:L,session:s})})})}import{createHash as Oa,randomUUID as Na}from"node:crypto";var Ca=t=>Oa("sha256").update(t).digest("hex"),jt=class{constructor(e,n,r,o){this.url=e;this.secretKey=n;this.authTag=r;this.log=o;this.base=e.replace(/^ws/,"http").replace(/\\/+$/,"")}base;ready=!1;watching=new Set;closed=!1;sign(e){return qr(e,this.secretKey)}async post(e,n){let r=`${this.base}${e}`,o=this.sign({kind:27235,created_at:Math.floor(Date.now()/1e3),content:"",tags:[["u",r],["method","POST"],["payload",Ca(n)],["nonce",Na()]]}),s=await fetch(r,{method:"POST",headers:{authorization:`Nostr ${Buffer.from(JSON.stringify(o)).toString("base64")}`,"content-type":"application/json","x-auth-tag":JSON.stringify(this.authTag)},body:n,signal:AbortSignal.timeout(2e4)}),i=await s.text();if(!s.ok)throw this.ready=!1,Object.assign(new Error(`${s.status} ${i.slice(0,300)}`.trim()),{status:s.status});return this.ready=!0,JSON.parse(i)}async publish(e){let n=e.tags.filter(s=>s[0]!=="auth"&&s[0]!=="ms");n.some(s=>s[0]==="h")&&n.push(["ms",String(Date.now()%1e3)]),n.push([...this.authTag]);let r=this.sign({...e,tags:n}),o=await this.post("/events",JSON.stringify(r));if(!o.accepted&&!o.message?.startsWith("duplicate"))throw new Error(o.message||"The community refused the event.");return r}async query(e){if(!e.length)return[];let n=await this.post("/query",JSON.stringify(e));return Array.isArray(n)?n:[]}watch(e,n,r,o=3e3){let s=new Set,i=n,a=0,c,l=async()=>{if(this.closed)return;let d=o;try{let u=await this.query([{...e,since:i-5}]);a=0;for(let y of u.sort((f,p)=>f.created_at-p.created_at))s.has(y.id)||(s.add(y.id),i=Math.max(i,y.created_at),r(y));if(s.size>2e3)for(let y of[...s].slice(0,1e3))s.delete(y)}catch(u){let y=u.message??String(u),f=/retry in (\\d+)s/.exec(y);d=f?Number(f[1])*1e3:Math.min(6e4,o*2**++a),this.log(`poll failed (${y.slice(0,160)}); next in ${Math.round(d/1e3)}s`)}this.closed||(c=setTimeout(()=>void l(),d),this.watching.add(c))};return l(),()=>{c&&clearTimeout(c)}}close(){this.closed=!0;for(let e of this.watching)clearTimeout(e)}};var Vn=30*6e4,ps="A Databricks agent in its own Databricks Sandbox.";function ne(t){try{Ve(q.log)&&fs(q.log).size>5*1024*1024&&qa(q.log,0)}catch{}Ma(q.log,`${new Date().toISOString()} ${t}\n`)}function Wn(t){try{return process.kill(t,0),zt(`/proc/${t}/cmdline`,"utf8").includes("serve")}catch{return!1}}var zn=()=>{let t=Number(Ve(q.pid)?zt(q.pid,"utf8"):"");return Number.isInteger(t)&&t>0&&Wn(t)?t:void 0};function Ne(t,e){return t===void 0&&(console.error(`No ${e} yet.`),process.exit(2)),t}var hs=(t,e)=>new jt(t.relay,e,t.authTag,ne);function gs(t,e){return[`<identity>You are ${t.name} (pubkey ${e}), an agent in Buzz, a chat app, owned by ${t.owner}.</identity>`,"People mention you in channels, threads and Solo chats; each mention is a turn. Messages in the conversation you haven\'t seen arrive with the mention, as JSON. Your final message is posted as your reply in that conversation: make it the answer itself, in Markdown, written for the people there, without saying that you\'re posting it.",to(t.harness,"standard",t.kind==="sandbox"?t.tools??[]:[]),Yr,t.instructions.trim()?`<agent-instructions>\n${t.instructions.trim()}\n</agent-instructions>`:""].filter(Boolean).join(`\n\n`)}async function Ha(t,e){let n=new Map;if(!e.length)return n;for(let r of await t.query([{kinds:[0],authors:e,limit:e.length*2}]).catch(()=>[]))try{let o=JSON.parse(r.content),s=o.display_name||o.name;s&&!n.has(r.pubkey)&&n.set(r.pubkey,String(s).slice(0,80))}catch{}return n}var ms=t=>({tools:t.tools??[],...t.workspaceId&&{workspaceId:t.workspaceId}});async function ys(t,e,n,r,o){let s=Dt(t.workspaceId),i=t.genieSpace;if(!i){o?.step({tool:"Asking Genie One",target:e});let f=0,p=await new Ge(s).ask(e,{...n&&{conversationId:n},signal:r,onProgress:R=>{for(let N of R.slice(f))o?.step(yo(N));f=Math.max(f,R.length)}}),b=[Wr(p)];p.status==="incomplete"&&b.push("_Genie One stopped early; this may be partial._");let x=p.sql[p.sql.length-1];return x&&b.push(`\\`\\`\\`sql\n${x.trim()}\n\\`\\`\\``),p.deepLink&&b.push(`[Explore in Databricks](${p.deepLink})`),{text:b.filter(Boolean).join(`\n\n`)||"Genie One had no answer.",conversation:p.conversationId}}let a=await s.ready(),c=t.genieLabel??"Genie";o?.step({tool:`Asking ${c}`,target:e});let l="",d=await new fe(a).answer(i,e,{...n&&{conversationId:n},signal:r,onUpdate:f=>{f.status!==l&&(l=f.status,o?.step(bo(c,l)))}}),u=[];d.text&&u.push(d.text),d.result?.columns.length&&u.push(We(d.result)),d.sql&&u.push(`\\`\\`\\`sql\n${d.sql.trim()}\n\\`\\`\\``),d.message.status!=="COMPLETED"&&u.push(`Genie stopped with status ${d.message.status}${d.error?`: ${d.error}`:""}.`),d.suggestions.length&&u.push(`_You could also ask:_ ${d.suggestions.slice(0,3).map(f=>`\\u201C${f}\\u201D`).join(" \\xB7 ")}`);let y=s.workspaceUrl(fe.webPath(i,d.message.conversation_id));return y&&u.push(`[Open in Genie](${y})`),{text:u.join(`\n\n`)||"Genie had no answer.",conversation:d.message.conversation_id}}async function Ga(){Pn();let t=Ne(qt(),"config.json"),e=Ne(Ht(),"agent key"),n=nt(e);Kn(q.pid,String(process.pid));let r=Hn(),o=new Set(r.handled),s=new Map,i=new Map,a=Date.now(),c=0,l=Date.now(),d;ne(`starting as ${n.slice(0,12)}\\u2026 (${t.kind==="genie"?"Genie":Le(t.harness)}, ${t.availability})`);let u=hs(t,e),y=new Ut(q.activity,new Ct(u,e,t.owner,ne)),f=ko(t.tools??[]),p=()=>Gn({...r,handled:[...o]}),b=()=>Pt(q.status,{pid:process.pid,pubkey:n,connected:u.ready,active:c,startedAt:new Date(a).toISOString(),lastActivity:new Date(l).toISOString(),since:r.since,...d&&{lastError:d}},420);async function x(S){let I=s.get(S);if(I&&Date.now()-I.at<10*6e4)return I.kind;let[O]=await u.query([{kinds:[39e3],"#d":[S],limit:1}]),$=ao(O);return s.set(S,{at:Date.now(),kind:$}),$}async function R(S,I,O){for(let $ of fo(I))await u.publish(po({conversation:S,content:$,authTag:t.authTag,...O&&{notify:O}}))}async function N(S,I,O,$){let m=r.sessions[I.key];if(t.kind==="genie"){let E=t.genieSpace?`genie:${t.genieSpace}`:"genie-one",A=m?.harness===E?m.id:void 0,M=await ys(t,$t(S.content)||"What can I ask you about?",A,O,$);return r.sessions[I.key]={harness:E,id:M.conversation,at:S.created_at},M.text}let g=m?.harness===t.harness?m:void 0,h=lo(I),k=(await u.query(h)).filter(E=>E.id!==S.id&&ze.includes(E.kind)&&E.created_at<=S.created_at&&E.tags.some(A=>A[0]==="h"&&A[1]===I.channel)).filter(E=>E.created_at>(g?.at??0)&&E.pubkey!==n).sort((E,A)=>E.created_at-A.created_at),T=k.slice(-12),w=uo({event:S,conversation:I,agent:n,context:T,total:k.length,names:await Ha(u,[...new Set([S.pubkey,...T.map(E=>E.pubkey)])]),scope:t.scope});if(process.env.BUZZ_RUNNER_ECHO==="1")return`echo: ${$t(S.content)} | ${I.key} | context ${T.length} | ${w.length} chars`;let _=await jn({harness:t.harness,model:t.model,permissions:"standard",...g&&{session:{id:g.id}},prompt:w,system:gs(t,n),signal:O,pidFile:at(I.key),...t.tools?.length&&{tools:ms(t)},onStep:(E,A)=>{ne(`  ${E}${A?` \\xB7 ${A}`:""}`),$.tool(E,A)},onThought:E=>$.thought(E),onSession:E=>{r.sessions[I.key]={harness:t.harness,id:E,at:g?.at??0},p()}});return r.sessions[I.key]={harness:t.harness,id:_.session,at:S.created_at},_.text}async function C(S,I){let O=`${at(I.key)}.stopped`;us(O,{force:!0}),c++,l=Date.now(),b(),ne(`mention ${S.id.slice(0,8)} in ${I.key}`);let $=y.start({eventId:S.id,channel:I.channel,...I.key!==I.channel&&{root:I.root},request:$t(S.content),labels:f}),m="done";try{let g=await N(S,I,AbortSignal.timeout(Vn),$);await R(I,g),ne(`replied in ${I.key}`)}catch(g){Ve(O)?(m="stopped",ne(`stopped in ${I.key}`)):(d=g.message??String(g),m="error",ne(`turn failed: ${d}`),await R(I,`I couldn\'t finish that: ${d}`,t.owner).catch(h=>ne(`couldn\'t post the failure: ${h.message}`)))}finally{await $.end(m,m==="error"?d:void 0),us(O,{force:!0}),c--,l=Date.now(),r.since=Math.max(r.since,S.created_at),p(),b()}}function L(S){if(!(o.has(S.id)||!Hr(S)||!so(S,n))){if(o.add(S.id),!io(S,t.owner)){ne(`ignored ${S.id.slice(0,8)}: not from the owner`);return}V=V.then(async()=>{let I=S.tags.find(m=>m[0]==="h")?.[1];if(!I)return;let O=co(S,t.scope,await x(I).catch(()=>({solo:!1})));if(!O)return;let $=(i.get(O.key)??Promise.resolve()).then(()=>C(S,O));i.set(O.key,$.catch(()=>{}))})}}let V=Promise.resolve(),j=JSON.stringify([t.name,t.picture??""]),W=async()=>{if(r.profile!==j)try{await u.publish(kn({name:t.name,...t.picture&&{picture:t.picture},about:ps,authTag:t.authTag})),r.profile=j,p(),ne("published the profile")}catch(S){ne(`profile not published yet: ${S.message}`),setTimeout(()=>void W(),6e4).unref()}};W();let z=r.since?r.since-5:Math.floor(Date.now()/1e3)-60;u.watch({kinds:ze,"#p":[n]},z,L),b(),setInterval(b,3e4).unref(),t.availability==="sleep"&&setInterval(()=>{let S=Date.now()-l>t.idleMinutes*6e4,I=Ve(q.awake)?fs(q.awake).mtimeMs:0;c||!S||Date.now()-I<10*6e4||(ne("idle with the owner\'s Buzz closed; stopping the Sandbox until Buzz wakes it"),p(),u.close(),Ua("databricks",["api","post",`/api/2.0/sandboxes/${t.sandbox}/stop`,"--json","{}"],O=>{O&&ne(`couldn\'t stop the Sandbox: ${O.message}`),process.exit(0)}))},6e4).unref(),process.on("SIGTERM",()=>{p(),u.close(),process.exit(0)})}async function ja(){let[t,...e]=process.argv.slice(2);if(t==="mcp"&&(await rs(Ne(e[0],"a tools config")),process.exit(0)),t==="mcp-names"){let n=(await Mn(Ne(e[0],"a tools config"),AbortSignal.timeout(12e4))).map(r=>`,${r.name}`).join("");process.stdout.write(n,()=>process.exit(0));return}switch(Pn(),t){case"keygen":{let n=Ht();n||(n=Pr(),as(n)),console.log(JSON.stringify({pubkey:nt(n)}));return}case"profile":{let n=Ne(qt(),"config.json");await hs(n,Ne(Ht(),"agent key")).publish(kn({name:n.name,...n.picture&&{picture:n.picture},about:ps,authTag:n.authTag}));let o=Hn();Gn({...o,profile:JSON.stringify([n.name,n.picture??""])}),console.log("published");return}case"start":{if(zn())return console.log("running");let n=Pa(q.log,"a"),r=Da(process.execPath,[process.argv[1],"serve"],{detached:!0,stdio:["ignore",n,n]});return r.unref(),Kn(q.pid,String(r.pid)),console.log("started")}case"stop":{let n=zn();if(n){process.kill(n,"SIGTERM");for(let r=0;r<50&&Wn(n);r++)await new Promise(o=>setTimeout(o,100));Wn(n)&&process.kill(n,"SIGKILL")}return console.log(n?"stopped":"not running")}case"interrupt":{let[n="",r=""]=e;for(let o of[`${n}/${r}`,n]){let s=at(o),i=Number(Ve(s)?zt(s,"utf8"):"");if(i){Kn(`${s}.stopped`,"");try{return process.kill(-i,"SIGTERM"),console.log("true")}catch{}}}return console.log("false")}case"status":{let n=zn(),r=Ve(q.status)?JSON.parse(zt(q.status,"utf8")):{},o=n&&r.pid===n?r:{},s=is();return console.log(JSON.stringify({...o,running:!!n,...s&&{bootedAt:s}}))}case"ask":{let n=Ne(qt(),"config.json"),r=e.join(" ")||"Say hello in one short sentence.";if(n.kind==="genie")return console.log((await ys(n,r,void 0,AbortSignal.timeout(Vn))).text);let o=await jn({harness:n.harness,model:n.model,permissions:"standard",prompt:r,system:gs(n,"diagnostic"),signal:AbortSignal.timeout(Vn),pidFile:at("ask"),...n.tools?.length&&{tools:ms(n)},onStep:(s,i)=>console.error(`step: ${s}${i?` \\xB7 ${i}`:""}`)});return console.log(o.text)}case"serve":return Ga();default:console.error("usage: runner.mjs keygen|profile|start|serve|stop|interrupt|status|ask|mcp|mcp-names"),process.exit(2)}}ja().catch(t=>{ne(`fatal: ${t?.stack??t}`),console.error(t?.message??t),process.exit(1)});\n';
 var RUNNER_SHA = "80f2c455fff38857";
@@ -971,10 +1313,10 @@ _Showing ${Math.min(maxRows, result.rows.length)} of ${total} rows._` : "";
   return [head, rule, ...body].join("\n") + note;
 }
 function toCsv(result) {
-  const quote = (value) => value === null ? "" : /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  const quote2 = (value) => value === null ? "" : /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
   return [
-    result.columns.map((column) => quote(column.name)).join(","),
-    ...result.rows.map((row) => row.map(quote).join(","))
+    result.columns.map((column) => quote2(column.name)).join(","),
+    ...result.rows.map((row) => row.map(quote2).join(","))
   ].join("\n");
 }
 var RESULT_LANGUAGE = "databricks-result";
@@ -1658,143 +2000,6 @@ var Genie = class {
   }
 };
 
-// packages/core/src/api/mcp.ts
-var PROTOCOL_VERSION = "2025-06-18";
-var McpError = class extends Error {
-  constructor(message, code, data) {
-    super(message);
-    this.code = code;
-    this.data = data;
-    this.name = "McpError";
-  }
-};
-var gatewayMcpPath = (fullName) => `/ai-gateway/mcp-services/${fullName}`;
-var McpClient = class {
-  constructor(client, path, query = {}) {
-    this.client = client;
-    this.path = path;
-    this.query = query;
-  }
-  session;
-  initializing;
-  nextId = 1;
-  toolsCache;
-  serverInfo;
-  instructions;
-  async listTools(signal) {
-    if (this.toolsCache && Date.now() - this.toolsCache.at < 5 * 6e4) return this.toolsCache.tools;
-    const tools = [];
-    let cursor;
-    do {
-      const page = await this.call("tools/list", cursor ? { cursor } : {}, signal);
-      tools.push(...page.tools ?? []);
-      cursor = page.nextCursor;
-    } while (cursor);
-    this.toolsCache = { at: Date.now(), tools };
-    return tools;
-  }
-  callTool(name, args, options = {}) {
-    return this.call(
-      "tools/call",
-      { name, arguments: args, ...options.meta && { _meta: options.meta } },
-      options.signal,
-      options.timeoutMs
-    );
-  }
-  async readResource(uri, signal) {
-    return await this.call("resources/read", { uri }, signal);
-  }
-  async ensureSession(signal) {
-    if (this.session) return;
-    this.initializing ??= (async () => {
-      const result = await this.send(
-        {
-          jsonrpc: "2.0",
-          id: this.nextId++,
-          method: "initialize",
-          params: {
-            protocolVersion: PROTOCOL_VERSION,
-            capabilities: {},
-            clientInfo: { name: "databricks-buzz-plugins", version: "0.1.0" }
-          }
-        },
-        signal,
-        true
-      );
-      this.serverInfo = result?.serverInfo;
-      this.instructions = result?.instructions;
-      await this.send({ jsonrpc: "2.0", method: "notifications/initialized" }, signal).catch(() => {
-      });
-    })().finally(() => {
-      this.initializing = void 0;
-    });
-    await this.initializing;
-  }
-  async call(method, params, signal, timeoutMs) {
-    await this.ensureSession(signal);
-    try {
-      return await this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
-    } catch (error) {
-      if (error.status === 404 && this.session) {
-        this.session = void 0;
-        await this.ensureSession(signal);
-        return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
-      }
-      throw error;
-    }
-  }
-  async send(message, signal, initializing = false, timeoutMs = 12e4) {
-    const response = await this.client.request(this.path, {
-      method: "POST",
-      query: this.query,
-      body: message,
-      timeoutMs,
-      ...signal && { signal },
-      headers: {
-        Accept: "application/json, text/event-stream",
-        ...!initializing && { "MCP-Protocol-Version": PROTOCOL_VERSION },
-        ...this.session && { "Mcp-Session-Id": this.session }
-      }
-    });
-    const session = response.headers["mcp-session-id"];
-    if (session) this.session = session;
-    if (message.id === void 0) return void 0;
-    if (response.status === 202) return void 0;
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
-    const type = response.headers["content-type"] ?? "";
-    const payloads = type.includes("text/event-stream") ? parseSse(response.body).map((event) => event.data) : [response.body];
-    for (const payload of payloads) {
-      let parsed;
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (parsed.id !== message.id) continue;
-      if (parsed.error)
-        throw new McpError(parsed.error.message ?? "MCP error", parsed.error.code, parsed.error.data);
-      return parsed.result;
-    }
-    throw new McpError(`No response to ${message.method}`);
-  }
-};
-function resultText(result) {
-  return (result.content ?? []).map((item) => item.type === "text" ? String(item.text) : "").filter(Boolean).join("\n\n");
-}
-function resultJson(result) {
-  if (result.structuredContent !== void 0) return result.structuredContent;
-  for (const item of result.content ?? []) {
-    if (item.type !== "text") continue;
-    const text = String(item.text).trim();
-    if (!text.startsWith("{") && !text.startsWith("[")) continue;
-    try {
-      return JSON.parse(text);
-    } catch {
-    }
-  }
-  return void 0;
-}
-
 // packages/core/src/api/mcp-catalog.ts
 var NATIVE = /* @__PURE__ */ new Set(["system.ai.genie_one_mcp", "system.ai.sandbox"]);
 var plain2 = (text = "") => text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
@@ -2262,6 +2467,610 @@ async function mcpLocalTools(service, choices, signal) {
   return { tools, problems, failures };
 }
 
+// packages/core/src/api/sql.ts
+var StatementError = class extends Error {
+  constructor(message, statementId, state) {
+    super(message);
+    this.statementId = statementId;
+    this.state = state;
+    this.name = "StatementError";
+  }
+};
+var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
+var EXPIRED = "Databricks no longer keeps this result. Run the statement again to see it.";
+var Sql = class {
+  constructor(client) {
+    this.client = client;
+  }
+  async warehouses(signal) {
+    const response = await this.client.get("/api/2.0/sql/warehouses", signal ? { signal } : {});
+    return response.warehouses ?? [];
+  }
+  /** The best default: running serverless, any serverless, running, first. */
+  static pick(warehouses) {
+    const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
+    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
+  }
+  /** Runs a statement and waits for its first result chunk. */
+  async execute(statement, options) {
+    const signal = options.signal;
+    let response = await this.client.post(
+      "/api/2.0/sql/statements",
+      {
+        statement,
+        warehouse_id: options.warehouseId,
+        // Short, so the statement ID comes back soon: with it, a run cut off
+        // (Buzz closing) can be picked up again.
+        wait_timeout: "10s",
+        on_wait_timeout: "CONTINUE",
+        disposition: "INLINE",
+        format: "JSON_ARRAY",
+        row_limit: options.rowLimit ?? 1e3,
+        ...options.catalog && { catalog: options.catalog },
+        ...options.schema && { schema: options.schema }
+      },
+      { timeoutMs: 3e4, ...signal && { signal } }
+    );
+    options.onStatement?.(response.statement_id);
+    return this.follow(response, options);
+  }
+  /**
+   * A statement started earlier, by its ID: waits for it if it's still
+   * running, then returns its first result chunk. Databricks keeps a result
+   * only for a while; after that this fails with `state` CLOSED.
+   */
+  async resume(statementId, options = {}) {
+    const signal = options.signal;
+    let response;
+    try {
+      response = await this.client.get(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}`, signal ? { signal } : {});
+    } catch (error) {
+      if (error.status === 404) throw new StatementError(EXPIRED, statementId, "CLOSED");
+      throw error;
+    }
+    return this.follow(response, options);
+  }
+  async follow(first, options) {
+    const signal = options.signal;
+    let response = first;
+    const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
+    const cancel = () => void this.cancel(response.statement_id).catch(() => {
+    });
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      let delay = 750;
+      while (RUNNING.has(response.status?.state ?? "")) {
+        if (Date.now() > deadline) {
+          cancel();
+          throw new StatementError("The query took too long and was cancelled.", response.statement_id, "CANCELED");
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        signal?.throwIfAborted();
+        delay = Math.min(3e3, delay * 1.5);
+        response = await this.client.get(
+          `/api/2.0/sql/statements/${encodeURIComponent(response.statement_id)}`,
+          signal ? { signal } : {}
+        );
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+    }
+    const state = response.status?.state;
+    if (state === "CLOSED") throw new StatementError(EXPIRED, response.statement_id, state);
+    if (state !== "SUCCEEDED")
+      throw new StatementError(
+        response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
+        response.statement_id,
+        state
+      );
+    return { statementId: response.statement_id, result: fromStatement(response) };
+  }
+  cancel(statementId) {
+    return this.client.post(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}/cancel`, {});
+  }
+  catalogs(signal) {
+    return this.client.get("/api/2.1/unity-catalog/catalogs", signal ? { signal } : {}).then((response) => response.catalogs ?? []);
+  }
+  schemas(catalog, signal) {
+    return this.client.get("/api/2.1/unity-catalog/schemas", {
+      query: { catalog_name: catalog },
+      ...signal && { signal }
+    }).then((response) => response.schemas ?? []);
+  }
+  tables(catalog, schema2, signal) {
+    return this.client.get(
+      "/api/2.1/unity-catalog/tables",
+      { query: { catalog_name: catalog, schema_name: schema2, max_results: 200 }, ...signal && { signal } }
+    ).then((response) => response.tables ?? []);
+  }
+  table(fullName, signal) {
+    return this.client.get(`/api/2.1/unity-catalog/tables/${encodeURIComponent(fullName)}`, signal ? { signal } : {});
+  }
+};
+function isReadOnlySql(statement) {
+  const stripped = statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ").replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/`[^`]*`/g, "``").trim();
+  const statements = stripped.split(";").map((part) => part.trim()).filter(Boolean);
+  if (!statements.length) return false;
+  return statements.every((part) => {
+    const first = /^\(*\s*(\w+)/.exec(part)?.[1]?.toUpperCase();
+    if (!first || !["SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "VALUES", "TABLE", "LIST"].includes(first))
+      return false;
+    return !/\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|COPY|OPTIMIZE|VACUUM|REFRESH|RESTORE|CALL)\b/i.test(
+      part.replace(/^WITH[\s\S]*?\bSELECT\b/i, "SELECT")
+    );
+  });
+}
+
+// packages/core/src/api/tags.ts
+var SKILLS_TAG = "agent_skills";
+var CHANNEL_TAG = "buzz_channel";
+var DOMAIN_TAG = "buzz_domain";
+var quote = (value) => `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+var ident = (value) => `\`${value.replace(/`/g, "``")}\``;
+var Tags = class {
+  constructor(client) {
+    this.client = client;
+  }
+  /**
+   * Sets a tag on a securable. `entityType` is the API's plural name:
+   * catalogs, schemas, tables, volumes, functions, skills, … A tag that's
+   * already there is updated.
+   */
+  async assign(entityType, entityName, key2, value = "") {
+    const body = { entity_type: entityType, entity_name: entityName, tag_key: key2, ...value && { tag_value: value } };
+    try {
+      return await this.client.post("/api/2.1/unity-catalog/entity-tag-assignments", body);
+    } catch (error) {
+      const code = error.errorCode;
+      if (code !== "ALREADY_EXISTS" && code !== "RESOURCE_ALREADY_EXISTS") throw error;
+      return this.client.json(
+        `/api/2.1/unity-catalog/entity-tag-assignments/${entityType}/${encodeURIComponent(entityName)}/tags/${encodeURIComponent(key2)}`,
+        { method: "PATCH", body, query: { update_mask: "tag_value" } }
+      );
+    }
+  }
+  async list(entityType, entityName) {
+    const response = await this.client.get(
+      `/api/2.1/unity-catalog/entity-tag-assignments/${entityType}/${encodeURIComponent(entityName)}/tags`
+    );
+    return response.tag_assignments ?? [];
+  }
+  remove(entityType, entityName, key2) {
+    return this.client.json(`/api/2.1/unity-catalog/entity-tag-assignments/${entityType}/${encodeURIComponent(entityName)}/tags/${encodeURIComponent(key2)}`, {
+      method: "DELETE"
+    });
+  }
+  /**
+   * Every schema the person can see that carries one of these tags (with
+   * `value`, only that value), across all catalogs, in one SQL query.
+   */
+  async schemas(warehouseId, tags, value, signal) {
+    if (!tags.length) return [];
+    const statement = `SELECT catalog_name, schema_name, tag_name, tag_value FROM system.information_schema.schema_tags WHERE tag_name IN (${tags.map(quote).join(", ")})` + (value !== void 0 ? ` AND tag_value = ${quote(value)}` : "") + " ORDER BY catalog_name, schema_name LIMIT 2000";
+    const { result } = await new Sql(this.client).execute(statement, { warehouseId, rowLimit: 2e3, timeoutMs: 12e4, ...signal && { signal } });
+    return result.rows.map((row) => ({ catalog: String(row[0]), schema: String(row[1]), tag: String(row[2]), value: row[3] == null ? "" : String(row[3]) }));
+  }
+  /** Tags a schema through SQL (works for plain and governed tags you may assign). */
+  async tagSchema(warehouseId, catalog, schema2, tags) {
+    const pairs = Object.entries(tags).map(([key2, value]) => `${quote(key2)} = ${quote(value)}`);
+    if (!pairs.length) return;
+    await new Sql(this.client).execute(`ALTER SCHEMA ${ident(catalog)}.${ident(schema2)} SET TAGS (${pairs.join(", ")})`, { warehouseId, timeoutMs: 12e4 });
+  }
+};
+
+// packages/core/src/warehouse.ts
+async function resolveWarehouse(service, explicit) {
+  const client = await service.ready();
+  const sql = new Sql(client);
+  const warehouses = await sql.warehouses();
+  const preferred = explicit || service.preferences.get("warehouseId");
+  const chosen = preferred && warehouses.find((w) => w.id === preferred || w.name === preferred) || Sql.pick(warehouses);
+  if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
+  return { id: chosen.id, name: chosen.name };
+}
+
+// packages/core/src/skill-catalog.ts
+var SKILL_LOCATIONS = "skillLocations";
+var FRESH_MS = 5 * 6e4;
+var IDLE = { status: "idle", schemas: [], skills: [] };
+var hostOf = (service) => {
+  const snapshot = service.snapshot();
+  return snapshot.status === "connected" ? snapshot.profile.host : void 0;
+};
+var schemaOf = (fullName) => fullName.split(".").slice(0, 2).join(".");
+var SkillCatalog = class {
+  constructor(service) {
+    this.service = service;
+    service.subscribe(() => {
+      const host = hostOf(service);
+      if (host === this.host) return;
+      this.host = host;
+      this.loading = void 0;
+      this.set(IDLE);
+    });
+    this.host = hostOf(service);
+  }
+  state = IDLE;
+  host;
+  loading;
+  listeners = /* @__PURE__ */ new Set();
+  snapshot = () => this.state;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  /** Schemas the person added by hand. */
+  locations() {
+    return this.service.preferences.get(SKILL_LOCATIONS) ?? [];
+  }
+  setLocations(locations) {
+    const clean = [...new Set(locations.map((location) => location.trim()).filter((location) => /^[^.\s]+\.[^.\s]+$/.test(location)))];
+    this.service.preferences.set(SKILL_LOCATIONS, clean.length ? clean : void 0);
+    void this.load(true);
+  }
+  /** Discovers schemas and lists their skills; reuses a fresh result unless `force`. */
+  load(force = false) {
+    if (!force && this.state.status === "ready" && this.state.at && Date.now() - this.state.at < FRESH_MS) return Promise.resolve(this.state);
+    if (this.loading && !force) return this.loading;
+    const host = this.host;
+    this.set({ ...this.state, status: "loading" });
+    let loading;
+    loading = (async () => {
+      try {
+        const client = await this.service.ready();
+        let tagged = [];
+        let note;
+        try {
+          const warehouse = await resolveWarehouse(this.service);
+          tagged = await new Tags(client).schemas(warehouse.id, [SKILLS_TAG, CHANNEL_TAG, DOMAIN_TAG]);
+        } catch (error) {
+          note = `Couldn't look for tagged skills schemas: ${describeError(error)}`;
+        }
+        const byName = /* @__PURE__ */ new Map();
+        for (const row of tagged) {
+          const name = `${row.catalog}.${row.schema}`;
+          const entry = byName.get(name) ?? { tags: {}, source: "tag" };
+          entry.tags[row.tag] = row.value;
+          byName.set(name, entry);
+        }
+        for (const [name, entry] of byName) if (!(SKILLS_TAG in entry.tags) && !(CHANNEL_TAG in entry.tags)) byName.delete(name);
+        for (const location of this.locations()) if (!byName.has(location)) byName.set(location, { tags: {}, source: "added" });
+        const schemas = [...byName].map(([schema2, entry]) => ({ schema: schema2, ...entry })).sort((a, b) => a.schema.localeCompare(b.schema));
+        const skills = schemas.length ? await this.listSkills(schemas.map((entry) => entry.schema)) : [];
+        const next = { status: "ready", schemas, skills, at: Date.now(), ...note && { note } };
+        if (host === this.host) this.set(next);
+        return next;
+      } catch (error) {
+        const next = { status: "error", schemas: [], skills: [], error: describeError(error) };
+        if (host === this.host) this.set(next);
+        return next;
+      } finally {
+        if (this.loading === loading) this.loading = void 0;
+      }
+    })();
+    this.loading = loading;
+    return loading;
+  }
+  /** All skills in these schemas: the registry first, the REST API if it fails. */
+  async listSkills(schemas) {
+    const skills = new Skills(await this.service.ready());
+    try {
+      return await skills.registry(schemas);
+    } catch {
+      const lists2 = await Promise.all(
+        schemas.map(async (schema2) => {
+          const [catalog, name] = schema2.split(".");
+          return (await skills.list(catalog, name).catch(() => [])).filter((skill) => skill.finalize_time || skill.bundle_name);
+        })
+      );
+      return lists2.flat().map((skill) => ({ fullName: skill.name.replace(/^skills\//, ""), description: skill.description ?? skill.comment ?? "" })).sort((a, b) => a.fullName.localeCompare(b.fullName));
+    }
+  }
+  async search(query, limit = 20) {
+    const state = await this.load();
+    return { skills: searchSkills(state.skills, query, limit), state };
+  }
+  /** The schema linked to a Buzz channel, if anyone set one up. */
+  async channel(channelId) {
+    const find = (state2) => {
+      const entry = state2.schemas.find((schema2) => schema2.tags[CHANNEL_TAG] === channelId);
+      return entry && { schema: entry.schema, channelId, ...entry.tags[DOMAIN_TAG] && { domainId: entry.tags[DOMAIN_TAG] } };
+    };
+    const state = await this.load();
+    const found = find(state);
+    if (found || !state.at || Date.now() - state.at < 6e4) return found;
+    return find(await this.load(true));
+  }
+  /** The skills in a channel's schema. */
+  async channelSkills(channelId) {
+    const link = await this.channel(channelId);
+    if (!link) return [];
+    return this.state.skills.filter((skill) => schemaOf(skill.fullName) === link.schema);
+  }
+  set(state) {
+    this.state = state;
+    for (const listener of [...this.listeners]) listener();
+  }
+};
+
+// plugins/agents/src/skills.ts
+var SCHEMA = /^[^.\s]+\.[^.\s]+$/;
+var SKILL = /^[^.\s]+\.[^.\s]+\.[^.\s]+$/;
+function normalizeSkills(value) {
+  const choice = value ?? {};
+  const clean = (list, pattern) => [
+    ...new Set(Array.isArray(list) ? list.filter((item) => typeof item === "string" && pattern.test(item)) : [])
+  ];
+  return { schemas: clean(choice.schemas, SCHEMA), names: clean(choice.names, SKILL), channel: choice.channel !== false };
+}
+var catalogs = /* @__PURE__ */ new WeakMap();
+function skillCatalogFor(service, profile) {
+  let byProfile = catalogs.get(service);
+  if (!byProfile) catalogs.set(service, byProfile = /* @__PURE__ */ new Map());
+  const key2 = profile ?? "";
+  let catalog = byProfile.get(key2);
+  if (!catalog) byProfile.set(key2, catalog = new SkillCatalog(profile && service.forProfile ? service.forProfile(profile) : service));
+  return catalog;
+}
+async function resolveSkills(source, choice, channelId) {
+  const problems = [];
+  const state = await source.load();
+  if (state.error) problems.push(state.error);
+  else if (state.note) problems.push(state.note);
+  const byName = new Map(state.skills.map((skill) => [skill.fullName, skill]));
+  const picked = /* @__PURE__ */ new Map();
+  for (const name of choice.names) {
+    const skill = byName.get(name);
+    if (skill) picked.set(name, skill);
+    else if (!state.error) problems.push(`${name} isn't available to you`);
+  }
+  const schemas = new Set(choice.schemas);
+  for (const skill of state.skills) if (schemas.has(schemaOf(skill.fullName))) picked.set(skill.fullName, skill);
+  if (choice.channel && channelId) {
+    try {
+      for (const skill of await source.channelSkills(channelId)) picked.set(skill.fullName, skill);
+    } catch (error) {
+      problems.push(`Couldn't load this channel's skills: ${describeError(error)}`);
+    }
+  }
+  return { skills: [...picked.values()].sort((a, b) => a.fullName.localeCompare(b.fullName)), problems };
+}
+var LISTED = 40;
+var NAMES_LISTED = 100;
+var DESCRIPTION_MAX = 200;
+var shorten = (text, max) => {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}\u2026` : flat;
+};
+function skillsSection(skills) {
+  if (!skills.length) return "";
+  const listed = skills.slice(0, LISTED).map((skill) => `- ${skill.fullName}: ${shorten(skill.description, DESCRIPTION_MAX) || "(no description)"}`);
+  const rest = skills.slice(LISTED);
+  const more = rest.length ? `Also available, without descriptions: ${rest.slice(0, NAMES_LISTED).map((skill) => skill.fullName).join(", ")}${rest.length > NAMES_LISTED ? `, and ${rest.length - NAMES_LISTED} more` : ""}.` : "";
+  return [
+    "<databricks-skills>",
+    "These skills are written instructions for particular kinds of work. Before you follow one, load it with skills_load, using its full name, and follow what it says. When it points to other files, read them with skills_read_files.",
+    ...listed,
+    more,
+    "</databricks-skills>"
+  ].filter(Boolean).join("\n");
+}
+function skillsNote(skills) {
+  return skills.length ? "Your owner's skills are installed in your Sandbox's skill folders. When one matches the task, follow its instructions." : "";
+}
+var FILE_CHARS = 12e3;
+var NAMES_IN_ERRORS = 60;
+var clipText = (text, max) => text.length > max ? `${text.slice(0, max)}
+\u2026 (${text.length - max} characters cut)` : text;
+function skillTools(api, skills) {
+  const byName = new Map(skills.map((skill) => [skill.fullName, skill]));
+  const find = (raw) => {
+    const name = typeof raw === "string" ? raw.trim() : "";
+    const found = byName.get(name);
+    if (found) return found;
+    const names = [...byName.keys()].slice(0, NAMES_IN_ERRORS);
+    return `There is no skill named "${name}". Your skills are: ${names.join(", ") || "none"}.`;
+  };
+  const nameParameter = { type: "string", description: "The skill's full name, as listed in your skills." };
+  return [
+    {
+      name: "skills_load",
+      description: "Loads one of your skills: its SKILL.md instructions, and the names of its other files. Load a skill before you follow it.",
+      parameters: { type: "object", properties: { name: nameParameter }, required: ["name"] },
+      async run(args, signal) {
+        const found = find(args.name);
+        if (typeof found === "string") return found;
+        const skills2 = await api(signal);
+        const [markdown, files] = await Promise.all([skills2.load(found.fullName, signal), skills2.files(found.fullName, signal).catch(() => [])]);
+        const others = files.filter((path) => path !== "SKILL.md");
+        return [
+          clipText(markdown.trim(), 2e4),
+          others.length ? `Other files in this skill (read them with skills_read_files): ${others.join(", ")}` : ""
+        ].filter(Boolean).join("\n\n");
+      }
+    },
+    {
+      name: "skills_read_files",
+      description: "Reads some of a skill's files, such as the ones its SKILL.md points to. Pass the skill's full name and the file paths that skills_load listed.",
+      parameters: {
+        type: "object",
+        properties: { name: nameParameter, paths: { type: "array", items: { type: "string" }, description: "Up to 10 file paths, relative to the skill." } },
+        required: ["name", "paths"]
+      },
+      async run(args, signal) {
+        const found = find(args.name);
+        if (typeof found === "string") return found;
+        const wanted = (Array.isArray(args.paths) ? args.paths : [args.paths]).filter((path) => typeof path === "string" && path.length > 0).slice(0, 10);
+        if (!wanted.length) return "Pass the paths of the files to read.";
+        const skills2 = await api(signal);
+        const files = new Set(await skills2.files(found.fullName, signal));
+        const parts = [];
+        for (const path of wanted) {
+          if (!files.has(path)) {
+            parts.push(`${path}: not a file in ${found.fullName}`);
+            continue;
+          }
+          parts.push(`=== ${path} ===
+${clipText(await skills2.read(found.fullName, path, signal), FILE_CHARS)}`);
+        }
+        return parts.join("\n\n");
+      }
+    }
+  ];
+}
+
+// plugins/agents/src/skills-sandbox.ts
+var SKILL_ROOTS = [`${SANDBOX_HOME}/.claude/skills`, `${SANDBOX_HOME}/.agents/skills`];
+var SKILLS_MANIFEST = `${SANDBOX_HOME}/.buzz/skills/manifest.json`;
+var SEPARATOR = "@@buzz-skills@@";
+var FOLDER = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+var FILES_MAX = 300;
+function folderOf(skill, bundle) {
+  const name = bundle || skill.split(".").pop() || "";
+  return FOLDER.test(name) && !name.includes("..") ? name : void 0;
+}
+var versionOf = (skill) => [skill.etag, skill.update_time, skill.finalize_time].filter(Boolean).join("|") || "unversioned";
+function planSync(desired, installed, present) {
+  const plan = { add: [], update: [], unchanged: [], remove: [], skipped: [] };
+  const taken = /* @__PURE__ */ new Set();
+  for (const item of desired) {
+    if (taken.has(item.folder)) {
+      plan.skipped.push({ skill: item.skill, reason: `another skill already uses the folder ${item.folder}` });
+      continue;
+    }
+    taken.add(item.folder);
+    const mine = installed[item.folder];
+    if (!present.has(item.folder)) plan.add.push(item);
+    else if (!mine) plan.skipped.push({ skill: item.skill, reason: `a folder named ${item.folder} is already there, and Buzz didn't install it` });
+    else if (mine.skill !== item.skill || mine.version !== item.version) plan.update.push(item);
+    else plan.unchanged.push(item);
+  }
+  for (const folder of Object.keys(installed)) if (!taken.has(folder)) plan.remove.push(folder);
+  return plan;
+}
+var safePath = (path) => path.length > 0 && !path.startsWith("/") && !path.split("/").some((part) => part === "" || part === "." || part === "..");
+function parseManifest(text) {
+  try {
+    const parsed = JSON.parse(text);
+    const roots = {};
+    for (const [root, entries] of Object.entries(parsed?.roots ?? {})) {
+      roots[root] = {};
+      for (const [folder, entry] of Object.entries(entries ?? {}))
+        if (FOLDER.test(folder) && typeof entry?.skill === "string" && typeof entry.version === "string") roots[root][folder] = { skill: entry.skill, version: entry.version };
+    }
+    return { roots };
+  } catch {
+    return { roots: {} };
+  }
+}
+async function writeSkill(sandboxes, sandbox, api, root, item, signal) {
+  const dir = `${root}/${item.folder}`;
+  const files = (await api.files(item.skill, signal)).filter(safePath);
+  if (!files.includes("SKILL.md")) throw new Error("it has no SKILL.md");
+  if (files.length > FILES_MAX) throw new Error(`it has more than ${FILES_MAX} files`);
+  try {
+    for (const path of files) await sandboxes.writeFile(sandbox, `${dir}/${path}`, await api.read(item.skill, path, signal), signal);
+  } catch (error) {
+    await sandboxes.bash(sandbox, `rm -rf -- ${shellQuote(dir)}`, { timeoutSeconds: 30 }).catch(() => {
+    });
+    throw error;
+  }
+}
+var queues = /* @__PURE__ */ new Map();
+function installSkills(input) {
+  const previous = queues.get(input.sandbox) ?? Promise.resolve();
+  const next = previous.catch(() => {
+  }).then(() => syncOnce(input));
+  queues.set(input.sandbox, next);
+  return next;
+}
+async function syncOnce({ sandboxes, sandbox, api, skills, signal }) {
+  const outcome = { added: /* @__PURE__ */ new Set(), updated: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), unchanged: /* @__PURE__ */ new Set(), problems: /* @__PURE__ */ new Set() };
+  const timeout = { timeoutSeconds: 60, ...signal && { signal } };
+  const before = await sandboxes.bash(sandbox, `cat ${shellQuote(SKILLS_MANIFEST)} 2>/dev/null; true`, timeout);
+  const manifest = parseManifest(before.stdout ?? "");
+  const hasInstalled = Object.values(manifest.roots).some((entries) => Object.keys(entries).length > 0);
+  if (!skills.length && !hasInstalled) return { added: [], updated: [], removed: [], unchanged: [], problems: [] };
+  const present = /* @__PURE__ */ new Map();
+  if (skills.length) {
+    const listing = await sandboxes.bash(
+      sandbox,
+      SKILL_ROOTS.map((root) => `ls -1A ${shellQuote(root)} 2>/dev/null; echo ${SEPARATOR}`).join("\n"),
+      timeout
+    );
+    const parts = (listing.stdout ?? "").split(`${SEPARATOR}
+`);
+    SKILL_ROOTS.forEach((root, index) => present.set(root, new Set((parts[index] ?? "").split("\n").map((line) => line.trim()).filter(Boolean))));
+  }
+  const versions = /* @__PURE__ */ new Map();
+  const failed = /* @__PURE__ */ new Set();
+  const schemas = [...new Set(skills.map((skill) => schemaOf(skill.fullName)))];
+  await Promise.all(
+    schemas.map(async (schema2) => {
+      const [catalog, name] = schema2.split(".");
+      try {
+        for (const skill of await api.list(catalog, name, signal)) versions.set(skillFullName(skill.name), { ...skill.bundle_name && { bundle: skill.bundle_name }, version: versionOf(skill) });
+      } catch (error) {
+        failed.add(schema2);
+        outcome.problems.add(`Couldn't check the skills in ${schema2}: ${describeError(error)}`);
+      }
+    })
+  );
+  const desired = [];
+  for (const skill of skills) {
+    const info = versions.get(skill.fullName);
+    if (!info) {
+      if (!failed.has(schemaOf(skill.fullName))) outcome.problems.add(`${skill.fullName} isn't listed in its schema`);
+      continue;
+    }
+    const folder = folderOf(skill.fullName, info.bundle);
+    if (!folder) {
+      outcome.problems.add(`${skill.fullName} has no folder name the agent can use`);
+      continue;
+    }
+    desired.push({ skill: skill.fullName, folder, version: info.version });
+  }
+  const next = { roots: {} };
+  for (const root of SKILL_ROOTS) {
+    const installed = manifest.roots[root] ?? {};
+    const plan = planSync(desired, installed, present.get(root) ?? /* @__PURE__ */ new Set());
+    for (const skipped of plan.skipped) outcome.problems.add(`${skipped.skill} isn't installed: ${skipped.reason}`);
+    const kept = {};
+    for (const item of plan.unchanged) {
+      kept[item.folder] = { skill: item.skill, version: item.version };
+      outcome.unchanged.add(item.skill);
+    }
+    const gone = [...plan.remove, ...plan.update.map((item) => item.folder)].filter((folder) => FOLDER.test(folder));
+    const cleared = gone.length ? await sandboxes.bash(sandbox, `rm -rf -- ${gone.map((folder) => shellQuote(`${root}/${folder}`)).join(" ")}`, timeout) : { exit_code: 0 };
+    const clearFailed = (cleared.exit_code ?? 0) !== 0;
+    for (const folder of plan.remove) {
+      if (clearFailed) kept[folder] = installed[folder];
+      else outcome.removed.add(installed[folder]?.skill ?? folder);
+    }
+    for (const item of [...plan.add, ...plan.update]) {
+      const isUpdate = plan.update.includes(item);
+      try {
+        await writeSkill(sandboxes, sandbox, api, root, item, signal);
+        kept[item.folder] = { skill: item.skill, version: item.version };
+        (isUpdate ? outcome.updated : outcome.added).add(item.skill);
+      } catch (error) {
+        outcome.problems.add(`Couldn't install ${item.skill}: ${describeError(error)}`);
+      }
+    }
+    next.roots[root] = kept;
+  }
+  const changed = JSON.stringify(next) !== JSON.stringify(manifest);
+  if (changed) await sandboxes.writeFile(sandbox, SKILLS_MANIFEST, `${JSON.stringify(next, null, 2)}
+`, signal);
+  return {
+    added: [...outcome.added],
+    updated: [...outcome.updated],
+    removed: [...outcome.removed],
+    unchanged: [...outcome.unchanged],
+    problems: [...outcome.problems]
+  };
+}
+
 // packages/core/src/api/ai.ts
 var DEFAULT_MODELS = [
   { id: "system.ai.claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
@@ -2513,7 +3322,16 @@ function AgentForm(props) {
         onChange({ ...rest, ...profile && { profile }, tools: config.tools.filter((tool) => tool.kind === "genie-one") });
       }
     }
-  ), kind.id === "sandbox" && /* @__PURE__ */ React.createElement(SandboxFields, { workspace, config, onChange, ...props.disabled !== void 0 && { disabled: props.disabled } }), kind.id === "custom" && /* @__PURE__ */ React.createElement(
+  ), kind.id === "sandbox" && /* @__PURE__ */ React.createElement(
+    SandboxFields,
+    {
+      service: props.service,
+      workspace,
+      config,
+      onChange,
+      ...props.disabled !== void 0 && { disabled: props.disabled }
+    }
+  ), kind.id === "custom" && /* @__PURE__ */ React.createElement(
     CustomAgentField,
     {
       service: workspace,
@@ -2552,7 +3370,7 @@ function SandboxFields(props) {
       ...remote && { accepts: (id) => harnessAccepts(remote, id), hint: `Models ${harness.label} can use, from AI Gateway in this workspace.` },
       onChange: (model) => onChange({ ...config, model })
     }
-  ), remote && /* @__PURE__ */ React.createElement(Field, { label: "Permissions", hint: permissionsHint(remote, config.permissions) }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.permissions, onChange: (event) => onChange({ ...config, permissions: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "standard" }, "Standard"), /* @__PURE__ */ React.createElement("option", { value: "full" }, "Full access"))), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
+  ), remote && /* @__PURE__ */ React.createElement(Field, { label: "Permissions", hint: permissionsHint(remote, config.permissions) }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.permissions, onChange: (event) => onChange({ ...config, permissions: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "standard" }, "Standard"), /* @__PURE__ */ React.createElement("option", { value: "full" }, "Full access"))), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(SkillsField, { service: props.service, ...config.profile && { profile: config.profile }, value: config.skills, ...disabled, onChange: (skills) => onChange({ ...config, skills }) }), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, disabled: props.disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })));
 }
 function SettingsTab(props) {
   const [draft, setDraft] = React.useState(props.config);
@@ -2968,6 +3786,69 @@ function ToolsField(props) {
     }
   );
 }
+function SkillsField(props) {
+  const { service, profile } = props;
+  const status2 = useConnection(service).status;
+  const catalog = React.useMemo(() => skillCatalogFor(service, profile), [service, profile]);
+  const state = React.useSyncExternalStore(catalog.subscribe, catalog.snapshot);
+  React.useEffect(() => {
+    if (status2 === "connected") void catalog.load();
+  }, [catalog, status2]);
+  const value = normalizeSkills(props.value);
+  const chosenSchemas = new Set(value.schemas);
+  const chosenNames = new Set(value.names);
+  const bySchema = /* @__PURE__ */ new Map();
+  for (const skill of state.skills) bySchema.set(schemaOf(skill.fullName), [...bySchema.get(schemaOf(skill.fullName)) ?? [], skill]);
+  const schemaNames = [.../* @__PURE__ */ new Set([...state.schemas.map((entry) => entry.schema), ...bySchema.keys(), ...chosenSchemas])].sort((a, b) => a.localeCompare(b));
+  const options = [];
+  const listed = /* @__PURE__ */ new Set();
+  for (const schema2 of schemaNames) {
+    if (!chosenSchemas.has(schema2) && !bySchema.has(schema2)) continue;
+    options.push({ id: `schema:${schema2}`, label: `All skills in ${schema2}`, group: schema2, detail: "Always the latest skills in this schema", keywords: "schema" });
+    for (const skill of bySchema.get(schema2) ?? []) {
+      listed.add(skill.fullName);
+      options.push({ id: `skill:${skill.fullName}`, label: skill.fullName.split(".").pop(), group: schema2, ...skill.description && { detail: skill.description }, keywords: skill.fullName });
+    }
+  }
+  for (const name of value.names) if (!listed.has(name)) options.push({ id: `skill:${name}`, label: name.split(".").pop(), group: "Chosen", detail: name });
+  for (const schema2 of value.schemas) if (!schemaNames.includes(schema2)) options.push({ id: `schema:${schema2}`, label: `All skills in ${schema2}`, group: "Chosen" });
+  const chosenIds = /* @__PURE__ */ new Set([...value.schemas.map((schema2) => `schema:${schema2}`), ...value.names.map((name) => `skill:${name}`)]);
+  const selected = options.filter((option) => chosenIds.has(option.id));
+  const toggle = (option, on) => {
+    const separator = option.id.indexOf(":");
+    const kind = option.id.slice(0, separator);
+    const id = option.id.slice(separator + 1);
+    if (kind === "schema") props.onChange({ ...value, schemas: on ? [...value.schemas.filter((item) => item !== id), id] : value.schemas.filter((item) => item !== id) });
+    else props.onChange({ ...value, names: on ? [...value.names.filter((item) => item !== id), id] : value.names.filter((item) => item !== id) });
+  };
+  const notes = [state.note, state.error].filter((note) => Boolean(note));
+  return /* @__PURE__ */ React.createElement(
+    MultiPicker,
+    {
+      label: "Skills",
+      hint: "Skills come from schemas tagged agent_skills or added in Settings \u2192 Databricks Knowledge.",
+      searchPlaceholder: (() => {
+        const skills = options.filter((option) => option.id.startsWith("skill:")).length;
+        return `Search ${skills} ${skills === 1 ? "skill" : "skills"}`;
+      })(),
+      selected,
+      options,
+      loading: status2 !== "connected" ? false : state.status === "loading" ? "Finding skills\u2026" : false,
+      notes,
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onToggle: toggle,
+      footer: /* @__PURE__ */ React.createElement("label", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          checked: value.channel,
+          ...props.disabled !== void 0 && { disabled: props.disabled },
+          onChange: (event) => props.onChange({ ...value, channel: event.target.checked })
+        }
+      ), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Use the skills of the channel it's working in"))
+    }
+  );
+}
 function CustomAgentField(props) {
   const { service } = props;
   const status2 = useConnection(service).status;
@@ -3048,6 +3929,7 @@ function normalizeHosted(value) {
     model: typeof config.model === "string" && harnessAccepts(harness, config.model) ? config.model : HARNESS_MODEL[harness],
     // Genie One unless the owner chose otherwise (an empty list is a choice).
     tools: Array.isArray(config.tools) ? normalizeChoices(config.tools) : [GENIE_ONE_CHOICE],
+    skills: normalizeSkills(config.skills),
     availability: config.availability === "always" ? "always" : "sleep",
     scope: config.scope === "channel" ? "channel" : "thread",
     instructions: typeof config.instructions === "string" ? config.instructions : "",
@@ -3135,10 +4017,20 @@ async function stopped(sandboxes, sandbox, signal) {
     signal?.throwIfAborted();
   }
 }
+async function syncHostedSkills(service, record, sandboxes, signal) {
+  if (record.config.kind !== "sandbox") return;
+  try {
+    const workspace = workspaceOf(service, record.config.profile);
+    const { skills } = await resolveSkills(skillCatalogFor(service, record.config.profile), normalizeSkills(record.config.skills));
+    await installSkills({ sandboxes, sandbox: record.sandbox, api: new Skills(await workspace.ready(signal)), skills, ...signal && { signal } });
+  } catch {
+  }
+}
 async function deploy(service, record, options) {
   const { client, sandboxes } = await sandboxOf(service, record, options.signal);
   await sandboxes.ensureRunning(record.sandbox, { ...options.signal && { signal: options.signal } });
   await uploadRunner(sandboxes, record.sandbox, options.signal);
+  await syncHostedSkills(service, record, sandboxes, options.signal);
   const workspaceId = workspaceIdOf(workspaceOf(service, record.config.profile));
   await sandboxes.writeFile(record.sandbox, `${AGENT_DIR}/config.json`, `${JSON.stringify(runnerConfigOf(record, client.host, workspaceId), null, 2)}
 `, options.signal);
@@ -3254,6 +4146,7 @@ function hostedProvider(agents, service) {
       const start = async () => {
         await sandboxes.ensureRunning(record.sandbox, { ...signal && { signal } });
         if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
+        await syncHostedSkills(service, record, sandboxes, signal);
         const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...signal && { signal } });
         if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
         return JSON.parse((result.stdout ?? "").trim() || "{}");
@@ -3395,7 +4288,7 @@ function HostedForm(props) {
       hint: `Models ${harness.label} can use, from AI Gateway in this workspace.`,
       onChange: (model) => onChange({ ...config, model })
     }
-  ), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...disabled, onChange: (tools) => onChange({ ...config, tools }) })), /* @__PURE__ */ React.createElement(Field, { label: "Availability", hint: AVAILABILITY_HINT[config.availability] }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.availability, onChange: (event) => onChange({ ...config, availability: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "sleep" }, "Sleep when Buzz is closed"), /* @__PURE__ */ React.createElement("option", { value: "always" }, "Always on"))), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), config.kind === "sandbox" && /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, ...disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })), !props.locked && /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Only your own messages reach it. Its Sandbox belongs to you in Databricks; removing the agent deletes it.")));
+  ), /* @__PURE__ */ React.createElement(ToolsField, { service: workspace, tools: config.tools, ...disabled, onChange: (tools) => onChange({ ...config, tools }) }), /* @__PURE__ */ React.createElement(SkillsField, { service: props.service, ...config.profile && { profile: config.profile }, value: config.skills, ...disabled, onChange: (skills) => onChange({ ...config, skills }) })), /* @__PURE__ */ React.createElement(Field, { label: "Availability", hint: AVAILABILITY_HINT[config.availability] }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.availability, onChange: (event) => onChange({ ...config, availability: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "sleep" }, "Sleep when Buzz is closed"), /* @__PURE__ */ React.createElement("option", { value: "always" }, "Always on"))), /* @__PURE__ */ React.createElement(Field, { label: "Conversation", hint: "Thread: each thread is its own conversation. Channel: one conversation for the whole channel." }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: config.scope, onChange: (event) => onChange({ ...config, scope: event.target.value }) }, /* @__PURE__ */ React.createElement("option", { value: "thread" }, "One per thread"), /* @__PURE__ */ React.createElement("option", { value: "channel" }, "One per channel"))), config.kind === "sandbox" && /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Optional. Who it is, what it should focus on, how to answer." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 5, ...disabled, value: config.instructions, onChange: (event) => onChange({ ...config, instructions: event.target.value }) })), !props.locked && /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "Only your own messages reach it. Its Sandbox belongs to you in Databricks; removing the agent deletes it.")));
 }
 var STATE_LABEL = {
   SANDBOX_STATE_RUNNING: "Running",
@@ -3739,151 +4632,6 @@ function trimHistory(messages, maxChars = 12e4, maxMessages = 120) {
   return messages.slice(start);
 }
 
-// packages/core/src/api/sql.ts
-var StatementError = class extends Error {
-  constructor(message, statementId, state) {
-    super(message);
-    this.statementId = statementId;
-    this.state = state;
-    this.name = "StatementError";
-  }
-};
-var RUNNING = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
-var EXPIRED = "Databricks no longer keeps this result. Run the statement again to see it.";
-var Sql = class {
-  constructor(client) {
-    this.client = client;
-  }
-  async warehouses(signal) {
-    const response = await this.client.get("/api/2.0/sql/warehouses", signal ? { signal } : {});
-    return response.warehouses ?? [];
-  }
-  /** The best default: running serverless, any serverless, running, first. */
-  static pick(warehouses) {
-    const score = (w) => (w.enable_serverless_compute || w.warehouse_type === "SERVERLESS" ? 2 : 0) + (w.state === "RUNNING" ? 1 : 0);
-    return [...warehouses].sort((a, b) => score(b) - score(a))[0];
-  }
-  /** Runs a statement and waits for its first result chunk. */
-  async execute(statement, options) {
-    const signal = options.signal;
-    let response = await this.client.post(
-      "/api/2.0/sql/statements",
-      {
-        statement,
-        warehouse_id: options.warehouseId,
-        // Short, so the statement ID comes back soon: with it, a run cut off
-        // (Buzz closing) can be picked up again.
-        wait_timeout: "10s",
-        on_wait_timeout: "CONTINUE",
-        disposition: "INLINE",
-        format: "JSON_ARRAY",
-        row_limit: options.rowLimit ?? 1e3,
-        ...options.catalog && { catalog: options.catalog },
-        ...options.schema && { schema: options.schema }
-      },
-      { timeoutMs: 3e4, ...signal && { signal } }
-    );
-    options.onStatement?.(response.statement_id);
-    return this.follow(response, options);
-  }
-  /**
-   * A statement started earlier, by its ID: waits for it if it's still
-   * running, then returns its first result chunk. Databricks keeps a result
-   * only for a while; after that this fails with `state` CLOSED.
-   */
-  async resume(statementId, options = {}) {
-    const signal = options.signal;
-    let response;
-    try {
-      response = await this.client.get(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}`, signal ? { signal } : {});
-    } catch (error) {
-      if (error.status === 404) throw new StatementError(EXPIRED, statementId, "CLOSED");
-      throw error;
-    }
-    return this.follow(response, options);
-  }
-  async follow(first, options) {
-    const signal = options.signal;
-    let response = first;
-    const deadline = Date.now() + (options.timeoutMs ?? 5 * 6e4);
-    const cancel = () => void this.cancel(response.statement_id).catch(() => {
-    });
-    signal?.addEventListener("abort", cancel, { once: true });
-    try {
-      let delay = 750;
-      while (RUNNING.has(response.status?.state ?? "")) {
-        if (Date.now() > deadline) {
-          cancel();
-          throw new StatementError("The query took too long and was cancelled.", response.statement_id, "CANCELED");
-        }
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        signal?.throwIfAborted();
-        delay = Math.min(3e3, delay * 1.5);
-        response = await this.client.get(
-          `/api/2.0/sql/statements/${encodeURIComponent(response.statement_id)}`,
-          signal ? { signal } : {}
-        );
-      }
-    } finally {
-      signal?.removeEventListener("abort", cancel);
-    }
-    const state = response.status?.state;
-    if (state === "CLOSED") throw new StatementError(EXPIRED, response.statement_id, state);
-    if (state !== "SUCCEEDED")
-      throw new StatementError(
-        response.status?.error?.message ?? `The query ended as ${state ?? "unknown"}.`,
-        response.statement_id,
-        state
-      );
-    return { statementId: response.statement_id, result: fromStatement(response) };
-  }
-  cancel(statementId) {
-    return this.client.post(`/api/2.0/sql/statements/${encodeURIComponent(statementId)}/cancel`, {});
-  }
-  catalogs(signal) {
-    return this.client.get("/api/2.1/unity-catalog/catalogs", signal ? { signal } : {}).then((response) => response.catalogs ?? []);
-  }
-  schemas(catalog, signal) {
-    return this.client.get("/api/2.1/unity-catalog/schemas", {
-      query: { catalog_name: catalog },
-      ...signal && { signal }
-    }).then((response) => response.schemas ?? []);
-  }
-  tables(catalog, schema2, signal) {
-    return this.client.get(
-      "/api/2.1/unity-catalog/tables",
-      { query: { catalog_name: catalog, schema_name: schema2, max_results: 200 }, ...signal && { signal } }
-    ).then((response) => response.tables ?? []);
-  }
-  table(fullName, signal) {
-    return this.client.get(`/api/2.1/unity-catalog/tables/${encodeURIComponent(fullName)}`, signal ? { signal } : {});
-  }
-};
-function isReadOnlySql(statement) {
-  const stripped = statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ").replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/`[^`]*`/g, "``").trim();
-  const statements = stripped.split(";").map((part) => part.trim()).filter(Boolean);
-  if (!statements.length) return false;
-  return statements.every((part) => {
-    const first = /^\(*\s*(\w+)/.exec(part)?.[1]?.toUpperCase();
-    if (!first || !["SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "VALUES", "TABLE", "LIST"].includes(first))
-      return false;
-    return !/\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|COPY|OPTIMIZE|VACUUM|REFRESH|RESTORE|CALL)\b/i.test(
-      part.replace(/^WITH[\s\S]*?\bSELECT\b/i, "SELECT")
-    );
-  });
-}
-
-// plugins/sql/src/runs.ts
-async function resolveWarehouse(service, explicit) {
-  const client = await service.ready();
-  const sql = new Sql(client);
-  const warehouses = await sql.warehouses();
-  const preferred = explicit || service.preferences.get("warehouseId");
-  const chosen = preferred && warehouses.find((w) => w.id === preferred || w.name === preferred) || Sql.pick(warehouses);
-  if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
-  return { id: chosen.id, name: chosen.name };
-}
-
 // plugins/sql/src/tools.ts
 var ALLOW_WRITES = "sqlAgentWrites";
 var AUDIENCE2 = "These rows came from the owner's Databricks access; everyone in this conversation can read what you post. To let readers re-run it with their own access, post the SQL in a ```sql block.";
@@ -3956,8 +4704,8 @@ function sqlTools(service) {
         const catalog = stringArg(args, "catalog", false);
         const schemaName = stringArg(args, "schema", false);
         if (!catalog) {
-          const catalogs = await sql.catalogs();
-          return catalogs.map((c) => `- ${c.name}${c.comment ? `: ${c.comment}` : ""}`).join("\n") || "No catalogs visible.";
+          const catalogs2 = await sql.catalogs();
+          return catalogs2.map((c) => `- ${c.name}${c.comment ? `: ${c.comment}` : ""}`).join("\n") || "No catalogs visible.";
         }
         if (!schemaName) {
           const schemas = await sql.schemas(catalog);
@@ -4211,6 +4959,7 @@ function normalizeDatabricks(config) {
     instructions: typeof value.instructions === "string" ? value.instructions : "",
     scope: value.scope === "channel" ? "channel" : "thread",
     tools: normalizeChoices(value.tools),
+    skills: normalizeSkills(value.skills),
     ...typeof value.profile === "string" && value.profile && { profile: value.profile },
     ...custom && { custom }
   };
@@ -4296,22 +5045,28 @@ function registerTypes(agents, kit, service) {
     );
     delivery.workingUntil(done);
   }
-  async function sandboxSetup(delivery, config, workspace, signal, step) {
+  const skillsFor = (config, channelId) => resolveSkills(skillCatalogFor(service, config.profile), normalizeSkills(config.skills), channelId);
+  async function sandboxSetup(delivery, config, workspace, signal, step, channelId) {
     const on = await sandboxOn(workspace, signal);
     const sandbox = on ? sandboxTools(workspace, delivery.agent.pubkey, delivery.agent.name, step) : [];
     const tools = await databricksTools(service, workspace, config, sandbox, signal);
+    const skills = await skillsFor(config, channelId).catch((error) => ({ skills: [], problems: [describeError(error)] }));
+    const skillApi = async (skillSignal) => new Skills(await workspace.ready(skillSignal));
+    const local = skills.skills.length ? [...tools.local, ...skillTools(skillApi, skills.skills)] : tools.local;
     const instructions = [
       config.instructions.trim(),
       on ? SANDBOX_PROMPT : "Databricks Sandbox isn't turned on in this workspace, so you can't run code or keep files this turn.",
+      skillsSection(skills.skills),
+      skills.problems.length ? `Skills that didn't load this turn: ${skills.problems.join("; ")}.` : "",
       toolsNote(workspace, service, tools.problems)
     ].filter(Boolean).join("\n\n");
-    return { tools, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
+    return { tools: { ...tools, local }, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
   }
   async function sandboxTurn(delivery, config, conversation, signal, report) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
-    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state));
+    const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
     const ai = new Ai(client);
@@ -4355,7 +5110,16 @@ function registerTypes(agents, kit, service) {
     if (tools) await uploadRunner(sandbox, sandboxFor(delivery.agent.pubkey), signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
     const continued = session.remote?.harness === harness ? { harness, id: session.remote.id } : void 0;
-    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions, config.tools), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
+    const skills = await skillsFor(config, conversation.channel).catch((error) => ({ skills: [], problems: [describeError(error)] }));
+    const installed = await installSkills({ sandboxes: sandbox, sandbox: sandboxFor(delivery.agent.pubkey), api: new Skills(client), skills: skills.skills, signal }).catch((error) => ({
+      added: [],
+      updated: [],
+      removed: [],
+      unchanged: [],
+      problems: [`Couldn't install skills: ${describeError(error)}`]
+    }));
+    for (const problem of [...skills.problems, ...installed.problems]) report.tool("skills", problem);
+    const instructions = [config.instructions.trim(), remoteNote(harness, config.permissions, config.tools), skillsNote(skills.skills), toolsNote(workspace, service, [])].filter(Boolean).join("\n\n");
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd: WORK_DIR, instructions, tools: false });
     const prompt = await kit.turnPrompt(delivery, conversation, continued && session.cursor ? { cursor: session.cursor } : {});
     let started = false;
@@ -4562,7 +5326,7 @@ ${answer.sql.trim()}
         }
         const workspace = agentService(service, config.profile);
         const client = await workspace.ready(standalone.signal);
-        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal, (state) => report.tool("sandbox", state));
+        const { tools, instructions } = await sandboxSetup(standalone.delivery, config, workspace, standalone.signal, (state) => report.tool("sandbox", state), standalone.delivery.channelId);
         const system = await kit.systemPrompt(standalone.delivery, { scope: config.scope, cwd: "~", instructions, tools: true });
         const ai = new Ai(client);
         await runLoop({

@@ -13,6 +13,7 @@
 // permissions (each harness's own guarded mode) and answer only their owner.
 import type { Agents, AgentType } from "@buzz/author";
 import { SANDBOX_HOME, Sandboxes } from "@dbx/core/api/sandbox";
+import { Skills } from "@dbx/core/api/skills";
 import type { DatabricksClient } from "@dbx/core/client";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
@@ -23,7 +24,9 @@ import { type ActivityLine, type ActivityTurn, turnsFromLines } from "./activity
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
-import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, ToolsField, useAgentService, WorkspaceField } from "./ui";
+import { normalizeSkills, resolveSkills, type SkillsChoice, skillCatalogFor } from "./skills";
+import { installSkills } from "./skills-sandbox";
+import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, SkillsField, ToolsField, useAgentService, WorkspaceField } from "./ui";
 
 export const HOSTED_TYPE_ID = "databricks-hosted";
 const AGENT_DIR = `${SANDBOX_HOME}/.buzz/agent`;
@@ -52,6 +55,8 @@ export type HostedConfig = {
   model: string;
   /** A Sandbox agent's Databricks tools (Genie One, Genie agents, MCP servers), as the local type's. */
   tools: ToolChoice[];
+  /** Unity Catalog skills, installed in its Sandbox. The channel's skills aren't installed for hosted agents. */
+  skills?: SkillsChoice;
   availability: Availability;
   scope: "thread" | "channel";
   instructions: string;
@@ -69,6 +74,7 @@ export function normalizeHosted(value: unknown): HostedConfig {
     model: typeof config.model === "string" && harnessAccepts(harness, config.model) ? config.model : HARNESS_MODEL[harness],
     // Genie One unless the owner chose otherwise (an empty list is a choice).
     tools: Array.isArray(config.tools) ? normalizeChoices(config.tools) : [GENIE_ONE_CHOICE],
+    skills: normalizeSkills(config.skills),
     availability: config.availability === "always" ? "always" : "sleep",
     scope: config.scope === "channel" ? "channel" : "thread",
     instructions: typeof config.instructions === "string" ? config.instructions : "",
@@ -202,11 +208,28 @@ async function stopped(sandboxes: Sandboxes, sandbox: string, signal?: AbortSign
   }
 }
 
+/**
+ * Installs a sandbox agent's skills in its Sandbox, where its harness looks for
+ * them. Hosted agents run unattended, so this runs when the agent is deployed
+ * and whenever Buzz wakes it; a failure doesn't stop the agent.
+ */
+async function syncHostedSkills(service: DatabricksService, record: HostedRecord, sandboxes: Sandboxes, signal?: AbortSignal) {
+  if (record.config.kind !== "sandbox") return;
+  try {
+    const workspace = workspaceOf(service, record.config.profile);
+    const { skills } = await resolveSkills(skillCatalogFor(service, record.config.profile), normalizeSkills(record.config.skills));
+    await installSkills({ sandboxes, sandbox: record.sandbox, api: new Skills(await workspace.ready(signal)), skills, ...(signal && { signal }) });
+  } catch {
+    // Kept for the next deploy or wake.
+  }
+}
+
 /** Starts the Sandbox if it sleeps, refreshes the runner and its config, and (re)starts it. */
 async function deploy(service: DatabricksService, record: HostedRecord, options: Readonly<{ restart: boolean; publishProfile: boolean; signal?: AbortSignal }>) {
   const { client, sandboxes } = await sandboxOf(service, record, options.signal);
   await sandboxes.ensureRunning(record.sandbox, { ...(options.signal && { signal: options.signal }) });
   await uploadRunner(sandboxes, record.sandbox, options.signal);
+  await syncHostedSkills(service, record, sandboxes, options.signal);
   const workspaceId = workspaceIdOf(workspaceOf(service, record.config.profile));
   await sandboxes.writeFile(record.sandbox, `${AGENT_DIR}/config.json`, `${JSON.stringify(runnerConfigOf(record, client.host, workspaceId), null, 2)}\n`, options.signal);
   // Best effort: the relay may admit the agent only once Buzz writes its listing, after
@@ -335,6 +358,7 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
         await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
         // A newer plugin brings a newer runner: put it in place and restart the runner on it.
         if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
+        await syncHostedSkills(service, record, sandboxes, signal);
         const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...(signal && { signal }) });
         if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
         return JSON.parse((result.stdout ?? "").trim() || "{}") as RunnerStatus;
@@ -522,6 +546,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
               onChange={(model) => onChange({ ...config, model })}
             />
             <ToolsField service={workspace} tools={config.tools} {...disabled} onChange={(tools) => onChange({ ...config, tools })} />
+            <SkillsField service={props.service} {...(config.profile && { profile: config.profile })} value={config.skills} {...disabled} onChange={(skills) => onChange({ ...config, skills })} />
           </>
         )}
         <Field label="Availability" hint={AVAILABILITY_HINT[config.availability]}>

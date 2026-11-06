@@ -11,7 +11,8 @@ flowchart LR
     agents[Agents]
     memory[Memory]
     lakebase[Lakebase]
-    genie & sql & agents & memory & lakebase -- "ctx.inject(['databricks'])" --> core
+    knowledge[Knowledge]
+    genie & sql & agents & memory & lakebase & knowledge -- "ctx.inject(['databricks'])" --> core
   end
   core -- "databricks auth token/login" --> cli[(Databricks CLI<br/>OS keychain)]
   core -- "curl --config - (HTTPS only)" --> ws[(Databricks workspace<br/>REST · MCP · AI Gateway)]
@@ -39,6 +40,7 @@ Buzz lets `ctx.host.request` reach only exact origins fixed in the manifest (at 
 | Memory | **Databricks Memory**: search/read/write/list/delete tools for every agent, plus a Settings view to browse, search and forget entries. | `actor_id` is the signed-in user, set by the plugin. Pointing at the same store a Databricks-hosted agent uses shares memory with it. |
 | Genie agents / custom agents | **Genie** (Genie One by default, or a Genie agent) and **Databricks custom agent** types. Custom agents are Model Serving endpoints (Responses, ChatAgent or chat formats, detected from the endpoint task) or Databricks Apps (Agent Runtime `/api/invocations`, then `/responses`). | One Genie conversation or agent session per Buzz thread. |
 | Databricks SQL MCP | SQL tools and the ` ```sql ` Run action call the Statement Execution API directly. The MCP client (`packages/core/src/api/mcp.ts`) speaks Streamable HTTP to Unity Gateway MCP services such as `system.ai.dbsql`, Genie One and the `/api/2.0/mcp/*` servers. | The direct API works without the Unity Gateway beta; MCP is used where it adds capability (Genie One). |
+| Unity Catalog skills, domains and Pages | **Databricks Knowledge**: **Set up Databricks** in a channel's menu (domain + skills schema, linked by schema tags), **Make this a skill** and **Add to page** on messages, draft cards agents post and people publish, and skill search and loading for every agent. Databricks agents take a **Skills** list; Claude Code, Codex and Pi get real skill folders in their Sandbox. | Skills are found across the metastore with one query on `information_schema.schema_tags` and one registry call. See *Skills, domains and Pages*. |
 | Other | Live chips and panels for job, run, pipeline, table and dashboard links. A **job-run Attention source** wakes an agent when a run finishes. A read-only `databricks_api_get` escape hatch. A Unity Catalog browser. | |
 
 ## Agent tools and workspaces
@@ -159,6 +161,80 @@ Buzz renders only the selected page and removes it when you leave, so state in a
   - `genieConversations` maps each Genie agent to its open conversation. Genie keeps conversations, so the page loads its messages, follows one still running and fetches the latest result.
   - `genieOneChat` holds Genie One's conversation ID and its 10 newest turns: question, response ID, steps (the server clears them once a response is done) and times. Genie One can't list a conversation's turns, but `genie_poll_response` returns an earlier response by its IDs, even after later questions (tested again an hour later), and `genie_get_query_result` its rows. A question still running when Buzz closed is followed to its end. A turn that failed on our side, such as a request cut off as Buzz closed, is saved without the error, so it's asked for again; only a turn you stopped keeps "Stopped.".
   - `sqlText` and `sqlLastRun` hold the statement and the run's statement ID. `Sql.resume` gets the result back (`GET /api/2.0/sql/statements/<id>`), or waits for a statement still running. Databricks keeps results only for a while; a `CLOSED` or missing statement says to run it again. Statements are sent with `wait_timeout: 10s`, so the ID arrives within 10 seconds and a run cut off after that can be picked up.
+
+## Skills, domains and Pages
+
+**Databricks Knowledge** (`plugins/knowledge`) ties channels to Unity Catalog. A channel can be linked to a **domain** and a **skills schema**. People turn messages into **skills** (Unity Catalog skills: a `SKILL.md` plus files, governed like volumes) and, once Pages is on, into **page** snippets. Every Buzz agent can search and load the team's skills, and Databricks agents can be equipped with them. Agents draft; people publish, as themselves.
+
+### Finding skills without walking the catalog
+
+The Skills API lists one schema at a time, and Unity Gateway's own `ug` finds skills by walking every catalog and schema under a time budget. Skills don't appear in the information schema, but schema tags do, so discovery is two calls:
+
+1. One SQL query on `system.information_schema.schema_tags` finds every schema tagged `agent_skills` (a skills schema) or `buzz_channel` (a channel's schema), across all catalogs. The information schema only shows what the person can see, so permissions apply without extra checks. About a second on a running warehouse.
+2. One `tools/list` on the skills registry's MCP server, scoped to those schemas (`/ai-gateway/skills/?schema=a.b&schema=c.d`), returns every skill in them as a `skill_<full name>` tool with its description. A schema that's missing or unreadable is skipped, not an error.
+
+Search runs locally over names and descriptions (`searchSkills`). `SkillCatalog` (`packages/core/src/skill-catalog.ts`) keeps the result for five minutes per workspace. Schemas added by hand in Settings are searched too, so a workspace without a SQL warehouse still works, and the catalog says why tagged schemas weren't found. The REST list is the fallback if the registry doesn't answer.
+
+### A channel's link lives in Databricks
+
+Plugins can't read or write a channel's Canvas, and per-device preferences aren't shared, so the link is a set of tags on the channel's schema:
+
+| Tag | Value | Why |
+| --- | --- | --- |
+| `agent_skills` | the channel's name | its skills are discovered like any skills schema |
+| `buzz_channel` | the channel's ID | every member's plugin, and every agent's tools (which get the channel ID in their call context), find the schema with the same query |
+| `buzz_domain` | the domain's ID | the channel's domain, without listing domains |
+| the domain's own governed tag | (none) | the schema belongs to the domain in Unity Catalog |
+
+A skill published to a channel's schema also gets the domain's governed tag (`POST /api/2.1/unity-catalog/entity-tag-assignments` with `entity_type: "skills"`; SQL `SET TAGS` can't tag skills). Unity Catalog's tag-based grant policies (Beta) can then share everything in a domain with one rule.
+
+### Set up Databricks (the channel menu)
+
+The panel links or creates the domain, then the schema, then tags. The order is chosen so a failed step leaves nothing behind:
+
+1. **Domain:** an existing one (listing needs MANAGE DISCOVERY), or a new draft. A domain needs a governed tag policy with the same key, so setup makes the policy first if it's missing. Accounts have a cap on tag policies, and setup says so plainly when it's reached. If this step fails, no schema is made.
+2. **Schema:** an existing `catalog.schema`, or a new one (CREATE SCHEMA). Only standard managed catalogs are offered, since skills need managed storage.
+3. **Tags:** the domain's governed tag (if that's refused, the channel still links and the step says what to ask a domain admin for), then `agent_skills` and `buzz_domain`, then `buzz_channel` last, so a channel never points at a half-made schema.
+4. **Optional grants** for a group or user: USE SCHEMA and READ VOLUME on the schema, then USE CATALOG separately, since that often needs an admin.
+
+A refused step shows what to ask for, with copyable SQL. Running setup again fixes missing tags. **Unlink** removes only `buzz_channel`. Other members see a new link when their catalog refreshes (within five minutes); the system tag views can lag a little after a change, so the panel shows the link from the setup result right away.
+
+### Tools for every agent
+
+Buzz offers plugin tools to every agent, and each call says which channel it's in (`context.channel`):
+
+- `databricks_skills_search`, `databricks_skills_load` (SKILL.md through the registry, plus the skill's other files) and `databricks_skills_read_files` (capped). Search puts the channel's skills first.
+- `databricks_skills_draft` and `databricks_page_draft` return a card to post, and never write. The skill's default schema is the channel's, then the person's default (Settings), else the card asks.
+- `databricks_channel_info` (the channel's domain, schema, skills and pages), `databricks_pages_search` and `databricks_page_read`. Without Pages, they say an account admin turns it on under Previews.
+
+### Skills for Databricks agents
+
+A **Skills** field (next to Tools) takes single skills or whole schemas (always their latest skills), and **Use the skills of the channel it's working in** (on by default). It's offered for the Sandbox agent, Claude Code, Codex and Pi, local or hosted.
+
+- **Model-loop agents** get a prompt section listing their skills (40 with descriptions, then names only) and `skills_load` and `skills_read_files`, limited to their resolved skills.
+- **Claude Code, Codex and Pi** get real skill folders in their Sandbox before each turn: Claude Code reads `~/.claude/skills`, Codex and Pi read `~/.agents/skills`. Buzz records what it installed in `~/.buzz/skills/manifest.json` and only changes those folders; a folder of the same name it didn't make is left alone and reported. Nothing is written when nothing changed.
+- **Hosted agents** get their skills when deployed or saved and on each wake (about every four minutes while Buzz is open), not before every turn, and not the channel's skills, because they answer while Buzz is closed.
+- Skill files are read and written as text, so binary files in a skill aren't supported yet.
+
+### Publishing
+
+A skill is created empty (`POST /api/2.1/unity-catalog/skills?parent=schemas/<c>.<s>&skill_id=<id>`), its files are uploaded through the Files API (`PUT /api/2.0/fs/files/Skills/<c>/<s>/<id>/<path>`), and finalize reads `SKILL.md`'s frontmatter into its name and description. `Skills.publish` does all three, removes a skill it just created if an upload fails, and refuses an existing name unless asked to replace it. The registry's own create/update/delete tools only return CLI commands, so publishing uses the REST API.
+
+Writes that others will see go through a person. An agent's `databricks_skills_draft` and `databricks_page_draft` tools return a ` ```databricks-skill ` or ` ```databricks-page ` block for the agent to post. The block renders as a card, and whoever clicks **Publish** (or **Add as draft**) does the write with their own access. The ⋯ menu's **Make this a skill** and **Add to page** open the same editors from a single message, in a top-layer modal (a native `<dialog>`: plugins get no portal, and the message row could clip an overlay). For a whole thread, ask an agent, which can read it.
+
+### Who does what
+
+| Who | Does | Needs |
+| --- | --- | --- |
+| Account admin | Turns on the Skills and Pages previews | Account admin |
+| Workspace admin | Turns on **Unity Gateway skills in Genie**; makes catalogs for skills; optionally a tag-based grant policy | Workspace admin |
+| Channel steward | **Set up Databricks** in the channel menu: links or creates the domain (draft) and schema, tags the schema, optionally grants a group | MANAGE DISCOVERY for domains, room for a tag policy in the account to create one, CREATE SCHEMA (or an existing schema), APPLY TAG on it, ASSIGN on the domain's tag |
+| Member | Searches and uses skills; publishes skills; adds draft page snippets | READ VOLUME; CREATE VOLUME on the schema; own Pages drafts need no extra rights (publishing needs Page Manager or Domain Admin) |
+| Plugin and agents | Act as the signed-in person; never raise anyone's rights | Databricks agents only obey their owner |
+
+Pages aren't encrypted with customer-managed keys and may be replicated across regions, so the page card warns against personal data. Domains are account-wide, so a domain made from one workspace is seen from the others in the account.
+
+**Checked live** in the lab workspace: tag discovery across catalogs; publish, replace, registry listing, search, load, file reads, tagging a skill and sharing; channel tags and `SkillCatalog.channel` finding them; the setup path's report when the account's tag-policy cap is reached; Claude Code, Codex and Pi in a Sandbox finding an installed skill (10–13 s) and a model-loop agent loading one (3.5 s); in the playground, Settings, the skill card publishing, the agent form's Skills field, a turn following a chosen skill, and **Make this a skill** from its reply. **Not yet:** creating a domain (the lab account is at its tag-policy cap), assigning a domain's governed tag, Pages beyond the 501 it answers in the lab, and these surfaces inside Buzz itself.
 
 ## Verification status
 

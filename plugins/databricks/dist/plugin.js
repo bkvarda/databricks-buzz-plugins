@@ -1396,6 +1396,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-dbx] .dbx-chip button { border: 0; background: transparent; color: var(--dbx-subtle); cursor: pointer; padding: 0 3px; font: inherit; line-height: 1; }
 [data-dbx] .dbx-card { background: var(--dbx-surface); border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius-card); }
+dialog.dbx-modal { padding: 0; border: 1px solid var(--border-standard, #E0E0E0); border-radius: 12px; background: var(--surface-panel, #FFFFFF); color: var(--text-standard, #161616); width: min(640px, calc(100vw - 32px)); max-height: 86vh; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.25); }
+dialog.dbx-modal::backdrop { background: rgba(0, 0, 0, 0.35); }
 [data-dbx] .dbx-row:hover { background: var(--affordance-row-hover, var(--affordance-subtle-hover, #F2F2F2)); }
 [data-dbx] .dbx-row[aria-selected="true"] { background: var(--affordance-selected, var(--affordance-subtle, #EDEDED)); }
 [data-dbx] .dbx-mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
@@ -2075,7 +2077,8 @@ var SUITE = [
   { id: "bkvarda.databricks-sql", folder: "sql", name: "Databricks SQL", blurb: "Run SQL from conversations and give agents governed SQL and catalog tools." },
   { id: "bkvarda.databricks-agents", folder: "agents", name: "Databricks Agents", blurb: "Agents powered by Databricks: models, Genie agents, your custom agents and Sandboxes." },
   { id: "bkvarda.databricks-memory", folder: "memory", name: "Databricks Memory", blurb: "Long-term agent memory in Databricks managed memory, shared across your agents." },
-  { id: "bkvarda.databricks-lakebase", folder: "lakebase", name: "Lakebase", blurb: "Let agents read operational data from Lakebase Postgres through the Data API." }
+  { id: "bkvarda.databricks-lakebase", folder: "lakebase", name: "Lakebase", blurb: "Let agents read operational data from Lakebase Postgres through the Data API." },
+  { id: "bkvarda.databricks-knowledge", folder: "knowledge", name: "Databricks Knowledge", blurb: "Unity Catalog skills, domains and Pages: make skills from messages and give every agent your team's skills." }
 ];
 function hostLabel(host) {
   return host.replace(/^https:\/\//, "");

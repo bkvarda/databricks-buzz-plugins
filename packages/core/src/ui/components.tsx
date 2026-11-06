@@ -423,6 +423,53 @@ export function Disclosure(props: { summary: ReactNode; children: ReactNode; def
   );
 }
 
+/**
+ * A modal in the browser's top layer (a native <dialog> opened with
+ * showModal), so no message row, scroller or transform around the component
+ * that opens it can clip or move it: plugins get no portal. Escape or the
+ * close button dismisses it; a click outside doesn't, so edits aren't lost.
+ */
+export function Modal(props: { title: string; onClose(): void; children: ReactNode }) {
+  const ref = React.useRef<HTMLDialogElement>(null);
+  const onClose = React.useRef(props.onClose);
+  onClose.current = props.onClose;
+  React.useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (!dialog.open) {
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+    }
+    const cancel = (event: Event) => {
+      event.preventDefault();
+      onClose.current();
+    };
+    dialog.addEventListener("cancel", cancel);
+    return () => {
+      dialog.removeEventListener("cancel", cancel);
+      if (dialog.open && typeof dialog.close === "function") dialog.close();
+    };
+  }, []);
+  ensureStyles();
+  return (
+    <dialog ref={ref} className="dbx-modal" aria-label={props.title}>
+      <DbxRoot style={{ padding: 20, overflow: "auto" }}>
+        <Stack gap={14}>
+          <Stack direction="row" justify="space-between" align="center" gap={8}>
+            <Text as="h2" size="xl" weight={500}>
+              {props.title}
+            </Text>
+            <Button variant="ghost" size="sm" aria-label="Close" onClick={() => onClose.current()}>
+              ✕
+            </Button>
+          </Stack>
+          {props.children}
+        </Stack>
+      </DbxRoot>
+    </dialog>
+  );
+}
+
 /** Formats relative age like "2m ago". */
 export function ago(ms: number, now = Date.now()) {
   const s = Math.max(0, Math.round((now - ms) / 1000));

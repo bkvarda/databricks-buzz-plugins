@@ -210,6 +210,8 @@ var STYLESHEET = `
 [data-dbx] .dbx-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-dbx] .dbx-chip button { border: 0; background: transparent; color: var(--dbx-subtle); cursor: pointer; padding: 0 3px; font: inherit; line-height: 1; }
 [data-dbx] .dbx-card { background: var(--dbx-surface); border: 1px solid var(--dbx-border); border-radius: var(--dbx-radius-card); }
+dialog.dbx-modal { padding: 0; border: 1px solid var(--border-standard, #E0E0E0); border-radius: 12px; background: var(--surface-panel, #FFFFFF); color: var(--text-standard, #161616); width: min(640px, calc(100vw - 32px)); max-height: 86vh; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.25); }
+dialog.dbx-modal::backdrop { background: rgba(0, 0, 0, 0.35); }
 [data-dbx] .dbx-row:hover { background: var(--affordance-row-hover, var(--affordance-subtle-hover, #F2F2F2)); }
 [data-dbx] .dbx-row[aria-selected="true"] { background: var(--affordance-selected, var(--affordance-subtle, #EDEDED)); }
 [data-dbx] .dbx-mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
@@ -957,7 +959,7 @@ function isReadOnlySql(statement) {
   });
 }
 
-// plugins/sql/src/runs.ts
+// packages/core/src/warehouse.ts
 async function resolveWarehouse(service, explicit) {
   const client = await service.ready();
   const sql = new Sql(client);
@@ -967,6 +969,8 @@ async function resolveWarehouse(service, explicit) {
   if (!chosen) throw new Error("No SQL warehouse is available to you in this workspace.");
   return { id: chosen.id, name: chosen.name };
 }
+
+// plugins/sql/src/runs.ts
 var hostOf = (service) => {
   const snapshot = service.snapshot();
   return snapshot.status === "connected" ? snapshot.profile.host : void 0;

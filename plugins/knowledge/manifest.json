@@ -1,0 +1,10 @@
+{
+  "id": "bkvarda.databricks-knowledge",
+  "name": "Databricks Knowledge",
+  "apiVersion": 1,
+  "description": "Unity Catalog skills, domains and Pages in your channels: make skills from messages, give every agent your team's skills, and link a channel to a domain.",
+  "discovery": {
+    "category": "agent-tools",
+    "tags": ["Databricks", "Unity Catalog", "Skills", "Domains", "Pages", "Agents"]
+  }
+}
