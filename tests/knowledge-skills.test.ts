@@ -120,12 +120,12 @@ describe("databricks_skills_load and read_files", () => {
   });
 });
 
-describe("databricks_skills_draft", () => {
+describe("databricks_skills_save", () => {
   const INSTRUCTIONS = "## Steps\n\n1. Use `main.sales.orders`\n\n```sql\nSELECT 1\n```\n\nSay \"done\".";
 
   it("returns a block that reads back as the same draft", async () => {
     const { tool, client } = setup();
-    const text = await tool("databricks_skills_draft").call(
+    const text = await tool("databricks_skills_save").call(
       { channel: "c1" },
       { name: "Quarterly revenue (SQL)", description: "How to write quarterly revenue SQL.", instructions: INSTRUCTIONS, files: [{ path: "references/tables.md", content: "# Tables\n" }] },
     );
@@ -145,26 +145,26 @@ describe("databricks_skills_draft", () => {
   it("targets the channel's schema, then the person's default, then asks", async () => {
     const args = { name: "steps", description: "Steps.", instructions: "Do it." };
     const linked = setup({}, { skillsDefaultSchema: "main.hr" });
-    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await linked.tool("databricks_skills_draft").call({ channel: "c1" }, args))![1]!).schema).toBe("main.sales");
+    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await linked.tool("databricks_skills_save").call({ channel: "c1" }, args))![1]!).schema).toBe("main.sales");
 
     const preferred = setup({}, { skillsDefaultSchema: "main.hr" });
-    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await preferred.tool("databricks_skills_draft").call({}, args))![1]!).schema).toBe("main.hr");
+    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await preferred.tool("databricks_skills_save").call({}, args))![1]!).schema).toBe("main.hr");
 
     const none = setup();
-    const asked = await none.tool("databricks_skills_draft").call({}, args);
+    const asked = await none.tool("databricks_skills_save").call({}, args);
     expect(asked).toContain("the card asks where to publish");
     expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(asked)![1]!).schema).toBeUndefined();
 
     const explicit = setup({}, { skillsDefaultSchema: "main.hr" });
-    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await explicit.tool("databricks_skills_draft").call({ channel: "c1" }, { ...args, schema: "main.hr" }))![1]!).schema).toBe("main.hr");
+    expect(parseDraft(/```databricks-skill\n([\s\S]*?)\n```/.exec(await explicit.tool("databricks_skills_save").call({ channel: "c1" }, { ...args, schema: "main.hr" }))![1]!).schema).toBe("main.hr");
   });
 
   it("rejects a draft that can't be published", async () => {
     const { tool, client } = setup();
     const base = { name: "steps", description: "Steps.", instructions: "Do it." };
-    await expect(tool("databricks_skills_draft").call({}, { ...base, description: "" })).rejects.toThrow(/Add a description/);
-    await expect(tool("databricks_skills_draft").call({}, { ...base, files: [{ path: "../escape.md", content: "x" }] })).rejects.toThrow(/cannot contain/);
-    await expect(tool("databricks_skills_draft").call({}, { ...base, schema: "nodot" })).rejects.toThrow(/catalog\.schema/);
+    await expect(tool("databricks_skills_save").call({}, { ...base, description: "" })).rejects.toThrow(/Add a description/);
+    await expect(tool("databricks_skills_save").call({}, { ...base, files: [{ path: "../escape.md", content: "x" }] })).rejects.toThrow(/cannot contain/);
+    await expect(tool("databricks_skills_save").call({}, { ...base, schema: "nodot" })).rejects.toThrow(/catalog\.schema/);
   });
 });
 

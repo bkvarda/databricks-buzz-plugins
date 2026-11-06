@@ -146,9 +146,9 @@ export function skillTools(service: DatabricksService, catalog: SkillCatalog): A
       },
     },
     {
-      name: "databricks_skills_draft",
+      name: "databricks_skills_save",
       description:
-        "Drafts a new skill from what you learned in this conversation, for the person to review and publish. This does NOT publish anything: it returns a databricks-skill block. Post that block exactly as it is in your reply; the person sees it as a card, edits it if needed, and publishes it from the card. Write instructions an agent can follow alone: the steps, the rules, the tables and the checks. The target schema defaults to the channel's skills schema.",
+        "Saves a skill (a how-to an agent can follow) to Databricks Unity Catalog, where the person's team and every agent can find it. Use it whenever the person asks to save, make, keep or share a skill, unless they ask for a Buzz note. It returns a databricks-skill block: post that block exactly as it is in your reply. The person sees it as a card, can edit it, and saves it with Publish; nothing is saved until then. Write instructions an agent can follow alone: the steps, the rules, the tables and the checks. The target schema defaults to the channel's skills schema.",
       inputSchema: schema.object(
         {
           name: schema.string("Short name for the skill, e.g. quarterly-revenue. Lowercase letters, digits, hyphens."),

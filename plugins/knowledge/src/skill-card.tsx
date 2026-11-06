@@ -238,7 +238,16 @@ export function SkillEditor(props: {
           Files: {draft.files.map((file) => file.path).join(", ")}
         </Text>
       )}
-      <Field label="Publish to" hint={schema ? undefined : "Pick a schema. Schemas you've set up as skills schemas are listed."}>
+      <Field
+        label="Publish to"
+        hint={
+          schema
+            ? undefined
+            : choices.length
+              ? "Pick a schema. Schemas you've set up as skills schemas are listed."
+              : "You have no skills schema yet. Make one in Settings → Databricks Knowledge (Create a skills schema), or choose Other… and type a schema you can create in."
+        }
+      >
         <Stack direction="row" gap={8} wrap>
           <select
             className="dbx-select"

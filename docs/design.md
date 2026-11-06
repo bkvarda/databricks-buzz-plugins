@@ -206,7 +206,7 @@ A refused step shows what to ask for, with copyable SQL. Running setup again fix
 Buzz offers plugin tools to every agent, and each call says which channel it's in (`context.channel`):
 
 - `databricks_skills_search`, `databricks_skills_load` (SKILL.md through the registry, plus the skill's other files) and `databricks_skills_read_files` (capped). Search puts the channel's skills first.
-- `databricks_skills_draft` and `databricks_page_draft` return a card to post, and never write. The skill's default schema is the channel's, then the person's default (Settings), else the card asks.
+- `databricks_skills_save` and `databricks_page_draft` return a card to post, and never write. The skill's default schema is the channel's, then the person's default (Settings), else the card asks.
 - `databricks_channel_info` (the channel's domain, schema, skills and pages), `databricks_pages_search` and `databricks_page_read`. Without Pages, they say an account admin turns it on under Previews.
 
 ### Skills for Databricks agents
@@ -222,7 +222,7 @@ A **Skills** field (next to Tools) takes single skills or whole schemas (always 
 
 A skill is created empty (`POST /api/2.1/unity-catalog/skills?parent=schemas/<c>.<s>&skill_id=<id>`), its files are uploaded through the Files API (`PUT /api/2.0/fs/files/Skills/<c>/<s>/<id>/<path>`), and finalize reads `SKILL.md`'s frontmatter into its name and description. `Skills.publish` does all three, removes a skill it just created if an upload fails, and refuses an existing name unless asked to replace it. The registry's own create/update/delete tools only return CLI commands, so publishing uses the REST API.
 
-Writes that others will see go through a person. An agent's `databricks_skills_draft` and `databricks_page_draft` tools return a ` ```databricks-skill ` or ` ```databricks-page ` block for the agent to post. The block renders as a card, and whoever clicks **Publish** (or **Add as draft**) does the write with their own access. The ⋯ menu's **Make this a skill** and **Add to page** open the same editors from a single message, in a top-layer modal (a native `<dialog>`: plugins get no portal, and the message row could clip an overlay). For a whole thread, ask an agent, which can read it.
+Writes that others will see go through a person. An agent's `databricks_skills_save` and `databricks_page_draft` tools return a ` ```databricks-skill ` or ` ```databricks-page ` block for the agent to post. The block renders as a card, and whoever clicks **Publish** (or **Add as draft**) does the write with their own access. The ⋯ menu's **Make this a skill** and **Add to page** open the same editors from a single message, in a top-layer modal (a native `<dialog>`: plugins get no portal, and the message row could clip an overlay). For a whole thread, ask an agent, which can read it.
 
 ### Who does what
 
