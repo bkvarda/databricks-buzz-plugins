@@ -2084,10 +2084,14 @@ function useSpaces(store) {
 }
 var SELECTED = "genieSpaceId";
 var GENIE_ONE_ENTRY = "genie-one";
-function useGenieOneAvailable(service, genieOne) {
+function useGenieOneStatus(service, genieOne) {
   const snapshot = useConnection(service);
   const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
-  return useAsync(async () => host ? genieOne.available() : false, [host]).data === true;
+  const check = useAsync(async () => host ? genieOne.available() : false, [host]);
+  return check.loading ? void 0 : check.data === true;
+}
+function useGenieOneAvailable(service, genieOne) {
+  return useGenieOneStatus(service, genieOne) === true;
 }
 function useSelection(service, oneAvailable) {
   const [selected, setSelected] = usePreference(service, SELECTED);
@@ -2105,38 +2109,103 @@ var rowStyle = {
   font: "inherit",
   color: "var(--dbx-ink)"
 };
+var oneLine = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+function Chevron(props) {
+  return /* @__PURE__ */ React.createElement("svg", { width: "13", height: "13", viewBox: "0 0 10 10", "aria-hidden": true, style: { flex: "none", transform: props.open ? void 0 : "rotate(-90deg)", transition: "transform 120ms" } }, /* @__PURE__ */ React.createElement("path", { d: "M2 3.5l3 3 3-3", fill: "none", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round" }));
+}
+var plural = (count) => `${count} ${count === 1 ? "agent" : "agents"}`;
 function genieSidebar(service, store, genieOne) {
   return function GenieSidebar(props) {
     const spaces = useSpaces(store);
-    const oneAvailable = useGenieOneAvailable(service, genieOne);
+    const oneStatus = useGenieOneStatus(service, genieOne);
+    const oneAvailable = oneStatus === true;
     const [selected, setSelected] = useSelection(service, oneAvailable);
+    const [open, setOpen] = React.useState();
+    const expanded = open ?? oneStatus === false;
     const [query, setQuery] = React.useState("");
-    const filtered = spaces.spaces.filter(
-      (space) => !query.trim() || `${space.title} ${space.description ?? ""}`.toLowerCase().includes(query.trim().toLowerCase())
-    );
-    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { padding: "12px 10px 8px" } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie agents"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh" }, "\u21BB")), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Find an agent", value: query, onChange: (event) => setQuery(event.target.value), "aria-label": "Find a Genie agent" })), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie agents", style: { flex: 1, overflow: "auto", padding: "0 6px 8px" } }, oneAvailable && /* @__PURE__ */ React.createElement(
+    const trigger = React.useRef(null);
+    const input = React.useRef(null);
+    const list = React.useRef(null);
+    const current = spaces.spaces.find((space) => space.space_id === selected);
+    const needle = query.trim().toLowerCase();
+    const filtered = spaces.spaces.filter((space) => !needle || `${space.title} ${space.description ?? ""}`.toLowerCase().includes(needle));
+    const close = () => {
+      setOpen(false);
+      setQuery("");
+    };
+    const pick = (id) => {
+      setSelected(id);
+      close();
+    };
+    const summary = current ? current.title : spaces.status === "error" ? "Couldn't list them" : spaces.status === "ready" ? spaces.spaces.length ? plural(spaces.spaces.length) : "None shared with you yet" : "Loading\u2026";
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        close();
+        trigger.current?.focus();
+        return;
+      }
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      event.preventDefault();
+      const options = [...list.current?.querySelectorAll("[role=option]") ?? []];
+      const next = options.indexOf(document.activeElement) + (event.key === "ArrowDown" ? 1 : -1);
+      if (next < 0) input.current?.focus();
+      else options[Math.min(next, options.length - 1)]?.focus();
+    };
+    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", style: { padding: "10px 10px 6px 12px" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh Genie agents" }, "\u21BB")), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie", style: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 2, padding: "0 6px 8px" } }, oneAvailable && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-row", "aria-selected": selected === GENIE_ONE_ENTRY, onClick: () => pick(GENIE_ONE_ENTRY), style: rowStyle }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie One"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Ask across all your data")))), /* @__PURE__ */ React.createElement(
       "button",
       {
+        ref: trigger,
         type: "button",
         className: "dbx-row",
-        "aria-selected": selected === GENIE_ONE_ENTRY,
-        onClick: () => setSelected(GENIE_ONE_ENTRY),
-        style: { ...rowStyle, marginBottom: 6 }
+        "aria-expanded": expanded,
+        "aria-controls": "dbx-genie-agents",
+        "aria-selected": Boolean(current),
+        onClick: () => expanded ? close() : setOpen(true),
+        title: current?.description,
+        style: { ...rowStyle, flex: "none" }
       },
-      /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie One"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Ask across all your data")))
-    ), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", style: { padding: 10 } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading\u2026")), spaces.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm", as: "div", style: { padding: 10 } }, spaces.error), spaces.status === "ready" && !filtered.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { padding: 10 } }, spaces.spaces.length ? "No agents match." : "No Genie agents are shared with you yet."), filtered.map((space) => /* @__PURE__ */ React.createElement(
-      "button",
+      /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Chevron, { open: expanded }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie agents"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", as: "div", style: oneLine }, summary)), spaces.status === "loading" && /* @__PURE__ */ React.createElement(Spinner, { size: 11 }))
+    ), expanded && /* @__PURE__ */ React.createElement(
+      "div",
       {
-        key: space.space_id,
-        type: "button",
-        className: "dbx-row",
-        "aria-selected": space.space_id === selected,
-        onClick: () => setSelected(space.space_id),
-        title: space.description,
-        style: rowStyle
+        id: "dbx-genie-agents",
+        className: "dbx-picker",
+        onKeyDown,
+        style: { display: "flex", flexDirection: "column", flex: "0 1 auto", minHeight: 0, margin: "2px 2px 0" }
       },
-      /* @__PURE__ */ React.createElement(Text, { size: "md", as: "div", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, space.title)
-    ))), props.children && /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", padding: 6 } }, props.children)));
+      /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          ref: input,
+          className: "dbx-input",
+          autoFocus: open === true,
+          placeholder: "Find an agent",
+          "aria-label": "Find a Genie agent",
+          value: query,
+          onChange: (event) => setQuery(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key !== "Enter" || !filtered[0]) return;
+            event.preventDefault();
+            pick(filtered[0].space_id);
+          }
+        }
+      ),
+      /* @__PURE__ */ React.createElement("div", { ref: list, className: "dbx-picker-list", role: "listbox", "aria-label": "Genie agents", style: { minHeight: 0 } }, spaces.status === "loading" && !spaces.spaces.length && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", style: { padding: "8px 10px" } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Loading\u2026")), spaces.status === "error" && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm", as: "div", style: { padding: "8px 10px" } }, spaces.error), spaces.status === "ready" && !filtered.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div", style: { padding: "8px 10px" } }, spaces.spaces.length ? `Nothing matches \u201C${query.trim()}\u201D.` : "No Genie agents are shared with you yet."), filtered.map((space) => /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          key: space.space_id,
+          type: "button",
+          role: "option",
+          className: "dbx-picker-option",
+          "aria-selected": space.space_id === selected,
+          onClick: () => pick(space.space_id),
+          title: space.description
+        },
+        /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-check", "aria-hidden": true }, space.space_id === selected ? "\u2713" : ""),
+        /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-text", style: { ...oneLine, display: "block" } }, space.title)
+      )))
+    )), props.children && /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", padding: 6 } }, props.children)));
   };
 }
 function geniePage(service, store, genieOne, chats) {
@@ -2159,7 +2228,7 @@ function geniePage(service, store, genieOne, chats) {
     else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = /* @__PURE__ */ React.createElement(GenieOneChat, { chat: chats.genieOneChat() });
     else if (spaces.status === "error") body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't list Genie agents" }, spaces.error);
     else if (!space)
-      body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Pick an agent on the left to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Open Genie agents on the left and pick one to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
     else body = /* @__PURE__ */ React.createElement(GenieChat, { key: space.space_id, service, space, chat: chats.space(space.space_id) });
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { height: "100%", overflow: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 920, margin: "0 auto", padding: "24px 28px 16px", minHeight: "100%", display: "flex", flexDirection: "column" } }, body));
   };
