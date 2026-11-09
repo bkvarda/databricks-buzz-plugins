@@ -1,5 +1,8 @@
 # Databricks plugins for Buzz
 
+> [!WARNING]
+> **Experimental. Not officially supported by Databricks.** These plugins are an experimental project. They aren't a Databricks product, Databricks doesn't support them, and they can change or break without notice. Several rely on Databricks features that are themselves in Beta or preview (Sandboxes, Unity Catalog skills, domains and Pages). Use them at your own risk, and report problems as issues in this repository.
+
 A suite of [Buzz](https://github.com/block/buzz-app) plugins that bring Databricks into conversations and agents: one sign-in, Genie with charts, runnable SQL, Databricks-powered agents with Sandboxes, long-term memory, Lakebase, and Unity Catalog skills and domains.
 
 | Plugin | What it adds |
