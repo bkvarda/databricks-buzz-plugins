@@ -31,9 +31,11 @@ open 'buzz://plugin-install?repository=bkvarda%2Fdatabricks-buzz-plugins&ref=mai
 open 'buzz://plugin-install?repository=bkvarda%2Fdatabricks-buzz-plugins&ref=main&path=plugins%2Fknowledge%2Fdist'
 ```
 
+**Updates:** Buzz checks for new versions at startup and every hour, and offers **Update and reload** when one is out. It also lists pending updates under the profile menu → **Plugins**. To turn this off for a plugin, use **Check for updates automatically** in that plugin's actions menu in Settings → Plugins.
+
 An organization can recommend the suite to everyone with a [managed plugins policy](https://github.com/block/buzz-app/blob/main/docs/managed-plugins.md); see [`docs/managed-plugins.example.json`](docs/managed-plugins.example.json).
 
-**Requirements:** the Buzz desktop app. Sandboxes need the **Databricks Sandbox** preview turned on in the workspace. Lakebase reads need the project's Data API turned on and a Postgres role for you, created by a project owner (Settings → Lakebase shows the SQL). Sign-in uses the official [Databricks CLI](https://docs.databricks.com/dev-tools/cli/); if it isn't installed, **Settings → Databricks** installs it for you (checksum-verified, into `~/.local/bin`). The **Databricks Agents** harness needs a Buzz build that includes the plugin harness kit (`ctx.agents.harness`, block/buzz-app#2364).
+**Requirements:** the Buzz desktop app, version 0.7.11 or later. Older Buzz refuses these plugins, because it doesn't recognize the update setting in their manifests; update Buzz first. Sandboxes need the **Databricks Sandbox** preview turned on in the workspace. Lakebase reads need the project's Data API turned on and a Postgres role for you, created by a project owner (Settings → Lakebase shows the SQL). Sign-in uses the official [Databricks CLI](https://docs.databricks.com/dev-tools/cli/); if it isn't installed, **Settings → Databricks** installs it for you (checksum-verified, into `~/.local/bin`). The **Databricks Agents** harness needs a Buzz build that includes the plugin harness kit (`ctx.agents.harness`, block/buzz-app#2364).
 
 ## How sign-in works
 

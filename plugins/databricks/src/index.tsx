@@ -7,6 +7,7 @@ import type { Context, Navigation, PluginInstaller } from "@buzz/author";
 import { parseWorkspaceUrl } from "@dbx/core/api/workspace";
 import { Connection } from "@dbx/core/connection";
 import { optionalService } from "@dbx/core/host-types";
+import { openPluginDetails } from "@dbx/core/installed";
 import { createService } from "@dbx/core/provider";
 import { bindReact, React } from "@dbx/core/react";
 import { RESULT_LANGUAGE } from "@dbx/core/result";
@@ -48,6 +49,7 @@ export function apply(ctx: Context) {
         connection={connection}
         service={service}
         installer={() => optionalService<PluginInstaller>(ctx, "pluginInstaller")}
+        openPlugin={(id) => openPluginDetails(ctx, id)}
       />
     ),
   });

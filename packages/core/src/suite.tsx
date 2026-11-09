@@ -5,6 +5,7 @@
 // registered and explain how to add the core plugin when it is missing.
 import type { Context, PluginInstaller } from "@buzz/author";
 import { optionalService } from "./host-types";
+import { openPluginDetails, useInstallationStatus } from "./installed";
 import { React } from "./react";
 import { CORE_PLUGIN_ID, type DatabricksService, withDatabricks } from "./service";
 import { Button, DbxRoot, EmptyState } from "./ui/components";
@@ -49,15 +50,38 @@ export function useLive<T>(live: Live<T>): T | undefined {
 
 export function MissingCore(props: { ctx: Context; feature: string }) {
   const [message, setMessage] = React.useState<string>();
+  const installer = React.useCallback(() => optionalService<PluginInstaller>(props.ctx, "pluginInstaller"), [props.ctx]);
+  const installed = useInstallationStatus(installer, [CORE_PLUGIN_ID]).get(CORE_PLUGIN_ID) === "installed";
   const add = async () => {
-    const installer = optionalService<PluginInstaller>(props.ctx, "pluginInstaller");
-    if (!installer) {
+    const service = installer();
+    if (!service) {
       setMessage("Add it from Settings → Plugins → Manage plugins → Add, using github.com/bkvarda/databricks-buzz-plugins.");
       return;
     }
-    const outcome = await installer.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable" as const);
+    const outcome = await service.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable" as const);
     if (outcome === "unavailable") setMessage("Close any open plugin review and try again.");
   };
+  if (installed)
+    return (
+      <DbxRoot style={{ padding: 32 }}>
+        <EmptyState
+          title="Turn on the Databricks plugin"
+          action={
+            <Button
+              variant="brand"
+              onClick={() => {
+                if (!openPluginDetails(props.ctx, CORE_PLUGIN_ID)) setMessage("Open Settings → Plugins → Manage plugins and turn on Databricks.");
+              }}
+            >
+              Open in Plugins
+            </Button>
+          }
+        >
+          {props.feature} uses the Databricks plugin ({CORE_PLUGIN_ID}) for sign-in. It's installed but turned off, or it couldn't start.
+          {message && <p>{message}</p>}
+        </EmptyState>
+      </DbxRoot>
+    );
   return (
     <DbxRoot style={{ padding: 32 }}>
       <EmptyState

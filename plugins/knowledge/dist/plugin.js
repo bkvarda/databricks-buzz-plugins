@@ -993,6 +993,47 @@ function numberArg(args, name, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.round(parsed)));
 }
 
+// packages/core/src/installed.ts
+function statusMethods(installer) {
+  const get = installer?.getInstallationStatus;
+  const subscribe = installer?.subscribeInstallationStatus;
+  if (typeof get !== "function" || typeof subscribe !== "function") return void 0;
+  return {
+    get: (id) => get.call(installer, id),
+    subscribe: (id, listener) => subscribe.call(installer, id, () => listener())
+  };
+}
+function useInstallationStatus(installer, ids) {
+  const key = ids.join("\n");
+  const getter = React.useRef(installer);
+  getter.current = installer;
+  const [statuses, setStatuses] = React.useState(/* @__PURE__ */ new Map());
+  React.useEffect(() => {
+    const methods = statusMethods(getter.current());
+    if (!methods) return;
+    const list = key.split("\n");
+    const read = () => {
+      const next = new Map(list.map((id) => [id, methods.get(id)]));
+      setStatuses((current) => sameStatuses(current, next) ? current : next);
+    };
+    const stops = list.map((id) => methods.subscribe(id, read));
+    read();
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [key]);
+  return statuses;
+}
+function sameStatuses(a, b) {
+  return a.size === b.size && [...b].every(([id, status]) => a.get(id) === status);
+}
+function openPluginDetails(ctx, id) {
+  const navigation = optionalService(ctx, "navigation");
+  if (!navigation) return false;
+  void navigation.open({ version: 1, kind: "settings", section: "plugins", pluginId: id });
+  return true;
+}
+
 // packages/core/src/ui/theme.ts
 var BRAND = {
   lava: "#FF3621",
@@ -1428,15 +1469,39 @@ function useLive(live) {
 }
 function MissingCore(props) {
   const [message, setMessage] = React.useState();
+  const installer = React.useCallback(() => optionalService(props.ctx, "pluginInstaller"), [props.ctx]);
+  const installed = useInstallationStatus(installer, [CORE_PLUGIN_ID]).get(CORE_PLUGIN_ID) === "installed";
   const add = async () => {
-    const installer = optionalService(props.ctx, "pluginInstaller");
-    if (!installer) {
+    const service = installer();
+    if (!service) {
       setMessage("Add it from Settings \u2192 Plugins \u2192 Manage plugins \u2192 Add, using github.com/bkvarda/databricks-buzz-plugins.");
       return;
     }
-    const outcome = await installer.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable");
+    const outcome = await service.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable");
     if (outcome === "unavailable") setMessage("Close any open plugin review and try again.");
   };
+  if (installed)
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: 32 } }, /* @__PURE__ */ React.createElement(
+      EmptyState,
+      {
+        title: "Turn on the Databricks plugin",
+        action: /* @__PURE__ */ React.createElement(
+          Button,
+          {
+            variant: "brand",
+            onClick: () => {
+              if (!openPluginDetails(props.ctx, CORE_PLUGIN_ID)) setMessage("Open Settings \u2192 Plugins \u2192 Manage plugins and turn on Databricks.");
+            }
+          },
+          "Open in Plugins"
+        )
+      },
+      props.feature,
+      " uses the Databricks plugin (",
+      CORE_PLUGIN_ID,
+      ") for sign-in. It's installed but turned off, or it couldn't start.",
+      message && /* @__PURE__ */ React.createElement("p", null, message)
+    ));
   return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: 32 } }, /* @__PURE__ */ React.createElement(
     EmptyState,
     {
@@ -2639,37 +2704,47 @@ function SkillEditor(props) {
       action: /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => service.openSettings() }, "Connect")
     },
     "A skill is published to Unity Catalog as you."
-  ), editing ? /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Name", hint: "Lowercase letters, digits, hyphens and underscores. Up to 64 characters." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input dbx-mono", value: draft.name, onChange: (event) => update({ name: event.target.value.trim() }), style: inputStyle }), draft.name && !validSkillId(draft.name) && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "xs" }, "That name won't work; use lowercase letters, digits, hyphens and underscores.")), /* @__PURE__ */ React.createElement(Field, { label: "Description", hint: "One sentence on when an agent should use it." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 2, value: draft.description, onChange: (event) => update({ description: event.target.value }), style: inputStyle })), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Markdown. Write it so an agent can follow it alone." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea dbx-mono", rows: 12, value: draft.instructions, onChange: (event) => update({ instructions: event.target.value }), style: inputStyle }))) : /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { weight: 600, mono: true }, draft.name), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, draft.description), /* @__PURE__ */ React.createElement(Disclosure, { summary: "Instructions" }, /* @__PURE__ */ React.createElement(Markdown, { source: draft.instructions }))), draft.files.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", mono: true }, "Files: ", draft.files.map((file) => file.path).join(", ")), /* @__PURE__ */ React.createElement(Field, { label: "Publish to", hint: schema2 ? void 0 : "Pick a schema. Schemas you've set up as skills schemas are listed." }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, wrap: true }, /* @__PURE__ */ React.createElement(
-    "select",
+  ), editing ? /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Name", hint: "Lowercase letters, digits, hyphens and underscores. Up to 64 characters." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input dbx-mono", value: draft.name, onChange: (event) => update({ name: event.target.value.trim() }), style: inputStyle }), draft.name && !validSkillId(draft.name) && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "xs" }, "That name won't work; use lowercase letters, digits, hyphens and underscores.")), /* @__PURE__ */ React.createElement(Field, { label: "Description", hint: "One sentence on when an agent should use it." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 2, value: draft.description, onChange: (event) => update({ description: event.target.value }), style: inputStyle })), /* @__PURE__ */ React.createElement(Field, { label: "Instructions", hint: "Markdown. Write it so an agent can follow it alone." }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea dbx-mono", rows: 12, value: draft.instructions, onChange: (event) => update({ instructions: event.target.value }), style: inputStyle }))) : /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { weight: 600, mono: true }, draft.name), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, draft.description), /* @__PURE__ */ React.createElement(Disclosure, { summary: "Instructions" }, /* @__PURE__ */ React.createElement(Markdown, { source: draft.instructions }))), draft.files.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", mono: true }, "Files: ", draft.files.map((file) => file.path).join(", ")), /* @__PURE__ */ React.createElement(
+    Field,
     {
-      className: "dbx-select",
-      "aria-label": "Target schema",
-      value: selected,
-      onChange: (event) => {
-        const next = event.target.value;
-        setOtherSchema(next === OTHER);
-        setSchema(next === OTHER ? "" : next);
-      },
-      style: { flex: "1 1 240px", minWidth: 0 }
+      label: "Publish to",
+      hint: schema2 ? void 0 : choices.length ? "Pick a schema. Schemas you've set up as skills schemas are listed." : "You have no skills schema yet. Make one in Settings \u2192 Databricks Knowledge (Create a skills schema), or choose Other\u2026 and type a schema you can create in."
     },
-    /* @__PURE__ */ React.createElement("option", { value: "" }, "Choose a schema"),
-    choices.map((name) => /* @__PURE__ */ React.createElement("option", { key: name, value: name }, name)),
-    /* @__PURE__ */ React.createElement("option", { value: OTHER }, "Other\u2026")
-  ), otherSchema && /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      className: "dbx-input",
-      "aria-label": "catalog.schema",
-      placeholder: "catalog.schema",
-      value: schema2,
-      onChange: (event) => setSchema(event.target.value.trim()),
-      style: { flex: "1 1 200px", minWidth: 0 }
-    }
-  ))), error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: replaceable ? "That name is taken" : "Couldn't publish it" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Button, { variant: "ghost", size: "sm", onClick: () => setEditing((value) => !value) }, editing ? "Done editing" : "Edit"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, onClose && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: onClose }, "Cancel"), replaceable && /* @__PURE__ */ React.createElement(Button, { disabled: busy, onClick: () => void publish(true) }, "Replace it"), /* @__PURE__ */ React.createElement(Button, { variant: "primary", disabled: busy || !connected, onClick: () => void publish(false) }, busy ? "Publishing\u2026" : "Publish skill"))));
+    /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, wrap: true }, /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        className: "dbx-select",
+        "aria-label": "Target schema",
+        value: selected,
+        onChange: (event) => {
+          const next = event.target.value;
+          setOtherSchema(next === OTHER);
+          setSchema(next === OTHER ? "" : next);
+        },
+        style: { flex: "1 1 240px", minWidth: 0 }
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "" }, "Choose a schema"),
+      choices.map((name) => /* @__PURE__ */ React.createElement("option", { key: name, value: name }, name)),
+      /* @__PURE__ */ React.createElement("option", { value: OTHER }, "Other\u2026")
+    ), otherSchema && /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        className: "dbx-input",
+        "aria-label": "catalog.schema",
+        placeholder: "catalog.schema",
+        value: schema2,
+        onChange: (event) => setSchema(event.target.value.trim()),
+        style: { flex: "1 1 200px", minWidth: 0 }
+      }
+    ))
+  ), error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: replaceable ? "That name is taken" : "Couldn't publish it" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between", wrap: true }, /* @__PURE__ */ React.createElement(Button, { variant: "ghost", size: "sm", onClick: () => setEditing((value) => !value) }, editing ? "Done editing" : "Edit"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, onClose && /* @__PURE__ */ React.createElement(Button, { variant: "ghost", onClick: onClose }, "Cancel"), replaceable && /* @__PURE__ */ React.createElement(Button, { disabled: busy, onClick: () => void publish(true) }, "Replace it"), /* @__PURE__ */ React.createElement(Button, { variant: "primary", disabled: busy || !connected, onClick: () => void publish(false) }, busy ? "Publishing\u2026" : "Publish skill"))));
 }
 
 // plugins/knowledge/src/skill-action.tsx
 var hasText = (message) => message.content.trim().length > 0;
+function SkillIcon() {
+  return /* @__PURE__ */ React.createElement("svg", { viewBox: "0 0 24 24", width: "1em", height: "1em", fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("path", { d: "M12 9.5A2.5 2.5 0 0 0 9.5 7H3v11h6a3 3 0 0 1 3 3" }), /* @__PURE__ */ React.createElement("path", { d: "M12 9.5V21" }), /* @__PURE__ */ React.createElement("path", { d: "M12 21a3 3 0 0 1 3-3h6v-7.5" }), /* @__PURE__ */ React.createElement("path", { d: "M12 9.5A2.5 2.5 0 0 1 14.5 7h.5" }), /* @__PURE__ */ React.createElement("path", { d: "M19 1.5v5M16.5 4h5" }));
+}
 function makeSkillAction(service, catalog) {
   return function MakeSkill(props) {
     const { message, close } = props;
@@ -2819,8 +2894,8 @@ ${body}${cut}`);
       }
     },
     {
-      name: "databricks_skills_draft",
-      description: "Drafts a new skill from what you learned in this conversation, for the person to review and publish. This does NOT publish anything: it returns a databricks-skill block. Post that block exactly as it is in your reply; the person sees it as a card, edits it if needed, and publishes it from the card. Write instructions an agent can follow alone: the steps, the rules, the tables and the checks. The target schema defaults to the channel's skills schema.",
+      name: "databricks_skills_save",
+      description: "Saves a skill (a how-to an agent can follow) to Databricks Unity Catalog, where the person's team and every agent can find it. Use it whenever the person asks to save, make, keep or share a skill, unless they ask for a Buzz note. It returns a databricks-skill block: post that block exactly as it is in your reply. The person sees it as a card, can edit it, and saves it with Publish; nothing is saved until then. Write instructions an agent can follow alone: the steps, the rules, the tables and the checks. The target schema defaults to the channel's skills schema.",
       inputSchema: schema.object(
         {
           name: schema.string("Short name for the skill, e.g. quarterly-revenue. Lowercase letters, digits, hyphens."),
@@ -3020,6 +3095,8 @@ function registerSkills(scope, service, catalog) {
   scope.conversation.registerMessageAction({
     id: "make-skill",
     title: "Make this a skill",
+    icon: SkillIcon,
+    placement: "toolbar",
     matches: (message) => hasText(message),
     component: makeSkillAction(service, catalog)
   });

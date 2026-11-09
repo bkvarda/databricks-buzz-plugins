@@ -3,6 +3,9 @@
   "name": "Databricks Genie",
   "apiVersion": 1,
   "description": "Ask Databricks Genie agents and Genie One about your data, with charts, from a page, the composer or any agent.",
+  "updates": {
+    "defaultEnabled": true
+  },
   "discovery": {
     "category": "agent-tools",
     "tags": [

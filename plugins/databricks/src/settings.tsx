@@ -5,6 +5,7 @@ import type { ProvidedService } from "@dbx/core/provider";
 import { React } from "@dbx/core/react";
 import { describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { Sql, type Warehouse } from "@dbx/core/api/sql";
+import { type InstallationStatus, useInstallationStatus } from "@dbx/core/installed";
 import {
   Badge,
   Button,
@@ -32,6 +33,19 @@ export const SUITE = [
   { id: "bkvarda.databricks-knowledge", folder: "knowledge", name: "Databricks Knowledge", blurb: "Unity Catalog skills, domains and Pages: make skills from messages and give every agent your team's skills." },
 ] as const;
 
+const SUITE_IDS: readonly string[] = SUITE.map((plugin) => plugin.id);
+
+/**
+ * How a suite plugin's row reads. A plugin that registered with this service
+ * is on. One Buzz reports as installed but that never registered is off or
+ * failed to start; offering Add there would only fail with "already installed".
+ * Hosts that can't report installation status keep offering Add.
+ */
+export function suiteState(active: boolean, status: InstallationStatus | undefined): "on" | "off" | "add" {
+  if (active) return "on";
+  return status === "installed" ? "off" : "add";
+}
+
 function hostLabel(host: string) {
   return host.replace(/^https:\/\//, "");
 }
@@ -40,6 +54,7 @@ export function ConnectionSettings(props: {
   connection: Connection;
   service: ProvidedService;
   installer: () => PluginInstaller | undefined;
+  openPlugin: (id: string) => boolean;
 }) {
   const { connection, service } = props;
   const snapshot = useConnection(service);
@@ -60,7 +75,7 @@ export function ConnectionSettings(props: {
         </Stack>
         <ConnectionGroup connection={connection} snapshot={snapshot} />
         {snapshot.status === "connected" && <DefaultsGroup service={service} />}
-        <SuiteGroup installer={props.installer} active={new Set(members.map((member) => member.id))} />
+        <SuiteGroup installer={props.installer} openPlugin={props.openPlugin} active={new Set(members.map((member) => member.id))} />
       </Stack>
     </DbxRoot>
   );
@@ -341,9 +356,14 @@ function DefaultsGroup(props: { service: ProvidedService }) {
   );
 }
 
-function SuiteGroup(props: { installer: () => PluginInstaller | undefined; active: ReadonlySet<string> }) {
+function SuiteGroup(props: { installer: () => PluginInstaller | undefined; openPlugin: (id: string) => boolean; active: ReadonlySet<string> }) {
   const [pending, setPending] = React.useState<string>();
   const [message, setMessage] = React.useState<string>();
+  const statuses = useInstallationStatus(props.installer, SUITE_IDS);
+  const open = (name: string, id: string) => {
+    setMessage(undefined);
+    if (!props.openPlugin(id)) setMessage(`Open Settings → Plugins → Manage plugins and turn on ${name}.`);
+  };
   const install = async (folder: string, id: string) => {
     const installer = props.installer();
     if (!installer) {
@@ -366,20 +386,26 @@ function SuiteGroup(props: { installer: () => PluginInstaller | undefined; activ
       <SectionHeader title="Databricks plugins" description="Each adds one part of Databricks to Buzz and uses this connection." />
       <Stack gap={8}>
         {SUITE.map((plugin) => {
-          const active = props.active.has(plugin.id);
+          const state = suiteState(props.active.has(plugin.id), statuses.get(plugin.id));
           return (
             <Card key={plugin.id} padding={14}>
               <Stack direction="row" align="center" justify="space-between" gap={12}>
                 <Stack gap={2} style={{ minWidth: 0 }}>
                   <Stack direction="row" gap={8} align="center">
                     <Text weight={500}>{plugin.name}</Text>
-                    {active && <Badge tone="success">On</Badge>}
+                    {state === "on" && <Badge tone="success">On</Badge>}
+                    {state === "off" && <Badge>Off</Badge>}
                   </Stack>
                   <Text tone="subtle" size="sm">
-                    {plugin.blurb}
+                    {state === "off" ? "Installed, but turned off or not running." : plugin.blurb}
                   </Text>
                 </Stack>
-                {!active && (
+                {state === "off" && (
+                  <Button size="sm" onClick={() => open(plugin.name, plugin.id)}>
+                    Turn on…
+                  </Button>
+                )}
+                {state === "add" && (
                   <Button size="sm" disabled={pending !== undefined} onClick={() => void install(plugin.folder, plugin.id)}>
                     {pending === plugin.id ? "Opening…" : "Add"}
                   </Button>

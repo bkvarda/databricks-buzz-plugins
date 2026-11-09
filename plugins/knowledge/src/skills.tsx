@@ -4,7 +4,7 @@
 import type { Context } from "@buzz/author";
 import type { DatabricksService } from "@dbx/core/service";
 import type { SkillCatalog } from "@dbx/core/skill-catalog";
-import { hasText, makeSkillAction } from "./skill-action";
+import { hasText, makeSkillAction, SkillIcon } from "./skill-action";
 import { skillBlock } from "./skill-card";
 import { DRAFT_LANGUAGE } from "./skill-draft";
 import { skillTools } from "./skill-tools";
@@ -21,6 +21,8 @@ export function registerSkills(scope: Context, service: DatabricksService, catal
   scope.conversation.registerMessageAction({
     id: "make-skill",
     title: "Make this a skill",
+    icon: SkillIcon,
+    placement: "toolbar",
     matches: (message) => hasText(message),
     component: makeSkillAction(service, catalog),
   });

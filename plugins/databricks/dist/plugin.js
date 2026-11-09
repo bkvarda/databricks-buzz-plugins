@@ -987,6 +987,47 @@ function bindReact(instance) {
   React = instance;
 }
 
+// packages/core/src/installed.ts
+function statusMethods(installer) {
+  const get = installer?.getInstallationStatus;
+  const subscribe = installer?.subscribeInstallationStatus;
+  if (typeof get !== "function" || typeof subscribe !== "function") return void 0;
+  return {
+    get: (id) => get.call(installer, id),
+    subscribe: (id, listener) => subscribe.call(installer, id, () => listener())
+  };
+}
+function useInstallationStatus(installer, ids) {
+  const key = ids.join("\n");
+  const getter = React.useRef(installer);
+  getter.current = installer;
+  const [statuses, setStatuses] = React.useState(/* @__PURE__ */ new Map());
+  React.useEffect(() => {
+    const methods = statusMethods(getter.current());
+    if (!methods) return;
+    const list = key.split("\n");
+    const read = () => {
+      const next = new Map(list.map((id) => [id, methods.get(id)]));
+      setStatuses((current) => sameStatuses(current, next) ? current : next);
+    };
+    const stops = list.map((id) => methods.subscribe(id, read));
+    read();
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [key]);
+  return statuses;
+}
+function sameStatuses(a, b) {
+  return a.size === b.size && [...b].every(([id, status]) => a.get(id) === status);
+}
+function openPluginDetails(ctx, id) {
+  const navigation = optionalService(ctx, "navigation");
+  if (!navigation) return false;
+  void navigation.open({ version: 1, kind: "settings", section: "plugins", pluginId: id });
+  return true;
+}
+
 // packages/core/src/service.ts
 var SERVICE_NAME = "databricks";
 var CORE_PLUGIN_ID = "bkvarda.databricks";
@@ -2084,6 +2125,11 @@ var SUITE = [
   { id: "bkvarda.databricks-lakebase", folder: "lakebase", name: "Lakebase", blurb: "Let agents read operational data from Lakebase Postgres through the Data API." },
   { id: "bkvarda.databricks-knowledge", folder: "knowledge", name: "Databricks Knowledge", blurb: "Unity Catalog skills, domains and Pages: make skills from messages and give every agent your team's skills." }
 ];
+var SUITE_IDS = SUITE.map((plugin) => plugin.id);
+function suiteState(active, status) {
+  if (active) return "on";
+  return status === "installed" ? "off" : "add";
+}
 function hostLabel(host) {
   return host.replace(/^https:\/\//, "");
 }
@@ -2091,7 +2137,7 @@ function ConnectionSettings(props) {
   const { connection, service } = props;
   const snapshot = useConnection(service);
   const members = React.useSyncExternalStore(service.subscribeMembers, service.members);
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 28, style: { paddingBottom: 32 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 10, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 22 }), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 500 }, "Databricks")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", as: "p" }, "Connect once and every Databricks plugin, and every agent using Databricks tools, works as you, with your Unity Catalog permissions.")), /* @__PURE__ */ React.createElement(ConnectionGroup, { connection, snapshot }), snapshot.status === "connected" && /* @__PURE__ */ React.createElement(DefaultsGroup, { service }), /* @__PURE__ */ React.createElement(SuiteGroup, { installer: props.installer, active: new Set(members.map((member) => member.id)) })));
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 28, style: { paddingBottom: 32 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 10, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 22 }), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 500 }, "Databricks")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", as: "p" }, "Connect once and every Databricks plugin, and every agent using Databricks tools, works as you, with your Unity Catalog permissions.")), /* @__PURE__ */ React.createElement(ConnectionGroup, { connection, snapshot }), snapshot.status === "connected" && /* @__PURE__ */ React.createElement(DefaultsGroup, { service }), /* @__PURE__ */ React.createElement(SuiteGroup, { installer: props.installer, openPlugin: props.openPlugin, active: new Set(members.map((member) => member.id)) })));
 }
 function ConnectionGroup(props) {
   const { connection, snapshot } = props;
@@ -2189,6 +2235,11 @@ function DefaultsGroup(props) {
 function SuiteGroup(props) {
   const [pending, setPending] = React.useState();
   const [message, setMessage] = React.useState();
+  const statuses = useInstallationStatus(props.installer, SUITE_IDS);
+  const open = (name, id) => {
+    setMessage(void 0);
+    if (!props.openPlugin(id)) setMessage(`Open Settings \u2192 Plugins \u2192 Manage plugins and turn on ${name}.`);
+  };
   const install = async (folder, id) => {
     const installer = props.installer();
     if (!installer) {
@@ -2207,8 +2258,8 @@ function SuiteGroup(props) {
     }
   };
   return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Databricks plugins", description: "Each adds one part of Databricks to Buzz and uses this connection." }), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, SUITE.map((plugin) => {
-    const active = props.active.has(plugin.id);
-    return /* @__PURE__ */ React.createElement(Card, { key: plugin.id, padding: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, plugin.name), active && /* @__PURE__ */ React.createElement(Badge, { tone: "success" }, "On")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, plugin.blurb)), !active && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: pending !== void 0, onClick: () => void install(plugin.folder, plugin.id) }, pending === plugin.id ? "Opening\u2026" : "Add")));
+    const state = suiteState(props.active.has(plugin.id), statuses.get(plugin.id));
+    return /* @__PURE__ */ React.createElement(Card, { key: plugin.id, padding: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, plugin.name), state === "on" && /* @__PURE__ */ React.createElement(Badge, { tone: "success" }, "On"), state === "off" && /* @__PURE__ */ React.createElement(Badge, null, "Off")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, state === "off" ? "Installed, but turned off or not running." : plugin.blurb)), state === "off" && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => open(plugin.name, plugin.id) }, "Turn on\u2026"), state === "add" && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: pending !== void 0, onClick: () => void install(plugin.folder, plugin.id) }, pending === plugin.id ? "Opening\u2026" : "Add")));
   })), message && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, message));
 }
 
@@ -2364,7 +2415,8 @@ function apply(ctx) {
       {
         connection,
         service,
-        installer: () => optionalService(ctx, "pluginInstaller")
+        installer: () => optionalService(ctx, "pluginInstaller"),
+        openPlugin: (id) => openPluginDetails(ctx, id)
       }
     )
   });

@@ -3,6 +3,9 @@
   "name": "Databricks Agents",
   "apiVersion": 1,
   "description": "Create agents that think on Databricks: models with Buzz tools and Databricks Sandboxes, Genie agents, and your own Agent Bricks agents.",
+  "updates": {
+    "defaultEnabled": true
+  },
   "discovery": {
     "category": "agents",
     "tags": [

@@ -3,6 +3,9 @@
   "name": "Databricks Memory",
   "apiVersion": 1,
   "description": "Give every agent long-term memory in Databricks managed memory, shared across your agents and your Databricks agents.",
+  "updates": {
+    "defaultEnabled": true
+  },
   "discovery": {
     "category": "agent-tools",
     "tags": [

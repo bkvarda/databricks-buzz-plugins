@@ -225,6 +225,47 @@ function describeError(error) {
   return String(error);
 }
 
+// packages/core/src/installed.ts
+function statusMethods(installer) {
+  const get = installer?.getInstallationStatus;
+  const subscribe = installer?.subscribeInstallationStatus;
+  if (typeof get !== "function" || typeof subscribe !== "function") return void 0;
+  return {
+    get: (id) => get.call(installer, id),
+    subscribe: (id, listener) => subscribe.call(installer, id, () => listener())
+  };
+}
+function useInstallationStatus(installer, ids) {
+  const key = ids.join("\n");
+  const getter = React.useRef(installer);
+  getter.current = installer;
+  const [statuses, setStatuses] = React.useState(/* @__PURE__ */ new Map());
+  React.useEffect(() => {
+    const methods = statusMethods(getter.current());
+    if (!methods) return;
+    const list = key.split("\n");
+    const read = () => {
+      const next = new Map(list.map((id) => [id, methods.get(id)]));
+      setStatuses((current) => sameStatuses(current, next) ? current : next);
+    };
+    const stops = list.map((id) => methods.subscribe(id, read));
+    read();
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [key]);
+  return statuses;
+}
+function sameStatuses(a, b) {
+  return a.size === b.size && [...b].every(([id, status]) => a.get(id) === status);
+}
+function openPluginDetails(ctx, id) {
+  const navigation = optionalService(ctx, "navigation");
+  if (!navigation) return false;
+  void navigation.open({ version: 1, kind: "settings", section: "plugins", pluginId: id });
+  return true;
+}
+
 // packages/core/src/ui/theme.ts
 var BRAND = {
   lava: "#FF3621",
@@ -560,15 +601,39 @@ function useLive(live) {
 }
 function MissingCore(props) {
   const [message, setMessage] = React.useState();
+  const installer = React.useCallback(() => optionalService(props.ctx, "pluginInstaller"), [props.ctx]);
+  const installed = useInstallationStatus(installer, [CORE_PLUGIN_ID]).get(CORE_PLUGIN_ID) === "installed";
   const add = async () => {
-    const installer = optionalService(props.ctx, "pluginInstaller");
-    if (!installer) {
+    const service = installer();
+    if (!service) {
       setMessage("Add it from Settings \u2192 Plugins \u2192 Manage plugins \u2192 Add, using github.com/bkvarda/databricks-buzz-plugins.");
       return;
     }
-    const outcome = await installer.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable");
+    const outcome = await service.requestInstall({ repository: REPOSITORY, reference: "main", path: "plugins/databricks/dist" }).catch(() => "unavailable");
     if (outcome === "unavailable") setMessage("Close any open plugin review and try again.");
   };
+  if (installed)
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: 32 } }, /* @__PURE__ */ React.createElement(
+      EmptyState,
+      {
+        title: "Turn on the Databricks plugin",
+        action: /* @__PURE__ */ React.createElement(
+          Button,
+          {
+            variant: "brand",
+            onClick: () => {
+              if (!openPluginDetails(props.ctx, CORE_PLUGIN_ID)) setMessage("Open Settings \u2192 Plugins \u2192 Manage plugins and turn on Databricks.");
+            }
+          },
+          "Open in Plugins"
+        )
+      },
+      props.feature,
+      " uses the Databricks plugin (",
+      CORE_PLUGIN_ID,
+      ") for sign-in. It's installed but turned off, or it couldn't start.",
+      message && /* @__PURE__ */ React.createElement("p", null, message)
+    ));
   return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: 32 } }, /* @__PURE__ */ React.createElement(
     EmptyState,
     {

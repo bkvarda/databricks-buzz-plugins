@@ -429,25 +429,35 @@ function ToolsDemo() {
   );
 }
 
-// A posted message with the ⋯ menu of registered message actions. The action
-// gets a stand-in message and session, as Buzz passes its own.
+// A posted message with its registered message actions: `toolbar` ones as
+// icon buttons, the rest in the ⋯ menu, as Buzz places them. The action gets
+// a stand-in message and session, as Buzz passes its own.
 function PostedMessage({ message }: { message: { at: number; text: string; via: string } }) {
   const [menu, setMenu] = React.useState(false);
   const [mounted, setMounted] = React.useState<Any>();
   useRegistry();
   const fake = { id: String(message.at), channelId: "playground", authorId: "playground-agent", createdAt: Math.floor(message.at / 1000), content: message.text };
   const actions = registry.messageActions.filter((action: Any) => action.matches(fake, {}));
+  const toolbar = actions.filter((action: Any) => action.placement === "toolbar");
+  const inMenu = actions.filter((action: Any) => action.placement !== "toolbar");
   return (
     <div style={{ border: "1px solid var(--border-standard)", borderRadius: 10, padding: 12, marginBottom: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-subtle)" }}>
         <span>posted via {message.via}</span>
-        {actions.length > 0 && (
-          <button type="button" aria-label="Message actions" onClick={() => setMenu(!menu)}>⋯</button>
-        )}
+        <span style={{ display: "flex", gap: 4 }}>
+          {toolbar.map((action: Any) => (
+            <button key={action.id} type="button" title={action.title} aria-label={action.title} onClick={() => setMounted(action)} style={{ fontSize: 16, lineHeight: 0, padding: 4 }}>
+              {action.icon ? <action.icon /> : "⋯"}
+            </button>
+          ))}
+          {inMenu.length > 0 && (
+            <button type="button" aria-label="Message actions" onClick={() => setMenu(!menu)}>⋯</button>
+          )}
+        </span>
       </div>
       {menu && (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", margin: "6px 0" }}>
-          {actions.map((action: Any) => (
+          {inMenu.map((action: Any) => (
             <button key={action.id} type="button" onClick={() => (setMenu(false), setMounted(action))}>
               {action.title}
             </button>

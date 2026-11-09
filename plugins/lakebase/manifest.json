@@ -3,6 +3,7 @@
   "name": "Lakebase",
   "apiVersion": 1,
   "description": "Let agents read operational data in Lakebase, Databricks managed Postgres, with your own access through the Data API.",
+  "updates": { "defaultEnabled": true },
   "discovery": {
     "category": "agent-tools",
     "tags": ["Databricks", "Lakebase", "Postgres", "OLTP"]
