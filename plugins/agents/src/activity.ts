@@ -100,6 +100,12 @@ export function thoughtStep(text: string): Step {
 /** A Genie One progress line ("Thinking: …", "Running SQL: …") as a step. */
 export const genieOneStep = (line: string): Step => (line.trim() ? { tool: "Genie One", target: snippet(line, 120) } : { tool: "Asking Genie One" });
 
+/** A wait while Databricks rate-limits Genie One, as a step: "Rate-limited · trying again in 4 s (retry 2)". */
+export const rateLimitStep = (notice: Readonly<{ attempt: number; waitMs: number; restarted?: boolean }>): Step => ({
+  tool: "Rate-limited",
+  target: `${notice.restarted ? "asking Genie One again" : "trying again"} in ${Math.max(1, Math.round(notice.waitMs / 1000))} s (retry ${notice.attempt})`,
+});
+
 /** A Genie agent's message status as a step. */
 export function genieStatusStep(label: string, status: string): Step {
   const phrase: Record<string, string> = {

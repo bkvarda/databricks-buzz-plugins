@@ -12,7 +12,7 @@
 // answer as Markdown for models.
 import { gatewayMcpPath, McpClient, resultJson, resultText } from "@dbx/core/api/mcp";
 import { resultBlock, resultSet, type ResultSet, toMarkdown } from "@dbx/core/result";
-import type { DatabricksService } from "@dbx/core/service";
+import { type DatabricksService, describeError, isApiError } from "@dbx/core/service";
 
 export const GENIE_ONE = "system.ai.genie_one_mcp";
 
@@ -187,6 +187,11 @@ export function answerMarkdown(answer: Pick<GenieOneAnswer, "text" | "results">,
 
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
+    // Stopped already (say, while being told about this wait): don't wait at all.
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
     const timer = setTimeout(resolve, ms);
     signal?.addEventListener(
       "abort",
@@ -198,11 +203,99 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     );
   });
 
+/**
+ * How long to wait before each retry while Databricks rate-limits Genie One,
+ * about half a minute in all: enough to ride out a short burst, not so long
+ * that the person is left wondering. Each wait varies by ±20%.
+ */
+export const RATE_LIMIT_WAITS_MS: readonly number[] = [2_000, 4_000, 8_000, 15_000];
+
+const RATE_LIMITED = /REQUEST_LIMIT_EXCEEDED|TOO_MANY_REQUESTS|rate[- ]?limit/i;
+
+/** True for a rate-limit refusal: an HTTP 429, or the error text Genie One and the gateway use. */
+export function isRateLimited(error: unknown): boolean {
+  if (isApiError(error) && (error.status === 429 || error.errorCode === "REQUEST_LIMIT_EXCEEDED" || error.errorCode === "TOO_MANY_REQUESTS")) return true;
+  return error instanceof Error && RATE_LIMITED.test(error.message);
+}
+
+/** Told before each wait: which retry is next, how long until it, and what Databricks said. */
+export type RetryNotice = Readonly<{
+  attempt: number;
+  waitMs: number;
+  reason: string;
+  /** True when the question is asked again (its earlier answer failed), so progress starts over. */
+  restarted: boolean;
+}>;
+
+/** A wait as a progress line: "Rate-limited by Databricks: trying again in 4 s". */
+export const retryLine = (notice: RetryNotice) =>
+  `Rate-limited by Databricks: ${notice.restarted ? "asking again" : "trying again"} in ${Math.max(1, Math.round(notice.waitMs / 1000))} s`;
+
+/** A rate-limited Genie One call, failed after its retries, or a response that failed because of one. */
+class RateLimited extends Error {
+  constructor(
+    message: string,
+    readonly conversationId?: string,
+  ) {
+    super(message);
+    this.name = "RateLimited";
+  }
+}
+
+/** A short pause that varies a little, so retries from several agents don't line up. */
+const jittered = (ms: number) => Math.round(ms * (0.8 + Math.random() * 0.4));
+
+/**
+ * Runs `run` again after each of RATE_LIMIT_WAITS_MS while it's rate-limited;
+ * any other failure, a Stop, or the last refusal goes to the caller.
+ */
+async function withBackoff<T>(
+  run: () => Promise<T>,
+  options: Readonly<{ signal?: AbortSignal; retryable?(error: unknown): boolean; onRetry?(notice: Omit<RetryNotice, "restarted">): void }>,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      const wait = RATE_LIMIT_WAITS_MS[attempt];
+      if (wait === undefined || options.signal?.aborted || !(options.retryable ?? isRateLimited)(error)) throw error;
+      const waitMs = jittered(wait);
+      options.onRetry?.({ attempt: attempt + 1, waitMs, reason: error instanceof Error ? error.message : String(error) });
+      await sleep(waitMs, options.signal);
+    }
+  }
+}
+
+/** What a Genie One check found: ready, or why not, in words for the person. */
+export type GenieOneCheck = Readonly<{ ok: true }> | Readonly<{ ok: false; reason: string; busy?: boolean }>;
+
+/** How long a check waits for Genie One's tool list before saying so. */
+export const CHECK_TIMEOUT_MS = 20_000;
+
+class CheckTimeout extends Error {}
+
+/** Why Genie One can't be used, from what the check ran into. */
+export function checkFailure(error: unknown): string {
+  if (error instanceof CheckTimeout) return `Genie One didn't answer within ${CHECK_TIMEOUT_MS / 1000} seconds.`;
+  if (isRateLimited(error)) return "Databricks is rate-limiting Genie One for your organization right now. Try again in a minute.";
+  if (isApiError(error) && error.isNotFound) return `Genie One isn't set up in this workspace. ${error.message}`;
+  return describeError(error);
+}
+
 export class GenieOne {
   private clients = new Map<string, McpClient>();
-  private availability = new Map<string, Promise<boolean>>();
+  private checks = new Map<string, Promise<GenieOneCheck>>();
+  private revision = 0;
+  private listeners = new Set<() => void>();
 
   constructor(private readonly service: DatabricksService) {}
+
+  /** Changes when the person asks to check again, so every view rechecks. */
+  checkRevision = () => this.revision;
+  subscribeChecks = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
 
   private async mcp(): Promise<McpClient> {
     const client = await this.service.ready();
@@ -217,26 +310,112 @@ export class GenieOne {
     return mcp;
   }
 
-  /** Whether Genie One answers in this workspace for this user. */
-  available(): Promise<boolean> {
+  private checkKey() {
     const snapshot = this.service.snapshot();
-    const key = snapshot.status === "connected" ? snapshot.profile.host : "none";
-    let check = this.availability.get(key);
+    return snapshot.status === "connected" ? snapshot.profile.host : "none";
+  }
+
+  /**
+   * Whether Genie One answers in this workspace for this person, and if not,
+   * why. Views share one check per workspace; a failure isn't remembered, so
+   * the next look (or `recheck`) tries again.
+   */
+  check(): Promise<GenieOneCheck> {
+    const key = this.checkKey();
+    let check = this.checks.get(key);
     if (!check) {
-      check = this.mcp()
-        .then((mcp) => mcp.listTools())
-        .then((tools) => tools.some((tool) => tool.name === "genie_ask"))
-        .catch(() => false)
-        .then((ok) => {
-          // Don't remember a failure; the next look tries again.
-          if (!ok) this.availability.delete(key);
-          return ok;
+      check = this.listWithin(CHECK_TIMEOUT_MS)
+        .then((tools): GenieOneCheck =>
+          tools.some((tool) => tool.name === "genie_ask")
+            ? { ok: true }
+            : { ok: false, reason: "Genie One answered, but without its question tool (genie_ask)." },
+        )
+        .catch((error: unknown): GenieOneCheck => ({ ok: false, reason: checkFailure(error), ...(isRateLimited(error) && { busy: true }) }))
+        .then((result) => {
+          if (!result.ok && this.checks.get(key) === check) this.checks.delete(key);
+          return result;
         });
-      this.availability.set(key, check);
+      this.checks.set(key, check);
     }
     return check;
   }
 
+  /** Whether Genie One answers in this workspace for this person. */
+  async available(): Promise<boolean> {
+    return (await this.check()).ok;
+  }
+
+  /**
+   * Forgets this workspace's check, and its MCP client with the tool list it
+   * caches, so the next check really asks Genie One again; every view rechecks.
+   */
+  recheck() {
+    const host = this.checkKey();
+    this.checks.delete(host);
+    for (const key of [...this.clients.keys()]) if (key.startsWith(`${host}|`)) this.clients.delete(key);
+    this.revision++;
+    for (const listener of [...this.listeners]) listener();
+  }
+
+  /**
+   * Genie One's tools, retrying while rate-limited, or a CheckTimeout after
+   * `ms` even if the request itself doesn't stop. A rate limit that outlasts
+   * the deadline reports as one, not as a timeout.
+   */
+  private async listWithin(ms: number) {
+    const controller = new AbortController();
+    let limited: unknown;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(limited ?? new CheckTimeout());
+      }, ms);
+    });
+    const list = this.mcp().then((mcp) =>
+      withBackoff(() => mcp.listTools(controller.signal), {
+        signal: controller.signal,
+        onRetry: (notice) => {
+          limited = new RateLimited(notice.reason);
+        },
+      }),
+    );
+    try {
+      return await Promise.race([list, timeout]);
+    } finally {
+      clearTimeout(timer);
+      list.catch(() => undefined);
+    }
+  }
+
+  /**
+   * One Genie One tool call, tried again while rate-limited, whether Databricks
+   * refuses the request (HTTP 429) or Genie One answers with a rate-limit error.
+   */
+  private callTool(
+    mcp: McpClient,
+    name: string,
+    args: Record<string, unknown>,
+    options: Readonly<{ signal?: AbortSignal; timeoutMs: number; onRetry?(notice: RetryNotice): void }>,
+  ) {
+    const { signal, timeoutMs, onRetry } = options;
+    return withBackoff(
+      async () => {
+        const result = await mcp.callTool(name, args, { ...(signal && { signal }), timeoutMs });
+        const text = result.isError ? resultText(result) : "";
+        if (text && RATE_LIMITED.test(text)) throw new RateLimited(text);
+        return result;
+      },
+      { ...(signal && { signal }), ...(onRetry && { onRetry: (notice) => onRetry({ ...notice, restarted: false }) }) },
+    );
+  }
+
+  /**
+   * Asks Genie One and follows the answer to its end. While Databricks
+   * rate-limits it, each call is tried again after a short wait (see
+   * RATE_LIMIT_WAITS_MS), and an answer that failed because of a rate limit is
+   * asked again in the same conversation. `onRetry` hears each wait.
+   */
   async ask(
     question: string,
     options: Readonly<{
@@ -245,14 +424,40 @@ export class GenieOne {
       onProgress?(steps: readonly string[]): void;
       /** As soon as Genie One takes the question: the IDs that get its answer back later. */
       onStarted?(ids: Readonly<{ conversationId: string; responseId: string }>): void;
+      onRetry?(notice: RetryNotice): void;
     }> = {},
   ): Promise<GenieOneAnswer> {
-    const { signal } = options;
+    let conversationId = options.conversationId;
+    return withBackoff(
+      async () => {
+        try {
+          return await this.askOnce(question, { ...options, ...(conversationId && { conversationId }) });
+        } catch (error) {
+          // Ask again where the failed answer was, so the conversation stays one.
+          if (error instanceof RateLimited && error.conversationId) conversationId = error.conversationId;
+          throw error;
+        }
+      },
+      {
+        ...(options.signal && { signal: options.signal }),
+        // Only a failed answer is asked again here; refused calls were already retried.
+        retryable: (error) => error instanceof RateLimited && error.conversationId !== undefined,
+        ...(options.onRetry && { onRetry: (notice) => options.onRetry?.({ ...notice, restarted: true }) }),
+      },
+    );
+  }
+
+  private async askOnce(
+    question: string,
+    options: Parameters<GenieOne["ask"]>[1] & {},
+  ): Promise<GenieOneAnswer> {
+    const { signal, onRetry } = options;
     const mcp = await this.mcp();
-    const asked = await mcp.callTool(
+    const asked = await this.callTool(
+      mcp,
       "genie_ask",
       { question, ...(options.conversationId && { conversation_id: options.conversationId }) },
-      { ...(signal && { signal }), timeoutMs: 170_000 },
+      { ...(signal && { signal }), timeoutMs: 170_000, ...(onRetry && { onRetry }) },
     );
     if (asked.isError) throw new Error(resultText(asked) || "Genie One couldn't take the question.");
     const started = resultJson<AskResult & PollResult>(asked) ?? {};
@@ -271,7 +476,7 @@ export class GenieOne {
   async response(
     conversationId: string,
     responseId: string,
-    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void }> = {},
+    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void; onRetry?(notice: RetryNotice): void }> = {},
   ): Promise<GenieOneAnswer> {
     return this.follow(await this.mcp(), conversationId, responseId, {}, "", options);
   }
@@ -282,9 +487,10 @@ export class GenieOne {
     responseId: string,
     started: PollResult,
     startedMarkdown: string,
-    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void }>,
+    options: Readonly<{ signal?: AbortSignal; onProgress?(steps: readonly string[]): void; onRetry?(notice: RetryNotice): void }>,
   ): Promise<GenieOneAnswer> {
-    const { signal } = options;
+    const { signal, onRetry } = options;
+    const retry = { ...(signal && { signal }), ...(onRetry && { onRetry }) };
     let state: PollResult = started;
     let markdown = startedMarkdown;
     let unknowns = 0;
@@ -296,10 +502,11 @@ export class GenieOne {
         if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
         // A response looked up again is polled at once.
         if (state.status) await sleep(POLL_MS, signal);
-        const polled = await mcp.callTool(
+        const polled = await this.callTool(
+          mcp,
           "genie_poll_response",
           { conversation_id: conversationId, response_id: responseId },
-          { ...(signal && { signal }), timeoutMs: 60_000 },
+          { ...retry, timeoutMs: 60_000 },
         );
         if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
         state = resultJson<PollResult>(polled) ?? { status: "unknown" };
@@ -315,18 +522,23 @@ export class GenieOne {
         void mcp.callTool("genie_cancel_response", { conversation_id: conversationId }).catch(() => undefined);
       throw error;
     }
-    if (state.status === "failed") throw new Error(markdown.trim() || "Genie One couldn't answer that.");
+    if (state.status === "failed") {
+      const reason = markdown.trim() || "Genie One couldn't answer that.";
+      // A rate limit inside Genie One (Unity Catalog, say) fails the answer; ask() asks again.
+      if (RATE_LIMITED.test(reason)) throw new RateLimited(reason, conversationId);
+      throw new Error(reason);
+    }
 
     const items = (state.query_items ?? []).slice(0, MAX_RESULTS);
     const results = (
       await Promise.all(
         items.map((item) =>
-          mcp
-            .callTool(
-              "genie_get_query_result",
-              { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
-              { ...(signal && { signal }), timeoutMs: 60_000 },
-            )
+          this.callTool(
+            mcp,
+            "genie_get_query_result",
+            { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
+            { ...(signal && { signal }), timeoutMs: 60_000 },
+          )
             .then((fetched) => (fetched.isError ? undefined : toResultSet(resultJson<QueryResult>(fetched) ?? {})))
             .catch(() => undefined),
         ),

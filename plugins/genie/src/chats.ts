@@ -12,7 +12,7 @@ import { Genie, type GenieMessage, messageId, summarize, TERMINAL } from "@dbx/c
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError } from "@dbx/core/service";
 import type { Turn } from "./chat";
-import type { GenieOne } from "./genie-one";
+import { type GenieOne, retryLine } from "./genie-one";
 import type { OneTurn } from "./genie-one-chat";
 
 /** Preference: Genie agent (space ID) → its open conversation on the Genie page. */
@@ -338,6 +338,7 @@ export class OneChat extends Store<OneChatState> {
     this.asking = controller;
     const key = turnKey("one");
     this.set((state) => ({ turns: [...state.turns, { key, question: text, steps: [], started: Date.now() }], busy: true }));
+    let steps: readonly string[] = [];
     try {
       const answer = await this.genieOne.ask(text, {
         ...(this.state.conversationId && { conversationId: this.state.conversationId }),
@@ -347,7 +348,15 @@ export class OneChat extends Store<OneChatState> {
           this.update(key, { responseId });
           this.save();
         },
-        onProgress: (steps) => this.update(key, { steps: [...steps] }),
+        onProgress: (next) => {
+          steps = next;
+          this.update(key, { steps: [...next] });
+        },
+        // A wait while Databricks rate-limits Genie One shows as the latest step; a question asked again starts over.
+        onRetry: (notice) => {
+          if (notice.restarted) steps = [];
+          this.update(key, { steps: [...steps, retryLine(notice)] });
+        },
       });
       this.set({ conversationId: answer.conversationId });
       this.update(key, { answer, steps: [...answer.steps], finished: Date.now() });

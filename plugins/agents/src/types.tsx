@@ -16,7 +16,7 @@ import { Skills } from "@dbx/core/api/skills";
 import { type DatabricksService, describeError } from "@dbx/core/service";
 import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normalizeChoices, type ToolChoice, toolLabels, workspaceIdOf } from "./capabilities";
 import { uploadRunner } from "./runner-upload";
-import { genieOneStep, genieStatusStep } from "./activity";
+import { genieOneStep, genieStatusStep, rateLimitStep } from "./activity";
 import { ActivityLog, type TurnReporter } from "./activity-log";
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
@@ -361,6 +361,11 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       onProgress: (steps) => {
         for (const line of steps.slice(shown)) report.step(genieOneStep(line));
         shown = Math.max(shown, steps.length);
+      },
+      // Waits while Databricks rate-limits Genie One; a question asked again starts its timeline over.
+      onRetry: (notice) => {
+        report.step(rateLimitStep(notice));
+        if (notice.restarted) shown = 0;
       },
     });
     const parts: string[] = [];

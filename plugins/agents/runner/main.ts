@@ -23,7 +23,7 @@ import { generateSecretKey, getPublicKey, type NostrEvent, verifyEvent } from "n
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { harnessLabel, RESULT_PROMPT, remoteNote } from "../src/remote";
 import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversationOf, fromOwner, mentionsAgent, plainText, profileTemplate, replyTemplate, splitMessage, turnPrompt } from "./buzz";
-import { genieOneStep, genieStatusStep } from "../src/activity";
+import { genieOneStep, genieStatusStep, rateLimitStep } from "../src/activity";
 import { toolLabels } from "../src/capabilities";
 import { Observer, RunnerActivity, type TurnActivity } from "./activity";
 import { bridgeTools, serveBridge } from "./bridge";
@@ -109,6 +109,11 @@ async function genieAnswer(config: RunnerConfig, question: string, conversationI
       onProgress: (steps) => {
         for (const line of steps.slice(shown)) activity?.step(genieOneStep(line));
         shown = Math.max(shown, steps.length);
+      },
+      // Waits while Databricks rate-limits Genie One; a question asked again starts its timeline over.
+      onRetry: (notice) => {
+        activity?.step(rateLimitStep(notice));
+        if (notice.restarted) shown = 0;
       },
     });
     const parts = [answerMarkdown(answer)];

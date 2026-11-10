@@ -86,22 +86,36 @@ const SELECTED = "genieSpaceId";
 /** The sidebar entry for Genie One (not a space ID). */
 export const GENIE_ONE_ENTRY = "genie-one";
 
-/** Whether Genie One answers here, or undefined while checking; rechecked when the workspace changes. */
-export function useGenieOneStatus(service: DatabricksService, genieOne: GenieOne): boolean | undefined {
+export type GenieOneStatus =
+  | Readonly<{ state: "checking" }>
+  | Readonly<{ state: "ready" }>
+  | Readonly<{ state: "off"; reason: string; busy?: boolean }>;
+
+/**
+ * Whether Genie One answers here: checking, ready, or off with the reason.
+ * Rechecked when the workspace changes or someone chooses Try again.
+ */
+export function useGenieOneStatus(service: DatabricksService, genieOne: GenieOne): GenieOneStatus {
   const snapshot = useConnection(service);
   const host = snapshot.status === "connected" ? snapshot.profile.host : undefined;
-  const check = useAsync(async () => (host ? genieOne.available() : false), [host]);
-  return check.loading ? undefined : check.data === true;
+  const revision = React.useSyncExternalStore(genieOne.subscribeChecks, genieOne.checkRevision);
+  const check = useAsync(async () => (host ? genieOne.check() : undefined), [host, revision]);
+  if (!host) return { state: "off", reason: "Connect Databricks to use Genie One." };
+  if (check.loading) return { state: "checking" };
+  const result = check.data;
+  if (result?.ok) return { state: "ready" };
+  if (result) return { state: "off", reason: result.reason, ...(result.busy && { busy: true }) };
+  return { state: "off", reason: check.error ? describeError(check.error) : "Genie One didn't answer." };
 }
 
 export function useGenieOneAvailable(service: DatabricksService, genieOne: GenieOne) {
-  return useGenieOneStatus(service, genieOne) === true;
+  return useGenieOneStatus(service, genieOne).state === "ready";
 }
 
-/** The selected entry, defaulting to Genie One when nothing is chosen. */
-export function useSelection(service: DatabricksService, oneAvailable: boolean) {
+/** The selected entry, defaulting to Genie One when nothing is chosen and it may be here. */
+export function useSelection(service: DatabricksService, preferOne: boolean) {
   const [selected, setSelected] = usePreference<string>(service, SELECTED);
-  return [selected ?? (oneAvailable ? GENIE_ONE_ENTRY : undefined), setSelected] as const;
+  return [selected ?? (preferOne ? GENIE_ONE_ENTRY : undefined), setSelected] as const;
 }
 
 const rowStyle = {
@@ -133,12 +147,11 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore, gen
   return function GenieSidebar(props: PageSidebarProps) {
     const spaces = useSpaces(store);
     const oneStatus = useGenieOneStatus(service, genieOne);
-    const oneAvailable = oneStatus === true;
-    const [selected, setSelected] = useSelection(service, oneAvailable);
+    const [selected, setSelected] = useSelection(service, oneStatus.state !== "off");
     // The agents list stays folded under its button unless Genie One isn't
-    // here to show instead.
+    // here to use instead.
     const [open, setOpen] = React.useState<boolean>();
-    const expanded = open ?? oneStatus === false;
+    const expanded = open ?? oneStatus.state === "off";
     const [query, setQuery] = React.useState("");
     const trigger = React.useRef<HTMLButtonElement>(null);
     const input = React.useRef<HTMLInputElement>(null);
@@ -187,19 +200,32 @@ export function genieSidebar(service: DatabricksService, store: SpacesStore, gen
             </Button>
           </Stack>
           <nav aria-label="Genie" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 2, padding: "0 6px 8px" }}>
-            {oneAvailable && (
-              <button type="button" className="dbx-row" aria-selected={selected === GENIE_ONE_ENTRY} onClick={() => pick(GENIE_ONE_ENTRY)} style={rowStyle}>
-                <Stack direction="row" gap={8} align="center">
-                  <DatabricksMark size={13} />
-                  <Stack gap={0} style={{ minWidth: 0 }}>
-                    <Text size="md">Genie One</Text>
-                    <Text size="xs" tone="subtle">
-                      Ask across all your data
-                    </Text>
-                  </Stack>
+            {/* Always listed, so it never just goes missing: while checking, or when it can't be used here, choosing it says why. */}
+            <button
+              type="button"
+              className="dbx-row"
+              aria-selected={selected === GENIE_ONE_ENTRY}
+              onClick={() => pick(GENIE_ONE_ENTRY)}
+              title={oneStatus.state === "off" ? oneStatus.reason : undefined}
+              style={rowStyle}
+            >
+              <Stack direction="row" gap={8} align="center">
+                <DatabricksMark size={13} />
+                <Stack gap={0} style={{ minWidth: 0, flex: 1 }}>
+                  <Text size="md">Genie One</Text>
+                  <Text size="xs" tone="subtle" as="div" style={oneLine}>
+                    {oneStatus.state === "ready"
+                      ? "Ask across all your data"
+                      : oneStatus.state === "checking"
+                        ? "Checking…"
+                        : oneStatus.busy
+                          ? "Busy right now"
+                          : "Not available here"}
+                  </Text>
                 </Stack>
-              </button>
-            )}
+                {oneStatus.state === "checking" && <Spinner size={11} />}
+              </Stack>
+            </button>
             <button
               ref={trigger}
               type="button"
@@ -295,8 +321,8 @@ export function geniePage(service: DatabricksService, store: SpacesStore, genieO
   return function GeniePage(_props: PageProps) {
     const snapshot = useConnection(service);
     const spaces = useSpaces(store);
-    const oneAvailable = useGenieOneAvailable(service, genieOne);
-    const [selected] = useSelection(service, oneAvailable);
+    const oneStatus = useGenieOneStatus(service, genieOne);
+    const [selected] = useSelection(service, oneStatus.state !== "off");
     const space = spaces.spaces.find((candidate) => candidate.space_id === selected);
     let body: React.ReactNode;
     if (snapshot.status !== "connected")
@@ -312,7 +338,30 @@ export function geniePage(service: DatabricksService, store: SpacesStore, genieO
           Genie answers questions about your data in plain language, with the access you already have.
         </EmptyState>
       );
-    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = <GenieOneChat chat={chats.genieOneChat()} />;
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "ready") body = <GenieOneChat chat={chats.genieOneChat()} />;
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "checking")
+      body = (
+        <EmptyState title="Checking Genie One…">
+          <Stack direction="row" gap={8} align="center" justify="center">
+            <Spinner size={12} />
+            <span>Seeing whether Genie One answers in this workspace.</span>
+          </Stack>
+        </EmptyState>
+      );
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "off")
+      body = (
+        <EmptyState
+          title={oneStatus.busy ? "Genie One is busy right now" : "Genie One isn't available here"}
+          action={
+            <Button variant="brand" onClick={() => genieOne.recheck()}>
+              Try again
+            </Button>
+          }
+        >
+          <p style={{ margin: "0 0 8px" }}>{oneStatus.reason}</p>
+          Genie agents still work: open them on the left and pick one.
+        </EmptyState>
+      );
     else if (spaces.status === "error") body = <Notice tone="danger" title="Couldn't list Genie agents">{spaces.error}</Notice>;
     else if (!space)
       body = (

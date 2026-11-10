@@ -949,6 +949,455 @@ function MissingCore(props) {
   ));
 }
 
+// packages/core/src/api/mcp.ts
+var PROTOCOL_VERSION = "2025-06-18";
+var McpError = class extends Error {
+  constructor(message, code, data) {
+    super(message);
+    this.code = code;
+    this.data = data;
+    this.name = "McpError";
+  }
+};
+var gatewayMcpPath = (fullName) => `/ai-gateway/mcp-services/${fullName}`;
+var McpClient = class {
+  constructor(client, path, query = {}) {
+    this.client = client;
+    this.path = path;
+    this.query = query;
+  }
+  session;
+  initializing;
+  nextId = 1;
+  toolsCache;
+  serverInfo;
+  instructions;
+  async listTools(signal) {
+    if (this.toolsCache && Date.now() - this.toolsCache.at < 5 * 6e4) return this.toolsCache.tools;
+    const tools = [];
+    let cursor;
+    do {
+      const page = await this.call("tools/list", cursor ? { cursor } : {}, signal);
+      tools.push(...page.tools ?? []);
+      cursor = page.nextCursor;
+    } while (cursor);
+    this.toolsCache = { at: Date.now(), tools };
+    return tools;
+  }
+  callTool(name, args, options = {}) {
+    return this.call(
+      "tools/call",
+      { name, arguments: args, ...options.meta && { _meta: options.meta } },
+      options.signal,
+      options.timeoutMs
+    );
+  }
+  async readResource(uri, signal) {
+    return await this.call("resources/read", { uri }, signal);
+  }
+  async ensureSession(signal) {
+    if (this.session) return;
+    this.initializing ??= (async () => {
+      const result = await this.send(
+        {
+          jsonrpc: "2.0",
+          id: this.nextId++,
+          method: "initialize",
+          params: {
+            protocolVersion: PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "databricks-buzz-plugins", version: "0.1.0" }
+          }
+        },
+        signal,
+        true
+      );
+      this.serverInfo = result?.serverInfo;
+      this.instructions = result?.instructions;
+      await this.send({ jsonrpc: "2.0", method: "notifications/initialized" }, signal).catch(() => {
+      });
+    })().finally(() => {
+      this.initializing = void 0;
+    });
+    await this.initializing;
+  }
+  async call(method, params, signal, timeoutMs) {
+    await this.ensureSession(signal);
+    try {
+      return await this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+    } catch (error) {
+      if (error.status === 404 && this.session) {
+        this.session = void 0;
+        await this.ensureSession(signal);
+        return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
+      }
+      throw error;
+    }
+  }
+  async send(message, signal, initializing = false, timeoutMs = 12e4) {
+    const response = await this.client.request(this.path, {
+      method: "POST",
+      query: this.query,
+      body: message,
+      timeoutMs,
+      ...signal && { signal },
+      headers: {
+        Accept: "application/json, text/event-stream",
+        ...!initializing && { "MCP-Protocol-Version": PROTOCOL_VERSION },
+        ...this.session && { "Mcp-Session-Id": this.session }
+      }
+    });
+    const session = response.headers["mcp-session-id"];
+    if (session) this.session = session;
+    if (message.id === void 0) return void 0;
+    if (response.status === 202) return void 0;
+    if (response.status < 200 || response.status >= 300) throw apiError(response);
+    const type = response.headers["content-type"] ?? "";
+    const payloads = type.includes("text/event-stream") ? parseSse(response.body).map((event) => event.data) : [response.body];
+    for (const payload of payloads) {
+      let parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (parsed.id !== message.id) continue;
+      if (parsed.error)
+        throw new McpError(parsed.error.message ?? "MCP error", parsed.error.code, parsed.error.data);
+      return parsed.result;
+    }
+    throw new McpError(`No response to ${message.method}`);
+  }
+};
+function resultText(result) {
+  return (result.content ?? []).map((item) => item.type === "text" ? String(item.text) : "").filter(Boolean).join("\n\n");
+}
+function resultJson(result) {
+  if (result.structuredContent !== void 0) return result.structuredContent;
+  for (const item of result.content ?? []) {
+    if (item.type !== "text") continue;
+    const text = String(item.text).trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) continue;
+    try {
+      return JSON.parse(text);
+    } catch {
+    }
+  }
+  return void 0;
+}
+
+// plugins/genie/src/genie-one.ts
+var GENIE_ONE = "system.ai.genie_one_mcp";
+var POLL_MS = 3e3;
+var MAX_RESULTS = 3;
+var cell = (value) => value === null || value === void 0 ? null : typeof value === "object" ? JSON.stringify(value) : String(value);
+function toResultSet(result) {
+  if (!result.ready || !result.columns?.length) return void 0;
+  const rows = (result.rows ?? []).map((row) => row.map(cell));
+  const total = result.total_row_count ?? void 0;
+  return resultSet(
+    result.columns.map((column) => ({ name: column.name, ...column.type_text && { type: column.type_text } })),
+    rows,
+    {
+      ...total !== void 0 && { totalRows: total },
+      truncated: Boolean(result.truncated) || total !== void 0 && total > rows.length
+    }
+  );
+}
+var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+function cleanAnswer(text) {
+  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/\s*\[Knowledge snippets?\]\([^)]*\)/gi, "").replace(/([.!?)])[ \t]+Knowledge snippets?(?=[ \t]*(\n|$))/gi, "$1").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
+}
+function withoutChartCaveats(markdown) {
+  const visual = String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`;
+  const lead = (match) => /^[ \t]*/.exec(match)?.[0] ?? "";
+  return markdown.replace(new RegExp(String.raw`[^.!?\n]*\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\b[^.!?\n]*\b${visual}\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(new RegExp(String.raw`[^.!?\n]*\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${visual}|you can (?:chart|plot|graph) (?:this|it|them|directly))\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+var sleep = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) {
+    reject(signal.reason);
+    return;
+  }
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener(
+    "abort",
+    () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    },
+    { once: true }
+  );
+});
+var RATE_LIMIT_WAITS_MS = [2e3, 4e3, 8e3, 15e3];
+var RATE_LIMITED = /REQUEST_LIMIT_EXCEEDED|TOO_MANY_REQUESTS|rate[- ]?limit/i;
+function isRateLimited(error) {
+  if (isApiError(error) && (error.status === 429 || error.errorCode === "REQUEST_LIMIT_EXCEEDED" || error.errorCode === "TOO_MANY_REQUESTS")) return true;
+  return error instanceof Error && RATE_LIMITED.test(error.message);
+}
+var retryLine = (notice) => `Rate-limited by Databricks: ${notice.restarted ? "asking again" : "trying again"} in ${Math.max(1, Math.round(notice.waitMs / 1e3))} s`;
+var RateLimited = class extends Error {
+  constructor(message, conversationId) {
+    super(message);
+    this.conversationId = conversationId;
+    this.name = "RateLimited";
+  }
+};
+var jittered = (ms) => Math.round(ms * (0.8 + Math.random() * 0.4));
+async function withBackoff(run, options) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      const wait = RATE_LIMIT_WAITS_MS[attempt];
+      if (wait === void 0 || options.signal?.aborted || !(options.retryable ?? isRateLimited)(error)) throw error;
+      const waitMs = jittered(wait);
+      options.onRetry?.({ attempt: attempt + 1, waitMs, reason: error instanceof Error ? error.message : String(error) });
+      await sleep(waitMs, options.signal);
+    }
+  }
+}
+var CHECK_TIMEOUT_MS = 2e4;
+var CheckTimeout = class extends Error {
+};
+function checkFailure(error) {
+  if (error instanceof CheckTimeout) return `Genie One didn't answer within ${CHECK_TIMEOUT_MS / 1e3} seconds.`;
+  if (isRateLimited(error)) return "Databricks is rate-limiting Genie One for your organization right now. Try again in a minute.";
+  if (isApiError(error) && error.isNotFound) return `Genie One isn't set up in this workspace. ${error.message}`;
+  return describeError(error);
+}
+var GenieOne = class {
+  constructor(service) {
+    this.service = service;
+  }
+  clients = /* @__PURE__ */ new Map();
+  checks = /* @__PURE__ */ new Map();
+  revision = 0;
+  listeners = /* @__PURE__ */ new Set();
+  /** Changes when the person asks to check again, so every view rechecks. */
+  checkRevision = () => this.revision;
+  subscribeChecks = (listener) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  async mcp() {
+    const client = await this.service.ready();
+    const snapshot = this.service.snapshot();
+    const workspaceId = snapshot.status === "connected" ? snapshot.workspaceId ?? snapshot.profile.workspaceId : void 0;
+    const key = `${client.host}|${workspaceId ?? ""}`;
+    let mcp = this.clients.get(key);
+    if (!mcp) {
+      mcp = new McpClient(client, gatewayMcpPath(GENIE_ONE), workspaceId ? { o: workspaceId } : {});
+      this.clients.set(key, mcp);
+    }
+    return mcp;
+  }
+  checkKey() {
+    const snapshot = this.service.snapshot();
+    return snapshot.status === "connected" ? snapshot.profile.host : "none";
+  }
+  /**
+   * Whether Genie One answers in this workspace for this person, and if not,
+   * why. Views share one check per workspace; a failure isn't remembered, so
+   * the next look (or `recheck`) tries again.
+   */
+  check() {
+    const key = this.checkKey();
+    let check = this.checks.get(key);
+    if (!check) {
+      check = this.listWithin(CHECK_TIMEOUT_MS).then(
+        (tools) => tools.some((tool) => tool.name === "genie_ask") ? { ok: true } : { ok: false, reason: "Genie One answered, but without its question tool (genie_ask)." }
+      ).catch((error) => ({ ok: false, reason: checkFailure(error), ...isRateLimited(error) && { busy: true } })).then((result) => {
+        if (!result.ok && this.checks.get(key) === check) this.checks.delete(key);
+        return result;
+      });
+      this.checks.set(key, check);
+    }
+    return check;
+  }
+  /** Whether Genie One answers in this workspace for this person. */
+  async available() {
+    return (await this.check()).ok;
+  }
+  /**
+   * Forgets this workspace's check, and its MCP client with the tool list it
+   * caches, so the next check really asks Genie One again; every view rechecks.
+   */
+  recheck() {
+    const host = this.checkKey();
+    this.checks.delete(host);
+    for (const key of [...this.clients.keys()]) if (key.startsWith(`${host}|`)) this.clients.delete(key);
+    this.revision++;
+    for (const listener of [...this.listeners]) listener();
+  }
+  /**
+   * Genie One's tools, retrying while rate-limited, or a CheckTimeout after
+   * `ms` even if the request itself doesn't stop. A rate limit that outlasts
+   * the deadline reports as one, not as a timeout.
+   */
+  async listWithin(ms) {
+    const controller = new AbortController();
+    let limited;
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(limited ?? new CheckTimeout());
+      }, ms);
+    });
+    const list = this.mcp().then(
+      (mcp) => withBackoff(() => mcp.listTools(controller.signal), {
+        signal: controller.signal,
+        onRetry: (notice) => {
+          limited = new RateLimited(notice.reason);
+        }
+      })
+    );
+    try {
+      return await Promise.race([list, timeout]);
+    } finally {
+      clearTimeout(timer);
+      list.catch(() => void 0);
+    }
+  }
+  /**
+   * One Genie One tool call, tried again while rate-limited, whether Databricks
+   * refuses the request (HTTP 429) or Genie One answers with a rate-limit error.
+   */
+  callTool(mcp, name, args, options) {
+    const { signal, timeoutMs, onRetry } = options;
+    return withBackoff(
+      async () => {
+        const result = await mcp.callTool(name, args, { ...signal && { signal }, timeoutMs });
+        const text = result.isError ? resultText(result) : "";
+        if (text && RATE_LIMITED.test(text)) throw new RateLimited(text);
+        return result;
+      },
+      { ...signal && { signal }, ...onRetry && { onRetry: (notice) => onRetry({ ...notice, restarted: false }) } }
+    );
+  }
+  /**
+   * Asks Genie One and follows the answer to its end. While Databricks
+   * rate-limits it, each call is tried again after a short wait (see
+   * RATE_LIMIT_WAITS_MS), and an answer that failed because of a rate limit is
+   * asked again in the same conversation. `onRetry` hears each wait.
+   */
+  async ask(question, options = {}) {
+    let conversationId = options.conversationId;
+    return withBackoff(
+      async () => {
+        try {
+          return await this.askOnce(question, { ...options, ...conversationId && { conversationId } });
+        } catch (error) {
+          if (error instanceof RateLimited && error.conversationId) conversationId = error.conversationId;
+          throw error;
+        }
+      },
+      {
+        ...options.signal && { signal: options.signal },
+        // Only a failed answer is asked again here; refused calls were already retried.
+        retryable: (error) => error instanceof RateLimited && error.conversationId !== void 0,
+        ...options.onRetry && { onRetry: (notice) => options.onRetry?.({ ...notice, restarted: true }) }
+      }
+    );
+  }
+  async askOnce(question, options) {
+    const { signal, onRetry } = options;
+    const mcp = await this.mcp();
+    const asked = await this.callTool(
+      mcp,
+      "genie_ask",
+      { question, ...options.conversationId && { conversation_id: options.conversationId } },
+      { ...signal && { signal }, timeoutMs: 17e4, ...onRetry && { onRetry } }
+    );
+    if (asked.isError) throw new Error(resultText(asked) || "Genie One couldn't take the question.");
+    const started = resultJson(asked) ?? {};
+    const conversationId = started.conversation_id ?? options.conversationId ?? "";
+    const responseId = started.response_id ?? "";
+    if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
+    options.onStarted?.({ conversationId, responseId });
+    return this.follow(mcp, conversationId, responseId, started, resultText(asked), options);
+  }
+  /**
+   * An earlier response, by its IDs: Genie One keeps them, even after later
+   * questions in the conversation. A response still running is followed to
+   * its end.
+   */
+  async response(conversationId, responseId, options = {}) {
+    return this.follow(await this.mcp(), conversationId, responseId, {}, "", options);
+  }
+  async follow(mcp, conversationId, responseId, started, startedMarkdown, options) {
+    const { signal, onRetry } = options;
+    const retry = { ...signal && { signal }, ...onRetry && { onRetry } };
+    let state = started;
+    let markdown = startedMarkdown;
+    let unknowns = 0;
+    let steps = [];
+    const deadline = Date.now() + 10 * 6e4;
+    try {
+      while (!state.status || state.status === "in_progress" || state.status === "unknown" && unknowns < 5) {
+        if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
+        if (state.status) await sleep(POLL_MS, signal);
+        const polled = await this.callTool(
+          mcp,
+          "genie_poll_response",
+          { conversation_id: conversationId, response_id: responseId },
+          { ...retry, timeoutMs: 6e4 }
+        );
+        if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
+        state = resultJson(polled) ?? { status: "unknown" };
+        markdown = resultText(polled);
+        unknowns = state.status === "unknown" ? unknowns + 1 : 0;
+        if (state.progress_steps?.length) {
+          steps = state.progress_steps;
+          options.onProgress?.(steps);
+        }
+      }
+    } catch (error) {
+      if (signal?.aborted)
+        void mcp.callTool("genie_cancel_response", { conversation_id: conversationId }).catch(() => void 0);
+      throw error;
+    }
+    if (state.status === "failed") {
+      const reason = markdown.trim() || "Genie One couldn't answer that.";
+      if (RATE_LIMITED.test(reason)) throw new RateLimited(reason, conversationId);
+      throw new Error(reason);
+    }
+    const items = (state.query_items ?? []).slice(0, MAX_RESULTS);
+    const results = (await Promise.all(
+      items.map(
+        (item) => this.callTool(
+          mcp,
+          "genie_get_query_result",
+          { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
+          { ...signal && { signal }, timeoutMs: 6e4 }
+        ).then((fetched) => fetched.isError ? void 0 : toResultSet(resultJson(fetched) ?? {})).catch(() => void 0)
+      )
+    )).filter((result) => result !== void 0);
+    return {
+      conversationId,
+      responseId,
+      status: state.status ?? "completed",
+      text: (state.final_answer ?? "").trim(),
+      markdown: markdown.trim(),
+      steps,
+      results,
+      sql: items.flatMap((item) => item.sql ? [item.sql] : []),
+      ...state.deep_link && { deepLink: state.deep_link }
+    };
+  }
+  /** Plain text for agents: the answer (with its tables and links), the SQL and the deep link. */
+  format(answer) {
+    const lines = ["Genie One", `conversation_id: ${answer.conversationId}`];
+    if (answer.status === "incomplete") lines.push("(Genie One stopped before finishing; the answer may be partial.)");
+    const text = cleanAnswer(answer.text);
+    if (text) lines.push("", text);
+    else for (const result of answer.results) lines.push("", toMarkdown(result, 20));
+    for (const statement of answer.sql.slice(0, 2)) lines.push("", "SQL Genie One ran:", "```sql", statement.trim(), "```");
+    if (answer.deepLink) lines.push("", `[Explore in Databricks](${answer.deepLink})`);
+    return lines.join("\n");
+  }
+};
+
 // plugins/genie/src/chats.ts
 var CONVERSATIONS = "genieConversations";
 var GENIE_ONE_CHAT = "genieOneChat";
@@ -1204,6 +1653,7 @@ var OneChat = class extends Store {
     this.asking = controller;
     const key = turnKey("one");
     this.set((state) => ({ turns: [...state.turns, { key, question: text, steps: [], started: Date.now() }], busy: true }));
+    let steps = [];
     try {
       const answer = await this.genieOne.ask(text, {
         ...this.state.conversationId && { conversationId: this.state.conversationId },
@@ -1213,7 +1663,15 @@ var OneChat = class extends Store {
           this.update(key, { responseId });
           this.save();
         },
-        onProgress: (steps) => this.update(key, { steps: [...steps] })
+        onProgress: (next) => {
+          steps = next;
+          this.update(key, { steps: [...next] });
+        },
+        // A wait while Databricks rate-limits Genie One shows as the latest step; a question asked again starts over.
+        onRetry: (notice) => {
+          if (notice.restarted) steps = [];
+          this.update(key, { steps: [...steps, retryLine(notice)] });
+        }
       });
       this.set({ conversationId: answer.conversationId });
       this.update(key, { answer, steps: [...answer.steps], finished: Date.now() });
@@ -1688,303 +2146,6 @@ function GenieChat(props) {
   )), /* @__PURE__ */ React.createElement("div", { ref: bottom })), /* @__PURE__ */ React.createElement("div", { style: { position: "sticky", bottom: 0, background: "var(--surface-panel, var(--dbx-surface))", paddingTop: 8 } }, /* @__PURE__ */ React.createElement(Composer, { onAsk: (question) => void chat.ask(question), busy: chat.busy, placeholder: `Ask ${space.title}`, autoFocus: !props.compact })));
 }
 
-// packages/core/src/api/mcp.ts
-var PROTOCOL_VERSION = "2025-06-18";
-var McpError = class extends Error {
-  constructor(message, code, data) {
-    super(message);
-    this.code = code;
-    this.data = data;
-    this.name = "McpError";
-  }
-};
-var gatewayMcpPath = (fullName) => `/ai-gateway/mcp-services/${fullName}`;
-var McpClient = class {
-  constructor(client, path, query = {}) {
-    this.client = client;
-    this.path = path;
-    this.query = query;
-  }
-  session;
-  initializing;
-  nextId = 1;
-  toolsCache;
-  serverInfo;
-  instructions;
-  async listTools(signal) {
-    if (this.toolsCache && Date.now() - this.toolsCache.at < 5 * 6e4) return this.toolsCache.tools;
-    const tools = [];
-    let cursor;
-    do {
-      const page = await this.call("tools/list", cursor ? { cursor } : {}, signal);
-      tools.push(...page.tools ?? []);
-      cursor = page.nextCursor;
-    } while (cursor);
-    this.toolsCache = { at: Date.now(), tools };
-    return tools;
-  }
-  callTool(name, args, options = {}) {
-    return this.call(
-      "tools/call",
-      { name, arguments: args, ...options.meta && { _meta: options.meta } },
-      options.signal,
-      options.timeoutMs
-    );
-  }
-  async readResource(uri, signal) {
-    return await this.call("resources/read", { uri }, signal);
-  }
-  async ensureSession(signal) {
-    if (this.session) return;
-    this.initializing ??= (async () => {
-      const result = await this.send(
-        {
-          jsonrpc: "2.0",
-          id: this.nextId++,
-          method: "initialize",
-          params: {
-            protocolVersion: PROTOCOL_VERSION,
-            capabilities: {},
-            clientInfo: { name: "databricks-buzz-plugins", version: "0.1.0" }
-          }
-        },
-        signal,
-        true
-      );
-      this.serverInfo = result?.serverInfo;
-      this.instructions = result?.instructions;
-      await this.send({ jsonrpc: "2.0", method: "notifications/initialized" }, signal).catch(() => {
-      });
-    })().finally(() => {
-      this.initializing = void 0;
-    });
-    await this.initializing;
-  }
-  async call(method, params, signal, timeoutMs) {
-    await this.ensureSession(signal);
-    try {
-      return await this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
-    } catch (error) {
-      if (error.status === 404 && this.session) {
-        this.session = void 0;
-        await this.ensureSession(signal);
-        return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, signal, false, timeoutMs);
-      }
-      throw error;
-    }
-  }
-  async send(message, signal, initializing = false, timeoutMs = 12e4) {
-    const response = await this.client.request(this.path, {
-      method: "POST",
-      query: this.query,
-      body: message,
-      timeoutMs,
-      ...signal && { signal },
-      headers: {
-        Accept: "application/json, text/event-stream",
-        ...!initializing && { "MCP-Protocol-Version": PROTOCOL_VERSION },
-        ...this.session && { "Mcp-Session-Id": this.session }
-      }
-    });
-    const session = response.headers["mcp-session-id"];
-    if (session) this.session = session;
-    if (message.id === void 0) return void 0;
-    if (response.status === 202) return void 0;
-    if (response.status < 200 || response.status >= 300) throw apiError(response);
-    const type = response.headers["content-type"] ?? "";
-    const payloads = type.includes("text/event-stream") ? parseSse(response.body).map((event) => event.data) : [response.body];
-    for (const payload of payloads) {
-      let parsed;
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (parsed.id !== message.id) continue;
-      if (parsed.error)
-        throw new McpError(parsed.error.message ?? "MCP error", parsed.error.code, parsed.error.data);
-      return parsed.result;
-    }
-    throw new McpError(`No response to ${message.method}`);
-  }
-};
-function resultText(result) {
-  return (result.content ?? []).map((item) => item.type === "text" ? String(item.text) : "").filter(Boolean).join("\n\n");
-}
-function resultJson(result) {
-  if (result.structuredContent !== void 0) return result.structuredContent;
-  for (const item of result.content ?? []) {
-    if (item.type !== "text") continue;
-    const text = String(item.text).trim();
-    if (!text.startsWith("{") && !text.startsWith("[")) continue;
-    try {
-      return JSON.parse(text);
-    } catch {
-    }
-  }
-  return void 0;
-}
-
-// plugins/genie/src/genie-one.ts
-var GENIE_ONE = "system.ai.genie_one_mcp";
-var POLL_MS = 3e3;
-var MAX_RESULTS = 3;
-var cell = (value) => value === null || value === void 0 ? null : typeof value === "object" ? JSON.stringify(value) : String(value);
-function toResultSet(result) {
-  if (!result.ready || !result.columns?.length) return void 0;
-  const rows = (result.rows ?? []).map((row) => row.map(cell));
-  const total = result.total_row_count ?? void 0;
-  return resultSet(
-    result.columns.map((column) => ({ name: column.name, ...column.type_text && { type: column.type_text } })),
-    rows,
-    {
-      ...total !== void 0 && { totalRows: total },
-      truncated: Boolean(result.truncated) || total !== void 0 && total > rows.length
-    }
-  );
-}
-var stripComments = (markdown) => markdown.replace(/<!--[\s\S]*?--\s*>/g, "").replace(/\n{3,}/g, "\n\n").trim();
-function cleanAnswer(text) {
-  return stripComments(text).replace(/\s*:citation\[[^\]]*\]/g, "").replace(/\s*\[Query Result\]\([^)\s]*#embed-[^)\s]*\)/g, "").replace(/\s*\[Knowledge snippets?\]\([^)]*\)/gi, "").replace(/([.!?)])[ \t]+Knowledge snippets?(?=[ \t]*(\n|$))/gi, "$1").replace(/`([^`]+)`\s*\[\1\]\(/g, "[$1](").replace(/[ \t]+$/gm, "").trim();
-}
-function withoutChartCaveats(markdown) {
-  const visual = String.raw`(?:charts?|graphs?|plots?|visuali[sz]ations?)`;
-  const lead = (match) => /^[ \t]*/.exec(match)?.[0] ?? "";
-  return markdown.replace(new RegExp(String.raw`[^.!?\n]*\b(?:can(?:'|’)?t|cannot|can not|unable to|not able to)\b[^.!?\n]*\b${visual}\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(new RegExp(String.raw`[^.!?\n]*\b(?:to (?:turn|make|build|create) (?:this|it|these|the results?) into an? ${visual}|you can (?:chart|plot|graph) (?:this|it|them|directly))\b[^.!?\n]*[.!?][ \t]*`, "gi"), lead).replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
-}
-var sleep = (ms, signal) => new Promise((resolve, reject) => {
-  const timer = setTimeout(resolve, ms);
-  signal?.addEventListener(
-    "abort",
-    () => {
-      clearTimeout(timer);
-      reject(signal.reason);
-    },
-    { once: true }
-  );
-});
-var GenieOne = class {
-  constructor(service) {
-    this.service = service;
-  }
-  clients = /* @__PURE__ */ new Map();
-  availability = /* @__PURE__ */ new Map();
-  async mcp() {
-    const client = await this.service.ready();
-    const snapshot = this.service.snapshot();
-    const workspaceId = snapshot.status === "connected" ? snapshot.workspaceId ?? snapshot.profile.workspaceId : void 0;
-    const key = `${client.host}|${workspaceId ?? ""}`;
-    let mcp = this.clients.get(key);
-    if (!mcp) {
-      mcp = new McpClient(client, gatewayMcpPath(GENIE_ONE), workspaceId ? { o: workspaceId } : {});
-      this.clients.set(key, mcp);
-    }
-    return mcp;
-  }
-  /** Whether Genie One answers in this workspace for this user. */
-  available() {
-    const snapshot = this.service.snapshot();
-    const key = snapshot.status === "connected" ? snapshot.profile.host : "none";
-    let check = this.availability.get(key);
-    if (!check) {
-      check = this.mcp().then((mcp) => mcp.listTools()).then((tools) => tools.some((tool) => tool.name === "genie_ask")).catch(() => false).then((ok) => {
-        if (!ok) this.availability.delete(key);
-        return ok;
-      });
-      this.availability.set(key, check);
-    }
-    return check;
-  }
-  async ask(question, options = {}) {
-    const { signal } = options;
-    const mcp = await this.mcp();
-    const asked = await mcp.callTool(
-      "genie_ask",
-      { question, ...options.conversationId && { conversation_id: options.conversationId } },
-      { ...signal && { signal }, timeoutMs: 17e4 }
-    );
-    if (asked.isError) throw new Error(resultText(asked) || "Genie One couldn't take the question.");
-    const started = resultJson(asked) ?? {};
-    const conversationId = started.conversation_id ?? options.conversationId ?? "";
-    const responseId = started.response_id ?? "";
-    if (!conversationId || !responseId) throw new Error("Genie One didn't return a conversation.");
-    options.onStarted?.({ conversationId, responseId });
-    return this.follow(mcp, conversationId, responseId, started, resultText(asked), options);
-  }
-  /**
-   * An earlier response, by its IDs: Genie One keeps them, even after later
-   * questions in the conversation. A response still running is followed to
-   * its end.
-   */
-  async response(conversationId, responseId, options = {}) {
-    return this.follow(await this.mcp(), conversationId, responseId, {}, "", options);
-  }
-  async follow(mcp, conversationId, responseId, started, startedMarkdown, options) {
-    const { signal } = options;
-    let state = started;
-    let markdown = startedMarkdown;
-    let unknowns = 0;
-    let steps = [];
-    const deadline = Date.now() + 10 * 6e4;
-    try {
-      while (!state.status || state.status === "in_progress" || state.status === "unknown" && unknowns < 5) {
-        if (Date.now() > deadline) throw new Error("Genie One didn't finish within 10 minutes.");
-        if (state.status) await sleep(POLL_MS, signal);
-        const polled = await mcp.callTool(
-          "genie_poll_response",
-          { conversation_id: conversationId, response_id: responseId },
-          { ...signal && { signal }, timeoutMs: 6e4 }
-        );
-        if (polled.isError) throw new Error(resultText(polled) || "Genie One failed.");
-        state = resultJson(polled) ?? { status: "unknown" };
-        markdown = resultText(polled);
-        unknowns = state.status === "unknown" ? unknowns + 1 : 0;
-        if (state.progress_steps?.length) {
-          steps = state.progress_steps;
-          options.onProgress?.(steps);
-        }
-      }
-    } catch (error) {
-      if (signal?.aborted)
-        void mcp.callTool("genie_cancel_response", { conversation_id: conversationId }).catch(() => void 0);
-      throw error;
-    }
-    if (state.status === "failed") throw new Error(markdown.trim() || "Genie One couldn't answer that.");
-    const items = (state.query_items ?? []).slice(0, MAX_RESULTS);
-    const results = (await Promise.all(
-      items.map(
-        (item) => mcp.callTool(
-          "genie_get_query_result",
-          { conversation_id: conversationId, response_id: responseId, item_id: item.item_id },
-          { ...signal && { signal }, timeoutMs: 6e4 }
-        ).then((fetched) => fetched.isError ? void 0 : toResultSet(resultJson(fetched) ?? {})).catch(() => void 0)
-      )
-    )).filter((result) => result !== void 0);
-    return {
-      conversationId,
-      responseId,
-      status: state.status ?? "completed",
-      text: (state.final_answer ?? "").trim(),
-      markdown: markdown.trim(),
-      steps,
-      results,
-      sql: items.flatMap((item) => item.sql ? [item.sql] : []),
-      ...state.deep_link && { deepLink: state.deep_link }
-    };
-  }
-  /** Plain text for agents: the answer (with its tables and links), the SQL and the deep link. */
-  format(answer) {
-    const lines = ["Genie One", `conversation_id: ${answer.conversationId}`];
-    if (answer.status === "incomplete") lines.push("(Genie One stopped before finishing; the answer may be partial.)");
-    const text = cleanAnswer(answer.text);
-    if (text) lines.push("", text);
-    else for (const result of answer.results) lines.push("", toMarkdown(result, 20));
-    for (const statement of answer.sql.slice(0, 2)) lines.push("", "SQL Genie One ran:", "```sql", statement.trim(), "```");
-    if (answer.deepLink) lines.push("", `[Explore in Databricks](${answer.deepLink})`);
-    return lines.join("\n");
-  }
-};
-
 // plugins/genie/src/genie-one-chat.tsx
 function parseStep(raw) {
   const clean = (text) => stripComments(text).replace(/\s*\|.*\|\s*$/s, "").trim();
@@ -2154,15 +2315,21 @@ var GENIE_ONE_ENTRY = "genie-one";
 function useGenieOneStatus(service, genieOne) {
   const snapshot = useConnection(service);
   const host = snapshot.status === "connected" ? snapshot.profile.host : void 0;
-  const check = useAsync(async () => host ? genieOne.available() : false, [host]);
-  return check.loading ? void 0 : check.data === true;
+  const revision = React.useSyncExternalStore(genieOne.subscribeChecks, genieOne.checkRevision);
+  const check = useAsync(async () => host ? genieOne.check() : void 0, [host, revision]);
+  if (!host) return { state: "off", reason: "Connect Databricks to use Genie One." };
+  if (check.loading) return { state: "checking" };
+  const result = check.data;
+  if (result?.ok) return { state: "ready" };
+  if (result) return { state: "off", reason: result.reason, ...result.busy && { busy: true } };
+  return { state: "off", reason: check.error ? describeError(check.error) : "Genie One didn't answer." };
 }
 function useGenieOneAvailable(service, genieOne) {
-  return useGenieOneStatus(service, genieOne) === true;
+  return useGenieOneStatus(service, genieOne).state === "ready";
 }
-function useSelection(service, oneAvailable) {
+function useSelection(service, preferOne) {
   const [selected, setSelected] = usePreference(service, SELECTED);
-  return [selected ?? (oneAvailable ? GENIE_ONE_ENTRY : void 0), setSelected];
+  return [selected ?? (preferOne ? GENIE_ONE_ENTRY : void 0), setSelected];
 }
 var rowStyle = {
   display: "block",
@@ -2185,10 +2352,9 @@ function genieSidebar(service, store, genieOne) {
   return function GenieSidebar(props) {
     const spaces = useSpaces(store);
     const oneStatus = useGenieOneStatus(service, genieOne);
-    const oneAvailable = oneStatus === true;
-    const [selected, setSelected] = useSelection(service, oneAvailable);
+    const [selected, setSelected] = useSelection(service, oneStatus.state !== "off");
     const [open, setOpen] = React.useState();
-    const expanded = open ?? oneStatus === false;
+    const expanded = open ?? oneStatus.state === "off";
     const [query, setQuery] = React.useState("");
     const trigger = React.useRef(null);
     const input = React.useRef(null);
@@ -2219,7 +2385,18 @@ function genieSidebar(service, store, genieOne) {
       if (next < 0) input.current?.focus();
       else options[Math.min(next, options.length - 1)]?.focus();
     };
-    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", style: { padding: "10px 10px 6px 12px" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh Genie agents" }, "\u21BB")), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie", style: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 2, padding: "0 6px 8px" } }, oneAvailable && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-row", "aria-selected": selected === GENIE_ONE_ENTRY, onClick: () => pick(GENIE_ONE_ENTRY), style: rowStyle }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie One"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Ask across all your data")))), /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { className: "shell-sidebar-default" }, /* @__PURE__ */ React.createElement(DbxRoot, { style: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", style: { padding: "10px 10px 6px 12px" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Genie"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => void store.load(true), "aria-label": "Refresh Genie agents", title: "Refresh Genie agents" }, "\u21BB")), /* @__PURE__ */ React.createElement("nav", { "aria-label": "Genie", style: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 2, padding: "0 6px 8px" } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "dbx-row",
+        "aria-selected": selected === GENIE_ONE_ENTRY,
+        onClick: () => pick(GENIE_ONE_ENTRY),
+        title: oneStatus.state === "off" ? oneStatus.reason : void 0,
+        style: rowStyle
+      },
+      /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 13 }), /* @__PURE__ */ React.createElement(Stack, { gap: 0, style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement(Text, { size: "md" }, "Genie One"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", as: "div", style: oneLine }, oneStatus.state === "ready" ? "Ask across all your data" : oneStatus.state === "checking" ? "Checking\u2026" : oneStatus.busy ? "Busy right now" : "Not available here")), oneStatus.state === "checking" && /* @__PURE__ */ React.createElement(Spinner, { size: 11 }))
+    ), /* @__PURE__ */ React.createElement(
       "button",
       {
         ref: trigger,
@@ -2279,8 +2456,8 @@ function geniePage(service, store, genieOne, chats) {
   return function GeniePage(_props) {
     const snapshot = useConnection(service);
     const spaces = useSpaces(store);
-    const oneAvailable = useGenieOneAvailable(service, genieOne);
-    const [selected] = useSelection(service, oneAvailable);
+    const oneStatus = useGenieOneStatus(service, genieOne);
+    const [selected] = useSelection(service, oneStatus.state !== "off");
     const space = spaces.spaces.find((candidate) => candidate.space_id === selected);
     let body;
     if (snapshot.status !== "connected")
@@ -2292,7 +2469,19 @@ function geniePage(service, store, genieOne, chats) {
         },
         "Genie answers questions about your data in plain language, with the access you already have."
       );
-    else if (selected === GENIE_ONE_ENTRY && oneAvailable) body = /* @__PURE__ */ React.createElement(GenieOneChat, { chat: chats.genieOneChat() });
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "ready") body = /* @__PURE__ */ React.createElement(GenieOneChat, { chat: chats.genieOneChat() });
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "checking")
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "Checking Genie One\u2026" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), /* @__PURE__ */ React.createElement("span", null, "Seeing whether Genie One answers in this workspace.")));
+    else if (selected === GENIE_ONE_ENTRY && oneStatus.state === "off")
+      body = /* @__PURE__ */ React.createElement(
+        EmptyState,
+        {
+          title: oneStatus.busy ? "Genie One is busy right now" : "Genie One isn't available here",
+          action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => genieOne.recheck() }, "Try again")
+        },
+        /* @__PURE__ */ React.createElement("p", { style: { margin: "0 0 8px" } }, oneStatus.reason),
+        "Genie agents still work: open them on the left and pick one."
+      );
     else if (spaces.status === "error") body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't list Genie agents" }, spaces.error);
     else if (!space)
       body = /* @__PURE__ */ React.createElement(EmptyState, { title: spaces.status === "loading" ? "Loading Genie agents\u2026" : "Choose a Genie agent" }, spaces.status === "ready" && spaces.spaces.length === 0 ? "Nobody has shared a Genie agent with you in this workspace yet. Create one in Databricks, then refresh." : "Open Genie agents on the left and pick one to start asking questions. Genie agents are curated by your data teams for a topic, like sales or support.");
