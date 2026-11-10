@@ -24,6 +24,7 @@ import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { harnessLabel, RESULT_PROMPT, remoteNote } from "../src/remote";
 import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversationOf, fromOwner, mentionsAgent, plainText, profileTemplate, replyTemplate, splitMessage, turnPrompt } from "./buzz";
 import { genieOneStep, genieStatusStep, rateLimitStep } from "../src/activity";
+import { OUTSIDER_TEXT, OutsiderNotes } from "../src/outsider";
 import { toolLabels } from "../src/capabilities";
 import { Observer, RunnerActivity, type TurnActivity } from "./activity";
 import { bridgeTools, serveBridge } from "./bridge";
@@ -155,6 +156,7 @@ async function serve() {
   writeFileSync(paths.pid, String(process.pid));
   const state = readState();
   const handled = new Set(state.handled);
+  const outsiderNotes = new OutsiderNotes();
   const channels = new Map<string, { at: number; kind: { type?: string; solo: boolean } }>();
   const queues = new Map<string, Promise<void>>();
   const startedAt = Date.now();
@@ -180,7 +182,7 @@ async function serve() {
     return kind;
   }
 
-  async function post(conversation: Conversation, text: string, notify?: string) {
+  async function post(conversation: Conversation, text: string, notify?: string | readonly string[]) {
     for (const part of splitMessage(text)) await relay.publish(replyTemplate({ conversation, content: part, authTag: config.authTag, ...(notify && { notify }) }));
   }
 
@@ -269,6 +271,8 @@ async function serve() {
     handled.add(event.id);
     if (!fromOwner(event, config.owner)) {
       log(`ignored ${event.id.slice(0, 8)}: not from the owner`);
+      // Say so once instead of going silent; nothing else runs.
+      void tellOutsider(event).catch((error: Error) => log(`couldn't tell ${event.pubkey.slice(0, 8)} that only the owner's requests are taken: ${error.message}`));
       return;
     }
     // Routed in arrival order (a Solo chat or DM is one conversation), then one turn at a time per conversation.
@@ -282,6 +286,17 @@ async function serve() {
     });
   }
   let routing: Promise<void> = Promise.resolve();
+
+  /** Tells someone other than the owner, once per conversation an hour, that this agent only takes its owner's requests. */
+  async function tellOutsider(event: NostrEvent) {
+    if (event.pubkey === pubkey) return;
+    const channel = event.tags.find((t) => t[0] === "h")?.[1];
+    if (!channel) return;
+    const conversation = conversationOf(event, config.scope, await kindOf(channel).catch(() => ({ solo: false })));
+    if (!conversation || !outsiderNotes.take(pubkey, event.pubkey, conversation.key)) return;
+    await post(conversation, OUTSIDER_TEXT, [event.pubkey, config.owner]);
+    log(`told ${event.pubkey.slice(0, 8)} in ${conversation.key} that only the owner's requests are taken`);
+  }
 
   // The profile, until the relay takes it (it may admit the agent only once its owner's listing exists).
   const profileKey = JSON.stringify([config.name, config.picture ?? ""]);

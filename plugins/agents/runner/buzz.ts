@@ -189,7 +189,7 @@ export function splitMessage(text: string, maxBytes = MAX_MESSAGE_BYTES): string
 }
 
 /** A reply in the conversation, signed later by the agent. */
-export function replyTemplate(input: Readonly<{ conversation: Conversation; content: string; authTag: readonly string[]; notify?: string }>): EventTemplate {
+export function replyTemplate(input: Readonly<{ conversation: Conversation; content: string; authTag: readonly string[]; notify?: string | readonly string[] }>): EventTemplate {
   return {
     kind: 9,
     created_at: Math.floor(Date.now() / 1000),
@@ -197,7 +197,7 @@ export function replyTemplate(input: Readonly<{ conversation: Conversation; cont
     tags: [
       ["h", input.conversation.channel],
       ...(input.conversation.topLevel ? [] : [["e", input.conversation.root, "", "reply"]]),
-      ...(input.notify ? [["p", input.notify]] : []),
+      ...(typeof input.notify === "string" ? [input.notify] : (input.notify ?? [])).map((person) => ["p", person]),
       [...input.authTag],
     ],
   };

@@ -18,6 +18,7 @@ import { fromAgentTool, GENIE_ONE_CHOICE, genieLocalTools, mcpLocalTools, normal
 import { uploadRunner } from "./runner-upload";
 import { genieOneStep, genieStatusStep, rateLimitStep } from "./activity";
 import { ActivityLog, type TurnReporter } from "./activity-log";
+import { noteOutsider, OutsiderNotes } from "./outsider";
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { type LocalTool, runLoop, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
@@ -196,6 +197,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
+  const outsiderNotes = new OutsiderNotes();
   const activity = new ActivityLog(agents.storage);
 
   /** Wraps a turn: queueing, Stop, failure replies, the working state and its Activity record. */
@@ -508,6 +510,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       const conversation = await kit.conversation(delivery, scopeOf(config));
       if (!conversation) {
         delivery.ignored?.();
+        // Someone other than the owner: say so once instead of going silent.
+        void noteOutsider(delivery, outsiderNotes);
         return;
       }
       const harness = config.harness;

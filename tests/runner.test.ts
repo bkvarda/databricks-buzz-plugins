@@ -12,6 +12,7 @@ import { decrypt, getConversationKey } from "nostr-tools/nip44";
 import { finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { attestedOwner, channelKind, conversationOf, splitMessage, threadRoot, turnPrompt } from "../plugins/agents/runner/buzz";
+import { OUTSIDER_TEXT } from "../plugins/agents/src/outsider";
 import { hoursLeft, normalizeHosted, REFRESH_AFTER_HOURS, runnerConfigOf, shouldRefresh, summarizeHosted } from "../plugins/agents/src/hosted";
 import { type FakeRelay, fakeRelay } from "./fake-relay";
 
@@ -179,14 +180,22 @@ describe("runner against a relay", () => {
     expect(followUp.id).not.toBe(root.id);
   });
 
-  it("answers messages its owner attested, and ignores everyone else", async () => {
+  it("answers messages its owner attested, and tells anyone else once that it only takes its owner's requests", async () => {
     const helper = generateSecretKey();
     const attested = finalizeEvent({ kind: 9, created_at: now(), content: "from my helper", tags: [["h", "general"], ["p", agentPubkey], attest(owner, getPublicKey(helper))] }, helper);
     relay.insert(attested);
-    post(stranger, "general", "from a stranger", [["p", agentPubkey]]);
+    const asked = post(stranger, "general", "from a stranger", [["p", agentPubkey]]);
     await relay.waitFor(fromAgent((e) => e.content.includes("from my helper")));
+    // The stranger hears why, in their thread, and the owner is tagged; nothing answers the question itself.
+    const strangerKey = getPublicKey(stranger);
+    const isNote = (e: NostrEvent) => e.content === OUTSIDER_TEXT && e.tags.some((t) => t[0] === "e" && t[1] === asked.id);
+    const note = await relay.waitFor(fromAgent(isNote));
+    expect(note.tags.filter((t) => t[0] === "p").map((t) => t[1])).toEqual([strangerKey, ownerPubkey]);
+    // A follow-up in the same thread gets no second note.
+    post(stranger, "general", "hello again?", [["p", agentPubkey], ["e", asked.id, "", "reply"]]);
     await new Promise((r) => setTimeout(r, 1500));
-    expect(relay.events.some(fromAgent((e) => e.content.includes("from a stranger")))).toBe(false);
+    expect(relay.events.some(fromAgent((e) => e.content.includes("from a stranger") || e.content.includes("hello again")))).toBe(false);
+    expect(relay.events.filter(fromAgent(isNote))).toHaveLength(1);
   });
 
   it("replies at the top level in a Solo chat", async () => {
