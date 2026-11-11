@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatCompletion, ChatMessage } from "@dbx/core/api/ai";
-import { runLoop, trimHistory } from "../plugins/agents/src/loop";
+import { runLoop, sendableHistory, trimHistory } from "../plugins/agents/src/loop";
 import { plainText } from "../plugins/agents/src/state";
 import { normalizeDatabricks, summarize } from "../plugins/agents/src/types";
 import { filterOptions, modelOptions } from "../plugins/agents/src/ui";
@@ -76,6 +76,31 @@ describe("agent loop", () => {
     const controller = new AbortController();
     controller.abort();
     await expect(runLoop({ model: "m", system: "s", history: [], prompt: "p", chat: async () => looping, signal: controller.signal })).rejects.toThrow();
+  });
+
+  it("keeps a reasoning-only reply as an empty string, not null", async () => {
+    const result = await runLoop({
+      model: "m", system: "s", history: [], prompt: "hi", buzz: fakeBuzz([]),
+      chat: async () => reply({ role: "assistant", content: [{ type: "reasoning", summary: [{ type: "summary_text", text: "thinking" }] }] as never }),
+      signal: new AbortController().signal,
+    });
+    expect(result.text).toBe("");
+    expect(result.messages.at(-1)).toEqual({ role: "assistant", content: "" });
+  });
+
+  it("repairs a saved empty reply, leaving tool-call messages alone", () => {
+    const call = { id: "1", type: "function" as const, function: { name: "send", arguments: "{}" } };
+    const history: ChatMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: null },
+      { role: "user", content: "again" },
+      { role: "assistant", content: null, tool_calls: [call] },
+      { role: "tool", tool_call_id: "1", content: "sent" },
+    ];
+    const repaired = sendableHistory(history);
+    expect(repaired[1]).toEqual({ role: "assistant", content: "" });
+    expect(repaired[3]).toBe(history[3]);
+    expect(repaired.filter((m, i) => m !== history[i])).toHaveLength(1);
   });
 
   it("trims history at user turns", () => {

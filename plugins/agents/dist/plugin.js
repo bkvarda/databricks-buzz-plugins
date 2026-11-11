@@ -4906,7 +4906,9 @@ async function runLoop(input) {
     const reasoning = reasoningText(choice.message.content);
     if (reasoning) input.onThought?.(reasoning);
     if (calls.length && content.trim()) input.onThought?.(content);
-    added.push({ role: "assistant", content: content || null, ...calls.length && { tool_calls: calls } });
+    added.push(
+      calls.length ? { role: "assistant", content: content || null, tool_calls: calls } : { role: "assistant", content }
+    );
     if (!calls.length) {
       text = content;
       break;
@@ -4936,6 +4938,11 @@ async function runLoop(input) {
     if (final) break;
   }
   return { text, posted, final, messages: added, steps, usage };
+}
+function sendableHistory(messages) {
+  return messages.map(
+    (message) => message.role === "assistant" && message.content == null && !message.tool_calls?.length ? { role: "assistant", content: "" } : message
+  );
 }
 function trimHistory(messages, maxChars = 12e4, maxMessages = 120) {
   const size = (list) => list.reduce((total, message) => total + (typeof message.content === "string" ? message.content.length : 0) + 200, 0);
@@ -5394,6 +5401,7 @@ function registerTypes(agents, kit, service) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
+    const history = sendableHistory(session.messages);
     const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
@@ -5403,7 +5411,7 @@ function registerTypes(agents, kit, service) {
       const result = await runLoop({
         model: delivery.model ?? config.model,
         system,
-        history: session.messages,
+        history,
         prompt: prompt.text,
         buzz: kit.tools(delivery.agent, conversation),
         buzzFilter: tools.buzzFilter,
@@ -5421,7 +5429,7 @@ function registerTypes(agents, kit, service) {
       await sessions.set(delivery.agent.key, conversation.key, {
         ...session,
         cursor: prompt.cursor,
-        messages: trimHistory([...session.messages, ...result.messages])
+        messages: trimHistory([...history, ...result.messages])
       });
     } catch (error) {
       if (!answered) prompt.restore();
