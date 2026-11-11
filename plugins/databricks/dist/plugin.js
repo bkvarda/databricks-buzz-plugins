@@ -715,6 +715,10 @@ var Connection = class {
   cli;
   transport;
   snapshot = () => this.state;
+  /** The profile this connection uses, or last tried while it signs in again. */
+  profileName() {
+    return this.target?.name;
+  }
   subscribe = (listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -864,11 +868,20 @@ var Connection = class {
     const generation = ++this.generation;
     this.target = profile;
     this.set({ status: "connecting", profile });
+    const token = async (tokenOptions) => {
+      try {
+        return (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken;
+      } catch (error) {
+        if (error instanceof SignInRequiredError && generation === this.generation && this.state.status === "connected")
+          this.expire(profile);
+        throw error;
+      }
+    };
     const client = new DatabricksClient({
       host: profile.host,
       ...profile.workspaceId && { workspaceId: profile.workspaceId },
       transport: this.transport,
-      token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken
+      token
     });
     try {
       const response = await client.request("/api/2.0/preview/scim/v2/Me", {
@@ -886,7 +899,7 @@ var Connection = class {
         host: profile.host,
         workspaceId,
         transport: this.transport,
-        token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken
+        token
       }) : client;
       this.current = { profile, client: routed };
       this.storage.set(SELECTION_KEY, JSON.stringify({ profile: profile.name }));
@@ -916,6 +929,16 @@ var Connection = class {
         needsSignIn
       });
     }
+  }
+  expire(profile) {
+    this.current = void 0;
+    this.set({
+      status: "error",
+      profile,
+      profiles: this.workspaceProfiles(),
+      message: "Your Databricks sign-in has expired.",
+      needsSignIn: true
+    });
   }
   async reloadProfiles() {
     this.profiles = await this.cli.profiles();
@@ -1117,8 +1140,7 @@ function createService(connection, openSettings, spawn) {
   const preferences = createPreferences(scope);
   const byProfile = /* @__PURE__ */ new Map();
   const profileService = (profile) => {
-    const current = connection.snapshot();
-    if (current.status === "connected" && current.profile.name === profile) return service;
+    if (connection.snapshot().status !== "signed-out" && connection.profileName() === profile) return service;
     let found = byProfile.get(profile);
     if (!found && spawn) {
       const derived = spawn(memoryStorage());

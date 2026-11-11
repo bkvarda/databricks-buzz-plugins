@@ -79,6 +79,16 @@ function deliveredText(delivery: Delivery): string {
   return trigger.text ?? "";
 }
 
+export const SIGN_IN_EXPIRED_REPLY =
+  "My Databricks sign-in expired, so I couldn't finish that. I opened the sign-in page in your browser: sign in there, then ask me again. If it didn't open, sign in again in Settings → Databricks.";
+
+/** Whether a failed turn failed because the Databricks sign-in expired. */
+export function signInExpired(error: unknown): boolean {
+  const named = error as { name?: string; snapshot?: { status?: string; needsSignIn?: boolean } } | null;
+  if (named?.name === "SignInRequiredError") return true;
+  return named?.name === "NotConnectedError" && named.snapshot?.status === "error" && named.snapshot.needsSignIn === true;
+}
+
 function provider(service: DatabricksService): NonNullable<AgentType["provider"]> {
   return {
     snapshot: () => {
@@ -229,6 +239,14 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           }
           const message = describeError(error);
           report.end("error", message);
+          if (signInExpired(error)) {
+            // Open the workspace's sign-in page now, rather than leaving the
+            // person to find where to sign in again.
+            const workspace = agentService(service, config.profile);
+            if (workspace.snapshot().status !== "signing-in") void (workspace.reauthenticate ?? workspace.signIn)().catch(() => {});
+            await kit.reply(delivery.agent, conversation, SIGN_IN_EXPIRED_REPLY, { notifyOwner: true }).catch(() => {});
+            return { ok: false as const, error: message };
+          }
           await kit.reply(delivery.agent, conversation, `I couldn't finish that: ${message}`, { notifyOwner: true }).catch(() => {});
           return { ok: false as const, error: message };
         },

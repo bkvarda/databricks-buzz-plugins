@@ -5247,6 +5247,12 @@ function deliveredText(delivery) {
   if (trigger.type === "mention") return plainText(trigger.event?.content ?? "");
   return trigger.text ?? "";
 }
+var SIGN_IN_EXPIRED_REPLY = "My Databricks sign-in expired, so I couldn't finish that. I opened the sign-in page in your browser: sign in there, then ask me again. If it didn't open, sign in again in Settings \u2192 Databricks.";
+function signInExpired(error) {
+  const named = error;
+  if (named?.name === "SignInRequiredError") return true;
+  return named?.name === "NotConnectedError" && named.snapshot?.status === "error" && named.snapshot.needsSignIn === true;
+}
 function provider(service) {
   return {
     snapshot: () => {
@@ -5366,6 +5372,14 @@ function registerTypes(agents, kit, service) {
         }
         const message = describeError(error);
         report.end("error", message);
+        if (signInExpired(error)) {
+          const workspace = agentService(service, config.profile);
+          if (workspace.snapshot().status !== "signing-in") void (workspace.reauthenticate ?? workspace.signIn)().catch(() => {
+          });
+          await kit.reply(delivery.agent, conversation, SIGN_IN_EXPIRED_REPLY, { notifyOwner: true }).catch(() => {
+          });
+          return { ok: false, error: message };
+        }
         await kit.reply(delivery.agent, conversation, `I couldn't finish that: ${message}`, { notifyOwner: true }).catch(() => {
         });
         return { ok: false, error: message };
