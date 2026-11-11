@@ -155,7 +155,11 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     const reasoning = reasoningText(choice.message.content);
     if (reasoning) input.onThought?.(reasoning);
     if (calls.length && content.trim()) input.onThought?.(content);
-    added.push({ role: "assistant", content: content || null, ...(calls.length && { tool_calls: calls }) });
+    // AI Gateway accepts a null content only beside tool calls: a reply that
+    // was only reasoning is kept as "" so later turns can still send it.
+    added.push(
+      calls.length ? { role: "assistant", content: content || null, tool_calls: calls } : { role: "assistant", content },
+    );
     if (!calls.length) {
       text = content;
       break;
@@ -185,6 +189,17 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     if (final) break;
   }
   return { text, posted, final, messages: added, steps, usage };
+}
+
+/** Repairs sessions saved before empty replies were kept as "": an assistant
+ * message with no content and no tool calls is rejected by AI Gateway. Run
+ * once on a loaded session, not on every model call. */
+export function sendableHistory(messages: readonly ChatMessage[]): ChatMessage[] {
+  return messages.map((message) =>
+    message.role === "assistant" && message.content == null && !message.tool_calls?.length
+      ? { role: "assistant", content: "" }
+      : message,
+  );
 }
 
 /** Keeps the saved session within budget, cutting at user turns so tool

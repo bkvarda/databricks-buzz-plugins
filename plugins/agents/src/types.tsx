@@ -20,7 +20,7 @@ import { genieOneStep, genieStatusStep, rateLimitStep } from "./activity";
 import { ActivityLog, type TurnReporter } from "./activity-log";
 import { noteOutsider, OutsiderNotes } from "./outsider";
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
-import { type LocalTool, runLoop, trimHistory } from "./loop";
+import { type LocalTool, runLoop, sendableHistory, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
 import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
 import { ensureAgentSandbox, SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
@@ -263,6 +263,9 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
+    // Saved before empty replies were kept as "", a session may hold a null
+    // reply that AI Gateway rejects; repaired here, it is saved repaired.
+    const history = sendableHistory(session.messages);
     const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
     const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
@@ -272,7 +275,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       const result = await runLoop({
         model: delivery.model ?? config.model,
         system,
-        history: session.messages,
+        history,
         prompt: prompt.text,
         buzz: kit.tools(delivery.agent, conversation),
         buzzFilter: tools.buzzFilter,
@@ -290,7 +293,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       await sessions.set(delivery.agent.key, conversation.key, {
         ...session,
         cursor: prompt.cursor,
-        messages: trimHistory([...session.messages, ...result.messages]),
+        messages: trimHistory([...history, ...result.messages]),
       });
     } catch (error) {
       if (!answered) prompt.restore();
