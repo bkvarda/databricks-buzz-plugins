@@ -96,6 +96,11 @@ export class Connection {
 
   snapshot = (): ConnectionSnapshot => this.state;
 
+  /** The profile this connection uses, or last tried while it signs in again. */
+  profileName(): string | undefined {
+    return this.target?.name;
+  }
+
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -264,12 +269,22 @@ export class Connection {
     const generation = ++this.generation;
     this.target = profile;
     this.set({ status: "connecting", profile });
+    // A sign-in that expires while connected shows as expired, so Settings and
+    // the agents offer "Sign in again" rather than failing each request.
+    const token = async (tokenOptions?: Readonly<{ force?: boolean }>) => {
+      try {
+        return (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken;
+      } catch (error) {
+        if (error instanceof SignInRequiredError && generation === this.generation && this.state.status === "connected")
+          this.expire(profile);
+        throw error;
+      }
+    };
     const client = new DatabricksClient({
       host: profile.host,
       ...(profile.workspaceId && { workspaceId: profile.workspaceId }),
       transport: this.transport,
-      token: async (tokenOptions) =>
-        (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken,
+      token,
     });
     try {
       const response = await client.request("/api/2.0/preview/scim/v2/Me", {
@@ -291,7 +306,7 @@ export class Connection {
               host: profile.host,
               workspaceId,
               transport: this.transport,
-              token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken,
+              token,
             })
           : client;
       this.current = { profile, client: routed };
@@ -323,6 +338,17 @@ export class Connection {
         needsSignIn,
       });
     }
+  }
+
+  private expire(profile: CliProfile) {
+    this.current = undefined;
+    this.set({
+      status: "error",
+      profile,
+      profiles: this.workspaceProfiles(),
+      message: "Your Databricks sign-in has expired.",
+      needsSignIn: true,
+    });
   }
 
   private async reloadProfiles() {

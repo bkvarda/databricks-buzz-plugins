@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { ChatCompletion, ChatMessage } from "@dbx/core/api/ai";
 import { runLoop, trimHistory } from "../plugins/agents/src/loop";
 import { plainText } from "../plugins/agents/src/state";
-import { normalizeDatabricks, summarize } from "../plugins/agents/src/types";
+import { normalizeDatabricks, signInExpired, summarize } from "../plugins/agents/src/types";
+import { SignInRequiredError } from "@dbx/core/cli";
+import { NotConnectedError } from "@dbx/core/connection";
 import { filterOptions, modelOptions } from "../plugins/agents/src/ui";
 import { Ai, modelLabel } from "@dbx/core/api/ai";
 import { fromCsv, parseCsv, RESULT_LANGUAGE, resultBlock, resultSet } from "@dbx/core/result";
@@ -474,5 +476,15 @@ describe("remote harnesses", () => {
     expect(old).toMatchObject({ harness: "builtin", permissions: "standard" });
     expect(summarize({ ...old, harness: "codex", permissions: "full" })).toBe("Sandbox · Codex · GPT-5.6 Sol · full access");
     expect(summarize({ ...old, harness: "claude" })).toBe("Sandbox · Claude Code · Claude Opus 5.5");
+  });
+});
+
+describe("expired Databricks sign-in", () => {
+  const profile = { name: "ws", host: "https://ws.cloud.databricks.com" };
+  it("recognizes an expired sign-in, not other failures", () => {
+    expect(signInExpired(new SignInRequiredError())).toBe(true);
+    expect(signInExpired(new NotConnectedError({ status: "error", profile, profiles: [], message: "x", needsSignIn: true }))).toBe(true);
+    expect(signInExpired(new NotConnectedError({ status: "signed-out", profiles: [] }))).toBe(false);
+    expect(signInExpired(new Error("Databricks returned HTTP 500"))).toBe(false);
   });
 });

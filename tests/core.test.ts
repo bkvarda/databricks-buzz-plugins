@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Host } from "@buzz/author";
 import { cliFailure, DatabricksCli, parseProfiles, parseToken, normalizeHost, isWorkspaceProfile, SignInRequiredError } from "@dbx/core/cli";
 import { Connection } from "@dbx/core/connection";
+import { createService } from "@dbx/core/provider";
 import { bodyAndTrailers, curlConfig, curlQuote, endMarker, splitHead } from "@dbx/core/curl";
 import { parseSse, SseParser } from "@dbx/core/sse";
 import { fromStatement, planChart, resultSet, toMarkdown } from "@dbx/core/result";
@@ -157,6 +158,91 @@ describe("CLI sign-in errors", () => {
     connection.cancelSignIn();
     await signing;
     expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true });
+  });
+});
+
+describe("sign-in expiring while connected", () => {
+  it("shows as expired once a request can't get a token, and signs in again to that profile", async () => {
+    let expired = false;
+    const { host, calls } = scriptedHost({
+      "cli-profiles": () => PROFILES,
+      // A token that is always due for refresh, so each request asks the CLI.
+      "cli-token": () => (expired ? EXPIRED : { code: 0, stdout: JSON.stringify({ access_token: "t", expires_in: 1 }) }),
+      "cli-login": async (_args, killed) => {
+        await killed;
+        return { code: null };
+      },
+    });
+    const storage = new Map<string, string>();
+    const connection = new Connection(host, { get: (key) => storage.get(key) ?? null, set: (key, value) => (value === null ? storage.delete(key) : storage.set(key, value)) }, async () => ({
+      status: 200,
+      headers: { "x-databricks-org-id": "1" },
+      body: JSON.stringify({ id: "u", userName: "me@example.com" }),
+    }));
+    await connection.useProfile("ws");
+    expect(connection.snapshot().status).toBe("connected");
+    const client = connection.client()!;
+    expired = true;
+    await expect(client.request("/api/2.0/preview/scim/v2/Me")).rejects.toBeInstanceOf(SignInRequiredError);
+    expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true, profile: { name: "ws" } });
+    await expect(connection.ready()).rejects.toThrow(/sign-in expired/);
+    const signing = connection.reauthenticate();
+    await vi.waitFor(() => expect(connection.snapshot().status).toBe("signing-in"));
+    expect(calls.find((call) => call.id === "cli-login")?.args).toEqual(["--profile", "ws", "--host", "https://ws.cloud.databricks.com"]);
+    connection.cancelSignIn();
+    await signing;
+  });
+});
+
+describe("one sign-in per workspace", () => {
+  const TWO = { code: 0, stdout: JSON.stringify({ profiles: [{ name: "ws", host: "https://ws.cloud.databricks.com", auth_type: "databricks-cli" }, { name: "other", host: "https://other.cloud.databricks.com", auth_type: "databricks-cli" }] }) };
+  const storage = () => {
+    const values = new Map<string, string>();
+    return { get: (key: string) => values.get(key) ?? null, set: (key: string, value: string | null) => (value === null ? values.delete(key) : values.set(key, value)) };
+  };
+  const me = async () => ({ status: 200, headers: { "x-databricks-org-id": "1" }, body: JSON.stringify({ id: "u", userName: "me@example.com" }) });
+
+  it("an agent that names the main profile keeps using the main connection after its sign-in expires", async () => {
+    let expired = false;
+    const { host, calls } = scriptedHost({
+      "cli-profiles": () => TWO,
+      "cli-token": () => (expired ? EXPIRED : { code: 0, stdout: JSON.stringify({ access_token: "t", expires_in: 1 }) }),
+      "cli-login": async (_args, killed) => {
+        await killed;
+        return { code: null };
+      },
+    });
+    const main = new Connection(host, storage(), me);
+    const service = createService(main, () => {}, (store) => new Connection(host, store, me));
+    await main.useProfile("ws");
+    expect(service.forProfile!("ws")).toBe(service);
+    expired = true;
+    await expect(main.client()!.request("/api/2.0/preview/scim/v2/Me")).rejects.toBeInstanceOf(SignInRequiredError);
+    expect(service.forProfile!("ws")).toBe(service);
+    const signing = service.reauthenticate!();
+    await vi.waitFor(() => expect(main.snapshot().status).toBe("signing-in"));
+    expect(service.forProfile!("ws")).toBe(service);
+    // Another workspace still gets its own connection.
+    expect(service.forProfile!("other")).not.toBe(service);
+    main.cancelSignIn();
+    await signing;
+    expect(calls.filter((call) => call.id === "cli-login")).toHaveLength(1);
+  });
+
+  it("a request from a profile it has left doesn't mark the new one expired", async () => {
+    let wsExpired = false;
+    const { host } = scriptedHost({
+      "cli-profiles": () => TWO,
+      "cli-token": (args) =>
+        wsExpired && args.includes("ws") ? EXPIRED : { code: 0, stdout: JSON.stringify({ access_token: "t", expires_in: 1 }) },
+    });
+    const connection = new Connection(host, storage(), me);
+    await connection.useProfile("ws");
+    const old = connection.client()!;
+    await connection.useProfile("other");
+    wsExpired = true;
+    await expect(old.request("/api/2.0/preview/scim/v2/Me")).rejects.toBeInstanceOf(SignInRequiredError);
+    expect(connection.snapshot()).toMatchObject({ status: "connected", profile: { name: "other" } });
   });
 });
 

@@ -34,9 +34,9 @@ export function createService(
   const preferences = createPreferences(scope);
   const byProfile = new Map<string, DatabricksService>();
   const profileService = (profile: string): DatabricksService => {
-    const current = connection.snapshot();
-    // The main connection's own profile is just the main service.
-    if (current.status === "connected" && current.profile.name === profile) return service;
+    // The main connection's own profile is just the main service, also while
+    // its sign-in has expired or is being renewed, so a workspace has one sign-in.
+    if (connection.snapshot().status !== "signed-out" && connection.profileName() === profile) return service;
     let found = byProfile.get(profile);
     if (!found && spawn) {
       const derived = spawn(memoryStorage());
