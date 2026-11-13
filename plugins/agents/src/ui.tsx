@@ -12,6 +12,7 @@ import { type DatabricksService, describeError, useAsync, useConnection } from "
 import { Badge, Button, DbxRoot, Field, Notice, openExternal, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { BrowserWait, useWorkspaceService, WorkspaceField } from "@dbx/core/ui/workspace";
 import { GENIE_ONE_CHOICE, type ToolChoice } from "./capabilities";
+import { CustomKindIcon, GenieKindIcon, SandboxKindIcon } from "./icons";
 import { HARNESS_MODEL, HARNESSES, type HarnessId, harnessAccepts, isRemote, type Permissions, permissionsHint } from "./remote";
 import { normalizeSkills, type SkillsChoice, skillCatalogFor } from "./skills";
 import type { SkillRef } from "@dbx/core/api/skills";
@@ -19,20 +20,26 @@ import { schemaOf } from "@dbx/core/skill-catalog";
 
 export type AgentKind = "sandbox" | "genie-one" | "custom";
 
-export const KINDS: readonly Readonly<{ id: AgentKind; label: string; detail: string }>[] = [
+export const KINDS: readonly Readonly<{ id: AgentKind; label: string; short: string; Icon: (props: { size?: number }) => React.ReactNode; detail: string }>[] = [
   {
     id: "sandbox",
     label: "Sandbox agent",
+    short: "A model with its own Sandbox and the tools you pick",
+    Icon: SandboxKindIcon,
     detail: "A model with its own Databricks Sandbox to run code, plus the tools you pick.",
   },
   {
     id: "genie-one",
     label: "Genie One",
+    short: "Answers about any data you can access",
+    Icon: GenieKindIcon,
     detail: "Answers questions about any data you can access, with a chart, the SQL and a link. Nothing to set up.",
   },
   {
     id: "custom",
     label: "Custom agent",
+    short: "Agent Bricks, Model Serving, an App or a Genie agent",
+    Icon: CustomKindIcon,
     detail: "An agent you already have: Agent Bricks or Model Serving, a Databricks App, or a Genie agent.",
   },
 ];
@@ -111,15 +118,16 @@ export function AgentForm(props: FormProps<DatabricksConfig> & { service: Databr
       <Stack gap={14}>
         <NeedsConnection service={props.service} />
         {props.intro}
-        <Field label="Type" hint={kind.detail}>
-          <select className="dbx-select" disabled={props.disabled} value={kind.id} onChange={(event) => onChange({ ...config, kind: event.target.value as AgentKind })}>
-            {KINDS.map((candidate) => (
-              <option key={candidate.id} value={candidate.id}>
-                {candidate.label}
-              </option>
-            ))}
-          </select>
-        </Field>
+        <SinglePicker
+          label="Type"
+          hint={kind.detail}
+          value={kind.id}
+          placeholder="Genie One"
+          search={false}
+          options={KINDS.map((candidate) => ({ id: candidate.id, label: candidate.label, group: "", detail: candidate.short, icon: <candidate.Icon /> }))}
+          {...(props.disabled !== undefined && { disabled: props.disabled })}
+          onChange={(option) => onChange({ ...config, kind: option.id as AgentKind })}
+        />
         <WorkspaceField
           service={props.service}
           {...(config.profile && { profile: config.profile })}
@@ -305,6 +313,8 @@ export type PickOption = Readonly<{
   /** Small, dimmed text at the right, such as an ID. */
   meta?: string;
   badge?: React.ReactNode;
+  /** A mark before the label, here and on the picker's button. */
+  icon?: React.ReactNode;
   /** Extra words the search matches. */
   keywords?: string;
   disabled?: boolean;
@@ -343,6 +353,9 @@ function Section(props: { label: string; hint?: React.ReactNode; children: React
     </div>
   );
 }
+
+/** Where an option's icon sits, beside its label (fixed, so the label takes the rest of the row). */
+const ICON_SLOT = { flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 20, height: 20 } as const;
 
 function OptionList(props: {
   options: readonly PickOption[];
@@ -384,6 +397,7 @@ function OptionList(props: {
                   {selected ? "✓" : ""}
                 </span>
               )}
+              {option.icon && <span style={ICON_SLOT}>{option.icon}</span>}
               <span className="dbx-picker-text">
                 <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                   <Text weight={500}>{option.label}</Text>
@@ -427,6 +441,8 @@ export function SinglePicker(props: {
   loading?: string | false;
   error?: string;
   disabled?: boolean;
+  /** False for a short list: no search box. */
+  search?: boolean;
   onChange(option: PickOption): void;
 }) {
   const [open, setOpen] = React.useState(false);
@@ -442,6 +458,13 @@ export function SinglePicker(props: {
     return () => document.removeEventListener("mousedown", outside);
   }, [open, close]);
   const current = props.options.find((option) => option.id === props.value);
+  const search = props.search !== false;
+  // Without a search box to type in, the chosen option takes the focus, so Escape and Tab work.
+  React.useEffect(() => {
+    if (!open || search) return;
+    const options = anchor.current?.querySelectorAll<HTMLButtonElement>(".dbx-picker-option");
+    ([...(options ?? [])].find((option) => option.getAttribute("aria-selected") === "true") ?? options?.[0])?.focus();
+  }, [open, search]);
   return (
     <Section label={props.label} hint={props.hint}>
       <div className="dbx-picker-anchor" ref={anchor}>
@@ -453,6 +476,7 @@ export function SinglePicker(props: {
           disabled={props.disabled}
           onClick={() => (open ? close() : setOpen(true))}
         >
+          {current?.icon && <span style={ICON_SLOT}>{current.icon}</span>}
           <span style={props.value ? undefined : { color: "var(--dbx-subtle)" }}>{current?.label ?? props.valueLabel ?? (props.value || props.placeholder)}</span>
         </button>
         {open && (
@@ -463,20 +487,22 @@ export function SinglePicker(props: {
               if (event.key === "Escape") (event.stopPropagation(), close());
             }}
           >
-            <input
-              className="dbx-input"
-              autoFocus
-              placeholder={props.searchPlaceholder ?? "Search"}
-              aria-label={`Search ${props.label.toLowerCase()}`}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter") return;
-                event.preventDefault();
-                const first = filterOptions(props.options, query).find((option) => !option.disabled);
-                if (first) (props.onChange(first), close());
-              }}
-            />
+            {search && (
+              <input
+                className="dbx-input"
+                autoFocus
+                placeholder={props.searchPlaceholder ?? "Search"}
+                aria-label={`Search ${props.label.toLowerCase()}`}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  const first = filterOptions(props.options, query).find((option) => !option.disabled);
+                  if (first) (props.onChange(first), close());
+                }}
+              />
+            )}
             {!(props.loading && props.options.length === 0) && (
               <OptionList
                 label={props.label}

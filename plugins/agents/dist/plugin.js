@@ -366,7 +366,7 @@ var DATABRICKS_MARK_MONO_SVG = DATABRICKS_MARK_SVG.replace(
   'fill="#FF3621"',
   'fill="currentColor"'
 );
-var svgDataUri = (svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+var svgDataUri = (svg2) => `data:image/svg+xml;utf8,${encodeURIComponent(svg2)}`;
 var DATABRICKS_ICON = svgDataUri(DATABRICKS_MARK_SVG);
 var DATABRICKS_ICON_MONO = svgDataUri(DATABRICKS_MARK_MONO_SVG);
 
@@ -382,7 +382,7 @@ function databricksIcon() {
 }
 function DatabricksMark(props) {
   const size = props.size ?? 16;
-  const svg = props.color === "current" ? DATABRICKS_MARK_SVG.replace('fill="#FF3621"', 'fill="currentColor"') : DATABRICKS_MARK_SVG;
+  const svg2 = props.color === "current" ? DATABRICKS_MARK_SVG.replace('fill="#FF3621"', 'fill="currentColor"') : DATABRICKS_MARK_SVG;
   return /* @__PURE__ */ React.createElement(
     "span",
     {
@@ -390,7 +390,7 @@ function DatabricksMark(props) {
       "aria-label": props.title,
       "aria-hidden": props.title ? void 0 : true,
       style: { display: "inline-flex", width: size, height: size * 1.1, flex: "none" },
-      dangerouslySetInnerHTML: { __html: svg.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
+      dangerouslySetInnerHTML: { __html: svg2.replace("<svg ", `<svg width="${size}" height="${size * 1.1}" `) }
     }
   );
 }
@@ -2687,6 +2687,34 @@ async function mcpLocalTools(service, choices, signal) {
   return { tools, problems, failures };
 }
 
+// plugins/agents/src/icons.tsx
+var LAVA = "#FF3621";
+var svg = (size, children) => /* @__PURE__ */ React.createElement("svg", { width: size, height: size, viewBox: "0 0 24 24", fill: "none", "aria-hidden": true, focusable: "false" }, children);
+function GenieKindIcon({ size = 20 }) {
+  return svg(
+    size,
+    /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("path", { fill: LAVA, d: "M10 2.5c.7 4.4 2.8 6.6 7.2 7.3-4.4.7-6.5 2.9-7.2 7.3-.7-4.4-2.8-6.6-7.2-7.3 4.4-.7 6.5-2.9 7.2-7.3Z" }), /* @__PURE__ */ React.createElement("path", { fill: LAVA, d: "M18 14c.35 2 1.3 2.95 3.3 3.3-2 .35-2.95 1.3-3.3 3.3-.35-2-1.3-2.95-3.3-3.3 2-.35 2.95-1.3 3.3-3.3Z" }))
+  );
+}
+function SandboxKindIcon({ size = 20 }) {
+  return svg(
+    size,
+    /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("rect", { x: "2.5", y: "4", width: "19", height: "16", rx: "3.5", fill: LAVA }), /* @__PURE__ */ React.createElement("path", { d: "M7 9.25 10 12l-3 2.75M12.5 15h4.5", stroke: "#fff", strokeWidth: "1.8", strokeLinecap: "round", strokeLinejoin: "round" }))
+  );
+}
+function OmnigentKindIcon({ size = 20 }) {
+  return svg(
+    size,
+    /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("path", { d: "M12 12V4.5M12 12l6.5 3.75M12 12l-6.5 3.75", stroke: LAVA, strokeWidth: "1.8", strokeLinecap: "round" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3.4", fill: LAVA }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "4", r: "2.3", fill: LAVA }), /* @__PURE__ */ React.createElement("circle", { cx: "18.9", cy: "16", r: "2.3", fill: LAVA }), /* @__PURE__ */ React.createElement("circle", { cx: "5.1", cy: "16", r: "2.3", fill: LAVA }))
+  );
+}
+function CustomKindIcon({ size = 20 }) {
+  return svg(
+    size,
+    /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("rect", { x: "7.25", y: "2.75", width: "9.5", height: "8.5", rx: "2", fill: LAVA }), /* @__PURE__ */ React.createElement("rect", { x: "2.25", y: "12.75", width: "9.5", height: "8.5", rx: "2", fill: LAVA }), /* @__PURE__ */ React.createElement("rect", { x: "12.25", y: "12.75", width: "9.5", height: "8.5", rx: "2", fill: LAVA }))
+  );
+}
+
 // plugins/agents/src/omnigent.ts
 var OMNIGENT_API = "/api/2.0/omnigent";
 var SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
@@ -3885,16 +3913,22 @@ var KINDS = [
   {
     id: "sandbox",
     label: "Sandbox agent",
+    short: "A model with its own Sandbox and the tools you pick",
+    Icon: SandboxKindIcon,
     detail: "A model with its own Databricks Sandbox to run code, plus the tools you pick."
   },
   {
     id: "genie-one",
     label: "Genie One",
+    short: "Answers about any data you can access",
+    Icon: GenieKindIcon,
     detail: "Answers questions about any data you can access, with a chart, the SQL and a link. Nothing to set up."
   },
   {
     id: "custom",
     label: "Custom agent",
+    short: "Agent Bricks, Model Serving, an App or a Genie agent",
+    Icon: CustomKindIcon,
     detail: "An agent you already have: Agent Bricks or Model Serving, a Databricks App, or a Genie agent."
   }
 ];
@@ -3913,7 +3947,19 @@ function AgentForm(props) {
   const { config, onChange } = props;
   const workspace = useAgentService(props.service, config.profile);
   const kind = KINDS.find((candidate) => candidate.id === config.kind) ?? KINDS[1];
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), props.intro, /* @__PURE__ */ React.createElement(Field, { label: "Type", hint: kind.detail }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", disabled: props.disabled, value: kind.id, onChange: (event) => onChange({ ...config, kind: event.target.value }) }, KINDS.map((candidate) => /* @__PURE__ */ React.createElement("option", { key: candidate.id, value: candidate.id }, candidate.label)))), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), props.intro, /* @__PURE__ */ React.createElement(
+    SinglePicker,
+    {
+      label: "Type",
+      hint: kind.detail,
+      value: kind.id,
+      placeholder: "Genie One",
+      search: false,
+      options: KINDS.map((candidate) => ({ id: candidate.id, label: candidate.label, group: "", detail: candidate.short, icon: /* @__PURE__ */ React.createElement(candidate.Icon, null) })),
+      ...props.disabled !== void 0 && { disabled: props.disabled },
+      onChange: (option) => onChange({ ...config, kind: option.id })
+    }
+  ), /* @__PURE__ */ React.createElement(
     WorkspaceField,
     {
       service: props.service,
@@ -4023,6 +4069,7 @@ function Section(props) {
   const id = React.useId();
   return /* @__PURE__ */ React.createElement("div", { role: "group", "aria-labelledby": id, style: { display: "flex", flexDirection: "column", gap: 4, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", justify: "space-between", align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, id }, props.label), props.aside), props.children, props.hint && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", as: "div" }, props.hint));
 }
+var ICON_SLOT = { flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 20, height: 20 };
 function OptionList(props) {
   const shown2 = filterOptions(props.options, props.query);
   let group = "";
@@ -4040,6 +4087,7 @@ function OptionList(props) {
         onClick: () => props.onPick(option)
       },
       props.multi ? /* @__PURE__ */ React.createElement("input", { type: "checkbox", tabIndex: -1, readOnly: true, checked: selected, "aria-hidden": true }) : /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-check", "aria-hidden": true }, selected ? "\u2713" : ""),
+      option.icon && /* @__PURE__ */ React.createElement("span", { style: ICON_SLOT }, option.icon),
       /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-text" }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, option.label), option.badge), option.detail && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "xs", as: "span", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, option.detail)),
       option.meta && /* @__PURE__ */ React.createElement("span", { className: "dbx-picker-meta" }, option.meta)
     ));
@@ -4062,6 +4110,12 @@ function SinglePicker(props) {
     return () => document.removeEventListener("mousedown", outside);
   }, [open, close]);
   const current = props.options.find((option) => option.id === props.value);
+  const search = props.search !== false;
+  React.useEffect(() => {
+    if (!open || search) return;
+    const options = anchor.current?.querySelectorAll(".dbx-picker-option");
+    ([...options ?? []].find((option) => option.getAttribute("aria-selected") === "true") ?? options?.[0])?.focus();
+  }, [open, search]);
   return /* @__PURE__ */ React.createElement(Section, { label: props.label, hint: props.hint }, /* @__PURE__ */ React.createElement("div", { className: "dbx-picker-anchor", ref: anchor }, /* @__PURE__ */ React.createElement(
     "button",
     {
@@ -4072,6 +4126,7 @@ function SinglePicker(props) {
       disabled: props.disabled,
       onClick: () => open ? close() : setOpen(true)
     },
+    current?.icon && /* @__PURE__ */ React.createElement("span", { style: ICON_SLOT }, current.icon),
     /* @__PURE__ */ React.createElement("span", { style: props.value ? void 0 : { color: "var(--dbx-subtle)" } }, current?.label ?? props.valueLabel ?? (props.value || props.placeholder))
   ), open && /* @__PURE__ */ React.createElement(
     "div",
@@ -4082,7 +4137,7 @@ function SinglePicker(props) {
         if (event.key === "Escape") event.stopPropagation(), close();
       }
     },
-    /* @__PURE__ */ React.createElement(
+    search && /* @__PURE__ */ React.createElement(
       "input",
       {
         className: "dbx-input",
@@ -4768,11 +4823,13 @@ function tendAgents(provider2) {
   };
 }
 var KIND_CHOICES = [
-  { id: "genie", label: "Genie", detail: "Answers data questions with Genie One, or with one of your Genie agents, as charts and tables." },
-  { id: "sandbox", label: "Sandbox agent", detail: "Claude Code, Codex or Pi, working in its own Databricks Sandbox with the Databricks CLI signed in as you." },
+  { id: "genie", label: "Genie", short: "Genie One or one of your Genie agents", Icon: GenieKindIcon, detail: "Answers data questions with Genie One, or with one of your Genie agents, as charts and tables." },
+  { id: "sandbox", label: "Sandbox agent", short: "Claude Code, Codex or Pi in its own Sandbox", Icon: SandboxKindIcon, detail: "Claude Code, Codex or Pi, working in its own Databricks Sandbox with the Databricks CLI signed in as you." },
   {
     id: "omnigent",
     label: "Omnigent agent",
+    short: "An Omnigent agent, in Omnigent sessions",
+    Icon: OmnigentKindIcon,
     detail: "An Omnigent agent (Claude Code, Codex, Pi, Polly\u2026) on a Sandbox that Omnigent runs. Each conversation is an Omnigent session in this workspace, which you can open and continue in Omnigent."
   }
 ];
@@ -4837,7 +4894,19 @@ function HostedForm(props) {
   const kind = KIND_CHOICES.find((choice) => choice.id === config.kind) ?? KIND_CHOICES[0];
   const harness = HARNESS_CHOICES.find((choice) => choice.id === config.harness) ?? HARNESS_CHOICES[0];
   const disabled = props.disabled !== void 0 ? { disabled: props.disabled } : {};
-  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), !props.locked && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Runs in Databricks, in its own Sandbox, so it can answer with Buzz closed. It can't use Buzz's own tools, and Buzz doesn't show it working."), available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, "Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview."), !props.locked && /* @__PURE__ */ React.createElement(Field, { label: "Type", hint: kind.detail }, /* @__PURE__ */ React.createElement("select", { className: "dbx-select", ...disabled, value: kind.id, onChange: (event) => onChange(normalizeHosted({ ...config, kind: event.target.value })) }, KIND_CHOICES.map((choice) => /* @__PURE__ */ React.createElement("option", { key: choice.id, value: choice.id }, choice.label)))), !props.locked && /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(NeedsConnection, { service: props.service }), !props.locked && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Runs in Databricks, in its own Sandbox, so it can answer with Buzz closed. It can't use Buzz's own tools, and Buzz doesn't show it working."), available.data === false && /* @__PURE__ */ React.createElement(Notice, { tone: "warning" }, "Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview."), !props.locked && /* @__PURE__ */ React.createElement(
+    SinglePicker,
+    {
+      label: "Type",
+      hint: kind.detail,
+      value: kind.id,
+      placeholder: "Genie",
+      search: false,
+      options: KIND_CHOICES.map((choice) => ({ id: choice.id, label: choice.label, group: "", detail: choice.short, icon: /* @__PURE__ */ React.createElement(choice.Icon, null) })),
+      ...disabled,
+      onChange: (option) => onChange(normalizeHosted({ ...config, kind: option.id }))
+    }
+  ), !props.locked && /* @__PURE__ */ React.createElement(
     WorkspaceField,
     {
       service: props.service,

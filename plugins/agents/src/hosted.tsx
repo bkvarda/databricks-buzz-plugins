@@ -24,6 +24,7 @@ import { type ActivityLine, type ActivityTurn, turnsFromLines } from "./activity
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
+import { GenieKindIcon, OmnigentKindIcon, SandboxKindIcon } from "./icons";
 import { DEFAULT_OMNIGENT_AGENT, Omnigent, omnigentAgentLabel } from "./omnigent";
 import { normalizeSkills, resolveSkills, type SkillsChoice, skillCatalogFor } from "./skills";
 import { installSkills } from "./skills-sandbox";
@@ -452,12 +453,15 @@ export function tendAgents(provider: HostedProvider): () => void {
 
 type FormProps = { config: HostedConfig; onChange(config: HostedConfig): void; disabled?: boolean };
 
-const KIND_CHOICES: readonly { id: HostedKind; label: string; detail: string }[] = [
-  { id: "genie", label: "Genie", detail: "Answers data questions with Genie One, or with one of your Genie agents, as charts and tables." },
-  { id: "sandbox", label: "Sandbox agent", detail: "Claude Code, Codex or Pi, working in its own Databricks Sandbox with the Databricks CLI signed in as you." },
+// Icons are components, made into elements when the form renders: React is bound only once the plugin starts.
+const KIND_CHOICES: readonly { id: HostedKind; label: string; short: string; Icon: (props: { size?: number }) => React.ReactNode; detail: string }[] = [
+  { id: "genie", label: "Genie", short: "Genie One or one of your Genie agents", Icon: GenieKindIcon, detail: "Answers data questions with Genie One, or with one of your Genie agents, as charts and tables." },
+  { id: "sandbox", label: "Sandbox agent", short: "Claude Code, Codex or Pi in its own Sandbox", Icon: SandboxKindIcon, detail: "Claude Code, Codex or Pi, working in its own Databricks Sandbox with the Databricks CLI signed in as you." },
   {
     id: "omnigent",
     label: "Omnigent agent",
+    short: "An Omnigent agent, in Omnigent sessions",
+    Icon: OmnigentKindIcon,
     detail:
       "An Omnigent agent (Claude Code, Codex, Pi, Polly…) on a Sandbox that Omnigent runs. Each conversation is an Omnigent session in this workspace, which you can open and continue in Omnigent.",
   },
@@ -541,15 +545,16 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
         )}
         {available.data === false && <Notice tone="warning">Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview.</Notice>}
         {!props.locked && (
-          <Field label="Type" hint={kind.detail}>
-            <select className="dbx-select" {...disabled} value={kind.id} onChange={(event) => onChange(normalizeHosted({ ...config, kind: event.target.value as HostedKind }))}>
-              {KIND_CHOICES.map((choice) => (
-                <option key={choice.id} value={choice.id}>
-                  {choice.label}
-                </option>
-              ))}
-            </select>
-          </Field>
+          <SinglePicker
+            label="Type"
+            hint={kind.detail}
+            value={kind.id}
+            placeholder="Genie"
+            search={false}
+            options={KIND_CHOICES.map((choice) => ({ id: choice.id, label: choice.label, group: "", detail: choice.short, icon: <choice.Icon /> }))}
+            {...disabled}
+            onChange={(option) => onChange(normalizeHosted({ ...config, kind: option.id as HostedKind }))}
+          />
         )}
         {!props.locked && (
           <WorkspaceField
