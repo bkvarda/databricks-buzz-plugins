@@ -24,6 +24,7 @@ import { type ActivityLine, type ActivityTurn, turnsFromLines } from "./activity
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
+import { DEFAULT_OMNIGENT_AGENT, Omnigent, omnigentAgentLabel } from "./omnigent";
 import { normalizeSkills, resolveSkills, type SkillsChoice, skillCatalogFor } from "./skills";
 import { installSkills } from "./skills-sandbox";
 import { cachedList, genieSpaces, ModelField, NeedsConnection, SinglePicker, SkillsField, ToolsField, useAgentService, WorkspaceField } from "./ui";
@@ -42,7 +43,7 @@ const QUIET_MINUTES = 10;
 /** Databricks stops a Sandbox this long after each start. */
 const SANDBOX_DAY_HOURS = 24;
 
-export type HostedKind = "genie" | "sandbox";
+export type HostedKind = "genie" | "sandbox" | "omnigent";
 export type Availability = "always" | "sleep";
 
 export type HostedConfig = {
@@ -51,6 +52,8 @@ export type HostedConfig = {
   profile?: string;
   /** A Genie agent to ask instead of Genie One. */
   genie?: { space: string; label: string };
+  /** The Omnigent agent (its name, e.g. "claude-native-ui") an Omnigent agent runs as. */
+  omnigent?: { agent: string; label: string };
   harness: RemoteHarness;
   model: string;
   /** A Sandbox agent's Databricks tools (Genie One, Genie agents, MCP servers), as the local type's. */
@@ -68,8 +71,15 @@ export function normalizeHosted(value: unknown): HostedConfig {
   const config = (value ?? {}) as Partial<HostedConfig>;
   const harness = HARNESS_CHOICES.some((choice) => choice.id === config.harness) ? (config.harness as RemoteHarness) : "claude";
   const genie = config.genie && typeof config.genie.space === "string" && config.genie.space ? { space: config.genie.space, label: String(config.genie.label || config.genie.space) } : undefined;
+  const kind: HostedKind = config.kind === "sandbox" || config.kind === "omnigent" ? config.kind : "genie";
+  const omnigent =
+    kind === "omnigent"
+      ? config.omnigent && typeof config.omnigent.agent === "string" && config.omnigent.agent
+        ? { agent: config.omnigent.agent, label: String(config.omnigent.label || omnigentAgentLabel(config.omnigent.agent)) }
+        : { agent: DEFAULT_OMNIGENT_AGENT, label: omnigentAgentLabel(DEFAULT_OMNIGENT_AGENT) }
+      : undefined;
   return {
-    kind: config.kind === "sandbox" ? "sandbox" : "genie",
+    kind,
     harness,
     model: typeof config.model === "string" && harnessAccepts(harness, config.model) ? config.model : HARNESS_MODEL[harness],
     // Genie One unless the owner chose otherwise (an empty list is a choice).
@@ -80,11 +90,19 @@ export function normalizeHosted(value: unknown): HostedConfig {
     instructions: typeof config.instructions === "string" ? config.instructions : "",
     ...(typeof config.profile === "string" && config.profile && { profile: config.profile }),
     ...(genie && { genie }),
+    ...(omnigent && { omnigent }),
   };
 }
 
 export function summarizeHosted(config: HostedConfig): string {
-  const what = config.kind === "genie" ? (config.genie ? `Genie · ${config.genie.label}` : "Genie One") : `${harnessLabel(config.harness)} · ${harnessModel(config.harness, config.model).replace(/^system\.ai\./, "")}`;
+  const what =
+    config.kind === "genie"
+      ? config.genie
+        ? `Genie · ${config.genie.label}`
+        : "Genie One"
+      : config.kind === "omnigent"
+        ? `Omnigent · ${config.omnigent?.label ?? omnigentAgentLabel(DEFAULT_OMNIGENT_AGENT)}`
+        : `${harnessLabel(config.harness)} · ${harnessModel(config.harness, config.model).replace(/^system\.ai\./, "")}`;
   return [what, config.availability === "always" ? "always on" : "sleeps when Buzz is closed", ...(config.profile ? [config.profile] : [])].join(" · ");
 }
 
@@ -128,6 +146,7 @@ export function runnerConfigOf(record: HostedRecord, host?: string, workspaceId?
     ...(record.picture && { picture: record.picture }),
     kind: config.kind,
     ...(config.genie && { genieSpace: config.genie.space, genieLabel: config.genie.label }),
+    ...(config.kind === "omnigent" && config.omnigent && { omnigentAgent: config.omnigent.agent, omnigentLabel: config.omnigent.label }),
     harness: config.harness,
     model: harnessModel(config.harness, config.model),
     // Unattended: always each harness's guarded mode.
@@ -436,6 +455,12 @@ type FormProps = { config: HostedConfig; onChange(config: HostedConfig): void; d
 const KIND_CHOICES: readonly { id: HostedKind; label: string; detail: string }[] = [
   { id: "genie", label: "Genie", detail: "Answers data questions with Genie One, or with one of your Genie agents, as charts and tables." },
   { id: "sandbox", label: "Sandbox agent", detail: "Claude Code, Codex or Pi, working in its own Databricks Sandbox with the Databricks CLI signed in as you." },
+  {
+    id: "omnigent",
+    label: "Omnigent agent",
+    detail:
+      "An Omnigent agent (Claude Code, Codex, Pi, Polly…) on a Sandbox that Omnigent runs. Each conversation is an Omnigent session in this workspace, which you can open and continue in Omnigent.",
+  },
 ];
 
 const AVAILABILITY_HINT: Record<Availability, string> = {
@@ -467,6 +492,36 @@ function GenieField(props: { service: DatabricksService; value?: { space: string
   );
 }
 
+/** One of the workspace's Omnigent agents that run in its Sandboxes, or why there are none. */
+function OmnigentField(props: { service: DatabricksService; value?: { agent: string; label: string }; onChange(value: { agent: string; label: string }): void; disabled?: boolean }) {
+  const status = useConnection(props.service).status;
+  const found = useAsync(async () => {
+    const omnigent = new Omnigent(await props.service.ready(), workspaceIdOf(props.service));
+    const check = await omnigent.check();
+    return check.ok ? { agents: await omnigent.agents(), url: omnigent.webUrl() } : { reason: check.reason };
+  }, [props.service, status]);
+  const value = props.value ?? { agent: DEFAULT_OMNIGENT_AGENT, label: omnigentAgentLabel(DEFAULT_OMNIGENT_AGENT) };
+  const agents = (found.data && "agents" in found.data && found.data.agents) || [];
+  const reason = found.error ? describeError(found.error) : found.data && "reason" in found.data ? found.data.reason : undefined;
+  return (
+    <Stack gap={8}>
+      {reason && <Notice tone="warning">{reason}</Notice>}
+      <SinglePicker
+        label="Omnigent agent"
+        hint="Its sessions run on Sandboxes Omnigent makes for you, with models from AI Gateway. It answers with what Omnigent's agent can do there; your Databricks tools and skills aren't added to it."
+        value={value.agent}
+        valueLabel={value.label}
+        placeholder={omnigentAgentLabel(DEFAULT_OMNIGENT_AGENT)}
+        searchPlaceholder={`Search ${agents.length} agents`}
+        options={agents.map((agent) => ({ id: agent.name, label: agent.label, group: "Omnigent", ...(agent.detail && { detail: agent.detail }) }))}
+        loading={found.loading && !found.data ? "Loading Omnigent agents…" : false}
+        {...(props.disabled !== undefined && { disabled: props.disabled })}
+        onChange={(option) => props.onChange({ agent: option.id, label: option.label })}
+      />
+    </Stack>
+  );
+}
+
 export function HostedForm(props: FormProps & { service: DatabricksService; locked?: boolean }) {
   const { config, onChange } = props;
   const workspace = useAgentService(props.service, config.profile);
@@ -487,7 +542,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
         {available.data === false && <Notice tone="warning">Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview.</Notice>}
         {!props.locked && (
           <Field label="Type" hint={kind.detail}>
-            <select className="dbx-select" {...disabled} value={kind.id} onChange={(event) => onChange({ ...config, kind: event.target.value as HostedKind })}>
+            <select className="dbx-select" {...disabled} value={kind.id} onChange={(event) => onChange(normalizeHosted({ ...config, kind: event.target.value as HostedKind }))}>
               {KIND_CHOICES.map((choice) => (
                 <option key={choice.id} value={choice.id}>
                   {choice.label}
@@ -508,7 +563,14 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
             }}
           />
         )}
-        {config.kind === "genie" ? (
+        {config.kind === "omnigent" ? (
+          <OmnigentField
+            service={workspace}
+            {...(config.omnigent && { value: config.omnigent })}
+            {...disabled}
+            onChange={(omnigent) => onChange({ ...config, omnigent })}
+          />
+        ) : config.kind === "genie" ? (
           <GenieField
             service={workspace}
             {...(config.genie && { value: config.genie })}
@@ -561,7 +623,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
             <option value="channel">One per channel</option>
           </select>
         </Field>
-        {config.kind === "sandbox" && (
+        {config.kind !== "genie" && (
           <Field label="Instructions" hint="Optional. Who it is, what it should focus on, how to answer.">
             <textarea className="dbx-textarea" rows={5} {...disabled} value={config.instructions} onChange={(event) => onChange({ ...config, instructions: event.target.value })} />
           </Field>

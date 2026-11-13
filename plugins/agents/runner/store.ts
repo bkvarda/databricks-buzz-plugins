@@ -44,8 +44,11 @@ export type RunnerConfig = Readonly<{
   authTag: string[];
   name: string;
   picture?: string;
-  /** "genie": Genie One or a Genie agent answers; "sandbox": a coding harness does. */
-  kind: "genie" | "sandbox";
+  /** "genie": Genie One or a Genie agent answers; "sandbox": a coding harness does; "omnigent": an Omnigent agent does, in Omnigent sessions. */
+  kind: "genie" | "sandbox" | "omnigent";
+  /** The Omnigent agent's name (e.g. "claude-native-ui") and what it's called. */
+  omnigentAgent?: string;
+  omnigentLabel?: string;
   /** A Genie agent (space) to ask instead of Genie One, and its name. */
   genieSpace?: string;
   genieLabel?: string;

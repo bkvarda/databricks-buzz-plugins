@@ -1,7 +1,8 @@
 // The hosted Databricks agent's runner, inside its Databricks Sandbox. It
 // holds the agent's key, stays connected to the Buzz community, answers its
-// owner's mentions with Genie or a coding harness (Claude Code, Codex, Pi),
-// and posts replies as the agent: with the owner's Buzz open or closed.
+// owner's mentions with Genie, a coding harness (Claude Code, Codex, Pi) or an
+// Omnigent agent (in Omnigent sessions, on Sandboxes Omnigent runs), and posts
+// replies as the agent: with the owner's Buzz open or closed.
 // Databricks stops the Sandbox 24 hours after it starts; the owner's Buzz
 // starts it (and this runner) again when it's open.
 //
@@ -22,6 +23,7 @@ import { resultBlock } from "@dbx/core/result";
 import { generateSecretKey, getPublicKey, type NostrEvent, verifyEvent } from "nostr-tools/pure";
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { harnessLabel, RESULT_PROMPT, remoteNote } from "../src/remote";
+import { DEFAULT_OMNIGENT_AGENT, Omnigent, omnigentAgentLabel } from "../src/omnigent";
 import { CHAT_KINDS, channelKind, contextFilters, type Conversation, conversationOf, fromOwner, mentionsAgent, plainText, profileTemplate, replyTemplate, splitMessage, turnPrompt } from "./buzz";
 import { genieOneStep, genieStatusStep, rateLimitStep } from "../src/activity";
 import { OUTSIDER_TEXT, OutsiderNotes } from "../src/outsider";
@@ -69,11 +71,26 @@ const connect = (config: RunnerConfig, secret: Uint8Array) => new HttpRelay(conf
 
 // ── Turns ──
 
+const omnigentAgentOf = (config: RunnerConfig) => config.omnigentAgent || DEFAULT_OMNIGENT_AGENT;
+
+/** What answers for this agent, for its log. */
+const engineLabel = (config: RunnerConfig) =>
+  config.kind === "genie" ? "Genie" : config.kind === "omnigent" ? `Omnigent · ${config.omnigentLabel ?? omnigentAgentLabel(omnigentAgentOf(config))}` : harnessLabel(config.harness);
+
+/** For an Omnigent agent, in place of the Sandbox note: where it runs, and what happens to its last message. */
+const OMNIGENT_NOTE = [
+  "<omnigent-session>",
+  "You are running as an Omnigent agent in an Omnigent session on a Databricks Sandbox. Your owner can open this session in Omnigent and see your work.",
+  "Your final message in each turn is posted to the Buzz conversation as your reply, so make it the answer itself, written for the people there. You don't have Buzz's own tools in this session.",
+  "Never print secrets into the conversation.",
+  "</omnigent-session>",
+].join("\n");
+
 function systemPrompt(config: RunnerConfig, pubkey: string): string {
   return [
     `<identity>You are ${config.name} (pubkey ${pubkey}), an agent in Buzz, a chat app, owned by ${config.owner}.</identity>`,
     "People mention you in channels, threads and Solo chats; each mention is a turn. Messages in the conversation you haven't seen arrive with the mention, as JSON. Your final message is posted as your reply in that conversation: make it the answer itself, in Markdown, written for the people there, without saying that you're posting it.",
-    remoteNote(config.harness, "standard", config.kind === "sandbox" ? (config.tools ?? []) : []),
+    config.kind === "omnigent" ? OMNIGENT_NOTE : remoteNote(config.harness, "standard", config.kind === "sandbox" ? (config.tools ?? []) : []),
     RESULT_PROMPT,
     config.instructions.trim() ? `<agent-instructions>\n${config.instructions.trim()}\n</agent-instructions>` : "",
   ]
@@ -148,6 +165,39 @@ async function genieAnswer(config: RunnerConfig, question: string, conversationI
   return { text: parts.join("\n\n") || "Genie had no answer.", conversation: answer.message.conversation_id };
 }
 
+/**
+ * An Omnigent agent's answer, in the conversation's Omnigent session (made on
+ * its first turn, with Buzz's instructions in its first message, since a
+ * built-in Omnigent agent takes no system prompt of its own). Stop interrupts
+ * the session's work.
+ */
+async function omnigentAnswer(
+  config: RunnerConfig,
+  input: Readonly<{ session?: string; title: string; prompt: string; preamble: string; signal: AbortSignal; activity?: TurnActivity; onSession?: (id: string) => void }>,
+): Promise<{ text: string; session: string }> {
+  const client = await sandboxService(config.workspaceId).ready();
+  const omnigent = new Omnigent(client, config.workspaceId);
+  const result = await omnigent.turn({
+    ...(input.session && { session: input.session }),
+    agent: omnigentAgentOf(config),
+    title: input.title,
+    text: (fresh) => (fresh ? `${input.preamble}\n\n${input.prompt}` : input.prompt),
+    signal: input.signal,
+    onStep: (step) => {
+      log(`  ${step.tool}${step.target ? ` · ${step.target}` : ""}`);
+      input.activity?.step(step);
+    },
+    onThought: (text) => input.activity?.thought(text),
+    ...(input.onSession && { onSession: input.onSession }),
+  });
+  // Where to find the session, on its first reply (a note that it's waiting for approval has its own link).
+  const link = result.fresh && !result.waiting ? `\n\n[Open in Omnigent](${omnigent.webUrl(result.session)})` : "";
+  return { text: `${result.text}${link}`, session: result.session };
+}
+
+/** Marks a conversation's running Omnigent turn, so `interrupt` can stop it. */
+const omnigentTurnPath = (conversation: string) => `${turnPidPath(conversation)}.omnigent`;
+
 async function serve() {
   ensureDirs();
   const config = need(readConfig(), "config.json");
@@ -163,7 +213,7 @@ async function serve() {
   let active = 0;
   let lastActivity = Date.now();
   let lastError: string | undefined;
-  log(`starting as ${pubkey.slice(0, 12)}… (${config.kind === "genie" ? "Genie" : harnessLabel(config.harness)}, ${config.availability})`);
+  log(`starting as ${pubkey.slice(0, 12)}… (${engineLabel(config)}, ${config.availability})`);
   const relay = connect(config, secret);
   // Each turn's steps and thinking: a log for the Activity tab, and frames for the owner's Buzz.
   const activities = new RunnerActivity(paths.activity, new Observer(relay, secret, config.owner, log));
@@ -195,7 +245,8 @@ async function serve() {
       state.sessions[conversation.key] = { harness: tag, id: result.conversation, at: event.created_at };
       return result.text;
     }
-    const session = saved?.harness === config.harness ? saved : undefined;
+    const tag = config.kind === "omnigent" ? `omnigent:${omnigentAgentOf(config)}` : config.harness;
+    const session = saved?.harness === tag ? saved : undefined;
     // The conversation's messages this harness session hasn't seen.
     const filters = contextFilters(conversation);
     const found = (await relay.query(filters)).filter(
@@ -206,6 +257,33 @@ async function serve() {
     const prompt = turnPrompt({ event, conversation, agent: pubkey, context, total: unseen.length, names: await names(relay, [...new Set([event.pubkey, ...context.map((e) => e.pubkey)])]), scope: config.scope });
     // Tests run the runner against a local relay without a harness.
     if (process.env.BUZZ_RUNNER_ECHO === "1") return `echo: ${plainText(event.content)} | ${conversation.key} | context ${context.length} | ${prompt.length} chars`;
+    if (config.kind === "omnigent") {
+      const marker = omnigentTurnPath(conversation.key);
+      writeFileSync(marker, session?.id ?? "");
+      // Stop, from `interrupt` in another process, leaves a file; the turn's signal ends with it.
+      const stop = new AbortController();
+      const watch = setInterval(() => existsSync(`${turnPidPath(conversation.key)}.stopped`) && stop.abort(new DOMException("Stopped", "AbortError")), 1000);
+      try {
+        const result = await omnigentAnswer(config, {
+          ...(session && { session: session.id }),
+          title: `Buzz · ${config.name} · #${conversation.channel}`,
+          prompt,
+          preamble: systemPrompt(config, pubkey),
+          signal: AbortSignal.any([signal, stop.signal]),
+          activity,
+          onSession: (id) => {
+            state.sessions[conversation.key] = { harness: tag, id, at: session?.at ?? 0 };
+            writeFileSync(marker, id);
+            save();
+          },
+        });
+        state.sessions[conversation.key] = { harness: tag, id: result.session, at: event.created_at };
+        return result.text;
+      } finally {
+        clearInterval(watch);
+        rmSync(marker, { force: true });
+      }
+    }
     const result = await runLocalTurn({
       harness: config.harness,
       model: config.model,
@@ -399,6 +477,11 @@ async function main() {
       const [channel = "", root = ""] = args;
       for (const key of [`${channel}/${root}`, channel]) {
         const file = turnPidPath(key);
+        // An Omnigent turn: the runner interrupts the session when it sees the file.
+        if (existsSync(omnigentTurnPath(key))) {
+          writeFileSync(`${file}.stopped`, "");
+          return console.log("true");
+        }
         const pid = Number(existsSync(file) ? readFileSync(file, "utf8") : "");
         if (!pid) continue;
         writeFileSync(`${file}.stopped`, "");
@@ -422,6 +505,10 @@ async function main() {
       const config = need(readConfig(), "config.json");
       const question = args.join(" ") || "Say hello in one short sentence.";
       if (config.kind === "genie") return console.log((await genieAnswer(config, question, undefined, AbortSignal.timeout(TURN_TIMEOUT_MS))).text);
+      if (config.kind === "omnigent") {
+        const result = await omnigentAnswer(config, { title: `Buzz · ${config.name} · diagnostic`, prompt: question, preamble: systemPrompt(config, "diagnostic"), signal: AbortSignal.timeout(TURN_TIMEOUT_MS) });
+        return console.log(result.text);
+      }
       const result = await runLocalTurn({
         harness: config.harness,
         model: config.model,
