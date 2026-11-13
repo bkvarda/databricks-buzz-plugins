@@ -1,7 +1,12 @@
-// Small marks for our agent types' kinds (the Type picker), drawn in
-// Databricks Lava like the Databricks mark beside them in Buzz's Harness menu.
+// Small marks for our agent types' kinds (the Type picker): our own, drawn in
+// Databricks Lava like the Databricks mark beside them in Buzz's Harness menu,
+// and Omnigent's logo for Omnigent agents.
 // Components, not elements: React is bound only once a plugin starts.
 import { React } from "@dbx/core/react";
+import { svgDataUri } from "@dbx/core/ui/theme";
+import { OMNIGENT_LOGO_SVG } from "./omnigent-logo";
+
+const OMNIGENT_LOGO = svgDataUri(OMNIGENT_LOGO_SVG);
 
 const LAVA = "#FF3621";
 
@@ -35,18 +40,9 @@ export function SandboxKindIcon({ size = 20 }: IconProps) {
   );
 }
 
-/** Omnigent agent: one hub that brings several agents together. */
+/** Omnigent agent: Omnigent's own logo. */
 export function OmnigentKindIcon({ size = 20 }: IconProps) {
-  return svg(
-    size,
-    <>
-      <path d="M12 12V4.5M12 12l6.5 3.75M12 12l-6.5 3.75" stroke={LAVA} strokeWidth="1.8" strokeLinecap="round" />
-      <circle cx="12" cy="12" r="3.4" fill={LAVA} />
-      <circle cx="12" cy="4" r="2.3" fill={LAVA} />
-      <circle cx="18.9" cy="16" r="2.3" fill={LAVA} />
-      <circle cx="5.1" cy="16" r="2.3" fill={LAVA} />
-    </>,
-  );
+  return <img src={OMNIGENT_LOGO} width={size} height={size} alt="" aria-hidden draggable={false} style={{ display: "block" }} />;
 }
 
 /** Custom agent: building blocks, for an agent built with Agent Bricks, Model Serving or an App. */
