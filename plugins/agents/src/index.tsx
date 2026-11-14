@@ -49,7 +49,7 @@ export function apply(ctx: Context) {
               ],
               [
                 "Databricks (hosted)",
-                "Runs in your Databricks workspace, in its own Sandbox, so it can answer with Buzz closed. Genie, or Claude Code, Codex or Pi in each harness's guarded mode. Always on, or asleep while Buzz is closed. It can't use Buzz's own tools, and Buzz doesn't show it working.",
+                "Runs in your Databricks workspace, in its own Sandbox, so it can answer with Buzz closed. Genie, Claude Code, Codex or Pi in each harness's guarded mode, or an Omnigent agent. Always on, or asleep while Buzz is closed. It can't use Buzz's own tools.",
               ],
             ].map(([title, body]) => (
               <Stack key={title} gap={2}>

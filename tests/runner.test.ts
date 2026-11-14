@@ -140,6 +140,10 @@ describe("runner against a relay", () => {
     expect(reply.tags).toContainEqual(["e", mention.id, "", "reply"]);
     expect(reply.tags).toContainEqual(["h", "general"]);
     expect(attestedOwner(reply)).toBe(ownerPubkey);
+    // It typed under the mention while it worked (how Buzz on a phone sees it working), attested like its replies.
+    const typed = relay.events.find((e) => e.pubkey === agentPubkey && e.kind === 20002 && e.tags.some((t) => t[0] === "e" && t[1] === mention.id));
+    expect(typed?.tags).toEqual(expect.arrayContaining([["h", "general"], ["e", mention.id, "", "reply"]]));
+    expect(attestedOwner(typed!)).toBe(ownerPubkey);
   });
 
   it("tells its owner's Buzz it's working: encrypted activity frames for the turn, and its activity log", async () => {
@@ -151,7 +155,7 @@ describe("runner against a relay", () => {
         .filter((e) => e.kind === 24200 && e.pubkey === agentPubkey)
         .flatMap((e) => {
           const plain = JSON.parse(decrypt(e.content, key)) as { kind: string; payload?: { events?: unknown[] } };
-          return (plain.kind === "batch" ? plain.payload!.events! : [plain]) as { kind: string; turnId: string; channelId: string; timestamp: string; payload?: { triggeringEventIds?: string[] } }[];
+          return (plain.kind === "batch" ? plain.payload!.events! : [plain]) as { seq: number; kind: string; turnId: string; channelId: string; timestamp: string; payload?: { triggeringEventIds?: string[] } }[];
         });
     const started = await (async () => {
       for (let i = 0; i < 50; i++) {
@@ -162,6 +166,10 @@ describe("runner against a relay", () => {
       throw new Error("no frames for the turn");
     })();
     expect(started).toMatchObject({ channelId: "general" });
+    // Numbered from 1 in this run, as Buzz's own agents do, so a phone tells same-millisecond frames apart.
+    const seqs = frames().map((f) => f.seq);
+    expect(seqs.every((n) => Number.isInteger(n) && n > 0)).toBe(true);
+    expect(new Set(seqs).size).toBe(seqs.length);
     expect(Number.isFinite(Date.parse(started.timestamp))).toBe(true);
     const envelope = relay.events.find((e) => e.kind === 24200 && e.pubkey === agentPubkey)!;
     for (const [name, value] of [["p", ownerPubkey], ["agent", agentPubkey], ["frame", "telemetry"]]) expect(envelope.tags.filter((t) => t[0] === name)).toEqual([[name, value]]);

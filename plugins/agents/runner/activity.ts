@@ -25,6 +25,8 @@ export class Observer {
   private queue: Record<string, unknown>[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
   private refused = false;
+  /** Numbers each frame, from 1 in each run, as Buzz's own agents do: Buzz on a phone tells same-millisecond frames apart by it. */
+  private seq = 0;
 
   constructor(
     private readonly relay: HttpRelay,
@@ -37,7 +39,7 @@ export class Observer {
   }
 
   send(event: Record<string, unknown>) {
-    this.queue.push(event);
+    this.queue.push({ seq: ++this.seq, ...event });
     this.timer ??= setTimeout(() => void this.flush(), FLUSH_MS);
   }
 

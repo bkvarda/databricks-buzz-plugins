@@ -540,7 +540,7 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
         <NeedsConnection service={props.service} />
         {!props.locked && (
           <Text tone="subtle" size="sm">
-            Runs in Databricks, in its own Sandbox, so it can answer with Buzz closed. It can't use Buzz's own tools, and Buzz doesn't show it working.
+            Runs in Databricks, in its own Sandbox, so it can answer with Buzz closed, including from your phone. It can't use Buzz's own tools.
           </Text>
         )}
         {available.data === false && <Notice tone="warning">Databricks Sandbox isn't on in this workspace, and this agent runs in one. An admin can turn on the Sandbox preview.</Notice>}
@@ -791,7 +791,7 @@ export function registerHostedType(agents: Agents, service: DatabricksService): 
     id: HOSTED_TYPE_ID,
     icon,
     title: "Databricks",
-    description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, or Claude Code, Codex or Pi in its own Sandbox. No Buzz tools or working indicator.",
+    description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, Claude Code, Codex or Pi in its own Sandbox, or an Omnigent agent. No Buzz tools.",
     defaults: () => ({ config: normalizeHosted({}) }),
     summary: (agent: { config: unknown; pubkey?: string }) => summarizeHosted(provider.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config)),
     Create: (props: { config: unknown; onChange(config: unknown): void; disabled: boolean }) => (

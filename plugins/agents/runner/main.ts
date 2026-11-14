@@ -32,6 +32,7 @@ import { Observer, RunnerActivity, type TurnActivity } from "./activity";
 import { bridgeTools, serveBridge } from "./bridge";
 import { sandboxService } from "./databricks";
 import { runLocalTurn } from "./harness";
+import { Typing } from "./typing";
 import { HttpRelay } from "./http";
 import { ensureDirs, paths, readConfig, readSecretKey, readState, type RunnerConfig, sandboxStartedAt, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
 
@@ -217,6 +218,8 @@ async function serve() {
   const relay = connect(config, secret);
   // Each turn's steps and thinking: a log for the Activity tab, and frames for the owner's Buzz.
   const activities = new RunnerActivity(paths.activity, new Observer(relay, secret, config.owner, log));
+  // Typing while it works, which is how Buzz on a phone (and everyone else in the channel) sees it working.
+  const typing = new Typing((template) => relay.publish(template), log);
   const labels = toolLabels(config.tools ?? []);
 
   const save = () => writeState({ ...state, handled: [...handled] });
@@ -317,6 +320,7 @@ async function serve() {
     status();
     log(`mention ${event.id.slice(0, 8)} in ${conversation.key}`);
     const activity = activities.start({ eventId: event.id, channel: conversation.channel, ...(conversation.key !== conversation.channel && { root: conversation.root }), request: plainText(event.content), labels });
+    const stopTyping = typing.start(conversation, event);
     let outcome: "done" | "stopped" | "error" = "done";
     try {
       const text = await answer(event, conversation, AbortSignal.timeout(TURN_TIMEOUT_MS), activity);
@@ -334,6 +338,7 @@ async function serve() {
       }
     } finally {
       // After the reply, so Buzz stops showing the agent working once it's there.
+      stopTyping();
       await activity.end(outcome, outcome === "error" ? lastError : undefined);
       rmSync(stopped, { force: true });
       active--;
