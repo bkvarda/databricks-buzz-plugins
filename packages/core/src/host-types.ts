@@ -5,6 +5,25 @@ import type { ComponentType } from "react";
 export type PanelProps = Panel["component"] extends ComponentType<infer P> ? P : never;
 export type PageProps = Page["component"] extends ComponentType<infer P> ? P : never;
 
+export type { Browser, BrowserViewProps } from "@buzz/author";
+
+/** A card under a message for one of its links (Buzz 1.0.1+; not in our vendored types yet). */
+export type LinkPreviewProps = Readonly<{
+  url: string;
+  /** The host's id for the message the link is in. */
+  messageId: string;
+  /** Opens `url` the way clicking the link does. False once the card retires. */
+  open(): boolean;
+}>;
+export type LinkPreviewRenderer = Readonly<{
+  id: string;
+  title: string;
+  matches(url: string): boolean;
+  /** The lowest order among matching renderers draws the card. */
+  order?: number;
+  component: ComponentType<LinkPreviewProps>;
+}>;
+
 export type AgentTool = AddedTool;
 export type ToolReply = Awaited<ReturnType<AddedTool["call"]>>;
 export type AttentionSourceSpec = Parameters<Agents["addAttentionSource"]>[0];

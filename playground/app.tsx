@@ -76,6 +76,20 @@ const host: Any = {
 
 // ── a tiny Cordis-like registry ──
 const services = new Map<string, unknown>();
+// Buzz for Mac's own browser, which plugins show websites in. The playground
+// can't host a native webview, so this only shows what it would load.
+function PlaygroundBrowserView(props: { url: string; storage?: string; label?: string }) {
+  return (
+    <div style={{ height: "100%", minHeight: 320, display: "grid", placeItems: "center", padding: 24, background: "var(--surface-inset)", color: "var(--text-subtle)", fontSize: 12, textAlign: "center" }}>
+      <div>
+        <div style={{ fontWeight: 600, color: "var(--text-standard)", marginBottom: 6 }}>Buzz browser: {props.label}</div>
+        <div style={{ wordBreak: "break-all" }}>{props.url}</div>
+        <div style={{ marginTop: 6 }}>storage: {props.storage ?? "private"}</div>
+      </div>
+    </div>
+  );
+}
+if (!new URLSearchParams(location.search).has("nobrowser")) services.set("browser", { available: true, View: PlaygroundBrowserView });
 const serviceListeners = new Set<() => void>();
 const registry = {
   pages: [] as Any[],
@@ -88,6 +102,7 @@ const registry = {
   agentTypes: [] as Any[],
   sources: [] as Any[],
   messageActions: [] as Any[],
+  linkPreviews: [] as Any[],
 };
 const registryListeners = new Set<() => void>();
 const bump = () => registryListeners.forEach((listener) => listener());
@@ -153,6 +168,7 @@ function makeCtx(pluginId: string): Any {
     conversation: {
       registerLink: (link: Any) => (registry.links.push({ ...link, pluginId }), bump()),
       registerCodeBlock: (block: Any) => (registry.codeBlocks.push({ ...block, pluginId }), bump()),
+      registerLinkPreview: (card: Any) => (registry.linkPreviews.push({ ...card, pluginId }), bump()),
       registerTool: (tool: Any) => (registry.tools.push({ ...tool, pluginId }), bump()),
       registerMessage: () => {},
       registerMessageAction: (action: Any) => (registry.messageActions.push({ ...action, pluginId }), bump()),
@@ -218,7 +234,9 @@ SELECT date_trunc('week', o_orderdate) AS week, count(*) AS orders, round(sum(o_
 FROM samples.tpch.orders
 WHERE o_orderdate >= '1998-01-01'
 GROUP BY 1 ORDER BY 1
-\`\`\``;
+\`\`\`
+
+The weekly numbers are on the dashboard too: https://example.cloud.databricks.com/dashboardsv3/0123456789abcdef0123456789abcdef/published?o=123`;
 
 function Shell() {
   useRegistry();
@@ -315,14 +333,31 @@ function messageParts(text: string): React.ReactNode[] {
 function ConversationDemo() {
   const [text, setText] = React.useState(CONVERSATION_SAMPLE);
   const [draft, setDraft] = React.useState("");
+  // A link's panel opens beside the conversation, as in a Buzz channel.
+  const [opened, setOpened] = React.useState("");
   const parts = messageParts(text);
+  const panelFor = (url: string) => registry.panels.filter((candidate) => candidate.matches(url)).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))[0];
+  const openLink = (url: string) => (panelFor(url) ? setOpened(url) : window.open(url, "_blank", "noreferrer"), true);
+  const previews = [...new Set(text.match(/https:\/\/[^\s)>\]]+/g) ?? [])].flatMap((url) => {
+    const card = registry.linkPreviews.filter((candidate) => candidate.matches(url)).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))[0];
+    return card ? [{ url, card }] : [];
+  });
+  const panel = opened ? panelFor(opened) : undefined;
   return (
-    <div style={{ maxWidth: 820, margin: "0 auto", padding: 24 }}>
+    <div style={{ display: "grid", gridTemplateColumns: panel ? "minmax(0, 1fr) 440px" : "minmax(0, 1fr)", height: "100%", overflow: "hidden" }}>
+    <div style={{ maxWidth: 820, width: "100%", margin: "0 auto", padding: 24, boxSizing: "border-box" }}>
       <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
         <div style={{ width: 32, height: 32, borderRadius: 8, background: "var(--surface-inset)", flex: "none" }} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>alex <span style={{ color: "var(--text-subtle)", fontWeight: 400 }}>9:41 AM</span></div>
           <div style={{ fontSize: 14 }}>{parts}</div>
+          {previews.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 4, marginTop: 4 }}>
+              {previews.map(({ url, card }) => (
+                <card.component key={`${card.pluginId}/${card.id}:${url}`} url={url} messageId="m1" open={() => openLink(url)} />
+              ))}
+            </div>
+          )}
         </div>
       </div>
       <details style={{ marginTop: 20 }}>
@@ -337,6 +372,18 @@ function ConversationDemo() {
           ))}
         </div>
       </div>
+    </div>
+    {panel && (
+      <div style={{ borderLeft: "1px solid var(--border-standard)", display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", borderBottom: "1px solid var(--border-standard)", fontSize: 12 }}>
+          <span>{panel.title}</span>
+          <button type="button" onClick={() => setOpened("")}>Close</button>
+        </div>
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+          <panel.component target={opened} close={() => setOpened("")} />
+        </div>
+      </div>
+    )}
     </div>
   );
 }

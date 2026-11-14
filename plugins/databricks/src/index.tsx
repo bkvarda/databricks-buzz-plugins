@@ -2,18 +2,19 @@
 //
 // Provides the `databricks` service to the other Databricks plugins, the
 // Settings card where people connect, live chips and a details panel for
-// Databricks links, and a few workspace tools for every agent.
+// Databricks links, dashboards beside the conversation, and a few workspace
+// tools for every agent.
 import type { Context, Navigation, PluginInstaller } from "@buzz/author";
 import { parseWorkspaceUrl } from "@dbx/core/api/workspace";
 import { Connection } from "@dbx/core/connection";
-import { optionalService } from "@dbx/core/host-types";
+import { type Browser, type LinkPreviewRenderer, optionalService } from "@dbx/core/host-types";
 import { openPluginDetails } from "@dbx/core/installed";
 import { createService } from "@dbx/core/provider";
 import { bindReact, React } from "@dbx/core/react";
 import { RESULT_LANGUAGE } from "@dbx/core/result";
 import { ResultBlock } from "@dbx/core/ui/data";
 import { SERVICE_NAME, SETTINGS_SECTION } from "@dbx/core/service";
-import { linkChip, panelMatches, workspacePanel } from "./links";
+import { dashboardCard, dashboardPanel, isDashboardUrl, linkChip, panelMatches, workspacePanel } from "./links";
 import { ConnectionSettings } from "./settings";
 import { coreTools, jobRunSource } from "./tools";
 
@@ -76,6 +77,30 @@ export function apply(ctx: Context) {
     matches: panelMatches,
     keepOpen: true,
     component: workspacePanel(service),
+  });
+
+  // Dashboards open in Buzz's browser, which only Buzz for Mac has; elsewhere
+  // their links keep opening in the web browser. Read View once: Cordis wraps
+  // service functions on each access, and React needs one component identity.
+  const browser = optionalService<Browser>(ctx, "browser");
+  const View = browser?.available ? browser.View : undefined;
+  if (View)
+    ctx.panels.register({
+      id: "dashboard",
+      title: "Dashboard",
+      matches: isDashboardUrl,
+      keepOpen: true,
+      component: dashboardPanel(View),
+    });
+  // Cards under messages arrived in Buzz 1.0.1.
+  const conversation = ctx.conversation as typeof ctx.conversation & { registerLinkPreview?(renderer: LinkPreviewRenderer): void };
+  conversation.registerLinkPreview?.({
+    id: "dashboard",
+    title: "Databricks dashboards",
+    // Ahead of any general web card.
+    order: -10,
+    matches: isDashboardUrl,
+    component: dashboardCard(service, !!View),
   });
 
   ctx.inject(["agents"], (scope: Context) => {

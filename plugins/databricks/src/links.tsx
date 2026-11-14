@@ -1,13 +1,14 @@
 // Databricks links in conversations: an inline chip with live status, and a
 // side panel with details. Everything is read with the *viewer's* own
 // sign-in, so each person only sees what Databricks lets them see.
-import type { ReactNode } from "react";
-import type { PanelProps } from "@dbx/core/host-types";
+import type { ComponentType, ReactNode } from "react";
+import type { BrowserViewProps, LinkPreviewProps, PanelProps } from "@dbx/core/host-types";
+import { type DashboardSummary, dashboardSummary } from "@dbx/core/api/dashboards";
 import { Jobs, LINK_LABEL, parseWorkspaceUrl, type RunStatus, runLabel, runTone, type WorkspaceLink } from "@dbx/core/api/workspace";
 import { Sql } from "@dbx/core/api/sql";
 import { React } from "@dbx/core/react";
-import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { ago, Badge, Button, DatabricksMark, DbxRoot, EmptyState, Notice, openExternal, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
+import { type DatabricksService, describeError, isApiError, useAsync, useConnection } from "@dbx/core/service";
+import { ago, Badge, Button, Card, DatabricksMark, DbxRoot, EmptyState, Notice, openExternal, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
 import { DataTable } from "@dbx/core/ui/data";
 import { resultSet } from "@dbx/core/result";
 
@@ -101,6 +102,114 @@ export const panelMatches = (url: string) => {
   const link = parseWorkspaceUrl(url);
   return link?.kind === "run" || link?.kind === "job" || link?.kind === "pipeline" || link?.kind === "table";
 };
+
+// Dashboards open beside the conversation in Buzz's own browser, as the live
+// dashboard (Buzz's window can't frame other sites, so the embedding Databricks
+// documents doesn't apply), and a card under the message says which one it is.
+
+type DashboardLink = Extract<WorkspaceLink, { kind: "dashboard" }>;
+
+function dashboardLink(url: string): DashboardLink | undefined {
+  const link = parseWorkspaceUrl(url);
+  return link?.kind === "dashboard" ? link : undefined;
+}
+
+export const isDashboardUrl = (url: string) => dashboardLink(url) !== undefined;
+
+/** Website storage for dashboards in Buzz's browser: one workspace sign-in, kept between opens and restarts. */
+export const DASHBOARD_STORAGE = "databricks";
+
+/** Cards for the same dashboard share one read for a minute. */
+const summaries = new Map<string, { at: number; value: Promise<DashboardSummary | undefined> }>();
+/** Names read so far, so a dashboard's tab is named before its page loads. */
+const names = new Map<string, string>();
+const dashboardKey = (link: DashboardLink) => `${link.host}/${link.dashboardId}`;
+
+function cachedSummary(service: DatabricksService, link: DashboardLink): Promise<DashboardSummary | undefined> {
+  const key = dashboardKey(link);
+  const hit = summaries.get(key);
+  if (hit && Date.now() - hit.at < 60_000) return hit.value;
+  const client = service.client();
+  if (!client) return Promise.resolve(undefined);
+  const value = dashboardSummary(client, link.dashboardId).then(
+    (summary) => {
+      if (summary) names.set(key, summary.name);
+      return summary;
+    },
+    (error: unknown) => {
+      // A failed read isn't kept, so the next card tries again.
+      summaries.delete(key);
+      throw error;
+    },
+  );
+  summaries.set(key, { at: Date.now(), value });
+  return value;
+}
+
+/** What a dashboard card says under the name. */
+export function dashboardDetail(summary: DashboardSummary, now = Date.now()): string {
+  if (summary.published !== undefined) return `Published ${ago(summary.published, now)}`;
+  if (summary.updated !== undefined) return `Not published · edited ${ago(summary.updated, now)}`;
+  return "Not published";
+}
+
+/** The live dashboard, in a tab beside the conversation. */
+export function dashboardPanel(View: ComponentType<BrowserViewProps>) {
+  return function DashboardPanel(props: PanelProps) {
+    const link = dashboardLink(props.target);
+    const label = (link && names.get(dashboardKey(link))) ?? "Dashboard";
+    return <View url={props.target} storage={DASHBOARD_STORAGE} label={label} />;
+  };
+}
+
+/** A card under a message for a dashboard link: its name, when it was published, and where to open it. */
+export function dashboardCard(service: DatabricksService, opensInBuzz: boolean) {
+  return function DashboardCard(props: LinkPreviewProps) {
+    const link = React.useMemo(() => dashboardLink(props.url), [props.url]);
+    const snapshot = useConnection(service);
+    const connected = snapshot.status === "connected";
+    const readable = !!link && connected && sameWorkspace(service, link);
+    const state = useAsync(async () => (readable && link ? cachedSummary(service, link) : undefined), [props.url, readable]);
+    if (!link) return null;
+    const host = link.host.replace(/^https:\/\//, "");
+    let detail: string;
+    if (!connected) detail = "Connect Databricks in Settings to see its name.";
+    else if (!readable) detail = `In ${host}, not the workspace you're connected to.`;
+    else if (state.loading && !state.data) detail = "Loading…";
+    else if (state.error)
+      detail = isApiError(state.error) && state.error.isPermission ? "You don't have access to this dashboard." : "Couldn't read this dashboard.";
+    else if (!state.data) detail = "This dashboard doesn't exist anymore.";
+    else detail = dashboardDetail(state.data);
+    return (
+      <DbxRoot style={{ width: "min(100%, 26rem)" }}>
+        <Card padding={12}>
+          <Stack gap={6}>
+            <Stack direction="row" gap={6} align="center">
+              <DatabricksMark size={12} />
+              <Text size="xs" tone="subtle">
+                Dashboard · {host.split(".")[0]}
+              </Text>
+            </Stack>
+            <Text weight={500}>{state.data?.name ?? "Databricks dashboard"}</Text>
+            <Text size="sm" tone="subtle">
+              {detail}
+            </Text>
+            <Stack direction="row" gap={6} style={{ marginTop: 4 }}>
+              {opensInBuzz && (
+                <Button size="sm" onClick={() => props.open()}>
+                  Open in Buzz
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => openExternal(props.url)}>
+                Open in browser
+              </Button>
+            </Stack>
+          </Stack>
+        </Card>
+      </DbxRoot>
+    );
+  };
+}
 
 function RunDetails(props: { run: RunStatus }) {
   const { run } = props;

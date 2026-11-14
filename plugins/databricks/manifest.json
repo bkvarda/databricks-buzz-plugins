@@ -2,7 +2,7 @@
   "id": "bkvarda.databricks",
   "name": "Databricks",
   "apiVersion": 1,
-  "description": "Sign in to Databricks once for every Databricks plugin, and see live status for Databricks links in conversations.",
+  "description": "Sign in to Databricks once for every Databricks plugin, see live status for Databricks links in conversations, and open dashboards beside the conversation.",
   "updates": { "defaultEnabled": true },
   "discovery": {
     "category": "developer-tools-and-integrations",

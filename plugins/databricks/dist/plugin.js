@@ -1268,10 +1268,10 @@ function planChart(result) {
     if (Number.isFinite(value)) return { type: "kpi", value, label: columns[0]?.name ?? "" };
   }
   if (rows.length < 2 || !numeric.length) return { type: "none" };
-  const time = columns.findIndex((column) => column.kind === "time");
-  if (time !== -1) {
-    const series = comparable(rows, numeric.filter((index) => index !== time)).slice(0, 4);
-    return series.length ? { type: "line", x: time, series } : { type: "none" };
+  const time2 = columns.findIndex((column) => column.kind === "time");
+  if (time2 !== -1) {
+    const series = comparable(rows, numeric.filter((index) => index !== time2)).slice(0, 4);
+    return series.length ? { type: "line", x: time2, series } : { type: "none" };
   }
   const label = columns.findIndex((column) => column.kind === "text");
   if (label !== -1 && rows.length <= 40) {
@@ -1851,8 +1851,8 @@ function ResultChart(props) {
   if (plan.type === "none") return null;
   if (plan.type === "kpi")
     return /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { padding: "8px 2px" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, plan.label), /* @__PURE__ */ React.createElement(Text, { size: "xl", weight: 600, style: { fontSize: "1.75rem", fontVariantNumeric: "tabular-nums" } }, formatNumber(plan.value)));
-  const names = plan.series.map((index) => props.result.columns[index]?.name ?? "");
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Legend, { names }), plan.type === "line" ? /* @__PURE__ */ React.createElement(LineChart, { result: props.result, plan }) : /* @__PURE__ */ React.createElement(BarChart, { result: props.result, plan }));
+  const names2 = plan.series.map((index) => props.result.columns[index]?.name ?? "");
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Legend, { names: names2 }), plan.type === "line" ? /* @__PURE__ */ React.createElement(LineChart, { result: props.result, plan }) : /* @__PURE__ */ React.createElement(BarChart, { result: props.result, plan }));
 }
 function ResultView(props) {
   const plan = React.useMemo(() => planChart(props.result), [props.result]);
@@ -1865,6 +1865,32 @@ function ResultBlock(props) {
   const result = React.useMemo(() => fromCsv(props.code), [props.code]);
   if (!result) throw new Error("Not a result table");
   return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "10px 44px 10px 12px" } }, /* @__PURE__ */ React.createElement(ResultView, { result, maxHeight: 320, compact: true }));
+}
+
+// packages/core/src/api/dashboards.ts
+var time = (value) => {
+  const ms = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(ms) ? ms : void 0;
+};
+var notFound = (error) => error instanceof Error && error.name === "DatabricksApiError" && error.isNotFound;
+async function dashboardSummary(client, dashboardId, signal) {
+  const path = `/api/2.0/lakeview/dashboards/${encodeURIComponent(dashboardId)}`;
+  let unpublished;
+  try {
+    const published = await client.get(`${path}/published`, { signal });
+    return { name: published.display_name || "Untitled dashboard", published: time(published.revision_create_time) };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    unpublished = error;
+  }
+  try {
+    const draft = await client.get(path, { signal });
+    return { name: draft.display_name || "Untitled dashboard", updated: time(draft.update_time) };
+  } catch (error) {
+    if (signal?.aborted || !notFound(error)) throw error;
+    if (notFound(unpublished)) return void 0;
+    throw unpublished;
+  }
 }
 
 // packages/core/src/api/sql.ts
@@ -2057,6 +2083,66 @@ var panelMatches = (url) => {
   const link = parseWorkspaceUrl(url);
   return link?.kind === "run" || link?.kind === "job" || link?.kind === "pipeline" || link?.kind === "table";
 };
+function dashboardLink(url) {
+  const link = parseWorkspaceUrl(url);
+  return link?.kind === "dashboard" ? link : void 0;
+}
+var isDashboardUrl = (url) => dashboardLink(url) !== void 0;
+var DASHBOARD_STORAGE = "databricks";
+var summaries = /* @__PURE__ */ new Map();
+var names = /* @__PURE__ */ new Map();
+var dashboardKey = (link) => `${link.host}/${link.dashboardId}`;
+function cachedSummary(service, link) {
+  const key = dashboardKey(link);
+  const hit = summaries.get(key);
+  if (hit && Date.now() - hit.at < 6e4) return hit.value;
+  const client = service.client();
+  if (!client) return Promise.resolve(void 0);
+  const value = dashboardSummary(client, link.dashboardId).then(
+    (summary) => {
+      if (summary) names.set(key, summary.name);
+      return summary;
+    },
+    (error) => {
+      summaries.delete(key);
+      throw error;
+    }
+  );
+  summaries.set(key, { at: Date.now(), value });
+  return value;
+}
+function dashboardDetail(summary, now = Date.now()) {
+  if (summary.published !== void 0) return `Published ${ago(summary.published, now)}`;
+  if (summary.updated !== void 0) return `Not published \xB7 edited ${ago(summary.updated, now)}`;
+  return "Not published";
+}
+function dashboardPanel(View) {
+  return function DashboardPanel(props) {
+    const link = dashboardLink(props.target);
+    const label = (link && names.get(dashboardKey(link))) ?? "Dashboard";
+    return /* @__PURE__ */ React.createElement(View, { url: props.target, storage: DASHBOARD_STORAGE, label });
+  };
+}
+function dashboardCard(service, opensInBuzz) {
+  return function DashboardCard(props) {
+    const link = React.useMemo(() => dashboardLink(props.url), [props.url]);
+    const snapshot = useConnection(service);
+    const connected = snapshot.status === "connected";
+    const readable = !!link && connected && sameWorkspace(service, link);
+    const state = useAsync(async () => readable && link ? cachedSummary(service, link) : void 0, [props.url, readable]);
+    if (!link) return null;
+    const host = link.host.replace(/^https:\/\//, "");
+    let detail;
+    if (!connected) detail = "Connect Databricks in Settings to see its name.";
+    else if (!readable) detail = `In ${host}, not the workspace you're connected to.`;
+    else if (state.loading && !state.data) detail = "Loading\u2026";
+    else if (state.error)
+      detail = isApiError(state.error) && state.error.isPermission ? "You don't have access to this dashboard." : "Couldn't read this dashboard.";
+    else if (!state.data) detail = "This dashboard doesn't exist anymore.";
+    else detail = dashboardDetail(state.data);
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { width: "min(100%, 26rem)" } }, /* @__PURE__ */ React.createElement(Card, { padding: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(DatabricksMark, { size: 12 }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Dashboard \xB7 ", host.split(".")[0])), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, state.data?.name ?? "Databricks dashboard"), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, detail), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, style: { marginTop: 4 } }, opensInBuzz && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => props.open() }, "Open in Buzz"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => openExternal(props.url) }, "Open in browser")))));
+  };
+}
 function RunDetails(props) {
   const { run } = props;
   return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusDot, { tone: runTone(run), label: runLabel(run) }), /* @__PURE__ */ React.createElement(Text, { weight: 500 }, runLabel(run)), run.startTime && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "started ", ago(run.startTime), run.endTime ? ` \xB7 took ${Math.max(1, Math.round((run.endTime - run.startTime) / 1e3))}s` : "")), run.message && /* @__PURE__ */ React.createElement(Notice, { tone: runTone(run) === "danger" ? "danger" : "info" }, run.message), run.tasks.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "Tasks"), run.tasks.map((task) => {
@@ -2439,6 +2525,25 @@ function apply(ctx) {
     matches: panelMatches,
     keepOpen: true,
     component: workspacePanel(service)
+  });
+  const browser = optionalService(ctx, "browser");
+  const View = browser?.available ? browser.View : void 0;
+  if (View)
+    ctx.panels.register({
+      id: "dashboard",
+      title: "Dashboard",
+      matches: isDashboardUrl,
+      keepOpen: true,
+      component: dashboardPanel(View)
+    });
+  const conversation = ctx.conversation;
+  conversation.registerLinkPreview?.({
+    id: "dashboard",
+    title: "Databricks dashboards",
+    // Ahead of any general web card.
+    order: -10,
+    matches: isDashboardUrl,
+    component: dashboardCard(service, !!View)
   });
   ctx.inject(["agents"], (scope) => {
     for (const tool of coreTools(service)) scope.agents.addTool(tool);
