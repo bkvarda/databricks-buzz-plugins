@@ -157,12 +157,16 @@ function personKey(value: string): string {
 export function parseQuery(query: string, now = Date.now()): SearchQuery {
   const out: SearchQuery = { text: "", from: [], to: [], in: [] };
   const words: string[] = [];
-  // Words, "quoted phrases", and filter:values (a value may be quoted too).
-  for (const [, token = ""] of query.matchAll(/((?:[a-z]+:)?"[^"]*"|\S+)/gi)) {
-    const filter = /^([a-z]+):(.+)$/i.exec(token);
-    const key = filter?.[1]?.toLowerCase();
-    const value = filter?.[2]?.replace(/^"|"$/g, "").trim() ?? "";
-    if (!filter || !value) {
+  // Filters (a value may follow a space, or be quoted, like from: @sam or from:@"Sam Lee"), "quoted phrases", and words.
+  const tokens = /\b(from|to|in|before|after|on|during|has|is):\s*([@#]?"[^"]*"|[^\s"]+)|("[^"]*")|(\S+)/gi;
+  for (const [token, rawKey, rawValue, phrase, word] of query.matchAll(tokens)) {
+    if (!rawKey) {
+      words.push(phrase ?? word ?? token);
+      continue;
+    }
+    const key = rawKey.toLowerCase();
+    const value = (rawValue ?? "").replace(/^([@#]?)"(.*)"$/, "$1$2").trim();
+    if (!value || /^[@#]$/.test(value)) {
       words.push(token);
       continue;
     }

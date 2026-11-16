@@ -921,6 +921,13 @@ async function searchBuzzQuery(client, app, query, limit = 20, signal) {
   const reply = JSON.parse(response.body);
   return { results: reply.results ?? [], ...reply.query && { query: reply.query } };
 }
+async function suggestBuzz(client, app, kind, typed, signal) {
+  if (!app.url) return [];
+  const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/${kind}`, { query: { q: typed, limit: 8 }, timeoutMs: 15e3, ...signal && { signal } });
+  if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) return [];
+  const reply = JSON.parse(response.body);
+  return (kind === "people" ? reply.people : reply.channels) ?? [];
+}
 
 // packages/core/src/ui/workspace.tsx
 var hostname = (host) => new URL(host).hostname;
@@ -1026,6 +1033,132 @@ function initialQuery(target) {
   const params = t?.kind === "page" ? t.route?.params : t?.params;
   return typeof params?.q === "string" ? params.q : "";
 }
+function typingAt(text, caret) {
+  const before = text.slice(0, caret);
+  const person = /(^|\s)(?:(from|to):\s*@?|@)([^\s@#"]*)$/i.exec(before);
+  if (person) {
+    const start = person.index + person[1].length;
+    return { kind: "people", filter: person[2]?.toLowerCase() ?? "from", typed: person[3] ?? "", start, end: caret };
+  }
+  const channel = /(^|\s)(?:in:\s*#?|#)([^\s#"]*)$/i.exec(before);
+  if (channel) {
+    const start = channel.index + channel[1].length;
+    return { kind: "channels", filter: "in", typed: channel[2] ?? "", start, end: caret };
+  }
+  return void 0;
+}
+function chooseSuggestion(text, typing, value) {
+  const token = typing.kind === "people" ? `${typing.filter}:@${/\s/.test(value) ? `"${value}"` : value}` : `in:#${value}`;
+  const after = text.slice(typing.end).replace(/^\S*/, "");
+  const next = `${text.slice(0, typing.start)}${token} ${after.replace(/^\s+/, "")}`;
+  return { text: next, caret: typing.start + token.length + 1 };
+}
+function SearchBox(props) {
+  const input = React.useRef(null);
+  const [typing, setTyping] = React.useState();
+  const [items, setItems] = React.useState([]);
+  const [active, setActive] = React.useState(0);
+  const app = props.app;
+  React.useEffect(() => {
+    if (!typing || !app) return setItems([]);
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      void props.workspace.ready().then(
+        async (client) => typing.kind === "people" ? (await suggestBuzz(client, app, "people", typing.typed, controller.signal)).map((p) => ({ key: p.pubkey, label: p.name, detail: `@${p.handle}`, value: p.handle })) : (await suggestBuzz(client, app, "channels", typing.typed, controller.signal)).map((c) => ({ key: c.id, label: `#${c.name}`, value: c.name }))
+      ).then(
+        (found) => {
+          if (controller.signal.aborted) return;
+          setItems(found);
+          setActive(0);
+        },
+        () => setItems([])
+      );
+    }, 120);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [typing?.kind, typing?.typed, typing?.filter, app?.name]);
+  const refresh = (text, caret) => setTyping(typingAt(text, caret));
+  const choose = (item) => {
+    if (!typing) return;
+    const next = chooseSuggestion(props.value, typing, item.value);
+    props.onChange(next.text);
+    setTyping(void 0);
+    setItems([]);
+    requestAnimationFrame(() => {
+      input.current?.focus();
+      input.current?.setSelectionRange(next.caret, next.caret);
+    });
+  };
+  const open = Boolean(typing && items.length);
+  return /* @__PURE__ */ React.createElement(
+    "form",
+    {
+      onSubmit: (event) => {
+        event.preventDefault();
+        if (open) return choose(items[active]);
+        props.onSearch(props.value);
+      }
+    },
+    /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { position: "relative", flex: 1 } }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        ref: input,
+        className: "dbx-input",
+        style: { width: "100%" },
+        autoFocus: true,
+        role: "combobox",
+        "aria-expanded": open,
+        "aria-autocomplete": "list",
+        placeholder: "Search public channels, e.g. from:@sam in:#general launch",
+        value: props.value,
+        onChange: (event) => {
+          props.onChange(event.target.value);
+          refresh(event.target.value, event.target.selectionStart ?? event.target.value.length);
+        },
+        onClick: (event) => refresh(event.currentTarget.value, event.currentTarget.selectionStart ?? 0),
+        onBlur: () => setTimeout(() => setTyping(void 0), 150),
+        onKeyDown: (event) => {
+          if (!open) return;
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            setActive((n) => (n + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length);
+          } else if (event.key === "Tab") {
+            event.preventDefault();
+            choose(items[active]);
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            setTyping(void 0);
+          }
+        }
+      }
+    ), open && /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        role: "listbox",
+        style: { position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 10, background: "var(--surface-raised, var(--background, #fff))", border: "1px solid var(--border-standard, #e5e5e5)", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", padding: 4, maxHeight: 320, overflowY: "auto" }
+      },
+      /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { padding: "4px 8px" } }, typing.kind === "people" ? typing.filter === "to" ? "Mentioning" : "From" : "In"),
+      items.map((item, n) => /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          key: item.key,
+          role: "option",
+          "aria-selected": n === active,
+          onMouseDown: (event) => {
+            event.preventDefault();
+            choose(item);
+          },
+          onMouseEnter: () => setActive(n),
+          style: { padding: "6px 8px", borderRadius: 6, cursor: "pointer", display: "flex", gap: 8, alignItems: "baseline", background: n === active ? "var(--surface-hover, rgba(0,0,0,0.05))" : "transparent" }
+        },
+        /* @__PURE__ */ React.createElement(Text, { size: "sm" }, item.label),
+        item.detail && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.detail)
+      ))
+    )), /* @__PURE__ */ React.createElement(Button, { variant: "primary", type: "submit", disabled: !app || !props.value.trim() || props.busy }, props.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, "Search"))
+  );
+}
 function Snippet(props) {
   const parts = props.text.split("**");
   return /* @__PURE__ */ React.createElement(Text, { size: "sm" }, parts.map((part, n) => n % 2 ? /* @__PURE__ */ React.createElement("b", { key: n }, part) : /* @__PURE__ */ React.createElement(React.Fragment, { key: n }, part)));
@@ -1061,7 +1194,7 @@ function searchPage(ctx, service) {
       setState({ loading: true, asked: text });
       try {
         const found = await searchBuzzQuery(await workspace.ready(), app, text.trim(), 30);
-        setState({ hits: found.results, ...found.query && { understood: found.query }, asked: text });
+        setState({ hits: found.results, ...found.query && { understood: found.query }, ...!found.query && { old: true }, asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
@@ -1080,16 +1213,7 @@ function searchPage(ctx, service) {
     else if (!indexes.data?.apps.length)
       body = /* @__PURE__ */ React.createElement(EmptyState, { title: `No search index in ${host}` }, "If the index is in another workspace, pick it above. An admin makes one in Agents \u2192 New agent \u2192 Databricks App, with the Search index template; it reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.");
     else
-      body = /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(
-        "form",
-        {
-          onSubmit: (event) => {
-            event.preventDefault();
-            void run(query);
-          }
-        },
-        /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, autoFocus: true, placeholder: "Search public channels, e.g. from:@sam in:#general launch", value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(Button, { variant: "primary", type: "submit", disabled: !app || !query.trim() || state.loading }, state.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, "Search"))
-      ), indexes.data.apps.length > 1 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Index"), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: app?.name ?? "", onChange: (event) => setPicked(event.target.value) }, indexes.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.description?.replace(/^Buzz search index:\s*/, "") || found.name)))), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, FILTER_HELP), filterLabels(state.understood).length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, style: { flexWrap: "wrap" } }, filterLabels(state.understood).map((label) => /* @__PURE__ */ React.createElement(Badge, { key: label }, label)), state.understood?.text && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "and \u201C", state.understood.text, "\u201D")), state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), state.hits && !state.hits.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing in public channels matches \u201C", state.asked, "\u201D."), state.hits?.map((hit) => /* @__PURE__ */ React.createElement(
+      body = /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(SearchBox, { workspace, ...app && { app }, value: query, onChange: setQuery, onSearch: (text) => void run(text), ...state.loading && { busy: true } }), indexes.data.apps.length > 1 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Index"), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: app?.name ?? "", onChange: (event) => setPicked(event.target.value) }, indexes.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.description?.replace(/^Buzz search index:\s*/, "") || found.name)))), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, FILTER_HELP), filterLabels(state.understood).length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, style: { flexWrap: "wrap" } }, filterLabels(state.understood).map((label) => /* @__PURE__ */ React.createElement(Badge, { key: label }, label)), state.understood?.text && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "and \u201C", state.understood.text, "\u201D")), state.old && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "This index runs older code" }, "It searched every word, filters included, as text. Its owner's Buzz updates it on its own once the Databricks Agents plugin is updated; Deploy again in its Settings tab does it now."), state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), state.hits && !state.hits.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing in public channels matches \u201C", state.asked, "\u201D."), state.hits?.map((hit) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: hit.id,

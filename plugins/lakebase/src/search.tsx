@@ -4,7 +4,7 @@
 // and the same search as an agent tool. Each search runs as the person
 // searching: Databricks Apps signs them in, and they need Can Use on the app.
 import type { Context } from "@buzz/author";
-import { type BuzzSearchHit, type BuzzSearchQuery, type DatabricksApp, searchApps, searchBuzz, searchBuzzQuery } from "@dbx/core/api/apps";
+import { type BuzzSearchHit, type BuzzSearchQuery, type DatabricksApp, searchApps, searchBuzz, searchBuzzQuery, suggestBuzz } from "@dbx/core/api/apps";
 import { type AgentTool, numberArg, optionalService, schema, stringArg } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
@@ -56,6 +56,158 @@ export function initialQuery(target: unknown): string {
   return typeof params?.q === "string" ? params.q : "";
 }
 
+/** What's being typed at the caret: a person after @ (or from:/to:), a channel after # (or in:). */
+export type Typing = Readonly<{ kind: "people" | "channels"; filter: "from" | "to" | "in"; typed: string; start: number; end: number }>;
+
+export function typingAt(text: string, caret: number): Typing | undefined {
+  const before = text.slice(0, caret);
+  const person = /(^|\s)(?:(from|to):\s*@?|@)([^\s@#"]*)$/i.exec(before);
+  if (person) {
+    const start = person.index + person[1]!.length;
+    return { kind: "people", filter: (person[2]?.toLowerCase() as "from" | "to" | undefined) ?? "from", typed: person[3] ?? "", start, end: caret };
+  }
+  const channel = /(^|\s)(?:in:\s*#?|#)([^\s#"]*)$/i.exec(before);
+  if (channel) {
+    const start = channel.index + channel[1]!.length;
+    return { kind: "channels", filter: "in", typed: channel[2] ?? "", start, end: caret };
+  }
+  return undefined;
+}
+
+/** The text with what was being typed replaced by the chosen filter, and where the caret goes. */
+export function chooseSuggestion(text: string, typing: Typing, value: string): { text: string; caret: number } {
+  const token = typing.kind === "people" ? `${typing.filter}:@${/\s/.test(value) ? `"${value}"` : value}` : `in:#${value}`;
+  const after = text.slice(typing.end).replace(/^\S*/, "");
+  const next = `${text.slice(0, typing.start)}${token} ${after.replace(/^\s+/, "")}`;
+  return { text: next, caret: typing.start + token.length + 1 };
+}
+
+type Suggestion = Readonly<{ key: string; label: string; detail?: string; value: string }>;
+
+/** The search box, with Slack-style suggestions for people (@) and channels (#). */
+function SearchBox(props: { workspace: DatabricksService; app?: DatabricksApp; value: string; onChange(value: string): void; onSearch(value: string): void; busy?: boolean }) {
+  const input = React.useRef<HTMLInputElement>(null);
+  const [typing, setTyping] = React.useState<Typing>();
+  const [items, setItems] = React.useState<Suggestion[]>([]);
+  const [active, setActive] = React.useState(0);
+  const app = props.app;
+  React.useEffect(() => {
+    if (!typing || !app) return setItems([]);
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      void props.workspace
+        .ready()
+        .then(async (client) =>
+          typing.kind === "people"
+            ? (await suggestBuzz(client, app, "people", typing.typed, controller.signal)).map((p) => ({ key: p.pubkey, label: p.name, detail: `@${p.handle}`, value: p.handle }))
+            : (await suggestBuzz(client, app, "channels", typing.typed, controller.signal)).map((c) => ({ key: c.id, label: `#${c.name}`, value: c.name })),
+        )
+        .then(
+          (found) => {
+            if (controller.signal.aborted) return;
+            setItems(found);
+            setActive(0);
+          },
+          () => setItems([]),
+        );
+    }, 120);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [typing?.kind, typing?.typed, typing?.filter, app?.name]);
+  const refresh = (text: string, caret: number) => setTyping(typingAt(text, caret));
+  const choose = (item: Suggestion) => {
+    if (!typing) return;
+    const next = chooseSuggestion(props.value, typing, item.value);
+    props.onChange(next.text);
+    setTyping(undefined);
+    setItems([]);
+    requestAnimationFrame(() => {
+      input.current?.focus();
+      input.current?.setSelectionRange(next.caret, next.caret);
+    });
+  };
+  const open = Boolean(typing && items.length);
+  return (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (open) return choose(items[active]!);
+        props.onSearch(props.value);
+      }}
+    >
+      <Stack direction="row" gap={8}>
+        <div style={{ position: "relative", flex: 1 }}>
+          <input
+            ref={input}
+            className="dbx-input"
+            style={{ width: "100%" }}
+            autoFocus
+            role="combobox"
+            aria-expanded={open}
+            aria-autocomplete="list"
+            placeholder="Search public channels, e.g. from:@sam in:#general launch"
+            value={props.value}
+            onChange={(event) => {
+              props.onChange(event.target.value);
+              refresh(event.target.value, event.target.selectionStart ?? event.target.value.length);
+            }}
+            onClick={(event) => refresh(event.currentTarget.value, event.currentTarget.selectionStart ?? 0)}
+            onBlur={() => setTimeout(() => setTyping(undefined), 150)}
+            onKeyDown={(event) => {
+              if (!open) return;
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                setActive((n) => (n + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length);
+              } else if (event.key === "Tab") {
+                event.preventDefault();
+                choose(items[active]!);
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                setTyping(undefined);
+              }
+            }}
+          />
+          {open && (
+            <div
+              role="listbox"
+              style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 10, background: "var(--surface-raised, var(--background, #fff))", border: "1px solid var(--border-standard, #e5e5e5)", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", padding: 4, maxHeight: 320, overflowY: "auto" }}
+            >
+              <Text size="xs" tone="tertiary" style={{ padding: "4px 8px" }}>
+                {typing!.kind === "people" ? (typing!.filter === "to" ? "Mentioning" : "From") : "In"}
+              </Text>
+              {items.map((item, n) => (
+                <div
+                  key={item.key}
+                  role="option"
+                  aria-selected={n === active}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    choose(item);
+                  }}
+                  onMouseEnter={() => setActive(n)}
+                  style={{ padding: "6px 8px", borderRadius: 6, cursor: "pointer", display: "flex", gap: 8, alignItems: "baseline", background: n === active ? "var(--surface-hover, rgba(0,0,0,0.05))" : "transparent" }}
+                >
+                  <Text size="sm">{item.label}</Text>
+                  {item.detail && (
+                    <Text size="xs" tone="subtle">
+                      {item.detail}
+                    </Text>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <Button variant="primary" type="submit" disabled={!app || !props.value.trim() || props.busy}>
+          {props.busy ? <Spinner size={11} /> : null}Search
+        </Button>
+      </Stack>
+    </form>
+  );
+}
+
 /** `**word**` marks in a snippet as bold text. */
 function Snippet(props: { text: string }) {
   const parts = props.text.split("**");
@@ -90,14 +242,14 @@ export function searchPage(ctx: Context, service: DatabricksService) {
     const host = snapshot.status === "connected" ? new URL(snapshot.profile.host).hostname : "this workspace";
     const opened = initialQuery(props.navigation?.target);
     const [query, setQuery] = React.useState(opened);
-    const [state, setState] = React.useState<{ loading?: boolean; hits?: BuzzSearchHit[]; understood?: BuzzSearchQuery; error?: string; asked?: string }>({});
+    const [state, setState] = React.useState<{ loading?: boolean; hits?: BuzzSearchHit[]; understood?: BuzzSearchQuery; old?: boolean; error?: string; asked?: string }>({});
     const app = indexes.data?.app;
     const run = async (text: string) => {
       if (!app || !text.trim()) return;
       setState({ loading: true, asked: text });
       try {
         const found = await searchBuzzQuery(await workspace.ready(), app, text.trim(), 30);
-        setState({ hits: found.results, ...(found.query && { understood: found.query }), asked: text });
+        setState({ hits: found.results, ...(found.query && { understood: found.query }), ...(!found.query && { old: true }), asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
@@ -129,19 +281,7 @@ export function searchPage(ctx: Context, service: DatabricksService) {
     else
       body = (
         <Stack gap={14}>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              void run(query);
-            }}
-          >
-            <Stack direction="row" gap={8}>
-              <input className="dbx-input" style={{ flex: 1 }} autoFocus placeholder="Search public channels, e.g. from:@sam in:#general launch" value={query} onChange={(event) => setQuery(event.target.value)} />
-              <Button variant="primary" type="submit" disabled={!app || !query.trim() || state.loading}>
-                {state.loading ? <Spinner size={11} /> : null}Search
-              </Button>
-            </Stack>
-          </form>
+          <SearchBox workspace={workspace} {...(app && { app })} value={query} onChange={setQuery} onSearch={(text) => void run(text)} {...(state.loading && { busy: true })} />
           {indexes.data.apps.length > 1 && (
             <Stack direction="row" gap={8} align="center">
               <Text size="sm" tone="subtle">Index</Text>
@@ -162,6 +302,11 @@ export function searchPage(ctx: Context, service: DatabricksService) {
               ))}
               {state.understood?.text && <Text size="sm" tone="subtle">and “{state.understood.text}”</Text>}
             </Stack>
+          )}
+          {state.old && (
+            <Notice tone="warning" title="This index runs older code">
+              It searched every word, filters included, as text. Its owner's Buzz updates it on its own once the Databricks Agents plugin is updated; Deploy again in its Settings tab does it now.
+            </Notice>
           )}
           {state.error && <Notice tone="danger">{state.error}</Notice>}
           {state.hits && !state.hits.length && <Text tone="subtle">Nothing in public channels matches “{state.asked}”.</Text>}

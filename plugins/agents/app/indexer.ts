@@ -163,7 +163,8 @@ app.onMention(async (mention, reply) => {
   await reply.say(format(query, hits));
 });
 
-app.route("/api/info", () => ({ json: { kind: "buzz-search", version: 1, name: app.identity?.name ?? app.appName, ready: state.ready } }));
+// Version 2: filters, and the people and channels routes.
+app.route("/api/info", () => ({ json: { kind: "buzz-search", version: 2, name: app.identity?.name ?? app.appName, ready: state.ready } }));
 
 app.route("/api/search", async (request) => {
   const query = request.url.searchParams.get("q") ?? "";
@@ -174,6 +175,16 @@ app.route("/api/search", async (request) => {
   // Who searched, for the app's logs; not what they searched for.
   console.log(`[index] search by ${request.user ?? "unknown"}: ${hits.length} results`);
   return { json: { results: hits, query: parsed, mode: index.mode, ...(state.stats && { indexed: state.stats }) } };
+});
+
+// Suggestions for the Search page as people type @ or #.
+app.route("/api/people", async (request) => {
+  if (!state.ready) return { status: 503, json: { error: state.setupError ?? "The index is still setting up." } };
+  return { json: { people: await index.suggestPeople(request.url.searchParams.get("q") ?? "", Number(request.url.searchParams.get("limit") ?? 8) || 8) } };
+});
+app.route("/api/channels", async (request) => {
+  if (!state.ready) return { status: 503, json: { error: state.setupError ?? "The index is still setting up." } };
+  return { json: { channels: await index.suggestChannels(request.url.searchParams.get("q") ?? "", Number(request.url.searchParams.get("limit") ?? 8) || 8) } };
 });
 
 app.describe(() => ({

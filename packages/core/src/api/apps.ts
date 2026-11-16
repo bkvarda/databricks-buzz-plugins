@@ -268,3 +268,17 @@ export async function searchBuzzQuery(client: DatabricksClient, app: Pick<Databr
   const reply = JSON.parse(response.body) as { results?: BuzzSearchHit[]; query?: BuzzSearchQuery };
   return { results: reply.results ?? [], ...(reply.query && { query: reply.query }) };
 }
+
+export type BuzzPersonSuggestion = Readonly<{ pubkey: string; name: string; handle: string }>;
+export type BuzzChannelSuggestion = Readonly<{ id: string; name: string }>;
+
+/** People or public channels starting with what's typed after @ or #; none from an index too old to say. */
+export async function suggestBuzz(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, kind: "people", typed: string, signal?: AbortSignal): Promise<BuzzPersonSuggestion[]>;
+export async function suggestBuzz(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, kind: "channels", typed: string, signal?: AbortSignal): Promise<BuzzChannelSuggestion[]>;
+export async function suggestBuzz(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, kind: "people" | "channels", typed: string, signal?: AbortSignal): Promise<(BuzzPersonSuggestion | BuzzChannelSuggestion)[]> {
+  if (!app.url) return [];
+  const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/${kind}`, { query: { q: typed, limit: 8 }, timeoutMs: 15_000, ...(signal && { signal }) });
+  if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) return [];
+  const reply = JSON.parse(response.body) as { people?: BuzzPersonSuggestion[]; channels?: BuzzChannelSuggestion[] };
+  return (kind === "people" ? reply.people : reply.channels) ?? [];
+}

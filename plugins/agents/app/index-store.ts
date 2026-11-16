@@ -267,6 +267,35 @@ export class SearchIndex {
     }));
   }
 
+  /** People whose handle or name (or a word of it) starts with `prefix`, for @ suggestions; the most active first. */
+  async suggestPeople(prefix: string, limit = 8): Promise<{ pubkey: string; name: string; handle: string }[]> {
+    const typed = prefix.replace(/^@/, "").trim().toLowerCase().replace(/[%_\\]/g, "");
+    const found = await this.query<{ pubkey: string; name: string; username: string | null }>(
+      `SELECT p.pubkey, p.name, p.username FROM ${this.schema}.people p
+       LEFT JOIN (SELECT author, count(*) AS n FROM ${this.schema}.messages GROUP BY author) a ON a.author = p.pubkey
+       WHERE $1 = '' OR lower(p.username) LIKE $1 || '%' OR lower(p.name) LIKE $1 || '%' OR lower(p.name) LIKE '% ' || $1 || '%'
+       ORDER BY (lower(p.username) = $1 OR lower(p.name) = $1) DESC, coalesce(a.n, 0) DESC, p.name
+       LIMIT $2`,
+      [typed, Math.max(1, Math.min(20, limit))],
+    );
+    // The handle to type: the profile's handle, else the name without spaces.
+    return found.rows.map((row) => ({ pubkey: row.pubkey, name: row.name, handle: row.username || row.name.toLowerCase().replace(/\s+/g, "") }));
+  }
+
+  /** Public channels whose name starts with `prefix` (or has a word that does), for # suggestions; the busiest first. */
+  async suggestChannels(prefix: string, limit = 8): Promise<{ id: string; name: string }[]> {
+    const typed = prefix.replace(/^#/, "").trim().toLowerCase().replace(/[%_\\]/g, "");
+    const found = await this.query<{ id: string; name: string }>(
+      `SELECT c.id, c.name FROM ${this.schema}.channels c
+       LEFT JOIN (SELECT channel, count(*) AS n FROM ${this.schema}.messages GROUP BY channel) m ON m.channel = c.id
+       WHERE c.public AND ($1 = '' OR lower(c.name) LIKE $1 || '%' OR lower(c.name) ~ ('[-_ ]' || $1))
+       ORDER BY (lower(c.name) = $1) DESC, coalesce(m.n, 0) DESC, c.name
+       LIMIT $2`,
+      [typed, Math.max(1, Math.min(20, limit))],
+    );
+    return found.rows;
+  }
+
   async stats(): Promise<IndexStats> {
     const found = await this.query<Record<string, string>>(`SELECT
       (SELECT count(*) FROM ${this.schema}.messages) AS messages,

@@ -19,7 +19,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { Apps, searchBuzz, searchBuzzQuery, UcSecrets } from "@dbx/core/api/apps";
+import { Apps, searchBuzz, searchBuzzQuery, suggestBuzz, UcSecrets } from "@dbx/core/api/apps";
 import { Lakebase } from "@dbx/core/api/workspace";
 import type { DatabricksClient } from "@dbx/core/client";
 import { Connection } from "@dbx/core/connection";
@@ -140,5 +140,9 @@ describe.skipIf(!PROFILE || !SCHEMA)(`live Databricks App identity (${PROFILE}, 
       expect(found.results, query).toEqual([]);
       expect(found.query, query).toBeDefined();
     }
+    // Suggestions for @ and #.
+    expect(await suggestBuzz(client, app!, "people", "sa")).toEqual([]);
+    expect(await suggestBuzz(client, app!, "people", "")).toEqual([]);
+    expect(await suggestBuzz(client, app!, "channels", "ge")).toEqual([]);
   }, 10 * 60_000);
 });

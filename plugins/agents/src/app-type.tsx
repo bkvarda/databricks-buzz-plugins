@@ -16,7 +16,7 @@ import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, isApiError, useAsync, useConnection } from "@dbx/core/service";
 import { Badge, Button, CodeView, DbxRoot, databricksIcon, Field, Notice, openExternal, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
 import { Lakebase } from "@dbx/core/api/workspace";
-import { INDEXER, SDK, STARTER } from "virtual:buzz-app";
+import { APP_SHA, INDEXER, SDK, STARTER } from "virtual:buzz-app";
 import { activated, type AppIdentity, type Answers, appYaml, identitySecretName, parseIdentity, SEARCH_APP_PREFIX } from "./app-identity";
 import { cachedList, NeedsConnection, SinglePicker, useAgentService, WorkspaceField } from "./ui";
 
@@ -96,6 +96,8 @@ export type AppRecord = {
   /** We made the app, so removing the identity deletes it. */
   createdApp: boolean;
   servicePrincipal?: { id: string; name?: string };
+  /** The plugin's template code (APP_SHA) it was last deployed with. */
+  deployedSha?: string;
   host?: string;
   community?: string;
   owner?: string;
@@ -148,6 +150,12 @@ export type AppProvider = ReturnType<typeof appProvider>;
 export function appProvider(agents: Pick<Agents, "storage">, service: DatabricksService) {
   const storage = agents.storage;
   const read = (pubkey: string) => parse(storage.get(recordKey(pubkey)));
+  const records = () =>
+    storage
+      .keys()
+      .filter((key) => key.startsWith(RECORD_PREFIX) && !key.includes(":pending:"))
+      .map((key) => parse(storage.get(key)))
+      .filter((record): record is AppRecord => Boolean(record?.pubkey));
   const write = (record: AppRecord) => storage.set(recordKey(record.pubkey!), JSON.stringify(record));
   const clientOf = (record: Pick<AppRecord, "config">, signal?: AbortSignal) => workspaceOf(service, record.config.profile).ready(signal);
 
@@ -182,6 +190,9 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
 
   return {
     read,
+    records,
+    /** Whether the plugin has newer template code than the app was deployed with. */
+    outdated: (record: AppRecord) => record.config.mode === "starter" && record.deployedSha !== APP_SHA,
     async provision(input: Readonly<{ name: string; picture?: string; community: string; config?: unknown; signal: AbortSignal }>) {
       const { signal } = input;
       const config = normalizeAppConfig(input.config);
@@ -253,7 +264,10 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
       if (!found) throw new Error("This app's identity was set up from another device; remove the agent and create it again here.");
       const record: AppRecord = { ...found, name: input.name, community: input.community, owner: String(input.auth[1]), authTag: [...input.auth].map(String) };
       await saveIdentity(record, { relay: input.community, owner: record.owner!, auth: record.authTag!, name: input.name, ...(record.picture && { picture: record.picture }), answers: record.config.answers }, input.signal);
-      if (record.config.mode === "starter") await deploy(record, input.signal);
+      if (record.config.mode === "starter") {
+        await deploy(record, input.signal);
+        record.deployedSha = APP_SHA;
+      }
       await write(record);
       await storage.set(pendingKey(input.community, found.name), null);
       // The Search page (Lakebase plugin) searches the index made last, in its workspace.
@@ -308,6 +322,7 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
       const code = templateFiles(record.config, record.secret, record.source);
       await writeWorkspaceFiles(await clientOf(record, signal), record.source, code.files, { keep: code.keep, ...(signal && { signal }) });
       await deploy(record, signal);
+      await write({ ...(read(pubkey) ?? record), deployedSha: APP_SHA });
     },
     /** The app in Databricks, and what its status page says. */
     async status(pubkey: string, signal?: AbortSignal): Promise<AppStatus> {
@@ -612,6 +627,11 @@ export function AppSettings(props: { service: DatabricksService; provider: AppPr
             </Text>
           </Row>
         </Stack>
+        {props.provider.outdated(record) && !isSearch(record.config) && (
+          <Notice tone="info" title="Newer code is available">
+            This plugin has a newer buzz-app.mjs. Deploy again puts it in the app's folder and deploys it; your app.mjs stays as it is.
+          </Notice>
+        )}
         {isSearch(record.config) && <SearchInfo provider={props.provider} pubkey={props.pubkey} live={live} busy={Boolean(busy)} run={run} />}
         {record.config.mode === "own" && (
           <Stack gap={8}>
@@ -690,7 +710,20 @@ function SearchInfo(props: { provider: AppProvider; pubkey: string; live?: AppSt
 
 // ── The type ──
 
-export function registerAppType(agents: Agents, service: DatabricksService): void {
+/**
+ * Search indexes run only the plugin's code, so the owner's Buzz deploys the
+ * newer code when the plugin updates (once, a little after it starts).
+ * Starter apps may have the owner's edits: their Settings tab offers it instead.
+ */
+export function refreshSearchIndexes(provider: AppProvider): () => void {
+  const timer = setTimeout(() => {
+    for (const record of provider.records())
+      if (record.community && isSearch(record.config) && provider.outdated(record)) void provider.redeploy(record.pubkey!).catch(() => {});
+  }, 20_000);
+  return () => clearTimeout(timer);
+}
+
+export function registerAppType(agents: Agents, service: DatabricksService): () => void {
   const provider = appProvider(agents, service);
   const icon = databricksIcon() as unknown as AgentType["icon"];
   const type = {
@@ -719,4 +752,5 @@ export function registerAppType(agents: Agents, service: DatabricksService): voi
     },
   };
   agents.register(type as unknown as AgentType);
+  return refreshSearchIndexes(provider);
 }

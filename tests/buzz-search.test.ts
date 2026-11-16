@@ -7,7 +7,7 @@ import { searchApps, searchBuzz } from "@dbx/core/api/apps";
 import { DatabricksClient } from "@dbx/core/client";
 import { npubEncode } from "nostr-tools/nip19";
 import { channelOf, dateRange, deletionOf, editOf, messageOf, parseQuery, personOf, searchTerms } from "../plugins/agents/app/index-events";
-import { filterLabels, initialQuery } from "../plugins/lakebase/src/search";
+import { chooseSuggestion, filterLabels, initialQuery, typingAt } from "../plugins/lakebase/src/search";
 import { appConfigProblem, appProvider, normalizeAppConfig, summarizeApp } from "../plugins/agents/src/app-type";
 import { parseIdentity } from "../plugins/agents/src/app-identity";
 import { fakeService } from "./fake-workspace";
@@ -66,6 +66,11 @@ describe("Slack's search filters", () => {
       thread: true,
     });
     expect(parseQuery('from:"Brandon K" plan', now)).toMatchObject({ from: ["brandon k"], text: "plan" });
+    // As people type it: a space after the colon, or a quoted name after @.
+    expect(parseQuery("from: @bkvarda", now)).toMatchObject({ from: ["bkvarda"], text: "" });
+    expect(parseQuery('to:@"Sam Lee" in: #general', now)).toMatchObject({ to: ["sam lee"], in: ["general"], text: "" });
+    // A filter with nothing after it is just a word.
+    expect(parseQuery("from: ", now)).toMatchObject({ from: [], text: "from:" });
   });
 
   it("reads dates as Slack does: before a day, after a day, on a day, during a month or year", () => {
@@ -92,6 +97,29 @@ describe("Slack's search filters", () => {
     expect(initialQuery({ kind: "page", route: { version: 1, params: { q: "from:@sam" } } })).toBe("from:@sam");
     expect(initialQuery({ kind: "plugin", params: { q: "launch" } })).toBe("launch");
     expect(initialQuery(undefined)).toBe("");
+  });
+});
+
+describe("suggestions as people type", () => {
+  it("knows when a person or a channel is being typed", () => {
+    expect(typingAt("launch @bk", 10)).toEqual({ kind: "people", filter: "from", typed: "bk", start: 7, end: 10 });
+    expect(typingAt("to: @sa", 7)).toMatchObject({ kind: "people", filter: "to", typed: "sa" });
+    expect(typingAt("from:", 5)).toMatchObject({ kind: "people", filter: "from", typed: "" });
+    expect(typingAt("in:#gen", 7)).toMatchObject({ kind: "channels", typed: "gen", start: 0 });
+    expect(typingAt("plan #", 6)).toMatchObject({ kind: "channels", typed: "" });
+    expect(typingAt("email@example", 13)).toBeUndefined();
+    expect(typingAt("launch plan", 11)).toBeUndefined();
+  });
+
+  it("puts the chosen person or channel in as a filter, and the caret after it", () => {
+    const text = "launch @bk plan";
+    const chosen = chooseSuggestion(text, typingAt(text, 10)!, "bkvarda");
+    expect(chosen).toEqual({ text: "launch from:@bkvarda plan", caret: 21 });
+    expect(chooseSuggestion("to:@sa", typingAt("to:@sa", 6)!, "sam lee").text).toBe('to:@"sam lee" ');
+    expect(chooseSuggestion("in:#ge", typingAt("in:#ge", 6)!, "general").text).toBe("in:#general ");
+    // And the parser reads them back.
+    expect(parseQuery(chosen.text)).toMatchObject({ from: ["bkvarda"], text: "launch plan" });
+    expect(parseQuery('to:@"sam lee" in:#general')).toMatchObject({ to: ["sam lee"], in: ["general"] });
   });
 });
 
@@ -152,6 +180,10 @@ describe("the Search index template", () => {
     await provider.activate({ pubkey, name: "Search", community: "wss://c.example", auth: ["auth", "o".repeat(64), "", "s".repeat(128)], config, signal });
     expect(parseIdentity(secrets.get("main.buzz_apps.buzz_buzz_search_index"))?.relay).toBe("wss://c.example");
     expect(calls.some((call) => call.path.endsWith("/deployments"))).toBe(true);
+    // It's on the plugin's current code; a record from before has no version, so it's redeployed.
+    const record = provider.read(pubkey)!;
+    expect(provider.outdated(record)).toBe(false);
+    expect(provider.outdated({ ...record, deployedSha: undefined })).toBe(true);
     // Letting everyone search gives the workspace's users group Can Use.
     await provider.allowEveryone(pubkey);
     expect(calls.at(-1)).toMatchObject({ method: "PATCH", path: "/api/2.0/permissions/apps/buzz-search-index", body: { access_control_list: [{ group_name: "users", permission_level: "CAN_USE" }] } });

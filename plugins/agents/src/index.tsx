@@ -25,7 +25,8 @@ export function apply(ctx: Context) {
     registerTypes(scope.agents, kit, databricks);
     const stop = registerHostedType(scope.agents, databricks);
     scope.effect(() => stop);
-    registerAppType(scope.agents, databricks);
+    const stopRefresh = registerAppType(scope.agents, databricks);
+    scope.effect(() => stopRefresh);
     return { kit: true };
   });
   ctx.settingsCards.register({
