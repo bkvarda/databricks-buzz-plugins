@@ -3,6 +3,7 @@
 // relay-signed), messages (9, and 40002 agent envelopes), author edits
 // (40003, latest wins), deletions (5 by the author, 9005 by the relay) and
 // profiles (0). Pure, so it's testable.
+import { decode } from "nostr-tools/nip19";
 import type { NostrEvent } from "nostr-tools/pure";
 import { CHAT_KINDS, plainText, threadRoot } from "../runner/buzz";
 
@@ -42,7 +43,7 @@ export function channelOf(metadata: NostrEvent): ChannelRow | undefined {
   };
 }
 
-export type MessageRow = Readonly<{ id: string; channel: string; author: string; root?: string; kind: number; createdAt: number; text: string }>;
+export type MessageRow = Readonly<{ id: string; channel: string; author: string; root?: string; kind: number; createdAt: number; text: string; mentions: string[] }>;
 
 export function messageOf(event: NostrEvent): MessageRow | undefined {
   if (!CHAT_KINDS.includes(event.kind)) return undefined;
@@ -51,7 +52,9 @@ export function messageOf(event: NostrEvent): MessageRow | undefined {
   const text = plainText(event.content);
   if (!text) return undefined;
   const root = threadRoot(event);
-  return { id: event.id, channel, author: event.pubkey, ...(root && root !== event.id && { root }), kind: event.kind, createdAt: event.created_at, text };
+  // Who it mentions (its `p` tags), for to:@someone.
+  const mentions = [...new Set(event.tags.flatMap((t) => (t[0] === "p" && HEX64.test(t[1] ?? "") ? [t[1]!] : [])))];
+  return { id: event.id, channel, author: event.pubkey, ...(root && root !== event.id && { root }), kind: event.kind, createdAt: event.created_at, text, mentions };
 }
 
 export type Edit = Readonly<{ target: string; author: string; text: string; at: number }>;
@@ -76,14 +79,16 @@ export function deletionOf(event: NostrEvent, relaySigners: ReadonlySet<string>)
   return { targets, author: event.pubkey, byRelay };
 }
 
-export type Person = Readonly<{ pubkey: string; name: string; updatedAt: number }>;
+export type Person = Readonly<{ pubkey: string; name: string; username?: string; updatedAt: number }>;
 
 export function personOf(event: NostrEvent): Person | undefined {
   if (event.kind !== 0) return undefined;
   try {
-    const profile = JSON.parse(event.content) as { name?: string; display_name?: string; displayName?: string };
+    const profile = JSON.parse(event.content) as { name?: string; display_name?: string; displayName?: string; nip05?: string };
     const name = profile.display_name || profile.displayName || profile.name;
-    return name ? { pubkey: event.pubkey, name: String(name).slice(0, 200), updatedAt: event.created_at } : undefined;
+    // The handle people type after @: their profile's name, else their NIP-05 name.
+    const username = (profile.name || (typeof profile.nip05 === "string" ? profile.nip05.split("@")[0] : "") || "").toLowerCase().replace(/^@/, "");
+    return name ? { pubkey: event.pubkey, name: String(name).slice(0, 200), ...(username && { username: username.slice(0, 100) }), updatedAt: event.created_at } : undefined;
   } catch {
     return undefined;
   }
@@ -97,4 +102,89 @@ export function searchTerms(query: string): string {
     .filter(Boolean)
     .slice(0, 32)
     .join(" ");
+}
+
+/**
+ * A search as Slack has it: words (with "quoted phrases", OR and -excluded
+ * words, as websearch_to_tsquery reads them) and filters:
+ *   from:@name  to:@name  in:#channel  before:2026-11-01  after:…  on:…
+ *   during:2026-11 (or a year)  has:link  is:thread
+ * Names can be a handle, a display name, an npub or a hex key; dates are UTC.
+ * Anything it doesn't know stays in the words.
+ */
+export type SearchQuery = {
+  text: string;
+  from: string[];
+  to: string[];
+  in: string[];
+  /** Epoch seconds: at or after, and before. */
+  after?: number;
+  before?: number;
+  link?: boolean;
+  thread?: boolean;
+};
+
+const DAY = 86_400;
+
+/** [start, end) of a date written YYYY-MM-DD, YYYY-MM or YYYY, today or yesterday, in UTC seconds. */
+export function dateRange(value: string, now = Date.now()): [number, number] | undefined {
+  const today = Math.floor(now / 1000 / DAY) * DAY;
+  if (value === "today") return [today, today + DAY];
+  if (value === "yesterday") return [today - DAY, today];
+  const match = /^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$/.exec(value);
+  if (!match) return undefined;
+  const [year, month, day] = [Number(match[1]), match[2] ? Number(match[2]) : undefined, match[3] ? Number(match[3]) : undefined];
+  if ((month !== undefined && (month < 1 || month > 12)) || (day !== undefined && (day < 1 || day > 31))) return undefined;
+  const start = Date.UTC(year, (month ?? 1) - 1, day ?? 1) / 1000;
+  const end = day !== undefined ? start + DAY : month !== undefined ? Date.UTC(year, month, 1) / 1000 : Date.UTC(year + 1, 0, 1) / 1000;
+  return [start, end];
+}
+
+/** A person as typed after from: or to:, as a hex key when it is one. */
+function personKey(value: string): string {
+  const bare = value.replace(/^@/, "");
+  if (HEX64.test(bare)) return bare;
+  if (/^(npub|nprofile)1[0-9a-z]+$/.test(bare)) {
+    try {
+      const decoded = decode(bare);
+      if (decoded.type === "npub") return decoded.data;
+      if (decoded.type === "nprofile") return decoded.data.pubkey;
+    } catch {}
+  }
+  return bare.toLowerCase();
+}
+
+export function parseQuery(query: string, now = Date.now()): SearchQuery {
+  const out: SearchQuery = { text: "", from: [], to: [], in: [] };
+  const words: string[] = [];
+  // Words, "quoted phrases", and filter:values (a value may be quoted too).
+  for (const [, token = ""] of query.matchAll(/((?:[a-z]+:)?"[^"]*"|\S+)/gi)) {
+    const filter = /^([a-z]+):(.+)$/i.exec(token);
+    const key = filter?.[1]?.toLowerCase();
+    const value = filter?.[2]?.replace(/^"|"$/g, "").trim() ?? "";
+    if (!filter || !value) {
+      words.push(token);
+      continue;
+    }
+    if (key === "from") out.from.push(personKey(value));
+    else if (key === "to") out.to.push(personKey(value));
+    else if (key === "in") out.in.push(value.replace(/^#/, "").toLowerCase());
+    else if (key === "has" && value.toLowerCase() === "link") out.link = true;
+    else if (key === "is" && value.toLowerCase() === "thread") out.thread = true;
+    else if (key === "before" || key === "after" || key === "on" || key === "during") {
+      const range = dateRange(value.toLowerCase(), now);
+      if (!range) {
+        words.push(token);
+        continue;
+      }
+      if (key === "before") out.before = Math.min(out.before ?? Infinity, range[0]);
+      else if (key === "after") out.after = Math.max(out.after ?? 0, range[1]);
+      else {
+        out.after = Math.max(out.after ?? 0, range[0]);
+        out.before = Math.min(out.before ?? Infinity, range[1]);
+      }
+    } else words.push(token);
+  }
+  out.text = words.join(" ").trim();
+  return out;
 }

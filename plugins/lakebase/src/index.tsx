@@ -2,10 +2,10 @@
 // Postgres) through the Data API, as the signed-in person. Postgres roles and
 // grants decide what each person can read; this plugin only reads. And Search:
 // a page (and agent tool) for a Buzz search index kept in Lakebase (./search).
-import type { Context } from "@buzz/author";
+import type { Context, Shortcuts } from "@buzz/author";
 import { type DataApiTarget, dataApiError, dataApiSetupSql, Lakebase } from "@dbx/core/api/workspace";
 import { apiError } from "@dbx/core/client";
-import { type AgentTool, numberArg, schema, stringArg } from "@dbx/core/host-types";
+import { type AgentTool, numberArg, optionalService, schema, stringArg } from "@dbx/core/host-types";
 import { bindReact, React } from "@dbx/core/react";
 import { resultSet, toMarkdown } from "@dbx/core/result";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
@@ -277,10 +277,20 @@ export function apply(ctx: Context) {
     primary: true,
     placement: "dock",
     icon: DATABRICKS_ICON_MONO,
-    component: () => {
+    // Opened with { q }, it runs that search.
+    route: { version: 1, validate: (params) => params === null || (typeof params === "object" && !Array.isArray(params) && typeof (params as { q?: unknown }).q === "string") },
+    component: (props) => {
       const runtime = useLive(live);
-      return runtime ? <runtime.Search /> : <MissingCore ctx={ctx} feature="Search" />;
+      return runtime ? <runtime.Search {...(props.navigation && { navigation: props.navigation })} /> : <MissingCore ctx={ctx} feature="Search" />;
     },
+  });
+  // ⌘⇧F (Ctrl+Shift+F elsewhere) opens Search, on Buzz builds that let plugins add shortcuts. People can rebind it in Buzz's settings.
+  const navigation = optionalService<{ open(target: unknown): Promise<unknown> }>(ctx, "navigation");
+  optionalService<Shortcuts>(ctx, "shortcuts")?.register({
+    id: "search",
+    title: "Search public channels",
+    binding: { key: "f", mod: true, shift: true },
+    run: () => void navigation?.open({ version: 1, kind: "page", pluginId: "bkvarda.databricks-lakebase", pageId: "search" }),
   });
   ctx.settingsCards.register({
     id: "lakebase",

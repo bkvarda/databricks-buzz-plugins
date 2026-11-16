@@ -4,11 +4,11 @@
 // and the same search as an agent tool. Each search runs as the person
 // searching: Databricks Apps signs them in, and they need Can Use on the app.
 import type { Context } from "@buzz/author";
-import { type BuzzSearchHit, type DatabricksApp, searchApps, searchBuzz } from "@dbx/core/api/apps";
+import { type BuzzSearchHit, type BuzzSearchQuery, type DatabricksApp, searchApps, searchBuzz, searchBuzzQuery } from "@dbx/core/api/apps";
 import { type AgentTool, numberArg, optionalService, schema, stringArg } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
-import { ago, Button, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { ago, Badge, Button, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
 import { useWorkspaceService, WorkspaceField } from "@dbx/core/ui/workspace";
 
 /** The index app picked, and the workspace (a CLI profile; unset is Buzz's own) it's in. The Databricks App type sets both when it makes an index. */
@@ -29,6 +29,31 @@ async function chosenIndex(service: DatabricksService, workspace: DatabricksServ
   const picked = service.preferences.get<string>(CHOSEN);
   const app = apps.find((found) => found.name === picked) ?? (apps.length === 1 ? apps[0] : apps.find((found) => found.app_status?.state === "RUNNING"));
   return { apps, ...(app && { app }) };
+}
+
+export const FILTER_HELP = "Filters: from:@name, to:@name, in:#channel, before:, after:, on: or during: a date (2026-11-03, 2026-11, today), has:link, is:thread. \"Exact phrases\", OR, and -word to leave a word out.";
+
+const day = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 10);
+
+/** The filters the index understood, as short labels. */
+export function filterLabels(query: BuzzSearchQuery | undefined): string[] {
+  if (!query) return [];
+  return [
+    ...query.from.map((name) => `from ${/^[0-9a-f]{64}$/.test(name) ? `${name.slice(0, 8)}…` : `@${name}`}`),
+    ...query.to.map((name) => `to ${/^[0-9a-f]{64}$/.test(name) ? `${name.slice(0, 8)}…` : `@${name}`}`),
+    ...query.in.map((channel) => `in #${channel}`),
+    ...(query.after !== undefined && query.after > 0 ? [`from ${day(query.after)}`] : []),
+    ...(typeof query.before === "number" ? [`before ${day(query.before)}`] : []),
+    ...(query.link ? ["has a link"] : []),
+    ...(query.thread ? ["in a thread"] : []),
+  ];
+}
+
+/** A search the page was opened with (route `{ q }`, or a link's `q`). */
+export function initialQuery(target: unknown): string {
+  const t = target as { kind?: string; route?: { params?: unknown }; params?: Record<string, string> } | undefined;
+  const params = t?.kind === "page" ? (t.route?.params as { q?: unknown } | undefined) : t?.params;
+  return typeof params?.q === "string" ? params.q : "";
 }
 
 /** `**word**` marks in a snippet as bold text. */
@@ -56,25 +81,34 @@ export function searchPage(ctx: Context, service: DatabricksService) {
     });
     return true;
   };
-  return function SearchPage() {
+  return function SearchPage(props: { navigation?: { target: unknown } }) {
     const [profile, setProfile] = usePreference<string>(service, SEARCH_PROFILE_PREFERENCE);
     const workspace = useWorkspaceService(service, profile);
     const snapshot = useConnection(workspace);
     const [picked, setPicked] = usePreference<string>(service, CHOSEN);
     const indexes = useAsync((signal) => chosenIndex(service, workspace, signal), [workspace, snapshot.status, picked]);
     const host = snapshot.status === "connected" ? new URL(snapshot.profile.host).hostname : "this workspace";
-    const [query, setQuery] = React.useState("");
-    const [state, setState] = React.useState<{ loading?: boolean; hits?: BuzzSearchHit[]; error?: string; asked?: string }>({});
+    const opened = initialQuery(props.navigation?.target);
+    const [query, setQuery] = React.useState(opened);
+    const [state, setState] = React.useState<{ loading?: boolean; hits?: BuzzSearchHit[]; understood?: BuzzSearchQuery; error?: string; asked?: string }>({});
     const app = indexes.data?.app;
     const run = async (text: string) => {
       if (!app || !text.trim()) return;
       setState({ loading: true, asked: text });
       try {
-        setState({ hits: await searchBuzz(await workspace.ready(), app, text.trim(), 30), asked: text });
+        const found = await searchBuzzQuery(await workspace.ready(), app, text.trim(), 30);
+        setState({ hits: found.results, ...(found.query && { understood: found.query }), asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
     };
+    // Opened with a search (a link, or the shortcut with one): run it once the index is found.
+    const ran = React.useRef(false);
+    React.useEffect(() => {
+      if (ran.current || !app || !opened) return;
+      ran.current = true;
+      void run(opened);
+    }, [app?.name]);
     let body: React.ReactNode;
     if (snapshot.status !== "connected")
       body = profile ? (
@@ -102,7 +136,7 @@ export function searchPage(ctx: Context, service: DatabricksService) {
             }}
           >
             <Stack direction="row" gap={8}>
-              <input className="dbx-input" style={{ flex: 1 }} autoFocus placeholder="Search public channels" value={query} onChange={(event) => setQuery(event.target.value)} />
+              <input className="dbx-input" style={{ flex: 1 }} autoFocus placeholder="Search public channels, e.g. from:@sam in:#general launch" value={query} onChange={(event) => setQuery(event.target.value)} />
               <Button variant="primary" type="submit" disabled={!app || !query.trim() || state.loading}>
                 {state.loading ? <Spinner size={11} /> : null}Search
               </Button>
@@ -118,6 +152,15 @@ export function searchPage(ctx: Context, service: DatabricksService) {
                   </option>
                 ))}
               </select>
+            </Stack>
+          )}
+          <Text size="xs" tone="tertiary">{FILTER_HELP}</Text>
+          {filterLabels(state.understood).length > 0 && (
+            <Stack direction="row" gap={6} style={{ flexWrap: "wrap" }}>
+              {filterLabels(state.understood).map((label) => (
+                <Badge key={label}>{label}</Badge>
+              ))}
+              {state.understood?.text && <Text size="sm" tone="subtle">and “{state.understood.text}”</Text>}
             </Stack>
           )}
           {state.error && <Notice tone="danger">{state.error}</Notice>}
@@ -177,8 +220,8 @@ export function searchTool(service: DatabricksService): AgentTool {
   return {
     name: "databricks_buzz_search",
     description:
-      "Searches this Buzz community's public channels (messages, with channel, author and time) through the Buzz search index in Databricks. Use it to find earlier discussions or decisions. Matches are marked **like this**.",
-    inputSchema: schema.object({ query: schema.string("Words to look for."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
+      "Searches this Buzz community's public channels (messages, with channel, author and time) through the Buzz search index in Databricks. Use it to find earlier discussions or decisions. Takes Slack's filters: from:@name, to:@name, in:#channel, before:/after:/on:/during: a date (YYYY-MM-DD, YYYY-MM, today), has:link, is:thread, plus \"phrases\", OR and -word. Matches are marked **like this**.",
+    inputSchema: schema.object({ query: schema.string("Words and filters, e.g. from:@sam in:#general after:2026-11-01 launch plan."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
     async call(_client, _context, args) {
       const query = stringArg(args, "query");
       const workspace = workspaceFor(service);

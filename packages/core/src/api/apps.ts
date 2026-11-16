@@ -250,12 +250,21 @@ export async function searchApps(client: DatabricksClient, signal?: AbortSignal)
   return (await new Apps(client).list(signal)).filter((app) => app.description?.startsWith(SEARCH_APP_PREFIX));
 }
 
+/** How the index read a search: its words, and the filters it understood. */
+export type BuzzSearchQuery = Readonly<{ text: string; from: string[]; to: string[]; in: string[]; after?: number; before?: number | null; link?: boolean; thread?: boolean }>;
+
 /** Searches an index app as the signed-in person (Databricks Apps signs them in; they need Can Use on the app). */
 export async function searchBuzz(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, query: string, limit = 20, signal?: AbortSignal): Promise<BuzzSearchHit[]> {
+  return (await searchBuzzQuery(client, app, query, limit, signal)).results;
+}
+
+/** The same, with how the index read the search (older indexes don't say). */
+export async function searchBuzzQuery(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, query: string, limit = 20, signal?: AbortSignal): Promise<{ results: BuzzSearchHit[]; query?: BuzzSearchQuery }> {
   if (!app.url) throw new Error(`The search index ${app.name} isn't running.`);
   const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/search`, { query: { q: query, limit }, timeoutMs: 30_000, ...(signal && { signal }) });
   if (response.status === 401 || response.status === 403) throw new Error(`You can't use the search index ${app.name} yet. Ask its owner to let you (its Settings tab in Buzz can give everyone in the workspace access).`);
   if (response.status === 503) throw new Error(`The search index ${app.name} is still setting up.`);
   if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) throw new Error(`The search index ${app.name} answered HTTP ${response.status}; it may be stopped or still starting.`);
-  return ((JSON.parse(response.body) as { results?: BuzzSearchHit[] }).results ?? []);
+  const reply = JSON.parse(response.body) as { results?: BuzzSearchHit[]; query?: BuzzSearchQuery };
+  return { results: reply.results ?? [], ...(reply.query && { query: reply.query }) };
 }

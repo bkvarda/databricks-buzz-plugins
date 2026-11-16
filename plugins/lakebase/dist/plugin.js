@@ -910,12 +910,16 @@ async function searchApps(client, signal) {
   return (await new Apps(client).list(signal)).filter((app) => app.description?.startsWith(SEARCH_APP_PREFIX));
 }
 async function searchBuzz(client, app, query, limit = 20, signal) {
+  return (await searchBuzzQuery(client, app, query, limit, signal)).results;
+}
+async function searchBuzzQuery(client, app, query, limit = 20, signal) {
   if (!app.url) throw new Error(`The search index ${app.name} isn't running.`);
   const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/search`, { query: { q: query, limit }, timeoutMs: 3e4, ...signal && { signal } });
   if (response.status === 401 || response.status === 403) throw new Error(`You can't use the search index ${app.name} yet. Ask its owner to let you (its Settings tab in Buzz can give everyone in the workspace access).`);
   if (response.status === 503) throw new Error(`The search index ${app.name} is still setting up.`);
   if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) throw new Error(`The search index ${app.name} answered HTTP ${response.status}; it may be stopped or still starting.`);
-  return JSON.parse(response.body).results ?? [];
+  const reply = JSON.parse(response.body);
+  return { results: reply.results ?? [], ...reply.query && { query: reply.query } };
 }
 
 // packages/core/src/ui/workspace.tsx
@@ -1003,6 +1007,25 @@ async function chosenIndex(service, workspace, signal) {
   const app = apps.find((found) => found.name === picked) ?? (apps.length === 1 ? apps[0] : apps.find((found) => found.app_status?.state === "RUNNING"));
   return { apps, ...app && { app } };
 }
+var FILTER_HELP = 'Filters: from:@name, to:@name, in:#channel, before:, after:, on: or during: a date (2026-11-03, 2026-11, today), has:link, is:thread. "Exact phrases", OR, and -word to leave a word out.';
+var day = (seconds) => new Date(seconds * 1e3).toISOString().slice(0, 10);
+function filterLabels(query) {
+  if (!query) return [];
+  return [
+    ...query.from.map((name) => `from ${/^[0-9a-f]{64}$/.test(name) ? `${name.slice(0, 8)}\u2026` : `@${name}`}`),
+    ...query.to.map((name) => `to ${/^[0-9a-f]{64}$/.test(name) ? `${name.slice(0, 8)}\u2026` : `@${name}`}`),
+    ...query.in.map((channel) => `in #${channel}`),
+    ...query.after !== void 0 && query.after > 0 ? [`from ${day(query.after)}`] : [],
+    ...typeof query.before === "number" ? [`before ${day(query.before)}`] : [],
+    ...query.link ? ["has a link"] : [],
+    ...query.thread ? ["in a thread"] : []
+  ];
+}
+function initialQuery(target) {
+  const t = target;
+  const params = t?.kind === "page" ? t.route?.params : t?.params;
+  return typeof params?.q === "string" ? params.q : "";
+}
 function Snippet(props) {
   const parts = props.text.split("**");
   return /* @__PURE__ */ React.createElement(Text, { size: "sm" }, parts.map((part, n) => n % 2 ? /* @__PURE__ */ React.createElement("b", { key: n }, part) : /* @__PURE__ */ React.createElement(React.Fragment, { key: n }, part)));
@@ -1022,25 +1045,33 @@ function searchPage(ctx, service) {
     });
     return true;
   };
-  return function SearchPage() {
+  return function SearchPage(props) {
     const [profile, setProfile] = usePreference(service, SEARCH_PROFILE_PREFERENCE);
     const workspace = useWorkspaceService(service, profile);
     const snapshot = useConnection(workspace);
     const [picked, setPicked] = usePreference(service, CHOSEN);
     const indexes = useAsync((signal) => chosenIndex(service, workspace, signal), [workspace, snapshot.status, picked]);
     const host = snapshot.status === "connected" ? new URL(snapshot.profile.host).hostname : "this workspace";
-    const [query, setQuery] = React.useState("");
+    const opened = initialQuery(props.navigation?.target);
+    const [query, setQuery] = React.useState(opened);
     const [state, setState] = React.useState({});
     const app = indexes.data?.app;
     const run = async (text) => {
       if (!app || !text.trim()) return;
       setState({ loading: true, asked: text });
       try {
-        setState({ hits: await searchBuzz(await workspace.ready(), app, text.trim(), 30), asked: text });
+        const found = await searchBuzzQuery(await workspace.ready(), app, text.trim(), 30);
+        setState({ hits: found.results, ...found.query && { understood: found.query }, asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
     };
+    const ran = React.useRef(false);
+    React.useEffect(() => {
+      if (ran.current || !app || !opened) return;
+      ran.current = true;
+      void run(opened);
+    }, [app?.name]);
     let body;
     if (snapshot.status !== "connected")
       body = profile ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Waiting for your sign-in to that workspace\u2026") : /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Search reads a search index in your Databricks workspace.");
@@ -1057,8 +1088,8 @@ function searchPage(ctx, service) {
             void run(query);
           }
         },
-        /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, autoFocus: true, placeholder: "Search public channels", value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(Button, { variant: "primary", type: "submit", disabled: !app || !query.trim() || state.loading }, state.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, "Search"))
-      ), indexes.data.apps.length > 1 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Index"), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: app?.name ?? "", onChange: (event) => setPicked(event.target.value) }, indexes.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.description?.replace(/^Buzz search index:\s*/, "") || found.name)))), state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), state.hits && !state.hits.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing in public channels matches \u201C", state.asked, "\u201D."), state.hits?.map((hit) => /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, autoFocus: true, placeholder: "Search public channels, e.g. from:@sam in:#general launch", value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(Button, { variant: "primary", type: "submit", disabled: !app || !query.trim() || state.loading }, state.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, "Search"))
+      ), indexes.data.apps.length > 1 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Index"), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: app?.name ?? "", onChange: (event) => setPicked(event.target.value) }, indexes.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.description?.replace(/^Buzz search index:\s*/, "") || found.name)))), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, FILTER_HELP), filterLabels(state.understood).length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, style: { flexWrap: "wrap" } }, filterLabels(state.understood).map((label) => /* @__PURE__ */ React.createElement(Badge, { key: label }, label)), state.understood?.text && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "and \u201C", state.understood.text, "\u201D")), state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), state.hits && !state.hits.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing in public channels matches \u201C", state.asked, "\u201D."), state.hits?.map((hit) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: hit.id,
@@ -1087,8 +1118,8 @@ function searchPage(ctx, service) {
 function searchTool(service) {
   return {
     name: "databricks_buzz_search",
-    description: "Searches this Buzz community's public channels (messages, with channel, author and time) through the Buzz search index in Databricks. Use it to find earlier discussions or decisions. Matches are marked **like this**.",
-    inputSchema: schema.object({ query: schema.string("Words to look for."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
+    description: `Searches this Buzz community's public channels (messages, with channel, author and time) through the Buzz search index in Databricks. Use it to find earlier discussions or decisions. Takes Slack's filters: from:@name, to:@name, in:#channel, before:/after:/on:/during: a date (YYYY-MM-DD, YYYY-MM, today), has:link, is:thread, plus "phrases", OR and -word. Matches are marked **like this**.`,
+    inputSchema: schema.object({ query: schema.string("Words and filters, e.g. from:@sam in:#general after:2026-11-01 launch plan."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
     async call(_client, _context, args) {
       const query = stringArg(args, "query");
       const workspace = workspaceFor(service);
@@ -1273,10 +1304,19 @@ function apply(ctx) {
     primary: true,
     placement: "dock",
     icon: DATABRICKS_ICON_MONO,
-    component: () => {
+    // Opened with { q }, it runs that search.
+    route: { version: 1, validate: (params) => params === null || typeof params === "object" && !Array.isArray(params) && typeof params.q === "string" },
+    component: (props) => {
       const runtime = useLive(live);
-      return runtime ? /* @__PURE__ */ React.createElement(runtime.Search, null) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Search" });
+      return runtime ? /* @__PURE__ */ React.createElement(runtime.Search, { ...props.navigation && { navigation: props.navigation } }) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Search" });
     }
+  });
+  const navigation = optionalService(ctx, "navigation");
+  optionalService(ctx, "shortcuts")?.register({
+    id: "search",
+    title: "Search public channels",
+    binding: { key: "f", mod: true, shift: true },
+    run: () => void navigation?.open({ version: 1, kind: "page", pluginId: "bkvarda.databricks-lakebase", pageId: "search" })
   });
   ctx.settingsCards.register({
     id: "lakebase",

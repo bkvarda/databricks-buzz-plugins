@@ -8,7 +8,7 @@
 import type { NostrEvent } from "nostr-tools/pure";
 import { verifyEvent } from "nostr-tools/pure";
 import { BuzzApp } from "./sdk";
-import { channelOf, deletionOf, editOf, INDEX_KINDS, messageOf, personOf } from "./index-events";
+import { channelOf, deletionOf, editOf, INDEX_KINDS, messageOf, parseQuery, personOf } from "./index-events";
 import { Lakebase, type SearchHit, SearchIndex, searchSchema } from "./index-store";
 
 const PAGE = 200;
@@ -156,7 +156,7 @@ function format(query: string, hits: readonly SearchHit[]): string {
 
 app.onMention(async (mention, reply) => {
   const query = mention.text.replace(/^(search( for)?|find|look up)\s+/i, "").trim();
-  if (!query) return reply.say("Tell me what to look for, like “search quarterly planning”.");
+  if (!query) return reply.say("Tell me what to look for, like “quarterly planning” or “from:@sam in:#general after:2026-11-01 launch”.");
   if (!state.ready) return reply.say(`I can't search yet: ${state.setupError ?? "I'm still setting up my index."}`);
   const stop = reply.typing();
   const hits = await index.search(query, 5).finally(stop);
@@ -169,10 +169,11 @@ app.route("/api/search", async (request) => {
   const query = request.url.searchParams.get("q") ?? "";
   const limit = Number(request.url.searchParams.get("limit") ?? 20);
   if (!state.ready) return { status: 503, json: { error: state.setupError ?? "The index is still setting up." } };
-  const hits = await index.search(query, Number.isFinite(limit) ? limit : 20);
+  const parsed = parseQuery(query);
+  const hits = await index.search(parsed, Number.isFinite(limit) ? limit : 20);
   // Who searched, for the app's logs; not what they searched for.
   console.log(`[index] search by ${request.user ?? "unknown"}: ${hits.length} results`);
-  return { json: { results: hits, mode: index.mode, ...(state.stats && { indexed: state.stats }) } };
+  return { json: { results: hits, query: parsed, mode: index.mode, ...(state.stats && { indexed: state.stats }) } };
 });
 
 app.describe(() => ({

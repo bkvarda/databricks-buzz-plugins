@@ -5,7 +5,9 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure
 import { describe, expect, it } from "vitest";
 import { searchApps, searchBuzz } from "@dbx/core/api/apps";
 import { DatabricksClient } from "@dbx/core/client";
-import { channelOf, deletionOf, editOf, messageOf, personOf, searchTerms } from "../plugins/agents/app/index-events";
+import { npubEncode } from "nostr-tools/nip19";
+import { channelOf, dateRange, deletionOf, editOf, messageOf, parseQuery, personOf, searchTerms } from "../plugins/agents/app/index-events";
+import { filterLabels, initialQuery } from "../plugins/lakebase/src/search";
 import { appConfigProblem, appProvider, normalizeAppConfig, summarizeApp } from "../plugins/agents/src/app-type";
 import { parseIdentity } from "../plugins/agents/src/app-identity";
 import { fakeService } from "./fake-workspace";
@@ -46,6 +48,50 @@ describe("what the index keeps", () => {
     expect(personOf(finalizeEvent({ kind: 0, created_at: 7, content: JSON.stringify({ name: "alice", display_name: "Alice A." }), tags: [] }, alice))).toMatchObject({ name: "Alice A." });
     expect(searchTerms("  q3 & 'plan' (draft)!! ")).toBe("q3 'plan' draft");
     expect(searchTerms("&&&")).toBe("");
+  });
+});
+
+describe("Slack's search filters", () => {
+  const now = Date.parse("2026-11-16T15:00:00Z");
+  const at = (date: string) => Date.parse(`${date}T00:00:00Z`) / 1000;
+
+  it("reads from:, to:, in:, has: and is:, and leaves the words", () => {
+    const bob = getPublicKey(alice);
+    expect(parseQuery(`from:@bkvarda to:${npubEncode(bob)} in:#general has:link is:thread launch "go live" -draft`, now)).toEqual({
+      text: 'launch "go live" -draft',
+      from: ["bkvarda"],
+      to: [bob],
+      in: ["general"],
+      link: true,
+      thread: true,
+    });
+    expect(parseQuery('from:"Brandon K" plan', now)).toMatchObject({ from: ["brandon k"], text: "plan" });
+  });
+
+  it("reads dates as Slack does: before a day, after a day, on a day, during a month or year", () => {
+    expect(parseQuery("before:2026-11-01", now)).toMatchObject({ before: at("2026-11-01") });
+    expect(parseQuery("after:2026-11-01", now)).toMatchObject({ after: at("2026-11-02") });
+    expect(parseQuery("on:2026-11-03", now)).toMatchObject({ after: at("2026-11-03"), before: at("2026-11-04") });
+    expect(parseQuery("during:2026-11", now)).toMatchObject({ after: at("2026-11-01"), before: at("2026-12-01") });
+    expect(parseQuery("during:2026", now)).toMatchObject({ after: at("2026-01-01"), before: at("2027-01-01") });
+    expect(parseQuery("on:today", now)).toMatchObject({ after: at("2026-11-16"), before: at("2026-11-17") });
+    expect(dateRange("2026-13")).toBeUndefined();
+    // What it can't read stays in the words.
+    expect(parseQuery("before:someday is:pinned", now)).toMatchObject({ text: "before:someday is:pinned", from: [], in: [] });
+  });
+
+  it("keeps who a message mentions, and people's handles", () => {
+    const bob = getPublicKey(generateSecretKey());
+    expect(messageOf(finalizeEvent({ kind: 9, created_at: 1, content: "hi", tags: [["h", "general"], ["p", bob], ["p", bob]] }, alice))?.mentions).toEqual([bob]);
+    expect(personOf(finalizeEvent({ kind: 0, created_at: 1, content: JSON.stringify({ name: "BKvarda", display_name: "Brandon" }), tags: [] }, alice))).toMatchObject({ name: "Brandon", username: "bkvarda" });
+    expect(personOf(finalizeEvent({ kind: 0, created_at: 1, content: JSON.stringify({ display_name: "Sam", nip05: "sam@example.com" }), tags: [] }, alice))?.username).toBe("sam");
+  });
+
+  it("shows what the index understood, and opens with a search", () => {
+    expect(filterLabels({ text: "launch", from: ["bkvarda"], to: [], in: ["general"], after: at("2026-11-02"), link: true })).toEqual(["from @bkvarda", "in #general", "from 2026-11-02", "has a link"]);
+    expect(initialQuery({ kind: "page", route: { version: 1, params: { q: "from:@sam" } } })).toBe("from:@sam");
+    expect(initialQuery({ kind: "plugin", params: { q: "launch" } })).toBe("launch");
+    expect(initialQuery(undefined)).toBe("");
   });
 });
 

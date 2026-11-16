@@ -8,8 +8,8 @@
 // database has it, and Postgres' own full-text index otherwise.
 import pg from "pg";
 import type { Workspace } from "./sdk";
-import type { ChannelRow, Deletion, Edit, MessageRow, Person } from "./index-events";
-import { searchTerms } from "./index-events";
+import type { ChannelRow, Deletion, Edit, MessageRow, Person, SearchQuery } from "./index-events";
+import { parseQuery, searchTerms } from "./index-events";
 
 /**
  * Each index app has its own schema, which its service principal owns: a
@@ -95,9 +95,13 @@ export class SearchIndex {
       created_at bigint NOT NULL, edited_at bigint, text text NOT NULL,
       tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED)`);
     await this.query(`CREATE INDEX IF NOT EXISTS messages_channel_time ON ${this.schema}.messages (channel, created_at DESC)`);
+    // Added after the first version: who a message mentions, and people's handles.
+    await this.query(`ALTER TABLE ${this.schema}.messages ADD COLUMN IF NOT EXISTS mentions text[]`);
+    await this.query(`CREATE INDEX IF NOT EXISTS messages_author_time ON ${this.schema}.messages (author, created_at DESC)`);
     await this.query(`CREATE TABLE IF NOT EXISTS ${this.schema}.edits (target text PRIMARY KEY, author text NOT NULL, text text NOT NULL, at bigint NOT NULL)`);
     await this.query(`CREATE TABLE IF NOT EXISTS ${this.schema}.deleted (id text PRIMARY KEY, author text NOT NULL, by_relay boolean NOT NULL)`);
     await this.query(`CREATE TABLE IF NOT EXISTS ${this.schema}.people (pubkey text PRIMARY KEY, name text NOT NULL, updated_at bigint NOT NULL)`);
+    await this.query(`ALTER TABLE ${this.schema}.people ADD COLUMN IF NOT EXISTS username text`);
     // Lakebase Search, if the database has it (or lets the app turn it on: the extensions may be trusted).
     for (const statement of ["CREATE EXTENSION IF NOT EXISTS lakebase_vector CASCADE", "CREATE EXTENSION IF NOT EXISTS lakebase_text"])
       await this.query(statement).catch((error: Error) => (this.extensionError = error.message));
@@ -154,10 +158,11 @@ export class SearchIndex {
     if (!rows.length) return;
     const ids = rows.map((r) => r.id);
     await this.query(
-      `INSERT INTO ${this.schema}.messages (id, channel, author, root, kind, created_at, text)
-       SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::int[], $6::bigint[], $7::text[])
-       ON CONFLICT (id) DO NOTHING`,
-      [ids, rows.map((r) => r.channel), rows.map((r) => r.author), rows.map((r) => r.root ?? null), rows.map((r) => r.kind), rows.map((r) => r.createdAt), rows.map((r) => r.text)],
+      `INSERT INTO ${this.schema}.messages (id, channel, author, root, kind, created_at, text, mentions)
+       SELECT id, channel, author, root, kind, created_at, text, string_to_array(nullif(mentions, ''), ',')
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::int[], $6::bigint[], $7::text[], $8::text[]) AS m(id, channel, author, root, kind, created_at, text, mentions)
+       ON CONFLICT (id) DO UPDATE SET mentions = excluded.mentions WHERE ${this.schema}.messages.mentions IS NULL`,
+      [ids, rows.map((r) => r.channel), rows.map((r) => r.author), rows.map((r) => r.root ?? null), rows.map((r) => r.kind), rows.map((r) => r.createdAt), rows.map((r) => r.text), rows.map((r) => r.mentions.join(","))],
     );
     await this.query(
       `UPDATE ${this.schema}.messages m SET text = e.text, edited_at = e.at FROM ${this.schema}.edits e
@@ -187,9 +192,10 @@ export class SearchIndex {
   async people(rows: readonly Person[]): Promise<void> {
     if (!rows.length) return;
     await this.query(
-      `INSERT INTO ${this.schema}.people (pubkey, name, updated_at) SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[])
-       ON CONFLICT (pubkey) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at WHERE excluded.updated_at > ${this.schema}.people.updated_at`,
-      [rows.map((r) => r.pubkey), rows.map((r) => r.name), rows.map((r) => r.updatedAt)],
+      `INSERT INTO ${this.schema}.people (pubkey, name, username, updated_at) SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::bigint[])
+       ON CONFLICT (pubkey) DO UPDATE SET name = excluded.name, username = excluded.username, updated_at = excluded.updated_at
+       WHERE excluded.updated_at > ${this.schema}.people.updated_at OR ${this.schema}.people.username IS NULL`,
+      [rows.map((r) => r.pubkey), rows.map((r) => r.name), rows.map((r) => r.username ?? null), rows.map((r) => r.updatedAt)],
     );
   }
 
@@ -201,25 +207,53 @@ export class SearchIndex {
     return authors.filter((author) => !known.has(author));
   }
 
-  /** The best matches in public channels: by BM25 with Lakebase Search, else Postgres' own ranking. */
-  async search(query: string, limit = 20): Promise<SearchHit[]> {
-    const terms = searchTerms(query);
-    if (!terms) return [];
-    const rank =
-      this.mode === "bm25"
-        ? { score: `m.tsv <@> to_bm25query(to_tsvector('english', $1), '${this.schema}.messages_bm25')`, order: "ASC" }
-        : { score: `ts_rank_cd(m.tsv, plainto_tsquery('english', $1))`, order: "DESC" };
+  /**
+   * The best matches in public channels for a search with Slack's filters
+   * (see parseQuery): ranked by BM25 with Lakebase Search, else Postgres' own
+   * ranking; with only filters, the newest first.
+   */
+  async search(input: string | SearchQuery, limit = 20): Promise<SearchHit[]> {
+    const query = typeof input === "string" ? parseQuery(input) : input;
+    const terms = searchTerms(query.text.replace(/(^|\s)-\S+/g, " ").replace(/\bOR\b/g, " "));
+    const values: unknown[] = [];
+    const param = (value: unknown) => `$${values.push(value)}`;
+    const where: string[] = [];
+    const words = query.text.trim() ? param(query.text) : undefined;
+    if (words) where.push(`m.tsv @@ websearch_to_tsquery('english', ${words})`);
+    // People: by hex key, handle, or display name (exact, or a prefix of it).
+    const people = (typed: string[]) => {
+      const keys = param(typed);
+      const prefixes = param(typed.map((name) => `${name.replace(/[%_\\]/g, "")}%`));
+      return `(SELECT pubkey FROM ${this.schema}.people p WHERE p.pubkey = ANY(${keys}) OR lower(p.username) = ANY(${keys}) OR lower(p.name) = ANY(${keys}) OR lower(p.name) LIKE ANY(${prefixes}) UNION SELECT unnest(${keys}::text[]))`;
+    };
+    if (query.from.length) where.push(`m.author IN ${people(query.from)}`);
+    if (query.to.length) where.push(`m.mentions && ARRAY${people(query.to)}`);
+    if (query.in.length) {
+      const channels = param(query.in);
+      where.push(`(lower(c.name) = ANY(${channels}) OR c.id = ANY(${channels}))`);
+    }
+    if (query.after !== undefined) where.push(`m.created_at >= ${param(query.after)}`);
+    if (query.before !== undefined && Number.isFinite(query.before)) where.push(`m.created_at < ${param(query.before)}`);
+    if (query.thread) where.push("m.root IS NOT NULL");
+    if (query.link) where.push(`m.text ~* 'https?://'`);
+    if (!where.length) return [];
+    const ranked = Boolean(words && terms);
+    const rankTerms = ranked ? param(terms) : undefined;
+    const score = !ranked
+      ? "0"
+      : this.mode === "bm25"
+        ? `m.tsv <@> to_bm25query(to_tsvector('english', ${rankTerms}), '${this.schema}.messages_bm25')`
+        : `-ts_rank_cd(m.tsv, websearch_to_tsquery('english', ${words}))`;
+    const snippet = words ? `ts_headline('english', m.text, websearch_to_tsquery('english', ${words}), 'MaxFragments=1,MaxWords=30,MinWords=10,StartSel=**,StopSel=**')` : "left(m.text, 240)";
     const found = await this.query<{ id: string; channel: string; channel_name: string; author: string; author_name: string | null; root: string | null; created_at: string; snippet: string }>(
-      `SELECT m.id, m.channel, c.name AS channel_name, m.author, p.name AS author_name, m.root, m.created_at,
-         ts_headline('english', m.text, plainto_tsquery('english', $1), 'MaxFragments=1,MaxWords=30,MinWords=10,StartSel=**,StopSel=**') AS snippet,
-         ${rank.score} AS score
+      `SELECT m.id, m.channel, c.name AS channel_name, m.author, p.name AS author_name, m.root, m.created_at, ${snippet} AS snippet, ${score} AS score
        FROM ${this.schema}.messages m
        JOIN ${this.schema}.channels c ON c.id = m.channel AND c.public
        LEFT JOIN ${this.schema}.people p ON p.pubkey = m.author
-       WHERE m.tsv @@ plainto_tsquery('english', $1)
-       ORDER BY score ${rank.order}, m.created_at DESC
-       LIMIT $2`,
-      [terms, Math.max(1, Math.min(50, limit))],
+       WHERE ${where.join(" AND ")}
+       ORDER BY ${ranked ? "score ASC, " : ""}m.created_at DESC
+       LIMIT ${param(Math.max(1, Math.min(50, limit)))}`,
+      values,
     );
     return found.rows.map((row) => ({
       id: row.id,

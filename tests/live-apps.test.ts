@@ -19,7 +19,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { Apps, searchBuzz, UcSecrets } from "@dbx/core/api/apps";
+import { Apps, searchBuzz, searchBuzzQuery, UcSecrets } from "@dbx/core/api/apps";
 import { Lakebase } from "@dbx/core/api/workspace";
 import type { DatabricksClient } from "@dbx/core/client";
 import { Connection } from "@dbx/core/connection";
@@ -64,11 +64,11 @@ describe.skipIf(!PROFILE || !SCHEMA)(`live Databricks App identity (${PROFILE}, 
     await connection.useProfile(PROFILE!);
     client = await connection.ready(undefined, 60_000);
     provider = appProvider({ storage } as never, createService(connection, () => {}));
-    // Earlier runs' probes (this test's names, over half an hour old), in case one was cut short.
+    // Earlier runs' probes (this test's names), in case one was cut short: a run that's
+    // interrupted and started again leaves its first attempt's app. Run one at a time.
     const me = connection.snapshot();
     for (const app of await new Apps(client).list()) {
       if (!/^buzz-(idx|live)-[0-9a-z]+$/.test(app.name) || !app.description?.endsWith(": Live probe")) continue;
-      if (Date.now() - Date.parse((app as { create_time?: string }).create_time ?? "") < 30 * 60_000) continue;
       await new Apps(client).delete(app.name).catch(() => {});
       await new UcSecrets(client).delete(identitySecretName(SCHEMA!, app.name)).catch(() => {});
       if (me.status === "connected" && me.user?.userName) await client.post("/api/2.0/workspace/delete", { path: `/Workspace/Users/${me.user.userName}/buzz-apps/${app.name}`, recursive: true }).catch(() => {});
@@ -134,5 +134,11 @@ describe.skipIf(!PROFILE || !SCHEMA)(`live Databricks App identity (${PROFILE}, 
     const app = await new Apps(client).get(APP);
     report.hits = await searchBuzz(client, app!, "revenue report");
     expect(Array.isArray(report.hits)).toBe(true);
+    // Slack's filters, each through Postgres (an empty index still has to run them).
+    for (const query of ['from:@sam in:#general after:2026-11-01 has:link is:thread "launch plan" -draft', "from:@sam", "to:@sam before:2026-11-01", "during:2026-11 OR launch", "-onlyexcluded"]) {
+      const found = await searchBuzzQuery(client, app!, query);
+      expect(found.results, query).toEqual([]);
+      expect(found.query, query).toBeDefined();
+    }
   }, 10 * 60_000);
 });
