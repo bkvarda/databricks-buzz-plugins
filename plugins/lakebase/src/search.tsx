@@ -9,14 +9,23 @@ import { type AgentTool, numberArg, optionalService, schema, stringArg } from "@
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { ago, Button, DbxRoot, EmptyState, Notice, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { useWorkspaceService, WorkspaceField } from "@dbx/core/ui/workspace";
 
-const CHOSEN = "buzzSearchApp";
+/** The index app picked, and the workspace (a CLI profile; unset is Buzz's own) it's in. The Databricks App type sets both when it makes an index. */
+export const SEARCH_APP_PREFERENCE = "buzzSearchApp";
+export const SEARCH_PROFILE_PREFERENCE = "buzzSearchProfile";
+const CHOSEN = SEARCH_APP_PREFERENCE;
+
+const workspaceFor = (service: DatabricksService) => {
+  const profile = service.preferences.get<string>(SEARCH_PROFILE_PREFERENCE);
+  return profile && service.forProfile ? service.forProfile(profile) : service;
+};
 
 type RelayView = { snapshot(): { viewer?: string; origin?: string } };
 
-/** The index to search: the one picked before, else the only running one. */
-async function chosenIndex(service: DatabricksService, signal?: AbortSignal): Promise<{ apps: DatabricksApp[]; app?: DatabricksApp }> {
-  const apps = await searchApps(await service.ready(signal), signal);
+/** The index to search in `workspace`: the one picked before, else the only (or a running) one. */
+async function chosenIndex(service: DatabricksService, workspace: DatabricksService, signal?: AbortSignal): Promise<{ apps: DatabricksApp[]; app?: DatabricksApp }> {
+  const apps = await searchApps(await workspace.ready(signal), signal);
   const picked = service.preferences.get<string>(CHOSEN);
   const app = apps.find((found) => found.name === picked) ?? (apps.length === 1 ? apps[0] : apps.find((found) => found.app_status?.state === "RUNNING"));
   return { apps, ...(app && { app }) };
@@ -48,9 +57,12 @@ export function searchPage(ctx: Context, service: DatabricksService) {
     return true;
   };
   return function SearchPage() {
-    const snapshot = useConnection(service);
+    const [profile, setProfile] = usePreference<string>(service, SEARCH_PROFILE_PREFERENCE);
+    const workspace = useWorkspaceService(service, profile);
+    const snapshot = useConnection(workspace);
     const [picked, setPicked] = usePreference<string>(service, CHOSEN);
-    const indexes = useAsync((signal) => chosenIndex(service, signal), [snapshot.status, picked]);
+    const indexes = useAsync((signal) => chosenIndex(service, workspace, signal), [workspace, snapshot.status, picked]);
+    const host = snapshot.status === "connected" ? new URL(snapshot.profile.host).hostname : "this workspace";
     const [query, setQuery] = React.useState("");
     const [state, setState] = React.useState<{ loading?: boolean; hits?: BuzzSearchHit[]; error?: string; asked?: string }>({});
     const app = indexes.data?.app;
@@ -58,14 +70,16 @@ export function searchPage(ctx: Context, service: DatabricksService) {
       if (!app || !text.trim()) return;
       setState({ loading: true, asked: text });
       try {
-        setState({ hits: await searchBuzz(await service.ready(), app, text.trim(), 30), asked: text });
+        setState({ hits: await searchBuzz(await workspace.ready(), app, text.trim(), 30), asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
     };
     let body: React.ReactNode;
     if (snapshot.status !== "connected")
-      body = (
+      body = profile ? (
+        <Text tone="subtle">Waiting for your sign-in to that workspace…</Text>
+      ) : (
         <EmptyState title="Connect Databricks" action={<Button variant="brand" onClick={() => service.openSettings()}>Connect</Button>}>
           Search reads a search index in your Databricks workspace.
         </EmptyState>
@@ -74,8 +88,8 @@ export function searchPage(ctx: Context, service: DatabricksService) {
     else if (indexes.error) body = <Notice tone="danger" title="Couldn't find search indexes">{describeError(indexes.error)}</Notice>;
     else if (!indexes.data?.apps.length)
       body = (
-        <EmptyState title="No search index yet">
-          An admin makes one in Agents → New agent → Databricks App, with the Search index template. It reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.
+        <EmptyState title={`No search index in ${host}`}>
+          If the index is in another workspace, pick it above. An admin makes one in Agents → New agent → Databricks App, with the Search index template; it reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.
         </EmptyState>
       );
     else
@@ -139,6 +153,18 @@ export function searchPage(ctx: Context, service: DatabricksService) {
             <Text as="h2" size="xl" weight={500}>Search</Text>
             <Text tone="subtle">Every public channel in this community, searched with Lakebase.</Text>
           </Stack>
+          {service.forProfile && (
+            <div style={{ maxWidth: 420 }}>
+              <WorkspaceField
+                service={service}
+                {...(profile && { profile })}
+                onChange={(next) => {
+                  setPicked(undefined);
+                  setProfile(next);
+                }}
+              />
+            </div>
+          )}
           {body}
         </Stack>
       </DbxRoot>
@@ -155,9 +181,10 @@ export function searchTool(service: DatabricksService): AgentTool {
     inputSchema: schema.object({ query: schema.string("Words to look for."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
     async call(_client, _context, args) {
       const query = stringArg(args, "query");
-      const { app, apps } = await chosenIndex(service);
-      if (!app) return apps.length ? "There's more than one search index; the owner picks one on the Search page." : "There's no Buzz search index in this workspace (an admin makes one with the Databricks App type's Search index template).";
-      const hits = await searchBuzz(await service.ready(), app, query, numberArg(args, "limit", 10, 1, 30));
+      const workspace = workspaceFor(service);
+      const { app, apps } = await chosenIndex(service, workspace);
+      if (!app) return apps.length ? "There's more than one search index; the owner picks one on the Search page." : "There's no Buzz search index in the workspace picked on the Search page (an admin makes one with the Databricks App type's Search index template).";
+      const hits = await searchBuzz(await workspace.ready(), app, query, numberArg(args, "limit", 10, 1, 30));
       if (!hits.length) return `Nothing in public channels matches “${query}”.`;
       return hits.map((hit) => `- #${hit.channelName} · ${hit.authorName ?? hit.author.slice(0, 8)} · ${new Date(hit.createdAt * 1000).toISOString().slice(0, 16)}Z${hit.root ? " (in a thread)" : ""}: ${hit.snippet}`).join("\n");
     },

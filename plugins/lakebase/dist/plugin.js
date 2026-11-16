@@ -918,10 +918,87 @@ async function searchBuzz(client, app, query, limit = 20, signal) {
   return JSON.parse(response.body).results ?? [];
 }
 
+// packages/core/src/ui/workspace.tsx
+var hostname = (host) => new URL(host).hostname;
+var ADD = "__add__";
+function useWorkspaceService(service, profile) {
+  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+function BrowserWait(props) {
+  const { cancelSignIn } = props.service;
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser", props.host ? ` (${hostname(props.host)})` : "", ".")), cancelSignIn && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => cancelSignIn() }, "Cancel"));
+}
+function WorkspaceStatus(props) {
+  const { service, snapshot } = props;
+  const signIn = (label) => service.reauthenticate ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => void service.reauthenticate() }, label) : void 0;
+  switch (snapshot.status) {
+    case "checking":
+    case "connecting":
+      return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026"));
+    case "signing-in":
+      return /* @__PURE__ */ React.createElement(BrowserWait, { service, ...snapshot.host && { host: snapshot.host } });
+    case "connected":
+      return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", hostname(snapshot.profile.host), " as ", snapshot.user.userName, ".");
+    case "error":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn(snapshot.needsSignIn ? "Sign in again" : "Sign in") }, snapshot.needsSignIn ? "Your sign-in to this workspace has expired." : snapshot.message);
+    case "signed-out":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn("Sign in") }, snapshot.error ?? "You're not signed in to this workspace.");
+    default:
+      return null;
+  }
+}
+function WorkspaceField(props) {
+  const main = useConnection(props.service);
+  const workspace = useWorkspaceService(props.service, props.profile);
+  const current = useConnection(workspace);
+  const [adding, setAdding] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [state, setState] = React.useState({});
+  if (!props.service.forProfile) return null;
+  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
+  const profiles = props.service.profiles();
+  const mainName = main.status === "connected" ? main.profile.name : void 0;
+  const signIn = async () => {
+    setState({ busy: true });
+    try {
+      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
+      props.onChange(profile === mainName ? void 0 : profile);
+      setAdding(false);
+      setUrl("");
+      setState({});
+    } catch (error) {
+      setState({ error: describeError(error) });
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: adding ? ADD : props.profile ?? "",
+      onChange: (event) => {
+        const value = event.target.value;
+        if (value === ADD) return setAdding(true);
+        setAdding(false);
+        props.onChange(value && value !== mainName ? value : void 0);
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
+    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
+    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
+  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.busy && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser."), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && !adding && /* @__PURE__ */ React.createElement(WorkspaceStatus, { service: workspace, snapshot: current })));
+}
+
 // plugins/lakebase/src/search.tsx
-var CHOSEN = "buzzSearchApp";
-async function chosenIndex(service, signal) {
-  const apps = await searchApps(await service.ready(signal), signal);
+var SEARCH_APP_PREFERENCE = "buzzSearchApp";
+var SEARCH_PROFILE_PREFERENCE = "buzzSearchProfile";
+var CHOSEN = SEARCH_APP_PREFERENCE;
+var workspaceFor = (service) => {
+  const profile = service.preferences.get(SEARCH_PROFILE_PREFERENCE);
+  return profile && service.forProfile ? service.forProfile(profile) : service;
+};
+async function chosenIndex(service, workspace, signal) {
+  const apps = await searchApps(await workspace.ready(signal), signal);
   const picked = service.preferences.get(CHOSEN);
   const app = apps.find((found) => found.name === picked) ?? (apps.length === 1 ? apps[0] : apps.find((found) => found.app_status?.state === "RUNNING"));
   return { apps, ...app && { app } };
@@ -946,9 +1023,12 @@ function searchPage(ctx, service) {
     return true;
   };
   return function SearchPage() {
-    const snapshot = useConnection(service);
+    const [profile, setProfile] = usePreference(service, SEARCH_PROFILE_PREFERENCE);
+    const workspace = useWorkspaceService(service, profile);
+    const snapshot = useConnection(workspace);
     const [picked, setPicked] = usePreference(service, CHOSEN);
-    const indexes = useAsync((signal) => chosenIndex(service, signal), [snapshot.status, picked]);
+    const indexes = useAsync((signal) => chosenIndex(service, workspace, signal), [workspace, snapshot.status, picked]);
+    const host = snapshot.status === "connected" ? new URL(snapshot.profile.host).hostname : "this workspace";
     const [query, setQuery] = React.useState("");
     const [state, setState] = React.useState({});
     const app = indexes.data?.app;
@@ -956,18 +1036,18 @@ function searchPage(ctx, service) {
       if (!app || !text.trim()) return;
       setState({ loading: true, asked: text });
       try {
-        setState({ hits: await searchBuzz(await service.ready(), app, text.trim(), 30), asked: text });
+        setState({ hits: await searchBuzz(await workspace.ready(), app, text.trim(), 30), asked: text });
       } catch (error) {
         setState({ error: describeError(error), asked: text });
       }
     };
     let body;
     if (snapshot.status !== "connected")
-      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Search reads a search index in your Databricks workspace.");
+      body = profile ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Waiting for your sign-in to that workspace\u2026") : /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Search reads a search index in your Databricks workspace.");
     else if (indexes.loading && !indexes.data) body = /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, null), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Finding search indexes\u2026"));
     else if (indexes.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't find search indexes" }, describeError(indexes.error));
     else if (!indexes.data?.apps.length)
-      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "No search index yet" }, "An admin makes one in Agents \u2192 New agent \u2192 Databricks App, with the Search index template. It reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.");
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: `No search index in ${host}` }, "If the index is in another workspace, pick it above. An admin makes one in Agents \u2192 New agent \u2192 Databricks App, with the Search index template; it reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.");
     else
       body = /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(
         "form",
@@ -991,7 +1071,17 @@ function searchPage(ctx, service) {
         },
         /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "#", hit.channelName, " \xB7 ", hit.authorName ?? `${hit.author.slice(0, 8)}\u2026`, " \xB7 ", ago(hit.createdAt * 1e3), hit.root ? " \xB7 in a thread" : ""), /* @__PURE__ */ React.createElement(Snippet, { text: hit.snippet }))
       )), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Searches public channels only, through ", app?.name ?? "the index", ", as you."));
-    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-page-inset, 24px)", maxWidth: 820 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 500 }, "Search"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Every public channel in this community, searched with Lakebase.")), body));
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-page-inset, 24px)", maxWidth: 820 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 500 }, "Search"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Every public channel in this community, searched with Lakebase.")), service.forProfile && /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 420 } }, /* @__PURE__ */ React.createElement(
+      WorkspaceField,
+      {
+        service,
+        ...profile && { profile },
+        onChange: (next) => {
+          setPicked(void 0);
+          setProfile(next);
+        }
+      }
+    )), body));
   };
 }
 function searchTool(service) {
@@ -1001,9 +1091,10 @@ function searchTool(service) {
     inputSchema: schema.object({ query: schema.string("Words to look for."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
     async call(_client, _context, args) {
       const query = stringArg(args, "query");
-      const { app, apps } = await chosenIndex(service);
-      if (!app) return apps.length ? "There's more than one search index; the owner picks one on the Search page." : "There's no Buzz search index in this workspace (an admin makes one with the Databricks App type's Search index template).";
-      const hits = await searchBuzz(await service.ready(), app, query, numberArg(args, "limit", 10, 1, 30));
+      const workspace = workspaceFor(service);
+      const { app, apps } = await chosenIndex(service, workspace);
+      if (!app) return apps.length ? "There's more than one search index; the owner picks one on the Search page." : "There's no Buzz search index in the workspace picked on the Search page (an admin makes one with the Databricks App type's Search index template).";
+      const hits = await searchBuzz(await workspace.ready(), app, query, numberArg(args, "limit", 10, 1, 30));
       if (!hits.length) return `Nothing in public channels matches \u201C${query}\u201D.`;
       return hits.map((hit) => `- #${hit.channelName} \xB7 ${hit.authorName ?? hit.author.slice(0, 8)} \xB7 ${new Date(hit.createdAt * 1e3).toISOString().slice(0, 16)}Z${hit.root ? " (in a thread)" : ""}: ${hit.snippet}`).join("\n");
     }

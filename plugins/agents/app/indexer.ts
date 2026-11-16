@@ -83,11 +83,13 @@ async function backfill(channel: string, stopped: () => boolean) {
       events = await app.query([{ kinds: INDEX_KINDS, "#h": [channel], until, limit: PAGE }]);
     } catch (error) {
       state.readErrors++;
+      console.log(`[index] couldn't read ${channel}: ${(error as Error).message.slice(0, 200)}`);
       await index.setCursor(channel, until, false, (error as Error).message.slice(0, 300));
       return;
     }
     if (!events.length) return index.setCursor(channel, until, true);
     await take(events);
+    console.log(`[index] ${channel}: read ${events.length} older events`);
     const oldest = Math.min(...events.map((event) => event.created_at));
     // A full page all in one second would repeat forever; step past it.
     until = events.length >= PAGE && oldest >= until ? until - 1 : oldest;
@@ -114,6 +116,7 @@ app.onConnect(() => {
       for (const channel of channels) relaySigners.add(channel.signer);
       await index.channels(channels);
       const open = channels.filter((channel) => channel.public).map((channel) => channel.id).sort();
+      console.log(`[index] found ${channels.length} channels, ${open.length} public`);
       // New messages, edits and deletions in public channels, from now on.
       if (open.join() !== watching) {
         stopWatches();
@@ -130,6 +133,7 @@ app.onConnect(() => {
       }
       state.reading = "";
       state.stats = await index.stats();
+      console.log(`[index] ${state.stats.messages} messages in ${state.stats.backfilled}/${state.stats.publicChannels} public channels`);
     } catch (error) {
       console.log(`[index] discovery failed: ${(error as Error).message}`);
     }

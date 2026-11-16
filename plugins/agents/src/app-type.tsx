@@ -256,6 +256,11 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
       if (record.config.mode === "starter") await deploy(record, input.signal);
       await write(record);
       await storage.set(pendingKey(input.community, found.name), null);
+      // The Search page (Lakebase plugin) searches the index made last, in its workspace.
+      if (isSearch(record.config)) {
+        service.preferences.set("buzzSearchProfile", record.config.profile);
+        service.preferences.set("buzzSearchApp", record.config.app);
+      }
     },
     async profile(input: Readonly<{ pubkey: string; community: string; name: string; picture?: string; signal: AbortSignal }>) {
       const found = read(input.pubkey);
