@@ -53,6 +53,34 @@ async function runnerModule(dir) {
   return { code, sha };
 }
 
+// A plugin with an app/ (the Buzz App library, for code running as a
+// Databricks App, and the starter app that uses it) gets both embedded as
+// `virtual:buzz-app`, so the plugin can put them in a workspace folder. The
+// library is also written to sdk/buzz-app.mjs for apps set up by hand.
+async function appModule(dir) {
+  const entry = join(dir, "app/sdk.ts");
+  if (!(await exists(entry))) return undefined;
+  const result = await build({
+    entryPoints: [entry],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node20",
+    minify: true,
+    legalComments: "none",
+    write: false,
+    tsconfig: join(root, "tsconfig.json"),
+    banner: { js: "// buzz-app.mjs: Buzz for Databricks Apps (built by databricks-buzz-plugins). Apache-2.0. Usage: plugins/agents/app/sdk.ts in the repo." },
+    logLevel: "silent",
+  });
+  const sdk = result.outputFiles[0].text;
+  const starter = await readFile(join(dir, "app/starter/app.mjs"), "utf8");
+  await mkdir(join(root, "sdk"), { recursive: true });
+  await writeFile(join(root, "sdk/buzz-app.mjs"), sdk);
+  const sha = createHash("sha256").update(sdk).update(starter).digest("hex").slice(0, 16);
+  return { sdk, starter, sha };
+}
+
 for (const name of plugins) {
   const dir = join(root, "plugins", name);
   const manifestPath = join(dir, "manifest.json");
@@ -63,6 +91,17 @@ for (const name of plugins) {
   await mkdir(out, { recursive: true });
   try {
     const runner = await runnerModule(dir);
+    const app = await appModule(dir);
+    const embedApp = {
+      name: "buzz-app",
+      setup(builder) {
+        builder.onResolve({ filter: /^virtual:buzz-app$/ }, () => ({ path: "buzz-app", namespace: "virtual-app" }));
+        builder.onLoad({ filter: /.*/, namespace: "virtual-app" }, () => {
+          if (!app) throw new Error("virtual:buzz-app needs app/sdk.ts");
+          return { contents: `export const SDK = ${JSON.stringify(app.sdk)};\nexport const STARTER = ${JSON.stringify(app.starter)};\nexport const APP_SHA = ${JSON.stringify(app.sha)};`, loader: "js" };
+        });
+      },
+    };
     const embed = {
       name: "agent-runner",
       setup(builder) {
@@ -88,7 +127,7 @@ for (const name of plugins) {
       treeShaking: true,
       metafile: true,
       tsconfig: join(root, "tsconfig.json"),
-      plugins: [hostOnly, embed],
+      plugins: [hostOnly, embed, embedApp],
       define: { "process.env.NODE_ENV": '"production"', __PLUGIN_VERSION__: JSON.stringify(rootPackage.version) },
       banner: { js: `// ${manifest.name} (${manifest.id}) — built by databricks-buzz-plugins. Apache-2.0.` },
       logLevel: "silent",

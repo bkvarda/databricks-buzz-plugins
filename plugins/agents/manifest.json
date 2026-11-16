@@ -2,7 +2,7 @@
   "id": "bkvarda.databricks-agents",
   "name": "Databricks Agents",
   "apiVersion": 1,
-  "description": "Create agents that think on Databricks: models with Buzz tools and Databricks Sandboxes, Genie agents, and your own Agent Bricks agents.",
+  "description": "Create agents that think on Databricks: models with Buzz tools and Databricks Sandboxes, Genie agents, your own Agent Bricks agents, and Buzz identities for Databricks Apps.",
   "updates": { "defaultEnabled": true },
   "discovery": {
     "category": "agents",

@@ -1,13 +1,16 @@
-// Databricks Agents: two Buzz agent types.
+// Databricks Agents: three Buzz agent types.
 //   Databricks           runs from the owner's Buzz (./types): Genie One, a
 //                        Sandbox agent with Buzz's tools, or a custom agent.
 //   Databricks (hosted)  runs in its own Databricks Sandbox (./hosted), so it
 //                        answers with Buzz closed: Genie, or Claude Code,
 //                        Codex or Pi.
+//   Databricks App       a Buzz identity for code running as a Databricks
+//                        App (./app-type), as its own service principal.
 import type { Context } from "@buzz/author";
 import { bindReact, React } from "@dbx/core/react";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
 import { DbxRoot, Notice, Stack, Text } from "@dbx/core/ui/components";
+import { registerAppType } from "./app-type";
 import { registerHostedType } from "./hosted";
 import { registerTypes } from "./types";
 
@@ -22,6 +25,7 @@ export function apply(ctx: Context) {
     registerTypes(scope.agents, kit, databricks);
     const stop = registerHostedType(scope.agents, databricks);
     scope.effect(() => stop);
+    registerAppType(scope.agents, databricks);
     return { kit: true };
   });
   ctx.settingsCards.register({
@@ -51,13 +55,17 @@ export function apply(ctx: Context) {
                 "Databricks (hosted)",
                 "Runs in your Databricks workspace, in its own Sandbox, so it can answer with Buzz closed. Genie, Claude Code, Codex or Pi in each harness's guarded mode, or an Omnigent agent. Always on, or asleep while Buzz is closed. It can't use Buzz's own tools.",
               ],
+              [
+                "Databricks App",
+                "A Buzz identity for code running as a Databricks App, like a Slack app's bot user. It works as the app's own service principal, with only the access you grant it, so it can answer anyone in its channels. Deploy the starter app, or connect an app you have.",
+              ],
             ].map(([title, body]) => (
               <Stack key={title} gap={2}>
                 <Text weight={500}>{title}</Text>
                 <Text tone="subtle" size="sm">{body}</Text>
               </Stack>
             ))}
-            <Text size="sm">To create one, open <b>Agents</b>, choose <b>New agent</b> and pick <b>Databricks</b> or <b>Databricks (hosted)</b> as the harness.</Text>
+            <Text size="sm">To create one, open <b>Agents</b>, choose <b>New agent</b> and pick <b>Databricks</b>, <b>Databricks (hosted)</b> or <b>Databricks App</b> as the harness.</Text>
           </Stack>
         </DbxRoot>
       );
