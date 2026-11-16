@@ -8,17 +8,23 @@
 //
 //   DBX_LIVE_PROFILE=<profile> DBX_LIVE_APPS=<catalog.schema> npx vitest run tests/live-apps.test.ts
 //
+// With DBX_LIVE_SEARCH=<Lakebase project ID> it deploys the Search index
+// template instead, checks it set up its index in that project's database as
+// its service principal (and that Lakebase Search answers), and searches it as
+// you. The index's schema stays in the database; nothing else does.
+//
 // Observed shapes go to tmp/live-apps-report.json.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { Apps, UcSecrets } from "@dbx/core/api/apps";
+import { Apps, searchBuzz, UcSecrets } from "@dbx/core/api/apps";
+import { Lakebase } from "@dbx/core/api/workspace";
 import type { DatabricksClient } from "@dbx/core/client";
 import { Connection } from "@dbx/core/connection";
 import { createService } from "@dbx/core/provider";
-import { parseIdentity } from "../plugins/agents/src/app-identity";
+import { identitySecretName, parseIdentity } from "../plugins/agents/src/app-identity";
 import { type AppStatus, appProvider } from "../plugins/agents/src/app-type";
 import { nodeHost } from "./node-host";
 
@@ -27,6 +33,7 @@ vi.mock("virtual:buzz-app", async () => {
   const { readFileSync } = await import("node:fs");
   return {
     SDK: readFileSync(new URL("../sdk/buzz-app.mjs", import.meta.url), "utf8"),
+    INDEXER: readFileSync(new URL("../sdk/search-index.mjs", import.meta.url), "utf8"),
     STARTER: readFileSync(new URL("../plugins/agents/app/starter/app.mjs", import.meta.url), "utf8"),
     APP_SHA: "live",
   };
@@ -34,7 +41,8 @@ vi.mock("virtual:buzz-app", async () => {
 
 const PROFILE = process.env.DBX_LIVE_PROFILE;
 const SCHEMA = process.env.DBX_LIVE_APPS;
-const APP = `buzz-live-${Date.now().toString(36)}`;
+const SEARCH = process.env.DBX_LIVE_SEARCH;
+const APP = `buzz-${SEARCH ? "idx" : "live"}-${Date.now().toString(36)}`;
 const report: Record<string, unknown> = {};
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
 
@@ -56,19 +64,35 @@ describe.skipIf(!PROFILE || !SCHEMA)(`live Databricks App identity (${PROFILE}, 
     await connection.useProfile(PROFILE!);
     client = await connection.ready(undefined, 60_000);
     provider = appProvider({ storage } as never, createService(connection, () => {}));
-  }, 90_000);
+    // Earlier runs' probes (this test's names, over half an hour old), in case one was cut short.
+    const me = connection.snapshot();
+    for (const app of await new Apps(client).list()) {
+      if (!/^buzz-(idx|live)-[0-9a-z]+$/.test(app.name) || !app.description?.endsWith(": Live probe")) continue;
+      if (Date.now() - Date.parse((app as { create_time?: string }).create_time ?? "") < 30 * 60_000) continue;
+      await new Apps(client).delete(app.name).catch(() => {});
+      await new UcSecrets(client).delete(identitySecretName(SCHEMA!, app.name)).catch(() => {});
+      if (me.status === "connected" && me.user?.userName) await client.post("/api/2.0/workspace/delete", { path: `/Workspace/Users/${me.user.userName}/buzz-apps/${app.name}`, recursive: true }).catch(() => {});
+      report.swept = [...((report.swept as string[] | undefined) ?? []), app.name];
+    }
+  }, 180_000);
 
   afterAll(async () => {
-    // Whatever happened, nothing is left behind but the code folder.
+    // Whatever happened, nothing is left behind (but a search index's schema in its database).
     if (pubkey) await provider.remove({ pubkey, signal: AbortSignal.timeout(120_000) }).catch((error) => (report.removeError = String(error)));
+    // By name too, in case creation stopped partway.
     await new Apps(client).delete(APP).catch(() => {});
+    await new UcSecrets(client).delete(identitySecretName(SCHEMA!, APP)).catch(() => {});
+    const me = connection.snapshot();
+    if (!source && me.status === "connected" && me.user?.userName) source = `/Workspace/Users/${me.user.userName}/buzz-apps/${APP}`;
     if (source) await client.post("/api/2.0/workspace/delete", { path: source, recursive: true }).catch(() => {});
     mkdirSync(new URL("../tmp/", import.meta.url), { recursive: true });
     writeFileSync(new URL("../tmp/live-apps-report.json", import.meta.url), JSON.stringify(report, null, 2));
   }, 180_000);
 
   it("makes the app, its key and its grants", async () => {
-    const config = { mode: "starter", app: APP, schema: SCHEMA, answers: "everyone" };
+    const lakebase = SEARCH ? await new Lakebase(client).defaultDatabase(SEARCH) : undefined;
+    if (SEARCH) expect(lakebase).toBeDefined();
+    const config = { mode: "starter", template: SEARCH ? "search" : "starter", app: APP, schema: SCHEMA, answers: "everyone", ...(lakebase && { lakebase: { project: SEARCH, branch: lakebase.branch, database: lakebase.database } }) };
     ({ pubkey } = await provider.provision({ name: "Live probe", community: "wss://relay.invalid", config, signal: signal() }));
     const record = provider.read(pubkey)!;
     source = record.source;
@@ -95,4 +119,20 @@ describe.skipIf(!PROFILE || !SCHEMA)(`live Databricks App identity (${PROFILE}, 
     expect(status.live?.pubkey).toBe(pubkey);
     expect(["connecting", "connected"]).toContain(status.live?.state);
   }, 30 * 60_000);
+
+  it.skipIf(!SEARCH)("sets up its index in Lakebase as its service principal, and searches as you", async () => {
+    type Live = Record<string, unknown>;
+    let live: Live = {};
+    for (let i = 0; i < 36; i++) {
+      live = ((await provider.status(pubkey)).live ?? {}) as Live;
+      if (typeof live.index === "string" && (live.index.startsWith("ready") || /isn't|failed|denied/.test(live.index)) && live.searchCheck !== "not run") break;
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    report.search = live;
+    expect(live.index).toMatch(/^ready/);
+    expect(live.searchCheck).toMatch(/^ok/);
+    const app = await new Apps(client).get(APP);
+    report.hits = await searchBuzz(client, app!, "revenue report");
+    expect(Array.isArray(report.hits)).toBe(true);
+  }, 10 * 60_000);
 });

@@ -252,6 +252,16 @@ export class Lakebase {
     return response.branches ?? [];
   }
 
+  /** A project's default branch and its first database, as full resource names (what an app's `postgres` resource takes). */
+  async defaultDatabase(projectId: string, signal?: AbortSignal): Promise<{ branch: string; database: string; databaseName: string } | undefined> {
+    const branches = await this.branches(projectId, signal);
+    const branch = branches.find((candidate) => candidate.status?.default) ?? branches.find((candidate) => candidate.name.endsWith("/production")) ?? branches[0];
+    if (!branch) return undefined;
+    const databases = await this.client.get<{ databases?: { name: string; status?: { postgres_database?: string } }[] }>(`/api/2.0/postgres/${branch.name}/databases`, signal ? { signal } : {});
+    const database = (databases.databases ?? []).find((candidate) => candidate.status?.postgres_database === "databricks_postgres") ?? databases.databases?.[0];
+    return database ? { branch: branch.name, database: database.name, databaseName: database.status?.postgres_database ?? database.name.split("/").pop()! } : undefined;
+  }
+
   /**
    * Data API base URLs for a project's default branch, one per database:
    * https://<read-write host>/api/2.0/workspace/<workspace-id>/rest/<database>

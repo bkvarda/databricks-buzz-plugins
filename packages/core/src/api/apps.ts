@@ -51,6 +51,9 @@ export function wait(ms: number, signal?: AbortSignal) {
   });
 }
 
+/** A resource an app uses, e.g. a Lakebase database: `{ name: "postgres", postgres: { branch, database, permission: "CAN_CONNECT_AND_CREATE" } }`. */
+export type AppResource = Readonly<{ name: string; description?: string; postgres?: Readonly<{ branch: string; database: string; permission: string }> }>;
+
 export class Apps {
   constructor(private readonly client: DatabricksClient) {}
 
@@ -77,10 +80,10 @@ export class Apps {
   }
 
   /** Creates an app; with `compute: false` it stays stopped until its first deployment. */
-  create(name: string, options: Readonly<{ description?: string; compute?: boolean; signal?: AbortSignal }> = {}): Promise<DatabricksApp> {
+  create(name: string, options: Readonly<{ description?: string; compute?: boolean; resources?: readonly AppResource[]; signal?: AbortSignal }> = {}): Promise<DatabricksApp> {
     return this.client.post<DatabricksApp>(
       "/api/2.0/apps",
-      { name, ...(options.description && { description: options.description }) },
+      { name, ...(options.description && { description: options.description }), ...(options.resources?.length && { resources: options.resources }) },
       { ...(options.compute === false && { query: { no_compute: true } }), ...(options.signal && { signal: options.signal }) },
     );
   }
@@ -99,6 +102,20 @@ export class Apps {
 
   stop(name: string, signal?: AbortSignal): Promise<DatabricksApp> {
     return this.client.post<DatabricksApp>(`/api/2.0/apps/${encodeURIComponent(name)}/stop`, {}, { ...(signal && { signal }) });
+  }
+
+  /** Lets a workspace group use the app (open it, call its API). `users` is everyone in the workspace. */
+  allow(name: string, group: string, permission: "CAN_USE" | "CAN_MANAGE" = "CAN_USE", signal?: AbortSignal): Promise<unknown> {
+    return this.client.json(`/api/2.0/permissions/apps/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      body: { access_control_list: [{ group_name: group, permission_level: permission }] },
+      ...(signal && { signal }),
+    });
+  }
+
+  async allowed(name: string, group: string, signal?: AbortSignal): Promise<boolean> {
+    const found = await this.client.get<{ access_control_list?: { group_name?: string; all_permissions?: { permission_level?: string }[] }[] }>(`/api/2.0/permissions/apps/${encodeURIComponent(name)}`, { ...(signal && { signal }) });
+    return (found.access_control_list ?? []).some((entry) => entry.group_name === group && (entry.all_permissions ?? []).some((p) => p.permission_level === "CAN_USE" || p.permission_level === "CAN_MANAGE"));
   }
 
   async delete(name: string, signal?: AbortSignal): Promise<void> {
@@ -209,4 +226,36 @@ export async function writeWorkspaceFiles(client: DatabricksClient, folder: stri
     }
     await client.post("/api/2.0/workspace/import", { path, format: "AUTO", overwrite: true, content: base64(content) }, { ...(signal && { signal }) });
   }
+}
+
+// ── Buzz search indexes (the Databricks Agents plugin's search template) ──
+
+/** A search index app's description starts with this. */
+export const SEARCH_APP_PREFIX = "Buzz search index";
+
+export type BuzzSearchHit = Readonly<{
+  id: string;
+  channel: string;
+  channelName: string;
+  author: string;
+  authorName?: string;
+  root?: string;
+  createdAt: number;
+  /** A short passage, with matches marked **like this**. */
+  snippet: string;
+}>;
+
+/** The search index apps this person can see. */
+export async function searchApps(client: DatabricksClient, signal?: AbortSignal): Promise<DatabricksApp[]> {
+  return (await new Apps(client).list(signal)).filter((app) => app.description?.startsWith(SEARCH_APP_PREFIX));
+}
+
+/** Searches an index app as the signed-in person (Databricks Apps signs them in; they need Can Use on the app). */
+export async function searchBuzz(client: DatabricksClient, app: Pick<DatabricksApp, "name" | "url">, query: string, limit = 20, signal?: AbortSignal): Promise<BuzzSearchHit[]> {
+  if (!app.url) throw new Error(`The search index ${app.name} isn't running.`);
+  const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/search`, { query: { q: query, limit }, timeoutMs: 30_000, ...(signal && { signal }) });
+  if (response.status === 401 || response.status === 403) throw new Error(`You can't use the search index ${app.name} yet. Ask its owner to let you (its Settings tab in Buzz can give everyone in the workspace access).`);
+  if (response.status === 503) throw new Error(`The search index ${app.name} is still setting up.`);
+  if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) throw new Error(`The search index ${app.name} answered HTTP ${response.status}; it may be stopped or still starting.`);
+  return ((JSON.parse(response.body) as { results?: BuzzSearchHit[] }).results ?? []);
 }

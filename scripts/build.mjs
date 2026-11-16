@@ -74,11 +74,30 @@ async function appModule(dir) {
     logLevel: "silent",
   });
   const sdk = result.outputFiles[0].text;
+  await mkdir(join(root, "sdk"), { recursive: true });
   const starter = await readFile(join(dir, "app/starter/app.mjs"), "utf8");
+  // The search index template: one file with its Postgres driver, so the app needs no npm install.
+  const indexerBuild = await build({
+    entryPoints: [join(dir, "app/indexer.ts")],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node20",
+    minify: true,
+    legalComments: "none",
+    write: false,
+    external: ["pg-native", "cloudflare:sockets"],
+    tsconfig: join(root, "tsconfig.json"),
+    // The Postgres driver is CommonJS and requires Node's own modules.
+    banner: { js: "// Buzz search index for Databricks Apps (built by databricks-buzz-plugins). Apache-2.0.\nimport { createRequire as __buzzRequire } from 'node:module';\nconst require = __buzzRequire(import.meta.url);" },
+    logLevel: "silent",
+  });
+  const indexer = indexerBuild.outputFiles[0].text;
+  await writeFile(join(root, "sdk/search-index.mjs"), indexer);
   await mkdir(join(root, "sdk"), { recursive: true });
   await writeFile(join(root, "sdk/buzz-app.mjs"), sdk);
-  const sha = createHash("sha256").update(sdk).update(starter).digest("hex").slice(0, 16);
-  return { sdk, starter, sha };
+  const sha = createHash("sha256").update(sdk).update(starter).update(indexer).digest("hex").slice(0, 16);
+  return { sdk, starter, indexer, sha };
 }
 
 for (const name of plugins) {
@@ -98,7 +117,7 @@ for (const name of plugins) {
         builder.onResolve({ filter: /^virtual:buzz-app$/ }, () => ({ path: "buzz-app", namespace: "virtual-app" }));
         builder.onLoad({ filter: /.*/, namespace: "virtual-app" }, () => {
           if (!app) throw new Error("virtual:buzz-app needs app/sdk.ts");
-          return { contents: `export const SDK = ${JSON.stringify(app.sdk)};\nexport const STARTER = ${JSON.stringify(app.starter)};\nexport const APP_SHA = ${JSON.stringify(app.sha)};`, loader: "js" };
+          return { contents: `export const SDK = ${JSON.stringify(app.sdk)};\nexport const STARTER = ${JSON.stringify(app.starter)};\nexport const INDEXER = ${JSON.stringify(app.indexer)};\nexport const APP_SHA = ${JSON.stringify(app.sha)};`, loader: "js" };
         });
       },
     };

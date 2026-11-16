@@ -2,7 +2,7 @@
   "id": "bkvarda.databricks-lakebase",
   "name": "Lakebase",
   "apiVersion": 1,
-  "description": "Let agents read operational data in Lakebase, Databricks managed Postgres, with your own access through the Data API.",
+  "description": "Search this community's public channels from a Buzz search index in Lakebase, and let agents read operational data in Lakebase, Databricks managed Postgres, with your own access through the Data API.",
   "updates": { "defaultEnabled": true },
   "discovery": {
     "category": "agent-tools",

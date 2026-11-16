@@ -57,13 +57,18 @@ export const activated = (identity: AppIdentity | undefined): identity is AppIde
 export const identitySecretName = (schema: string, app: string) => `${schema}.buzz_${app.replace(/-/g, "_")}`;
 
 /** What the app's library needs in its environment, in app.yaml form. */
-export function appYaml(input: Readonly<{ secret: string; source?: string }>): string {
+export function appYaml(input: Readonly<{ secret: string; source?: string; lakebase?: boolean }>): string {
   return [
     'command: ["node", "app.mjs"]',
     "env:",
     "  - name: BUZZ_IDENTITY_SECRET",
     `    value: "${input.secret}"`,
     ...(input.source ? ["  - name: BUZZ_APP_SOURCE", `    value: "${input.source}"`] : []),
+    // The app's Lakebase database resource (PGHOST and the rest come with it).
+    ...(input.lakebase ? ["  - name: LAKEBASE_ENDPOINT", "    valueFrom: postgres"] : []),
     "",
   ].join("\n");
 }
+
+/** A search index app's description starts with this; Buzz's Search page finds indexes by it. */
+export { SEARCH_APP_PREFIX } from "@dbx/core/api/apps";

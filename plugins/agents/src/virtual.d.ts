@@ -8,5 +8,7 @@ declare module "virtual:agent-runner" {
 declare module "virtual:buzz-app" {
   export const SDK: string;
   export const STARTER: string;
+  /** The search index template, bundled with its Postgres driver. */
+  export const INDEXER: string;
   export const APP_SHA: string;
 }

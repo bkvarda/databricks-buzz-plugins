@@ -31,14 +31,14 @@ var DataApiRoleError = class extends Error {
   }
 };
 function dataApiError(error, table) {
-  const status = error.status;
+  const status2 = error.status;
   const message = error.message ?? String(error);
-  if (status === 503 && /data api is not enabled/i.test(message))
+  if (status2 === 503 && /data api is not enabled/i.test(message))
     return new Error("The Data API isn't turned on for this Lakebase project. Turn it on in Lakebase \u2192 the project \u2192 Data API.", { cause: error });
-  if (status === 404 && /PGRST205|could not find the table/i.test(`${message} ${error.body ?? ""}`))
+  if (status2 === 404 && /PGRST205|could not find the table/i.test(`${message} ${error.body ?? ""}`))
     return new Error(`There's no table or view named ${table} that you can read. Check the name and schema, and that it's in an exposed schema.`, { cause: error });
   if (/permission denied to set role/i.test(detail(error))) return new DataApiRoleError(error);
-  if (status === 401 || status === 403)
+  if (status2 === 401 || status2 === 403)
     return new Error(`Lakebase refused the request (${detail(error)}). You need a Postgres role on this branch with access to the table.`, { cause: error });
   return error instanceof Error ? error : new Error(message);
 }
@@ -61,6 +61,15 @@ var Lakebase = class {
       signal ? { signal } : {}
     );
     return response.branches ?? [];
+  }
+  /** A project's default branch and its first database, as full resource names (what an app's `postgres` resource takes). */
+  async defaultDatabase(projectId, signal) {
+    const branches = await this.branches(projectId, signal);
+    const branch = branches.find((candidate) => candidate.status?.default) ?? branches.find((candidate) => candidate.name.endsWith("/production")) ?? branches[0];
+    if (!branch) return void 0;
+    const databases2 = await this.client.get(`/api/2.0/postgres/${branch.name}/databases`, signal ? { signal } : {});
+    const database = (databases2.databases ?? []).find((candidate) => candidate.status?.postgres_database === "databricks_postgres") ?? databases2.databases?.[0];
+    return database ? { branch: branch.name, database: database.name, databaseName: database.status?.postgres_database ?? database.name.split("/").pop() } : void 0;
   }
   /**
    * Data API base URLs for a project's default branch, one per database:
@@ -114,9 +123,9 @@ var Lakebase = class {
 
 // packages/core/src/client.ts
 var DatabricksApiError = class extends Error {
-  constructor(status, errorCode, message, body) {
+  constructor(status2, errorCode, message, body) {
     super(message);
-    this.status = status;
+    this.status = status2;
     this.errorCode = errorCode;
     this.body = body;
     this.name = "DatabricksApiError";
@@ -343,7 +352,7 @@ function useInstallationStatus(installer, ids) {
   return statuses;
 }
 function sameStatuses(a, b) {
-  return a.size === b.size && [...b].every(([id, status]) => a.get(id) === status);
+  return a.size === b.size && [...b].every(([id, status2]) => a.get(id) === status2);
 }
 function openPluginDetails(ctx, id) {
   const navigation = optionalService(ctx, "navigation");
@@ -721,6 +730,15 @@ function CodeView(props) {
 function Disclosure(props) {
   return /* @__PURE__ */ React.createElement("details", { open: props.defaultOpen }, /* @__PURE__ */ React.createElement("summary", { style: { cursor: "pointer", fontSize: "0.75rem", color: "var(--dbx-subtle)", userSelect: "none" } }, props.summary), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8 } }, props.children));
 }
+function ago(ms, now = Date.now()) {
+  const s = Math.max(0, Math.round((now - ms) / 1e3));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
 
 // packages/core/src/suite.tsx
 var REPOSITORY = "https://github.com/bkvarda/databricks-buzz-plugins";
@@ -797,8 +815,203 @@ function MissingCore(props) {
   ));
 }
 
+// packages/core/src/api/apps.ts
+var status = (error) => error.status;
+var missing = (error) => status(error) === 404 || ["RESOURCE_DOES_NOT_EXIST", "NOT_FOUND"].includes(String(error.errorCode));
+function wait(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      },
+      { once: true }
+    );
+  });
+}
+var Apps = class {
+  constructor(client) {
+    this.client = client;
+  }
+  /** The app, or undefined when there's none by that name. */
+  async get(name, signal) {
+    try {
+      return await this.client.get(`/api/2.0/apps/${encodeURIComponent(name)}`, { ...signal && { signal } });
+    } catch (error) {
+      if (missing(error)) return void 0;
+      throw error;
+    }
+  }
+  async list(signal) {
+    const found = [];
+    let token;
+    for (let page = 0; page < 20; page++) {
+      const reply = await this.client.get("/api/2.0/apps", { query: { page_size: 100, page_token: token }, ...signal && { signal } });
+      found.push(...reply.apps ?? []);
+      token = reply.next_page_token;
+      if (!token) break;
+    }
+    return found;
+  }
+  /** Creates an app; with `compute: false` it stays stopped until its first deployment. */
+  create(name, options = {}) {
+    return this.client.post(
+      "/api/2.0/apps",
+      { name, ...options.description && { description: options.description }, ...options.resources?.length && { resources: options.resources } },
+      { ...options.compute === false && { query: { no_compute: true } }, ...options.signal && { signal: options.signal } }
+    );
+  }
+  deploy(name, sourceCodePath, signal) {
+    return this.client.post(`/api/2.0/apps/${encodeURIComponent(name)}/deployments`, { source_code_path: sourceCodePath, mode: "SNAPSHOT" }, { ...signal && { signal } });
+  }
+  deployment(name, id, signal) {
+    return this.client.get(`/api/2.0/apps/${encodeURIComponent(name)}/deployments/${encodeURIComponent(id)}`, { ...signal && { signal } });
+  }
+  start(name, signal) {
+    return this.client.post(`/api/2.0/apps/${encodeURIComponent(name)}/start`, {}, { ...signal && { signal } });
+  }
+  stop(name, signal) {
+    return this.client.post(`/api/2.0/apps/${encodeURIComponent(name)}/stop`, {}, { ...signal && { signal } });
+  }
+  /** Lets a workspace group use the app (open it, call its API). `users` is everyone in the workspace. */
+  allow(name, group, permission = "CAN_USE", signal) {
+    return this.client.json(`/api/2.0/permissions/apps/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      body: { access_control_list: [{ group_name: group, permission_level: permission }] },
+      ...signal && { signal }
+    });
+  }
+  async allowed(name, group, signal) {
+    const found = await this.client.get(`/api/2.0/permissions/apps/${encodeURIComponent(name)}`, { ...signal && { signal } });
+    return (found.access_control_list ?? []).some((entry) => entry.group_name === group && (entry.all_permissions ?? []).some((p) => p.permission_level === "CAN_USE" || p.permission_level === "CAN_MANAGE"));
+  }
+  async delete(name, signal) {
+    try {
+      await this.client.json(`/api/2.0/apps/${encodeURIComponent(name)}`, { method: "DELETE", ...signal && { signal } });
+    } catch (error) {
+      if (!missing(error)) throw error;
+    }
+  }
+  /** Polls the app until `done` says so, or `timeoutMs` passes. */
+  async until(name, done, options) {
+    const end = Date.now() + options.timeoutMs;
+    for (; ; ) {
+      const app = await this.get(name, options.signal);
+      if (!app || done(app) || Date.now() > end) return app;
+      await wait(options.intervalMs ?? 5e3, options.signal);
+    }
+  }
+};
+var SEARCH_APP_PREFIX = "Buzz search index";
+async function searchApps(client, signal) {
+  return (await new Apps(client).list(signal)).filter((app) => app.description?.startsWith(SEARCH_APP_PREFIX));
+}
+async function searchBuzz(client, app, query, limit = 20, signal) {
+  if (!app.url) throw new Error(`The search index ${app.name} isn't running.`);
+  const response = await client.request(`${app.url.replace(/\/+$/, "")}/api/search`, { query: { q: query, limit }, timeoutMs: 3e4, ...signal && { signal } });
+  if (response.status === 401 || response.status === 403) throw new Error(`You can't use the search index ${app.name} yet. Ask its owner to let you (its Settings tab in Buzz can give everyone in the workspace access).`);
+  if (response.status === 503) throw new Error(`The search index ${app.name} is still setting up.`);
+  if (response.status !== 200 || !/json/.test(response.headers["content-type"] ?? "")) throw new Error(`The search index ${app.name} answered HTTP ${response.status}; it may be stopped or still starting.`);
+  return JSON.parse(response.body).results ?? [];
+}
+
+// plugins/lakebase/src/search.tsx
+var CHOSEN = "buzzSearchApp";
+async function chosenIndex(service, signal) {
+  const apps = await searchApps(await service.ready(signal), signal);
+  const picked = service.preferences.get(CHOSEN);
+  const app = apps.find((found) => found.name === picked) ?? (apps.length === 1 ? apps[0] : apps.find((found) => found.app_status?.state === "RUNNING"));
+  return { apps, ...app && { app } };
+}
+function Snippet(props) {
+  const parts = props.text.split("**");
+  return /* @__PURE__ */ React.createElement(Text, { size: "sm" }, parts.map((part, n) => n % 2 ? /* @__PURE__ */ React.createElement("b", { key: n }, part) : /* @__PURE__ */ React.createElement(React.Fragment, { key: n }, part)));
+}
+function searchPage(ctx, service) {
+  const open = (hit) => {
+    const relay = optionalService(ctx, "relay")?.snapshot();
+    const navigation = ctx.navigation;
+    if (!relay?.viewer || !relay.origin || !navigation) return false;
+    void navigation.open({
+      version: 1,
+      kind: "conversation",
+      scope: { viewer: relay.viewer, communityOrigin: relay.origin },
+      channelId: hit.channel,
+      messageId: hit.id,
+      ...hit.root && { threadRootId: hit.root, context: "channel" }
+    });
+    return true;
+  };
+  return function SearchPage() {
+    const snapshot = useConnection(service);
+    const [picked, setPicked] = usePreference(service, CHOSEN);
+    const indexes = useAsync((signal) => chosenIndex(service, signal), [snapshot.status, picked]);
+    const [query, setQuery] = React.useState("");
+    const [state, setState] = React.useState({});
+    const app = indexes.data?.app;
+    const run = async (text) => {
+      if (!app || !text.trim()) return;
+      setState({ loading: true, asked: text });
+      try {
+        setState({ hits: await searchBuzz(await service.ready(), app, text.trim(), 30), asked: text });
+      } catch (error) {
+        setState({ error: describeError(error), asked: text });
+      }
+    };
+    let body;
+    if (snapshot.status !== "connected")
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Search reads a search index in your Databricks workspace.");
+    else if (indexes.loading && !indexes.data) body = /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, null), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Finding search indexes\u2026"));
+    else if (indexes.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't find search indexes" }, describeError(indexes.error));
+    else if (!indexes.data?.apps.length)
+      body = /* @__PURE__ */ React.createElement(EmptyState, { title: "No search index yet" }, "An admin makes one in Agents \u2192 New agent \u2192 Databricks App, with the Search index template. It reads this community's public channels into Lakebase. If there is one, ask its owner to let you use it.");
+    else
+      body = /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(
+        "form",
+        {
+          onSubmit: (event) => {
+            event.preventDefault();
+            void run(query);
+          }
+        },
+        /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, autoFocus: true, placeholder: "Search public channels", value: query, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement(Button, { variant: "primary", type: "submit", disabled: !app || !query.trim() || state.loading }, state.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, "Search"))
+      ), indexes.data.apps.length > 1 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Index"), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: app?.name ?? "", onChange: (event) => setPicked(event.target.value) }, indexes.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.description?.replace(/^Buzz search index:\s*/, "") || found.name)))), state.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, state.error), state.hits && !state.hits.length && /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Nothing in public channels matches \u201C", state.asked, "\u201D."), state.hits?.map((hit) => /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          key: hit.id,
+          type: "button",
+          className: "dbx-card",
+          style: { textAlign: "left", padding: 12, border: "1px solid var(--border-standard, #e5e5e5)", borderRadius: 10, background: "transparent", cursor: "pointer" },
+          onClick: () => {
+            if (!open(hit)) setState((current) => ({ ...current, error: "This Buzz can't open messages from plugins; find it in #" + hit.channelName + "." }));
+          }
+        },
+        /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "#", hit.channelName, " \xB7 ", hit.authorName ?? `${hit.author.slice(0, 8)}\u2026`, " \xB7 ", ago(hit.createdAt * 1e3), hit.root ? " \xB7 in a thread" : ""), /* @__PURE__ */ React.createElement(Snippet, { text: hit.snippet }))
+      )), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Searches public channels only, through ", app?.name ?? "the index", ", as you."));
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "var(--space-page-inset, 24px)", maxWidth: 820 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 500 }, "Search"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle" }, "Every public channel in this community, searched with Lakebase.")), body));
+  };
+}
+function searchTool(service) {
+  return {
+    name: "databricks_buzz_search",
+    description: "Searches this Buzz community's public channels (messages, with channel, author and time) through the Buzz search index in Databricks. Use it to find earlier discussions or decisions. Matches are marked **like this**.",
+    inputSchema: schema.object({ query: schema.string("Words to look for."), limit: schema.integer("Results (default 10, max 30).") }, ["query"]),
+    async call(_client, _context, args) {
+      const query = stringArg(args, "query");
+      const { app, apps } = await chosenIndex(service);
+      if (!app) return apps.length ? "There's more than one search index; the owner picks one on the Search page." : "There's no Buzz search index in this workspace (an admin makes one with the Databricks App type's Search index template).";
+      const hits = await searchBuzz(await service.ready(), app, query, numberArg(args, "limit", 10, 1, 30));
+      if (!hits.length) return `Nothing in public channels matches \u201C${query}\u201D.`;
+      return hits.map((hit) => `- #${hit.channelName} \xB7 ${hit.authorName ?? hit.author.slice(0, 8)} \xB7 ${new Date(hit.createdAt * 1e3).toISOString().slice(0, 16)}Z${hit.root ? " (in a thread)" : ""}: ${hit.snippet}`).join("\n");
+    }
+  };
+}
+
 // plugins/lakebase/src/index.tsx
-var inject = ["react", "settingsCards"];
+var inject = ["react", "settingsCards", "pages"];
 var DATABASES = "lakebaseDatabases";
 var databases = (service) => service.preferences.get(DATABASES) ?? [];
 function rowsToResult(rows) {
@@ -959,14 +1172,26 @@ function apply(ctx) {
   const live = attach(ctx, { id: "bkvarda.databricks-lakebase", name: "Lakebase" }, (scope, databricks) => {
     scope.inject(["agents"], (agents) => {
       for (const tool of lakebaseTools(databricks)) agents.agents.addTool(tool);
+      agents.agents.addTool(searchTool(databricks));
     });
-    return databricks;
+    return { databricks, Search: searchPage(ctx, databricks) };
+  });
+  ctx.pages.register({
+    id: "search",
+    title: "Search",
+    primary: true,
+    placement: "dock",
+    icon: DATABRICKS_ICON_MONO,
+    component: () => {
+      const runtime = useLive(live);
+      return runtime ? /* @__PURE__ */ React.createElement(runtime.Search, null) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Search" });
+    }
   });
   ctx.settingsCards.register({
     id: "lakebase",
     title: "Lakebase",
     component: () => {
-      const service = useLive(live);
+      const service = useLive(live)?.databricks;
       return service ? /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(LakebaseSettings, { service })) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Lakebase" });
     }
   });

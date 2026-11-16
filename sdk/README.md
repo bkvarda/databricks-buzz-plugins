@@ -32,4 +32,8 @@ app.start();
 - `new BuzzApp({ answers })`: `"everyone"` (the default), `"owner"`, or a list of pubkeys. Without it, the agent's **Answers** setting in Buzz applies.
 - It serves a status page on the app's port (`/` and `/api/status`), which the agent's Settings tab in Buzz reads.
 
-Built from [`plugins/agents/app/sdk.ts`](../plugins/agents/app/sdk.ts) by `npm run build`.
+- `app.onConnect(handler)` runs once it's signed in to Buzz (what it returns runs when it signs out); `app.query(filters)` and `app.publish(template)` read and write the community as the app; `app.route(path, handler)` serves your own API on its port, with `request.user` from Databricks Apps; `app.describe(fields)` adds to its status page.
+
+[`search-index.mjs`](search-index.mjs) is the Search index template's `app.mjs` (the library, the indexer and its Postgres driver in one file), for deploying by hand: it needs a Lakebase database resource and `LAKEBASE_ENDPOINT` (`valueFrom: postgres`) in `app.yaml`.
+
+Built from [`plugins/agents/app/sdk.ts`](../plugins/agents/app/sdk.ts) and [`indexer.ts`](../plugins/agents/app/indexer.ts) by `npm run build`.

@@ -15,8 +15,9 @@ import { APP_NAME, Apps, type DatabricksApp, ensureSchema, grantPrivileges, list
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, isApiError, useAsync, useConnection } from "@dbx/core/service";
 import { Badge, Button, CodeView, DbxRoot, databricksIcon, Field, Notice, openExternal, Spinner, Stack, StatusDot, Text } from "@dbx/core/ui/components";
-import { SDK, STARTER } from "virtual:buzz-app";
-import { activated, type AppIdentity, type Answers, appYaml, identitySecretName, parseIdentity } from "./app-identity";
+import { Lakebase } from "@dbx/core/api/workspace";
+import { INDEXER, SDK, STARTER } from "virtual:buzz-app";
+import { activated, type AppIdentity, type Answers, appYaml, identitySecretName, parseIdentity, SEARCH_APP_PREFIX } from "./app-identity";
 import { cachedList, NeedsConnection, SinglePicker, useAgentService, WorkspaceField } from "./ui";
 
 export const APP_TYPE_ID = "databricks-app";
@@ -24,12 +25,19 @@ const RECORD_PREFIX = "bkvarda.databricks-app.v1:";
 const DEFAULT_SCHEMA = "buzz_apps";
 
 export type AppMode = "starter" | "own";
+/** What "deploy for me" deploys: the starter bot, or the search index. */
+export type AppTemplate = "starter" | "search";
+/** A Lakebase database, as full resource names (`projects/…/branches/…` and `…/databases/…`). */
+export type AppDatabase = { project: string; branch: string; database: string };
 
 export type AppTypeConfig = {
   /** A CLI profile for another workspace; unset uses Buzz's connection. */
   profile?: string;
-  /** Deploy the starter app into a new app, or connect an app that's there. */
+  /** Deploy a template into a new app, or connect an app that's there. */
   mode: AppMode;
+  template: AppTemplate;
+  /** The search index's database. */
+  lakebase?: AppDatabase;
   app: string;
   /** `catalog.schema` for its key. */
   schema: string;
@@ -38,8 +46,11 @@ export type AppTypeConfig = {
 
 export function normalizeAppConfig(value: unknown): AppTypeConfig {
   const config = (value ?? {}) as Partial<AppTypeConfig>;
+  const lakebase = config.lakebase;
   return {
     mode: config.mode === "own" ? "own" : "starter",
+    template: config.template === "search" ? "search" : "starter",
+    ...(lakebase && typeof lakebase.branch === "string" && typeof lakebase.database === "string" && typeof lakebase.project === "string" && { lakebase: { project: lakebase.project, branch: lakebase.branch, database: lakebase.database } }),
     app: typeof config.app === "string" ? config.app.trim().toLowerCase() : "",
     schema: typeof config.schema === "string" ? config.schema.trim() : "",
     answers: config.answers === "owner" ? "owner" : "everyone",
@@ -54,11 +65,21 @@ export function appConfigProblem(config: AppTypeConfig): string | undefined {
   if (!config.app) return config.mode === "own" ? "Pick the app." : "Name the app.";
   if (!APP_NAME.test(config.app)) return "App names use lowercase letters, numbers and hyphens (at most 30), and start and end with a letter or number.";
   if (!SCHEMA.test(config.schema)) return "Pick where its key is kept: a catalog and a schema.";
+  if (isSearch(config) && !config.lakebase) return "Pick the Lakebase project for its index.";
   return undefined;
 }
 
+/** A search index the plugin deploys. */
+export const isSearch = (config: Pick<AppTypeConfig, "mode" | "template">) => config.mode === "starter" && config.template === "search";
+
+/** The code a template's folder gets. Edits to the starter's app.mjs and app.yaml are kept; the search index is replaced on each deploy. */
+function templateFiles(config: AppTypeConfig, secret: string, source: string): { files: Record<string, string>; keep: string[] } {
+  if (isSearch(config)) return { files: { "app.mjs": INDEXER, "app.yaml": appYaml({ secret, source, lakebase: true }) }, keep: [] };
+  return { files: { "buzz-app.mjs": SDK, "app.mjs": STARTER, "app.yaml": appYaml({ secret, source }) }, keep: ["app.mjs", "app.yaml"] };
+}
+
 export function summarizeApp(config: AppTypeConfig): string {
-  return [config.app || "No app yet", config.mode === "starter" ? "starter app" : "your app", config.answers === "owner" ? "answers only you" : "answers everyone", ...(config.profile ? [config.profile] : [])].join(" · ");
+  return [config.app || "No app yet", config.mode === "own" ? "your app" : isSearch(config) ? "search index" : "starter app", config.answers === "owner" ? "answers only you" : "answers everyone", ...(config.profile ? [config.profile] : [])].join(" · ");
 }
 
 // ── Records (this device) ──
@@ -190,7 +211,11 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
         throw new Error(`There's already an app named ${config.app} in this workspace. Pick another name, or choose "Connect an app you have" to use it.`);
       if (!app) {
         if (config.mode === "own") throw new Error(`There's no app named ${config.app} in this workspace.`);
-        app = await apps.create(config.app, { description: `Buzz app: ${input.name}`.slice(0, 200), signal });
+        app = await apps.create(config.app, {
+          description: `${isSearch(config) ? SEARCH_APP_PREFIX : "Buzz app"}: ${input.name}`.slice(0, 200),
+          ...(isSearch(config) && config.lakebase && { resources: [{ name: "postgres", description: "The search index", postgres: { branch: config.lakebase.branch, database: config.lakebase.database, permission: "CAN_CONNECT_AND_CREATE" } }] }),
+          signal,
+        });
         record.createdApp = true;
         await storage.set(pending, JSON.stringify(record));
       }
@@ -217,7 +242,8 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
       await grantPrivileges(client, "schema", config.schema, principal, ["USE_SCHEMA"], signal).catch((error) => Promise.reject(grantFailed(error, `the schema ${config.schema}`, principal)));
       await grantPrivileges(client, "secret", secret, principal, ["READ_SECRET"], signal).catch((error) => Promise.reject(grantFailed(error, secret, principal)));
       // Its code: the starter, or the files to add to your own app. Edits to app.mjs and app.yaml are kept.
-      await writeWorkspaceFiles(client, record.source, { "buzz-app.mjs": SDK, "app.mjs": STARTER, "app.yaml": appYaml({ secret, source: record.source }) }, { keep: ["app.mjs", "app.yaml"], signal });
+      const code = templateFiles(config, secret, record.source);
+      await writeWorkspaceFiles(client, record.source, code.files, { keep: code.keep, signal });
       // The pending record stays until activation, so a repeated creation finds it.
       await write(record);
       return { pubkey, ...(record.picture && { picture: record.picture }) };
@@ -259,11 +285,23 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
       await saveIdentity(record, { answers }, signal);
       await write({ ...record, config: { ...record.config, answers } });
     },
+    /** Lets everyone in the workspace use the app (for a search index: search from Buzz). */
+    async allowEveryone(pubkey: string, signal?: AbortSignal) {
+      const record = read(pubkey);
+      if (!record) throw new Error("This app is managed from another device.");
+      await new Apps(await clientOf(record, signal)).allow(record.config.app, "users", "CAN_USE", signal);
+    },
+    async everyoneAllowed(pubkey: string, signal?: AbortSignal): Promise<boolean> {
+      const record = read(pubkey);
+      if (!record) return false;
+      return new Apps(await clientOf(record, signal)).allowed(record.config.app, "users", signal).catch(() => false);
+    },
     /** Puts the current library in its folder and deploys the folder again. */
     async redeploy(pubkey: string, signal?: AbortSignal) {
       const record = read(pubkey);
       if (!record) throw new Error("This app is managed from another device.");
-      await writeWorkspaceFiles(await clientOf(record, signal), record.source, { "buzz-app.mjs": SDK, "app.mjs": STARTER, "app.yaml": appYaml({ secret: record.secret, source: record.source }) }, { keep: ["app.mjs", "app.yaml"], ...(signal && { signal }) });
+      const code = templateFiles(record.config, record.secret, record.source);
+      await writeWorkspaceFiles(await clientOf(record, signal), record.source, code.files, { keep: code.keep, ...(signal && { signal }) });
       await deploy(record, signal);
     },
     /** The app in Databricks, and what its status page says. */
@@ -287,7 +325,7 @@ export function appProvider(agents: Pick<Agents, "storage">, service: Databricks
 // ── Create form ──
 
 const MODE_HINT: Record<AppMode, string> = {
-  starter: "Makes a new app with a small starter that answers mentions and says who it runs as. Its code goes in a folder in your workspace, ready for you to change.",
+  starter: "Makes a new app from a template. Its code goes in a folder in your workspace.",
   own: "Connects an app that's already in this workspace. You add buzz-app.mjs and one setting to its code; the agent's Settings tab shows how.",
 };
 
@@ -318,6 +356,52 @@ function CatalogField(props: { service: DatabricksService; value: string; onChan
       <Field label="Schema" hint="Made if it isn't there.">
         <input className="dbx-input" value={schema} disabled={props.disabled} onChange={(event) => props.onChange(`${catalog}.${event.target.value.trim()}`)} />
       </Field>
+    </Stack>
+  );
+}
+
+const TEMPLATE_HINT: Record<AppTemplate, string> = {
+  starter: "A small bot that answers mentions and says who it runs as, ready for you to change.",
+  search: "Reads the community's public channels into a Lakebase database and searches them: from the Search page in Buzz, or when someone mentions it. Only public channels, which everyone in the community can read already.",
+};
+
+/** A Lakebase project for the search index: its default branch and database. */
+function DatabaseField(props: { service: DatabricksService; value?: AppDatabase; onChange(value: AppDatabase | undefined): void; disabled?: boolean }) {
+  const status = useConnection(props.service).status;
+  const projects = useAsync(() => cachedList(props.service, "lakebase-projects", async () => new Lakebase(await props.service.ready()).projects()), [props.service, status]);
+  const [error, setError] = React.useState<string>();
+  const project = props.value?.project ?? "";
+  return (
+    <Stack gap={8}>
+      <SinglePicker
+        label="Lakebase project"
+        hint={
+          props.value
+            ? `Its index goes in ${props.value.database.split("/").pop()} on ${props.value.branch.split("/").pop()}, in a buzz_search schema the app owns. Lakebase Search (lakebase_text) gives the best ranking; without it, Postgres' own full-text search is used.`
+            : "The app gets access to its default branch's database and keeps its index there."
+        }
+        value={project}
+        valueLabel={(projects.data ?? []).find((found) => found.id === project)?.name ?? (project || "Pick a project")}
+        placeholder="Pick a project"
+        searchPlaceholder={`Search ${(projects.data ?? []).length} projects`}
+        options={(projects.data ?? []).map((found) => ({ id: found.id, label: found.name, group: "Lakebase" }))}
+        loading={projects.loading && !projects.data ? "Loading Lakebase projects…" : false}
+        {...(props.disabled !== undefined && { disabled: props.disabled })}
+        onChange={(option) => {
+          setError(undefined);
+          void props.service
+            .ready()
+            .then((client) => new Lakebase(client).defaultDatabase(option.id))
+            .then(
+              (found) => {
+                if (!found) setError("That project has no database on its default branch.");
+                props.onChange(found ? { project: option.id, branch: found.branch, database: found.database } : undefined);
+              },
+              (cause: unknown) => setError(describeError(cause)),
+            );
+        }}
+      />
+      {error && <Notice tone="warning">{error}</Notice>}
     </Stack>
   );
 }
@@ -369,6 +453,25 @@ export function AppForm(props: { service: DatabricksService; config: AppTypeConf
             <option value="own">Connect an app you have</option>
           </select>
         </Field>
+        {config.mode === "starter" && (
+          <Field label="Template" hint={TEMPLATE_HINT[config.template]}>
+            <select className="dbx-select" {...disabled} value={config.template} onChange={(event) => onChange({ ...config, template: event.target.value as AppTemplate })}>
+              <option value="starter">Starter bot</option>
+              <option value="search">Search index</option>
+            </select>
+          </Field>
+        )}
+        {isSearch(config) && (
+          <DatabaseField
+            service={workspace}
+            {...(config.lakebase && { value: config.lakebase })}
+            {...disabled}
+            onChange={(lakebase) => {
+              const { lakebase: _old, ...rest } = config;
+              onChange({ ...rest, ...(lakebase && { lakebase }) });
+            }}
+          />
+        )}
         {config.mode === "starter" ? (
           <Field label="App name" hint="Lowercase letters, numbers and hyphens. It's the app's name in Databricks and part of its URL.">
             <input className="dbx-input" placeholder="my-buzz-app" value={config.app} {...disabled} onChange={(event) => onChange({ ...config, app: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} />
@@ -504,6 +607,7 @@ export function AppSettings(props: { service: DatabricksService; provider: AppPr
             </Text>
           </Row>
         </Stack>
+        {isSearch(record.config) && <SearchInfo provider={props.provider} pubkey={props.pubkey} live={live} busy={Boolean(busy)} run={run} />}
         {record.config.mode === "own" && (
           <Stack gap={8}>
             <Text weight={500}>Connect your app's code</Text>
@@ -544,6 +648,38 @@ export function AppSettings(props: { service: DatabricksService; provider: AppPr
         </Stack>
       </Stack>
     </DbxRoot>
+  );
+}
+
+/** A search index's progress, and who can search it. */
+function SearchInfo(props: { provider: AppProvider; pubkey: string; live?: AppStatus["live"]; busy: boolean; run(label: string, work: () => Promise<unknown>): void }) {
+  const allowed = useAsync((signal) => props.provider.everyoneAllowed(props.pubkey, signal), [props.pubkey, props.busy]);
+  const live = props.live as (AppStatus["live"] & Record<string, unknown>) | undefined;
+  const line = (label: string, value: unknown) =>
+    typeof value === "string" || typeof value === "number" ? (
+      <Row label={label}>
+        <Text size="sm">{String(value)}</Text>
+      </Row>
+    ) : null;
+  return (
+    <Stack gap={8}>
+      <Text weight={500}>Search</Text>
+      {line("Index", live?.index)}
+      {line("Indexed", live?.indexed)}
+      {line("Self-check", live?.searchCheck)}
+      {line("Reading", live?.reading)}
+      <Text size="sm" tone="subtle">
+        People search from the Search page in Buzz (in the Lakebase plugin), as themselves: they need Can Use on this app.{" "}
+        {allowed.data ? "Everyone in the workspace has it." : "So far only you have it."} It indexes public channels only, but anyone with Can Use can search them, so give it to people in this community.
+      </Text>
+      {allowed.data === false && (
+        <Stack direction="row" gap={8}>
+          <Button size="sm" disabled={props.busy} onClick={() => props.run("allow", () => props.provider.allowEveryone(props.pubkey))}>
+            Let everyone in the workspace search
+          </Button>
+        </Stack>
+      )}
+    </Stack>
   );
 }
 

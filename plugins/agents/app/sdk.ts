@@ -127,6 +127,21 @@ export type Reply = Readonly<{
 
 export type MentionHandler = (mention: Mention, reply: Reply) => unknown;
 
+/** A request to the app through Databricks Apps, which signs people in first. */
+export type AppRequest = Readonly<{
+  method: string;
+  url: URL;
+  /** Who's asking, from the Databricks Apps proxy (X-Forwarded-Email), when a person is. */
+  user?: string;
+  /** Their token, when the app has user authorization (on-behalf-of) scopes. */
+  userToken?: string;
+  body(): Promise<string>;
+}>;
+export type AppResponse = Readonly<{ status?: number; json?: unknown; html?: string; text?: string }>;
+export type RouteHandler = (request: AppRequest) => AppResponse | Promise<AppResponse>;
+/** Runs each time it signs in to Buzz; what it returns runs when it signs out. */
+export type ConnectHandler = (app: BuzzApp) => void | (() => void) | Promise<void | (() => void)>;
+
 export type BuzzAppOptions = Readonly<{
   /** Whose mentions it takes: everyone (the default), only its owner, or these pubkeys and its owner. The plugin's setting applies unless this is set. */
   answers?: Answers | readonly string[];
@@ -157,6 +172,10 @@ export class BuzzApp {
   state: AppState = "starting";
   lastError?: string;
   private handlers: MentionHandler[] = [];
+  private connects: ConnectHandler[] = [];
+  private disconnects: (() => void)[] = [];
+  private routes = new Map<string, RouteHandler>();
+  private extras: (() => Record<string, unknown>)[] = [];
   private stopWatch?: () => void;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private server?: Server;
@@ -201,12 +220,33 @@ export class BuzzApp {
     return this;
   }
 
+  /** Runs once it's signed in to Buzz (again after a new key or community), e.g. to start reading channels. */
+  onConnect(handler: ConnectHandler): this {
+    this.connects.push(handler);
+    return this;
+  }
+
+  /** Serves `path` (exact, e.g. "/api/search") on the app's port. */
+  route(path: string, handler: RouteHandler): this {
+    this.routes.set(path, handler);
+    return this;
+  }
+
+  /** Adds fields to the status page and /api/status. */
+  describe(fields: () => Record<string, unknown>): this {
+    this.extras.push(fields);
+    return this;
+  }
+
   /** Serves the status page, then signs in once the identity is ready (and keeps checking it). */
   async start(): Promise<void> {
     const port = this.options.port ?? Number(this.env.DATABRICKS_APP_PORT || 8000);
     this.server = createServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://app");
+      const route = this.routes.get(url.pathname);
+      if (route) return void this.serve(route, request, url, response);
       const status = this.status();
-      if ((request.url ?? "/").startsWith("/api/status")) {
+      if (url.pathname.startsWith("/api/status")) {
         response.writeHead(200, { "content-type": "application/json" });
         return response.end(JSON.stringify(status));
       }
@@ -223,6 +263,37 @@ export class BuzzApp {
     await this.refresh();
   }
 
+  private async serve(route: RouteHandler, request: import("node:http").IncomingMessage, url: URL, response: import("node:http").ServerResponse) {
+    const header = (name: string) => {
+      const value = request.headers[name];
+      return typeof value === "string" && value ? value : undefined;
+    };
+    let reply: AppResponse;
+    try {
+      const user = header("x-forwarded-email");
+      const userToken = header("x-forwarded-access-token");
+      reply = await route({
+        method: request.method ?? "GET",
+        url,
+        ...(user && { user }),
+        ...(userToken && { userToken }),
+        body: () =>
+          new Promise((resolve, reject) => {
+            let text = "";
+            request.setEncoding("utf8");
+            request.on("data", (chunk: string) => (text += chunk));
+            request.on("end", () => resolve(text));
+            request.on("error", reject);
+          }),
+      });
+    } catch (error) {
+      reply = { status: 500, json: { error: (error as Error).message ?? String(error) } };
+    }
+    const type = reply.json !== undefined ? "application/json" : reply.html !== undefined ? "text/html; charset=utf-8" : "text/plain; charset=utf-8";
+    response.writeHead(reply.status ?? 200, { "content-type": type });
+    response.end(reply.json !== undefined ? JSON.stringify(reply.json) : (reply.html ?? reply.text ?? ""));
+  }
+
   stop() {
     this.stopWatch?.();
     this.relay?.close();
@@ -235,7 +306,7 @@ export class BuzzApp {
     // Signed in, but the community hasn't answered yet (or stopped answering).
     const reaching = this.state === "connected" && !this.relay?.ready;
     const lastError = this.lastError ?? (reaching && this.relayError ? `Can't reach the Buzz community: ${this.relayError}` : undefined);
-    return {
+    const base = {
       state: reaching ? ("connecting" as const) : this.state,
       ...(lastError && { lastError }),
       ...(this.pubkey && { pubkey: this.pubkey }),
@@ -249,6 +320,13 @@ export class BuzzApp {
       startedAt: new Date(this.startedAt).toISOString(),
       ...(this.lastMention && { lastMention: new Date(this.lastMention).toISOString() }),
     };
+    const extra: Record<string, unknown> = {};
+    for (const fields of this.extras) {
+      try {
+        Object.assign(extra, fields());
+      } catch {}
+    }
+    return { ...extra, ...base, ...(Object.keys(extra).length && { extra }) };
   }
 
   /** Signs a template as the identity, with its owner's attestation, and publishes it. */
@@ -310,6 +388,11 @@ export class BuzzApp {
   }
 
   private signOut() {
+    for (const stop of this.disconnects.splice(0)) {
+      try {
+        stop();
+      } catch {}
+    }
     this.stopWatch?.();
     this.stopWatch = undefined;
     this.relay?.close();
@@ -325,6 +408,18 @@ export class BuzzApp {
     this.log(`signing in as ${this.pubkey!.slice(0, 12)}… for ${identity.name ?? "this app"}`);
     // Mentions from a minute before it started (a restart's gap), then live ones.
     this.stopWatch = relay.watch({ kinds: CHAT_KINDS, "#p": [this.pubkey!] }, now() - 60, (event) => this.onEvent(event), this.options.pollMs ?? 3000);
+    for (const connect of this.connects)
+      void Promise.resolve()
+        .then(() => connect(this))
+        .then(
+          (stop) => {
+            if (typeof stop !== "function") return;
+            // Signed out (or in again) meanwhile: stop it now.
+            if (this.relay === relay) this.disconnects.push(stop);
+            else stop();
+          },
+          (error: unknown) => this.log(`a connect handler failed: ${(error as Error).message ?? error}`),
+        );
   }
 
   private async publishProfile(identity: AppIdentity) {
@@ -454,6 +549,7 @@ function statusPage(status: ReturnType<BuzzApp["status"]>): string {
     ["Owner", status.owner],
     ["Identity secret", status.secret],
     ["Mentions answered", String(status.answered)],
+    ...Object.entries((status as { extra?: Record<string, unknown> }).extra ?? {}).map(([label, value]): [string, string | undefined] => [label, typeof value === "object" ? JSON.stringify(value) : String(value)]),
     ["Started", status.startedAt],
   ];
   return `<!doctype html><meta charset="utf-8"><title>${escape(status.name ?? status.app ?? "Buzz app")}</title>

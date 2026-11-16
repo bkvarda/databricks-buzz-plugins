@@ -1,6 +1,7 @@
 // Lakebase: let agents read operational data in Lakebase (Databricks managed
 // Postgres) through the Data API, as the signed-in person. Postgres roles and
-// grants decide what each person can read; this plugin only reads.
+// grants decide what each person can read; this plugin only reads. And Search:
+// a page (and agent tool) for a Buzz search index kept in Lakebase (./search).
 import type { Context } from "@buzz/author";
 import { type DataApiTarget, dataApiError, dataApiSetupSql, Lakebase } from "@dbx/core/api/workspace";
 import { apiError } from "@dbx/core/client";
@@ -10,8 +11,10 @@ import { resultSet, toMarkdown } from "@dbx/core/result";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
 import { Badge, Button, CodeView, DbxRoot, Disclosure, Field, Notice, SectionHeader, Spinner, Stack, Text } from "@dbx/core/ui/components";
+import { DATABRICKS_ICON_MONO } from "@dbx/core/ui/theme";
+import { searchPage, searchTool } from "./search";
 
-export const inject = ["react", "settingsCards"];
+export const inject = ["react", "settingsCards", "pages"];
 
 export type Database = { name: string; url: string; description?: string };
 const DATABASES = "lakebaseDatabases";
@@ -264,14 +267,26 @@ export function apply(ctx: Context) {
   const live = attach(ctx, { id: "bkvarda.databricks-lakebase", name: "Lakebase" }, (scope, databricks) => {
     scope.inject(["agents"], (agents: Context) => {
       for (const tool of lakebaseTools(databricks)) agents.agents.addTool(tool);
+      agents.agents.addTool(searchTool(databricks));
     });
-    return databricks;
+    return { databricks, Search: searchPage(ctx, databricks) };
+  });
+  ctx.pages.register({
+    id: "search",
+    title: "Search",
+    primary: true,
+    placement: "dock",
+    icon: DATABRICKS_ICON_MONO,
+    component: () => {
+      const runtime = useLive(live);
+      return runtime ? <runtime.Search /> : <MissingCore ctx={ctx} feature="Search" />;
+    },
   });
   ctx.settingsCards.register({
     id: "lakebase",
     title: "Lakebase",
     component: () => {
-      const service = useLive(live);
+      const service = useLive(live)?.databricks;
       return service ? (
         <DbxRoot>
           <LakebaseSettings service={service} />
