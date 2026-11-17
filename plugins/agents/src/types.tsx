@@ -35,6 +35,8 @@ type TabProps<C> = PropsOf<Tab<C>["component"]>;
 type CreateProps<C> = PropsOf<NonNullable<AgentType<C>["Create"]>>;
 
 const TURN_TIMEOUT_MS = 30 * 60_000;
+/** How long before the turn's time limit a Sandbox agent wraps up, posting where things stand. */
+const WRAP_UP_MS = 3 * 60_000;
 
 /** Runs one conversation's turns in order, so saved sessions never race. */
 class Queue {
@@ -259,7 +261,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     return { tools: { ...tools, local }, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
   }
 
-  async function sandboxTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter) {
+  async function sandboxTurn(delivery: Delivery, config: DatabricksConfig, conversation: HarnessConversation, signal: AbortSignal, report: TurnReporter, deadline: number) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
@@ -283,10 +285,13 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
           return completion;
         },
         signal,
+        deadline,
         onStep: (tool, target) => report.tool(tool, target),
         onThought: (text) => report.thought(text),
       });
-      if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
+      // Out of steps or time without saying so itself: say where it stopped, so nobody waits on it.
+      if (result.unfinished?.notice) await kit.reply(delivery.agent, conversation, result.unfinished.notice, { notifyOwner: true });
+      else if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
       await sessions.set(delivery.agent.key, conversation.key, {
         ...session,
         cursor: prompt.cursor,
@@ -515,11 +520,13 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
         return;
       }
       const harness = config.harness;
+      // Buzz ends the delivery at TURN_TIMEOUT_MS from now, queue wait included.
+      const deadline = Date.now() + TURN_TIMEOUT_MS - WRAP_UP_MS;
       turn(delivery, conversation, config, (signal, report) =>
         config.kind === "sandbox"
           ? isRemote(harness)
             ? remoteTurn(delivery, config, harness, conversation, signal, report)
-            : sandboxTurn(delivery, config, conversation, signal, report)
+            : sandboxTurn(delivery, config, conversation, signal, report, deadline)
           : config.kind === "custom"
             ? customTurn(delivery, config, conversation, signal, report)
             : genieOneTurn(delivery, config, conversation, signal, report),

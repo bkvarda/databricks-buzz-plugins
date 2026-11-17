@@ -70,13 +70,62 @@ describe("agent loop", () => {
     expect(result.messages.find((m) => m.role === "tool")?.content).toMatch(/no tool named missing/);
   });
 
-  it("stops at the step limit and honors abort", async () => {
+  it("wraps up at the step limit instead of going quiet, and honors abort", async () => {
     const looping = reply({ role: "assistant", content: null, tool_calls: [{ id: "x", type: "function", function: { name: "databricks_genie_ask", arguments: "{}" } }] });
-    const result = await runLoop({ model: "m", system: "s", history: [], prompt: "p", buzz: fakeBuzz([]), chat: async () => looping, signal: new AbortController().signal, maxSteps: 3 });
-    expect(result.steps).toBe(3);
+    // It keeps calling tools after it's told to wrap up: those don't run, and the turn says where it stopped.
+    const log: unknown[] = [];
+    const result = await runLoop({ model: "m", system: "s", history: [], prompt: "p", buzz: fakeBuzz(log), chat: async () => looping, signal: new AbortController().signal, maxSteps: 3 });
+    expect(result.steps).toBe(5);
+    expect(log.filter((entry) => (entry as { name?: string })?.name === "databricks_genie_ask")).toHaveLength(3);
+    expect(result.messages.find((m) => m.role === "user" && /out of steps \(3\)/.test(m.content as string))).toBeDefined();
+    expect(result.unfinished).toEqual({ reason: "steps", notice: expect.stringMatching(/stopped before finishing.*3 steps.*Mention me/) });
+    // Told to wrap up, it posts where things stand itself: nothing more to say for it.
+    const script = [looping, reply({ role: "assistant", content: null, tool_calls: [{ id: "s", type: "function", function: { name: "send", arguments: '{"text":"Built the store; tests next.","final":true}' } }] })];
+    const wrapped = await runLoop({ model: "m", system: "s", history: [], prompt: "p", buzz: fakeBuzz([]), chat: async () => script.shift()!, signal: new AbortController().signal, maxSteps: 1 });
+    expect(wrapped).toMatchObject({ posted: true, final: true });
+    expect(wrapped.unfinished).toBeUndefined();
     const controller = new AbortController();
     controller.abort();
     await expect(runLoop({ model: "m", system: "s", history: [], prompt: "p", chat: async () => looping, signal: controller.signal })).rejects.toThrow();
+  });
+
+  it("wraps up before the turn's time runs out, and keeps a long turn within the context", async () => {
+    const big = "x".repeat(5_000);
+    let calls = 0;
+    const seen: (readonly ChatMessage[])[] = [];
+    const result = await runLoop({
+      model: "m", system: "s", history: [], prompt: "p",
+      local: [{ name: "read", description: "read", parameters: { type: "object" }, run: async () => big }],
+      chat: async (request) => {
+        seen.push(request.messages);
+        calls++;
+        return calls < 30
+          ? reply({ role: "assistant", content: null, tool_calls: [{ id: `r${calls}`, type: "function", function: { name: "read", arguments: "{}" } }] })
+          : reply({ role: "assistant", content: "Read 29 files; the summary is half done." });
+      },
+      signal: new AbortController().signal,
+      deadline: Date.now() + 60_000,
+      maxTurnChars: 50_000,
+    });
+    expect(result.unfinished).toBeUndefined();
+    expect(result.text).toBe("Read 29 files; the summary is half done.");
+    const last = seen.at(-1)!;
+    const size = last.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
+    expect(size).toBeLessThan(60_000);
+    // The oldest results were cleared, the newest kept, and every tool result still follows its call.
+    const results = last.filter((m) => m.role === "tool");
+    expect(results).toHaveLength(29);
+    expect(results[0]?.content).toMatch(/cleared/);
+    expect(results.at(-1)?.content).toBe(big);
+    // Past the deadline, it's told to wrap up; its text is what's posted.
+    const late = await runLoop({
+      model: "m", system: "s", history: [], prompt: "p",
+      chat: async () => reply({ role: "assistant", content: "Done with the first half; mention me for the rest." }),
+      signal: new AbortController().signal,
+      deadline: Date.now() - 1,
+    });
+    expect(late.messages[1]).toMatchObject({ role: "user", content: expect.stringMatching(/out of time/) });
+    expect(late.unfinished).toEqual({ reason: "time", notice: "Done with the first half; mention me for the rest." });
   });
 
   it("never keeps an empty response, and leaves out one saved by an earlier version", async () => {

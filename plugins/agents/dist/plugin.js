@@ -7902,6 +7902,23 @@ var MAX_RESULT = 24e3;
 var NAME2 = /^[a-zA-Z0-9_-]{1,64}$/;
 var MAX_TOKENS = 16e3;
 var MAX_CUTOFFS = 2;
+var MAX_STEPS = 100;
+var WRAP_UP_RESPONSES = 2;
+var MAX_TURN_CHARS = 24e4;
+var KEEP_RECENT = 8;
+var CLEARED = "(This output was cleared to keep the conversation within the model's context. Run it again if you need it.)";
+var wrapUpNote = (reason, steps) => `(This turn is out of ${reason === "steps" ? `steps (${steps})` : "time"}. Don't start anything new: use send with final: true to say what's done, what's left, and that you'll carry on when you're mentioned again.)`;
+var stoppedNotice = (reason, steps) => `I stopped before finishing: this turn ${reason === "steps" ? `used its ${steps} steps` : "ran out of time"}. Mention me to carry on from here.`;
+var charsOf = (message) => (typeof message.content === "string" ? message.content.length : 0) + (message.role === "assistant" && message.tool_calls ? JSON.stringify(message.tool_calls).length : 0);
+function clearOldResults(messages, maxChars) {
+  let total = messages.reduce((sum, message) => sum + charsOf(message), 0);
+  for (let i2 = 0; i2 < messages.length - KEEP_RECENT && total > maxChars; i2++) {
+    const message = messages[i2];
+    if (message.role !== "tool" || message.content.length <= CLEARED.length * 2) continue;
+    total -= message.content.length - CLEARED.length;
+    messages[i2] = { ...message, content: CLEARED };
+  }
+}
 function sendable(message) {
   return message.role !== "assistant" || Boolean(message.content) || Boolean(message.tool_calls?.length);
 }
@@ -7976,11 +7993,20 @@ async function runLoop(input) {
   let text = "";
   let partial = "";
   let cutoffs = 0;
-  const maxSteps = input.maxSteps ?? 24;
+  const maxSteps = input.maxSteps ?? MAX_STEPS;
   let steps = 0;
-  while (steps < maxSteps) {
+  let wrapping;
+  let wrapResponses = 0;
+  let wrapPosted = false;
+  for (; ; ) {
     input.signal.throwIfAborted();
+    if (!wrapping) {
+      wrapping = steps >= maxSteps ? "steps" : input.deadline !== void 0 && Date.now() >= input.deadline ? "time" : void 0;
+      if (wrapping) added.push({ role: "user", content: wrapUpNote(wrapping, steps) });
+    }
+    if (wrapping && wrapResponses++ >= WRAP_UP_RESPONSES) break;
     steps++;
+    clearOldResults(added, input.maxTurnChars ?? MAX_TURN_CHARS);
     const completion = await input.chat({
       model: input.model,
       messages: [{ role: "system", content: input.system }, ...history, ...added],
@@ -8026,12 +8052,14 @@ async function runLoop(input) {
       let result;
       try {
         const localTool = local.get(name);
-        if (localTool && !buzzNames.has(name)) result = await localTool.run(args, input.signal);
+        if (wrapping && !MESSAGE_TOOLS.has(name)) result = "Error: this turn is out of steps or time, so nothing new runs. Post where things stand with send (final: true).";
+        else if (localTool && !buzzNames.has(name)) result = await localTool.run(args, input.signal);
         else if (input.buzz && buzzNames.has(name)) {
           const reply = await callBuzz(input.buzz, name, args);
           result = reply.error ? `Error: ${reply.text}` : reply.text;
           if (!reply.error && MESSAGE_TOOLS.has(name)) {
             posted = true;
+            if (wrapping) wrapPosted = true;
             if (args.final === true) final = true;
           }
         } else result = `Error: there is no tool named ${name}.`;
@@ -8042,7 +8070,8 @@ async function runLoop(input) {
     }
     if (final) break;
   }
-  return { text, posted, final, messages: added, steps, usage };
+  const unfinished = wrapping && !final ? { reason: wrapping, ...!wrapPosted && { notice: text.trim() || stoppedNotice(wrapping, maxSteps) } } : void 0;
+  return { text, posted, final, messages: added, steps, usage, ...unfinished && { unfinished } };
 }
 function trimHistory(all, maxChars = 12e4, maxMessages = 120) {
   const messages = all.filter(sendable);
@@ -8315,6 +8344,7 @@ function plainText(content) {
 
 // plugins/agents/src/types.tsx
 var TURN_TIMEOUT_MS = 30 * 6e4;
+var WRAP_UP_MS = 3 * 6e4;
 var Queue = class {
   tails = /* @__PURE__ */ new Map();
   running = /* @__PURE__ */ new Map();
@@ -8498,7 +8528,7 @@ function registerTypes(agents, kit, service) {
     ].filter(Boolean).join("\n\n");
     return { tools: { ...tools, local }, instructions, cwd: on ? `${SANDBOX_HOME}/work` : "~" };
   }
-  async function sandboxTurn(delivery, config, conversation, signal, report) {
+  async function sandboxTurn(delivery, config, conversation, signal, report, deadline) {
     const workspace = agentService(service, config.profile);
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
@@ -8522,10 +8552,12 @@ function registerTypes(agents, kit, service) {
           return completion;
         },
         signal,
+        deadline,
         onStep: (tool, target2) => report.tool(tool, target2),
         onThought: (text) => report.thought(text)
       });
-      if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
+      if (result.unfinished?.notice) await kit.reply(delivery.agent, conversation, result.unfinished.notice, { notifyOwner: true });
+      else if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
       await sessions.set(delivery.agent.key, conversation.key, {
         ...session,
         cursor: prompt.cursor,
@@ -8742,11 +8774,12 @@ ${answer.sql.trim()}
         return;
       }
       const harness = config.harness;
+      const deadline = Date.now() + TURN_TIMEOUT_MS - WRAP_UP_MS;
       turn(
         delivery,
         conversation,
         config,
-        (signal, report) => config.kind === "sandbox" ? isRemote(harness) ? remoteTurn(delivery, config, harness, conversation, signal, report) : sandboxTurn(delivery, config, conversation, signal, report) : config.kind === "custom" ? customTurn(delivery, config, conversation, signal, report) : genieOneTurn(delivery, config, conversation, signal, report)
+        (signal, report) => config.kind === "sandbox" ? isRemote(harness) ? remoteTurn(delivery, config, harness, conversation, signal, report) : sandboxTurn(delivery, config, conversation, signal, report, deadline) : config.kind === "custom" ? customTurn(delivery, config, conversation, signal, report) : genieOneTurn(delivery, config, conversation, signal, report)
       );
     },
     async runOnce(standalone) {

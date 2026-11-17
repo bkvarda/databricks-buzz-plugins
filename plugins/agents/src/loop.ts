@@ -26,7 +26,12 @@ export type LoopInput = Readonly<{
   local?: readonly LocalTool[];
   chat(request: { model: string; messages: readonly ChatMessage[]; tools: readonly FunctionTool[]; maxTokens: number; signal: AbortSignal }): Promise<ChatCompletion>;
   signal: AbortSignal;
+  /** Model responses per turn (default 100). */
   maxSteps?: number;
+  /** When the turn has to wrap up (epoch ms), ahead of its hard time limit. */
+  deadline?: number;
+  /** Characters of this turn's own messages to send before older tool results are cleared (default 240,000). */
+  maxTurnChars?: number;
   /** Output tokens per model response (default 16,000; a model with a lower ceiling gets its own). */
   maxTokens?: number;
   onStep?(tool: string, target?: string): void;
@@ -45,6 +50,12 @@ export type LoopResult = Readonly<{
   messages: readonly ChatMessage[];
   steps: number;
   usage: { prompt: number; completion: number };
+  /**
+   * Set when the turn ran out of steps or time before the model finished. The
+   * model is asked to post where things stand; `notice` is what to post when
+   * it didn't (its last text, or a plain note), so a turn never ends silently.
+   */
+  unfinished?: Readonly<{ reason: "steps" | "time"; notice?: string }>;
 }>;
 
 const MESSAGE_TOOLS = new Set(["send", "reply_in_subthread"]);
@@ -54,6 +65,35 @@ const NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 const MAX_TOKENS = 16_000;
 /** Responses cut off at the output limit in a row before the turn gives up. */
 const MAX_CUTOFFS = 2;
+/** A long piece of work (reading, building, testing) in one turn: about 25 minutes of steps. */
+const MAX_STEPS = 100;
+/** Responses the model gets to post where things stand once the turn is out of steps or time. */
+const WRAP_UP_RESPONSES = 2;
+/** This turn's messages, roughly 60,000 tokens, before older tool results are cleared to make room. */
+const MAX_TURN_CHARS = 240_000;
+/** Recent messages whose tool results are always kept. */
+const KEEP_RECENT = 8;
+const CLEARED = "(This output was cleared to keep the conversation within the model's context. Run it again if you need it.)";
+
+const wrapUpNote = (reason: "steps" | "time", steps: number) =>
+  `(This turn is out of ${reason === "steps" ? `steps (${steps})` : "time"}. Don't start anything new: use send with final: true to say what's done, what's left, and that you'll carry on when you're mentioned again.)`;
+
+const stoppedNotice = (reason: "steps" | "time", steps: number) =>
+  `I stopped before finishing: this turn ${reason === "steps" ? `used its ${steps} steps` : "ran out of time"}. Mention me to carry on from here.`;
+
+const charsOf = (message: ChatMessage) =>
+  (typeof message.content === "string" ? message.content.length : 0) + (message.role === "assistant" && message.tool_calls ? JSON.stringify(message.tool_calls).length : 0);
+
+/** Clears the oldest long tool results until this turn's messages fit, keeping the recent ones and every message's place. */
+export function clearOldResults(messages: ChatMessage[], maxChars: number): void {
+  let total = messages.reduce((sum, message) => sum + charsOf(message), 0);
+  for (let i = 0; i < messages.length - KEEP_RECENT && total > maxChars; i++) {
+    const message = messages[i]!;
+    if (message.role !== "tool" || message.content.length <= CLEARED.length * 2) continue;
+    total -= message.content.length - CLEARED.length;
+    messages[i] = { ...message, content: CLEARED };
+  }
+}
 
 /**
  * Whether a saved message can go back to the model: an assistant message with
@@ -155,11 +195,21 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
   // A reply cut off at the output limit, continued in the next response.
   let partial = "";
   let cutoffs = 0;
-  const maxSteps = input.maxSteps ?? 24;
+  const maxSteps = input.maxSteps ?? MAX_STEPS;
   let steps = 0;
-  while (steps < maxSteps) {
+  // Out of steps or time: the model gets a few responses to post where things stand.
+  let wrapping: "steps" | "time" | undefined;
+  let wrapResponses = 0;
+  let wrapPosted = false;
+  for (;;) {
     input.signal.throwIfAborted();
+    if (!wrapping) {
+      wrapping = steps >= maxSteps ? "steps" : input.deadline !== undefined && Date.now() >= input.deadline ? "time" : undefined;
+      if (wrapping) added.push({ role: "user", content: wrapUpNote(wrapping, steps) });
+    }
+    if (wrapping && wrapResponses++ >= WRAP_UP_RESPONSES) break;
     steps++;
+    clearOldResults(added, input.maxTurnChars ?? MAX_TURN_CHARS);
     const completion = await input.chat({
       model: input.model,
       messages: [{ role: "system", content: input.system }, ...history, ...added],
@@ -208,12 +258,14 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
       let result: string;
       try {
         const localTool = local.get(name);
-        if (localTool && !buzzNames.has(name)) result = await localTool.run(args, input.signal);
+        if (wrapping && !MESSAGE_TOOLS.has(name)) result = "Error: this turn is out of steps or time, so nothing new runs. Post where things stand with send (final: true).";
+        else if (localTool && !buzzNames.has(name)) result = await localTool.run(args, input.signal);
         else if (input.buzz && buzzNames.has(name)) {
           const reply = await callBuzz(input.buzz, name, args);
           result = reply.error ? `Error: ${reply.text}` : reply.text;
           if (!reply.error && MESSAGE_TOOLS.has(name)) {
             posted = true;
+            if (wrapping) wrapPosted = true;
             if (args.final === true) final = true;
           }
         } else result = `Error: there is no tool named ${name}.`;
@@ -224,7 +276,9 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     }
     if (final) break;
   }
-  return { text, posted, final, messages: added, steps, usage };
+  // Out of steps or time and the model didn't post where things stand: say it for it.
+  const unfinished = wrapping && !final ? { reason: wrapping, ...(!wrapPosted && { notice: text.trim() || stoppedNotice(wrapping, maxSteps) }) } : undefined;
+  return { text, posted, final, messages: added, steps, usage, ...(unfinished && { unfinished }) };
 }
 
 /** Keeps the saved session within budget, cutting at user turns so tool
