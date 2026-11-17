@@ -181,6 +181,66 @@ export function harnessCommand(
   }
 }
 
+/**
+ * The command that compacts a harness session in place, run in the work
+ * folder where the session lives. Claude Code takes `/compact` headless (it
+ * reports a `compact_boundary`); Pi takes a `compact` command in its RPC mode,
+ * answered with one `response` line, so the script feeds it through a FIFO and
+ * stops it once that arrives. Codex has no command for it: it compacts itself
+ * as its context fills.
+ */
+export function compactCommand(harness: Exclude<RemoteHarness, "codex">, model: string, session: string): string {
+  const cd = `cd ${shellQuote(WORK_DIR)} || exit 1`;
+  if (harness === "claude")
+    return `${cd}; printf '/compact' | claude -p --model ${shellQuote(model)} --output-format stream-json --verbose --resume ${shellQuote(session)} 2>/dev/null`;
+  return [
+    cd,
+    "d=$(mktemp -d) && mkfifo \"$d/in\" || exit 1",
+    `timeout 260 pi --mode rpc --model ${shellQuote(model)} --session-id ${shellQuote(session)} < "$d/in" > "$d/out" 2>/dev/null &`,
+    "p=$!",
+    'exec 3> "$d/in"',
+    `printf '%s\\n' '{"id":"buzz-compact","type":"compact"}' >&3`,
+    `for i in $(seq 1 258); do grep -q '"type":"response"' "$d/out" 2>/dev/null && break; kill -0 $p 2>/dev/null || break; sleep 1; done`,
+    "exec 3>&-",
+    "kill $p 2>/dev/null; wait $p 2>/dev/null",
+    `grep -m1 '"type":"response"' "$d/out"`,
+    'rm -rf "$d"',
+  ].join("\n");
+}
+
+/** What a compaction's output says: compacted, nothing to compact, or why it failed. */
+export function compactOutcome(harness: Exclude<RemoteHarness, "codex">, stdout: string): { ok: true; compacted: boolean } | { ok: false; error: string } {
+  const events = stdout.split("\n").flatMap((line) => {
+    try {
+      return [JSON.parse(line) as Record<string, unknown>];
+    } catch {
+      return [];
+    }
+  });
+  if (harness === "claude") {
+    if (events.some((event) => event.type === "system" && event.subtype === "compact_boundary")) return { ok: true, compacted: true };
+    const result = events.find((event) => event.type === "result");
+    const text = typeof result?.result === "string" ? result.result : "";
+    return { ok: false, error: text || (result ? "Claude Code didn't compact the session." : "Claude Code didn't answer.") };
+  }
+  const response = events.find((event) => event.type === "response");
+  if (response?.success === true) return { ok: true, compacted: true };
+  const error = typeof response?.error === "string" ? response.error : "";
+  if (/nothing to compact/i.test(error)) return { ok: true, compacted: false };
+  return { ok: false, error: error || "Pi didn't answer." };
+}
+
+/** Compacts the conversation's harness session on its Sandbox. */
+export async function compactRemote(
+  input: Readonly<{ sandboxes: Sandboxes; sandbox: string; harness: RemoteHarness; model: string; session: string; signal: AbortSignal }>,
+): Promise<{ compacted: boolean }> {
+  if (input.harness === "codex") throw new Error("Codex compacts its own context as it fills up; it has no command to do it on request.");
+  const result = await input.sandboxes.bash(input.sandbox, compactCommand(input.harness, input.model, input.session), { timeoutSeconds: 280, signal: input.signal });
+  const outcome = compactOutcome(input.harness, result.stdout ?? "");
+  if (!outcome.ok) throw new Error(`${harnessLabel(input.harness)} couldn't compact: ${outcome.error}`);
+  return { compacted: outcome.compacted };
+}
+
 /** The detached script: runs the harness in the work folder and records its exit code. */
 export function runScript(command: string, files: RunFiles): string {
   return ["#!/bin/bash", `cd ${shellQuote(WORK_DIR)} || exit 1`, `${command} > ${shellQuote(files.events)} 2> ${shellQuote(files.stderr)}`, `echo $? > ${shellQuote(files.exit)}`, ""].join("\n");

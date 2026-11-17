@@ -4556,6 +4556,51 @@ function harnessCommand(input) {
     }
   }
 }
+function compactCommand(harness, model, session) {
+  const cd = `cd ${shellQuote(WORK_DIR)} || exit 1`;
+  if (harness === "claude")
+    return `${cd}; printf '/compact' | claude -p --model ${shellQuote(model)} --output-format stream-json --verbose --resume ${shellQuote(session)} 2>/dev/null`;
+  return [
+    cd,
+    'd=$(mktemp -d) && mkfifo "$d/in" || exit 1',
+    `timeout 260 pi --mode rpc --model ${shellQuote(model)} --session-id ${shellQuote(session)} < "$d/in" > "$d/out" 2>/dev/null &`,
+    "p=$!",
+    'exec 3> "$d/in"',
+    `printf '%s\\n' '{"id":"buzz-compact","type":"compact"}' >&3`,
+    `for i in $(seq 1 258); do grep -q '"type":"response"' "$d/out" 2>/dev/null && break; kill -0 $p 2>/dev/null || break; sleep 1; done`,
+    "exec 3>&-",
+    "kill $p 2>/dev/null; wait $p 2>/dev/null",
+    `grep -m1 '"type":"response"' "$d/out"`,
+    'rm -rf "$d"'
+  ].join("\n");
+}
+function compactOutcome(harness, stdout) {
+  const events = stdout.split("\n").flatMap((line) => {
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  });
+  if (harness === "claude") {
+    if (events.some((event) => event.type === "system" && event.subtype === "compact_boundary")) return { ok: true, compacted: true };
+    const result = events.find((event) => event.type === "result");
+    const text = typeof result?.result === "string" ? result.result : "";
+    return { ok: false, error: text || (result ? "Claude Code didn't compact the session." : "Claude Code didn't answer.") };
+  }
+  const response = events.find((event) => event.type === "response");
+  if (response?.success === true) return { ok: true, compacted: true };
+  const error = typeof response?.error === "string" ? response.error : "";
+  if (/nothing to compact/i.test(error)) return { ok: true, compacted: false };
+  return { ok: false, error: error || "Pi didn't answer." };
+}
+async function compactRemote(input) {
+  if (input.harness === "codex") throw new Error("Codex compacts its own context as it fills up; it has no command to do it on request.");
+  const result = await input.sandboxes.bash(input.sandbox, compactCommand(input.harness, input.model, input.session), { timeoutSeconds: 280, signal: input.signal });
+  const outcome = compactOutcome(input.harness, result.stdout ?? "");
+  if (!outcome.ok) throw new Error(`${harnessLabel(input.harness)} couldn't compact: ${outcome.error}`);
+  return { compacted: outcome.compacted };
+}
 function runScript(command, files) {
   return ["#!/bin/bash", `cd ${shellQuote(WORK_DIR)} || exit 1`, `${command} > ${shellQuote(files.events)} 2> ${shellQuote(files.stderr)}`, `echo $? > ${shellQuote(files.exit)}`, ""].join("\n");
 }
@@ -8073,7 +8118,9 @@ async function runLoop(input) {
   const unfinished = wrapping && !final ? { reason: wrapping, ...!wrapPosted && { notice: text.trim() || stoppedNotice(wrapping, maxSteps) } } : void 0;
   return { text, posted, final, messages: added, steps, usage, ...unfinished && { unfinished } };
 }
-function trimHistory(all, maxChars = 12e4, maxMessages = 120) {
+var HISTORY_CHARS = 12e4;
+var HISTORY_MESSAGES = 120;
+function splitHistory(all, maxChars = HISTORY_CHARS, maxMessages = HISTORY_MESSAGES) {
   const messages = all.filter(sendable);
   const size = (list) => list.reduce((total, message) => total + (typeof message.content === "string" ? message.content.length : 0) + 200, 0);
   let start = 0;
@@ -8082,7 +8129,85 @@ function trimHistory(all, maxChars = 12e4, maxMessages = 120) {
     if (next === -1) break;
     start = next;
   }
-  return messages.slice(start);
+  return { kept: messages.slice(start), dropped: messages.slice(0, start) };
+}
+function trimHistory(all, maxChars = HISTORY_CHARS, maxMessages = HISTORY_MESSAGES) {
+  return splitHistory(all, maxChars, maxMessages).kept;
+}
+
+// plugins/agents/src/compaction.ts
+var SUMMARY_MAX = 8e3;
+var COMPACT_CHARS = 2e4;
+var COMPACT_MESSAGES = 12;
+var TRANSCRIPT_MAX = 12e4;
+var clip2 = (text, max) => text.length > max ? `${text.slice(0, max)} \u2026 (${text.length - max} more characters)` : text;
+function transcript(messages, max = TRANSCRIPT_MAX) {
+  const lines = messages.map((message) => {
+    if (message.role === "tool") return `[tool result] ${clip2(message.content, 800)}`;
+    if (message.role === "assistant") {
+      const calls = (message.tool_calls ?? []).map((call) => `[called ${call.function.name}] ${clip2(call.function.arguments, 300)}`);
+      return [message.content ? `[agent] ${clip2(message.content, 3e3)}` : "", ...calls].filter(Boolean).join("\n");
+    }
+    return `[${message.role === "user" ? "conversation" : message.role}] ${clip2(message.content, 4e3)}`;
+  });
+  const text = lines.join("\n\n");
+  if (text.length <= max) return text;
+  return `${text.slice(0, max / 2)}
+
+\u2026 (${text.length - max} characters left out) \u2026
+
+${text.slice(-max / 2)}`;
+}
+var INSTRUCTIONS = "You keep the running summary of a conversation in Buzz, a team chat, for an AI agent that takes part in it. The conversation's oldest messages no longer fit in the agent's context, so your summary stands in for them. Write it for the agent itself.";
+function summaryRequest(previous, dropped) {
+  return [
+    { role: "system", content: INSTRUCTIONS },
+    {
+      role: "user",
+      content: [
+        previous ? `<previous_summary>
+${previous}
+</previous_summary>` : "",
+        `<messages>
+${transcript(dropped)}
+</messages>`,
+        `Write the updated summary${previous ? ", merging the previous summary with these messages into one" : ""}. Keep:
+- what people asked for, and who asked;
+- decisions, and why they were made;
+- what was done, with exact names: files, commands, branches, pull requests, links, IDs and numbers;
+- what is in progress or still to do, and anything the agent promised.
+Leave out greetings, and tool output that no longer matters. Use short Markdown bullets under a few headings, at most 600 words. Reply with the summary only.`
+      ].filter(Boolean).join("\n\n")
+    }
+  ];
+}
+async function summarize2(chat, previous, dropped, signal) {
+  const text = (await chat(summaryRequest(previous, dropped), signal)).trim();
+  if (!text) throw new Error("The model returned an empty summary.");
+  return clip2(text, SUMMARY_MAX);
+}
+function withSummary(system, summary) {
+  if (!summary?.trim()) return system;
+  return `${system}
+
+<earlier_in_this_conversation>
+The start of this conversation no longer fits in your context. This is a summary of it, written as it fell out; read the conversation for anything it leaves out.
+
+${summary.trim()}
+</earlier_in_this_conversation>`;
+}
+async function keepWithinBudget(save, session, messages, chat, signal, onSummarizing) {
+  const { kept, dropped } = splitHistory(messages);
+  if (!dropped.length) return save({ ...session, messages: kept });
+  await save({ ...session, messages: [...dropped, ...kept] });
+  try {
+    onSummarizing?.();
+    const summary = await summarize2(chat, session.summary, dropped, signal);
+    await save({ ...session, messages: kept, summary });
+  } catch {
+    const over = splitHistory(messages, HISTORY_CHARS * 2, HISTORY_MESSAGES * 2);
+    if (over.dropped.length) await save({ ...session, messages: over.kept });
+  }
 }
 
 // packages/core/src/warehouse.ts
@@ -8205,7 +8330,7 @@ var sandboxFor = (pubkey) => sandboxId(`buzz-agent-${pubkey.slice(0, 12)}`);
 var SANDBOX_PROMPT = `<databricks-sandbox>
 You have your own Databricks Sandbox: a Linux machine in Databricks with Python, Node.js, Rust, git, the Databricks CLI (already signed in as your owner) and internet access. Your working folder is ${SANDBOX_HOME}/work; relative paths in every sandbox tool are relative to it, and each sandbox_exec call is a fresh bash login shell that starts there. Files under ${SANDBOX_HOME} persist across restarts; other paths reset when the sandbox stops. Keep state in files. Use sandbox_read_file / sandbox_write_file / sandbox_list for files. Commands time out after the limit you give (default 120 seconds, up to 1800); start long jobs in the background with nohup and check on them. Never print secrets into conversations.
 </databricks-sandbox>`;
-var clip2 = (text, max = 2e4) => text.length > max ? `${text.slice(0, max / 2)}
+var clip3 = (text, max = 2e4) => text.length > max ? `${text.slice(0, max / 2)}
 \u2026 (${text.length - max} characters cut) \u2026
 ${text.slice(-max / 2)}` : text;
 async function ensureAgentSandbox(service, pubkey, agentName, signal, onState) {
@@ -8260,9 +8385,9 @@ function sandboxTools(service, pubkey, agentName, onState) {
         return [
           `exit_code: ${result.exit_code ?? "unknown"} (${status3}${result.truncated ? ", output truncated" : ""})`,
           result.stdout ? `stdout:
-${clip2(result.stdout)}` : "stdout: (empty)",
+${clip3(result.stdout)}` : "stdout: (empty)",
           result.stderr ? `stderr:
-${clip2(result.stderr, 8e3)}` : ""
+${clip3(result.stderr, 8e3)}` : ""
         ].filter(Boolean).join("\n");
       }
     },
@@ -8273,7 +8398,7 @@ ${clip2(result.stderr, 8e3)}` : ""
       async run(args, signal) {
         const sandboxes = await ensure(signal);
         const path = String(args.path ?? "");
-        return clip2(await sandboxes.readFile(id, path.startsWith("/") ? path : `${SANDBOX_HOME}/work/${path}`, signal), 6e4);
+        return clip3(await sandboxes.readFile(id, path.startsWith("/") ? path : `${SANDBOX_HOME}/work/${path}`, signal), 6e4);
       }
     },
     {
@@ -8345,6 +8470,7 @@ function plainText(content) {
 // plugins/agents/src/types.tsx
 var TURN_TIMEOUT_MS = 30 * 6e4;
 var WRAP_UP_MS = 3 * 6e4;
+var summaryChat = (ai, model) => async (messages, signal) => messageText((await ai.chat({ model, messages, maxTokens: 2e3, signal })).choices[0]?.message.content ?? null);
 var Queue = class {
   tails = /* @__PURE__ */ new Map();
   running = /* @__PURE__ */ new Map();
@@ -8476,6 +8602,7 @@ function registerTypes(agents, kit, service) {
   };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
+  const compacting = /* @__PURE__ */ new Set();
   const outsiderNotes = new OutsiderNotes();
   const activity = new ActivityLog(agents.storage);
   function turn(delivery, conversation, config, work) {
@@ -8533,7 +8660,7 @@ function registerTypes(agents, kit, service) {
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
     const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
-    const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
+    const system = withSummary(await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true }), session.summary);
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
     const ai = new Ai(client);
     let answered = false;
@@ -8558,15 +8685,30 @@ function registerTypes(agents, kit, service) {
       });
       if (result.unfinished?.notice) await kit.reply(delivery.agent, conversation, result.unfinished.notice, { notifyOwner: true });
       else if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
-      await sessions.set(delivery.agent.key, conversation.key, {
-        ...session,
-        cursor: prompt.cursor,
-        messages: trimHistory([...session.messages, ...result.messages])
-      });
+      await keepSession(delivery.agent.key, conversation.key, { ...session, cursor: prompt.cursor }, [...session.messages, ...result.messages], summaryChat(ai, delivery.model ?? config.model), signal, report);
     } catch (error) {
       if (!answered) prompt.restore();
       throw error;
     }
+  }
+  function keepSession(agent, key2, session, messages, chat, signal, report) {
+    return keepWithinBudget((next) => sessions.set(agent, key2, next), session, messages, chat, signal, () => report?.step({ tool: "Summarizing earlier messages" }));
+  }
+  async function compact2(agent, config, key2, signal) {
+    const session = sessions.get(agent.key, key2);
+    if (config.kind === "genie-one") throw new Error("Genie One keeps the conversation and manages its context itself. Start a new session to begin again.");
+    if (config.kind !== "sandbox") return;
+    const workspace = agentService(service, config.profile);
+    if (isRemote(config.harness)) {
+      if (session.remote?.harness !== config.harness) return;
+      const sandboxes = await ensureAgentSandbox(workspace, agent.pubkey, agent.name, signal);
+      await compactRemote({ sandboxes, sandbox: sandboxFor(agent.pubkey), harness: config.harness, model: harnessModel(config.harness, config.model), session: session.remote.id, signal });
+      return;
+    }
+    const { kept, dropped } = splitHistory(session.messages, COMPACT_CHARS, COMPACT_MESSAGES);
+    if (!dropped.length) return;
+    const summary = await summarize2(summaryChat(new Ai(await workspace.ready(signal)), config.model), session.summary, dropped, signal);
+    await sessions.set(agent.key, key2, { ...sessions.get(agent.key, key2), messages: kept, summary });
   }
   async function remoteTurn(delivery, config, harness, conversation, signal, report) {
     const workspace = agentService(service, config.profile);
@@ -8706,7 +8848,7 @@ ${answer.sql.trim()}
     provider: provider(service),
     // Genie One needs no setup: it finds the right data across the workspace.
     defaults: () => ({ config: normalizeDatabricks({ kind: "genie-one", tools: [GENIE_ONE_CHOICE] }) }),
-    summary: (agent) => summarize2(normalizeDatabricks(agent.config)),
+    summary: (agent) => summarize3(normalizeDatabricks(agent.config)),
     adopt: (carry, config) => ({ ...config, instructions: carry.instructions ?? config.instructions }),
     carry: (config) => config.instructions.trim() ? { instructions: config.instructions } : {},
     Create: (props) => /* @__PURE__ */ React.createElement(
@@ -8752,15 +8894,24 @@ ${answer.sql.trim()}
     },
     sessionControls: {
       scope: (agent) => scopeOf(normalizeDatabricks(agent.config)),
-      state: (agent, place) => queue.active(`${agent.key}|${conversationKey(scopeOf(normalizeDatabricks(agent.config)), place)}`) ? "active" : "idle",
+      state: (agent, place) => {
+        const key2 = `${agent.key}|${conversationKey(scopeOf(normalizeDatabricks(agent.config)), place)}`;
+        return compacting.has(key2) ? "compacting" : queue.active(key2) ? "active" : "idle";
+      },
       async run(agent, place, action) {
         const config = normalizeDatabricks(agent.config);
         const key2 = conversationKey(scopeOf(config), place);
         if (action === "interrupt") return queue.interrupt(`${agent.key}|${key2}`);
         if (action === "new") return sessions.clear(agent.key, key2);
-        if (config.kind !== "sandbox" || isRemote(config.harness)) return;
-        const session = sessions.get(agent.key, key2);
-        await sessions.set(agent.key, key2, { ...session, messages: trimHistory(session.messages, 2e4, 12) });
+        const queued = `${agent.key}|${key2}`;
+        compacting.add(queued);
+        await queue.run(queued, async (signal) => {
+          try {
+            await compact2(agent, config, key2, signal);
+          } finally {
+            compacting.delete(queued);
+          }
+        });
       },
       subscribe: (listener) => queue.subscribe(listener)
     },
@@ -8843,7 +8994,7 @@ function LocalActivity(props) {
     }
   );
 }
-function summarize2(config) {
+function summarize3(config) {
   const where = config.profile ? [config.profile] : [];
   if (config.kind === "genie-one") return ["Genie One", ...where].join(" \xB7 ");
   if (config.kind === "custom") return [config.custom?.label ?? "No agent chosen", ...where].join(" \xB7 ");

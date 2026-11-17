@@ -5,7 +5,7 @@
 // replies as the agent. Databricks does the thinking.
 import type { AgentType, Agents, Delivery, HarnessConversation, HarnessKit } from "@buzz/author";
 import type { ComponentType } from "react";
-import { Ai, DEFAULT_MODEL, DEFAULT_MODELS, modelLabel } from "@dbx/core/api/ai";
+import { Ai, type ChatMessage, DEFAULT_MODEL, DEFAULT_MODELS, messageText, modelLabel } from "@dbx/core/api/ai";
 import { Genie } from "@dbx/core/api/genie";
 import { answerMarkdown, GenieOne } from "../../genie/src/genie-one";
 import { SANDBOX_HOME, Sandboxes } from "@dbx/core/api/sandbox";
@@ -20,13 +20,14 @@ import { genieOneStep, genieStatusStep, rateLimitStep } from "./activity";
 import { ActivityLog, type TurnReporter } from "./activity-log";
 import { noteOutsider, OutsiderNotes } from "./outsider";
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
-import { type LocalTool, runLoop, trimHistory } from "./loop";
+import { COMPACT_CHARS, COMPACT_MESSAGES, keepWithinBudget, summarize as summarizeHistory, withSummary } from "./compaction";
+import { type LocalTool, runLoop, splitHistory, trimHistory } from "./loop";
 import { sqlTools } from "../../sql/src/tools";
-import { HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
+import { compactRemote, HARNESS_IDS, RESULT_PROMPT, type HarnessId, harnessAccepts, harnessLabel, harnessModel, isRemote, type RemoteHarness, remoteNote, runRemoteTurn, WORK_DIR } from "./remote";
 import { ensureAgentSandbox, SANDBOX_PROMPT, sandboxFor, sandboxTools } from "./sandbox";
 import { normalizeSkills, resolveSkills, type SkillApi, skillCatalogFor, skillsNote, skillsSection, skillTools } from "./skills";
 import { installSkills } from "./skills-sandbox";
-import { plainText, Sessions } from "./state";
+import { plainText, type Session, Sessions } from "./state";
 import { type AgentKind, AgentForm, type CustomAgent, type DatabricksConfig, SettingsTab } from "./ui";
 
 type Tab<C> = NonNullable<AgentType<C>["tabs"]>[number];
@@ -37,6 +38,10 @@ type CreateProps<C> = PropsOf<NonNullable<AgentType<C>["Create"]>>;
 const TURN_TIMEOUT_MS = 30 * 60_000;
 /** How long before the turn's time limit a Sandbox agent wraps up, posting where things stand. */
 const WRAP_UP_MS = 3 * 60_000;
+
+/** A model's reply text, for summaries: no tools, a short answer. */
+const summaryChat = (ai: Ai, model: string) => async (messages: readonly ChatMessage[], signal: AbortSignal) =>
+  messageText((await ai.chat({ model, messages, maxTokens: 2_000, signal })).choices[0]?.message.content ?? null);
 
 /** Runs one conversation's turns in order, so saved sessions never race. */
 class Queue {
@@ -199,6 +204,8 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
   };
   const sessions = new Sessions(agents.storage);
   const queue = new Queue();
+  /** Conversations whose session is being compacted, for Buzz's session controls. */
+  const compacting = new Set<string>();
   const outsiderNotes = new OutsiderNotes();
   const activity = new ActivityLog(agents.storage);
 
@@ -266,7 +273,7 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     const client = await workspace.ready(signal);
     const session = sessions.get(delivery.agent.key, conversation.key);
     const { tools, instructions, cwd } = await sandboxSetup(delivery, config, workspace, signal, (state) => report.tool("sandbox", state), conversation.channel);
-    const system = await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true });
+    const system = withSummary(await kit.systemPrompt(delivery, { scope: config.scope, cwd, instructions, tools: true }), session.summary);
     const prompt = await kit.turnPrompt(delivery, conversation, session.cursor ? { cursor: session.cursor } : {});
     const ai = new Ai(client);
     let answered = false;
@@ -292,15 +299,35 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
       // Out of steps or time without saying so itself: say where it stopped, so nobody waits on it.
       if (result.unfinished?.notice) await kit.reply(delivery.agent, conversation, result.unfinished.notice, { notifyOwner: true });
       else if (!result.posted && result.text.trim()) await kit.reply(delivery.agent, conversation, result.text.trim());
-      await sessions.set(delivery.agent.key, conversation.key, {
-        ...session,
-        cursor: prompt.cursor,
-        messages: trimHistory([...session.messages, ...result.messages]),
-      });
+      await keepSession(delivery.agent.key, conversation.key, { ...session, cursor: prompt.cursor }, [...session.messages, ...result.messages], summaryChat(ai, delivery.model ?? config.model), signal, report);
     } catch (error) {
       if (!answered) prompt.restore();
       throw error;
     }
+  }
+
+  /** Saves a Built-in session within budget, summarizing what falls off (see keepWithinBudget). */
+  function keepSession(agent: string, key: string, session: Session, messages: readonly ChatMessage[], chat: (messages: readonly ChatMessage[], signal: AbortSignal) => Promise<string>, signal: AbortSignal, report?: TurnReporter) {
+    return keepWithinBudget((next) => sessions.set(agent, key, next), session, messages, chat, signal, () => report?.step({ tool: "Summarizing earlier messages" }));
+  }
+
+  /** Compact session: a Built-in agent's history into its summary, or a harness's own session on its Sandbox. */
+  async function compact(agent: Parameters<NonNullable<AgentType["sessionControls"]>["run"]>[0], config: DatabricksConfig, key: string, signal: AbortSignal) {
+    const session = sessions.get(agent.key, key);
+    if (config.kind === "genie-one") throw new Error("Genie One keeps the conversation and manages its context itself. Start a new session to begin again.");
+    // A custom agent gets its recent messages each turn; the oldest just fall off.
+    if (config.kind !== "sandbox") return;
+    const workspace = agentService(service, config.profile);
+    if (isRemote(config.harness)) {
+      if (session.remote?.harness !== config.harness) return;
+      const sandboxes = await ensureAgentSandbox(workspace, agent.pubkey, agent.name, signal);
+      await compactRemote({ sandboxes, sandbox: sandboxFor(agent.pubkey), harness: config.harness, model: harnessModel(config.harness, config.model), session: session.remote.id, signal });
+      return;
+    }
+    const { kept, dropped } = splitHistory(session.messages, COMPACT_CHARS, COMPACT_MESSAGES);
+    if (!dropped.length) return;
+    const summary = await summarizeHistory(summaryChat(new Ai(await workspace.ready(signal)), config.model), session.summary, dropped, signal);
+    await sessions.set(agent.key, key, { ...sessions.get(agent.key, key), messages: kept, summary });
   }
 
   /** A Sandbox agent whose harness is Claude Code, Codex or Pi, running in its Sandbox. */
@@ -496,16 +523,25 @@ export function registerTypes(agents: Agents, kit: HarnessKit, service: Databric
     },
     sessionControls: {
       scope: (agent) => scopeOf(normalizeDatabricks(agent.config)),
-      state: (agent, place) => (queue.active(`${agent.key}|${conversationKey(scopeOf(normalizeDatabricks(agent.config)), place)}`) ? "active" : "idle"),
+      state: (agent, place) => {
+        const key = `${agent.key}|${conversationKey(scopeOf(normalizeDatabricks(agent.config)), place)}`;
+        return compacting.has(key) ? "compacting" : queue.active(key) ? "active" : "idle";
+      },
       async run(agent, place, action) {
         const config = normalizeDatabricks(agent.config);
         const key = conversationKey(scopeOf(config), place);
         if (action === "interrupt") return queue.interrupt(`${agent.key}|${key}`);
         if (action === "new") return sessions.clear(agent.key, key);
-        // Claude Code, Codex and Pi manage their own context.
-        if (config.kind !== "sandbox" || isRemote(config.harness)) return;
-        const session = sessions.get(agent.key, key);
-        await sessions.set(agent.key, key, { ...session, messages: trimHistory(session.messages, 20_000, 12) });
+        // In the conversation's queue, so a mention meanwhile waits for it, and Interrupt stops it.
+        const queued = `${agent.key}|${key}`;
+        compacting.add(queued);
+        await queue.run(queued, async (signal) => {
+          try {
+            await compact(agent, config, key, signal);
+          } finally {
+            compacting.delete(queued);
+          }
+        });
       },
       subscribe: (listener) => queue.subscribe(listener),
     },

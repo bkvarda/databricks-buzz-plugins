@@ -281,10 +281,16 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
   return { text, posted, final, messages: added, steps, usage, ...(unfinished && { unfinished }) };
 }
 
-/** Keeps the saved session within budget, cutting at user turns so tool
- * results never lose the assistant message that asked for them, and drops
- * messages that can't be sent back (see sendable). */
-export function trimHistory(all: readonly ChatMessage[], maxChars = 120_000, maxMessages = 120): ChatMessage[] {
+/** A saved session's budget: the characters and messages kept before the oldest turns fall off. */
+export const HISTORY_CHARS = 120_000;
+export const HISTORY_MESSAGES = 120;
+
+/**
+ * Splits a saved session into what stays within budget and what falls off,
+ * cutting at user turns so tool results never lose the assistant message that
+ * asked for them. Messages that can't be sent back (see sendable) go neither way.
+ */
+export function splitHistory(all: readonly ChatMessage[], maxChars = HISTORY_CHARS, maxMessages = HISTORY_MESSAGES): { kept: ChatMessage[]; dropped: ChatMessage[] } {
   const messages = all.filter(sendable);
   const size = (list: readonly ChatMessage[]) =>
     list.reduce((total, message) => total + (typeof message.content === "string" ? message.content.length : 0) + 200, 0);
@@ -294,5 +300,10 @@ export function trimHistory(all: readonly ChatMessage[], maxChars = 120_000, max
     if (next === -1) break;
     start = next;
   }
-  return messages.slice(start);
+  return { kept: messages.slice(start), dropped: messages.slice(0, start) };
+}
+
+/** The part of a saved session that stays within budget (see splitHistory). */
+export function trimHistory(all: readonly ChatMessage[], maxChars = HISTORY_CHARS, maxMessages = HISTORY_MESSAGES): ChatMessage[] {
+  return splitHistory(all, maxChars, maxMessages).kept;
 }

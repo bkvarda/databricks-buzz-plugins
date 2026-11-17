@@ -6,6 +6,8 @@ export type Session = {
   /** The harness kit's opaque cursor for what this session has been shown. */
   cursor?: string;
   messages: ChatMessage[];
+  /** A Built-in agent's summary of the messages that fell out of `messages` (see ./compaction.ts). */
+  summary?: string;
   /** Genie agents keep Genie's own conversation per Buzz conversation. */
   genieConversationId?: string;
   genieOneConversationId?: string;
