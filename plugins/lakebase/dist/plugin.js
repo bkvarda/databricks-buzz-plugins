@@ -147,6 +147,14 @@ function apiError(response) {
     const parsed = JSON.parse(response.body);
     code = parsed.error_code ?? (typeof parsed.error === "object" ? parsed.error?.code : void 0);
     message = parsed.message ?? (typeof parsed.error === "object" ? parsed.error?.message : parsed.error) ?? parsed.error_description ?? message;
+    if (/^\s*\{/.test(message)) {
+      try {
+        const inner = JSON.parse(message);
+        const text = inner.message ?? inner.error?.message;
+        if (typeof text === "string" && text) message = text;
+      } catch {
+      }
+    }
   } catch {
     const text = response.body.trim();
     if (text && text.length < 400 && !text.startsWith("<")) message = text;

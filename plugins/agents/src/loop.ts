@@ -24,9 +24,11 @@ export type LoopInput = Readonly<{
   /** Which Buzz tools to offer (default: all). */
   buzzFilter?(name: string): boolean;
   local?: readonly LocalTool[];
-  chat(request: { model: string; messages: readonly ChatMessage[]; tools: readonly FunctionTool[]; signal: AbortSignal }): Promise<ChatCompletion>;
+  chat(request: { model: string; messages: readonly ChatMessage[]; tools: readonly FunctionTool[]; maxTokens: number; signal: AbortSignal }): Promise<ChatCompletion>;
   signal: AbortSignal;
   maxSteps?: number;
+  /** Output tokens per model response (default 16,000; a model with a lower ceiling gets its own). */
+  maxTokens?: number;
   onStep?(tool: string, target?: string): void;
   /** What the model said alongside its tool calls, and any reasoning it returned. */
   onThought?(text: string): void;
@@ -48,6 +50,19 @@ export type LoopResult = Readonly<{
 const MESSAGE_TOOLS = new Set(["send", "reply_in_subthread"]);
 const MAX_RESULT = 24_000;
 const NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+/** Enough for a sizeable file in one tool call, and well inside the chat request's time limit. */
+const MAX_TOKENS = 16_000;
+/** Responses cut off at the output limit in a row before the turn gives up. */
+const MAX_CUTOFFS = 2;
+
+/**
+ * Whether a saved message can go back to the model: an assistant message with
+ * neither text nor tool calls can't (Claude rejects `content: null`), and
+ * earlier versions saved one when a response came back empty.
+ */
+export function sendable(message: ChatMessage): boolean {
+  return message.role !== "assistant" || Boolean(message.content) || Boolean(message.tool_calls?.length);
+}
 
 type ListedTool = { name: string; description?: string; inputSchema?: Record<string, unknown> };
 
@@ -131,10 +146,15 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     })),
   ];
   const added: ChatMessage[] = [{ role: "user", content: input.prompt }];
+  const history = input.history.filter(sendable);
+  const maxTokens = input.maxTokens ?? MAX_TOKENS;
   const usage = { prompt: 0, completion: 0 };
   let posted = false;
   let final = false;
   let text = "";
+  // A reply cut off at the output limit, continued in the next response.
+  let partial = "";
+  let cutoffs = 0;
   const maxSteps = input.maxSteps ?? 24;
   let steps = 0;
   while (steps < maxSteps) {
@@ -142,8 +162,9 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     steps++;
     const completion = await input.chat({
       model: input.model,
-      messages: [{ role: "system", content: input.system }, ...input.history, ...added],
+      messages: [{ role: "system", content: input.system }, ...history, ...added],
       tools,
+      maxTokens,
       signal: input.signal,
     });
     usage.prompt += completion.usage?.prompt_tokens ?? 0;
@@ -155,11 +176,30 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     const reasoning = reasoningText(choice.message.content);
     if (reasoning) input.onThought?.(reasoning);
     if (calls.length && content.trim()) input.onThought?.(content);
-    added.push({ role: "assistant", content: content || null, ...(calls.length && { tool_calls: calls }) });
+    // Stopped at the output limit before it finished: a tool call that long
+    // arrives as nothing at all. Say so and let it go on, in smaller steps.
+    if (!calls.length && choice.finish_reason === "length") {
+      if (++cutoffs > MAX_CUTOFFS)
+        throw new Error("The model's responses kept stopping at its output limit before they were complete. Ask for smaller steps, such as writing a large file in parts.");
+      if (content.trim()) {
+        partial += content;
+        added.push({ role: "assistant", content });
+        added.push({ role: "user", content: "(Your reply stopped at the output limit. Continue exactly where it stopped, without repeating anything.)" });
+      } else
+        added.push({
+          role: "user",
+          content: "(Your last response stopped at the output limit before it was complete, so none of it arrived, not even its tool call. Do it in smaller steps: write a large file in several parts, or run shorter commands.)",
+        });
+      continue;
+    }
+    cutoffs = 0;
+    // A response with neither text nor tool calls isn't kept: it can't be sent back.
+    if (content || calls.length) added.push({ role: "assistant", content: content || null, ...(calls.length && { tool_calls: calls }) });
     if (!calls.length) {
-      text = content;
+      text = partial + content;
       break;
     }
+    partial = "";
     for (const call of calls) {
       input.signal.throwIfAborted();
       const args = parseArgs(call);
@@ -188,8 +228,10 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
 }
 
 /** Keeps the saved session within budget, cutting at user turns so tool
- * results never lose the assistant message that asked for them. */
-export function trimHistory(messages: readonly ChatMessage[], maxChars = 120_000, maxMessages = 120): ChatMessage[] {
+ * results never lose the assistant message that asked for them, and drops
+ * messages that can't be sent back (see sendable). */
+export function trimHistory(all: readonly ChatMessage[], maxChars = 120_000, maxMessages = 120): ChatMessage[] {
+  const messages = all.filter(sendable);
   const size = (list: readonly ChatMessage[]) =>
     list.reduce((total, message) => total + (typeof message.content === "string" ? message.content.length : 0) + 200, 0);
   let start = 0;

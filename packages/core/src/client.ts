@@ -67,6 +67,14 @@ export function apiError(response: HttpResponse): DatabricksApiError {
       (typeof parsed.error === "object" ? parsed.error?.message : parsed.error) ??
       parsed.error_description ??
       message;
+    // AI Gateway passes a model's own error on as JSON text: {"message":"{\"message\":\"…\"}"}.
+    if (/^\s*\{/.test(message)) {
+      try {
+        const inner = JSON.parse(message) as { message?: unknown; error?: { message?: unknown } };
+        const text = inner.message ?? inner.error?.message;
+        if (typeof text === "string" && text) message = text;
+      } catch {}
+    }
   } catch {
     const text = response.body.trim();
     if (text && text.length < 400 && !text.startsWith("<")) message = text;

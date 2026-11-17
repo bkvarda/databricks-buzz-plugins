@@ -92,6 +92,21 @@ const NO_REASONING_WITH_TOOLS = new Set<string>();
 
 const needsReasoningOff = (error: unknown) => /reasoning_effort/i.test((error as Error)?.message ?? "") && /not supported/i.test((error as Error)?.message ?? "");
 
+/** Models' output-token ceilings, learned when they reject a larger max_tokens. */
+const OUTPUT_LIMITS = new Map<string, number>();
+
+/**
+ * The ceiling a model names when max_tokens is above it. Each says it its own
+ * way: "max_tokens: 32000 > 128000…", "max_tokens (32000) cannot exceed 8192",
+ * "max_new_tokens 32000 cannot be greater than max_output_tokens 8192".
+ */
+export function outputLimit(error: unknown, asked: number): number | undefined {
+  const message = (error as Error)?.message ?? "";
+  if (!/max(_new|_output)?_tokens|output tokens/i.test(message)) return undefined;
+  const below = [...message.matchAll(/\d+/g)].map((match) => Number(match[0])).filter((n) => n >= 256 && n < asked);
+  return below.length ? Math.max(...below) : undefined;
+}
+
 export class Ai {
   /** Remembers which chat route the workspace answers. */
   private route: "gateway" | "serving" | undefined;
@@ -109,22 +124,33 @@ export class Ai {
     }>,
   ): Promise<ChatCompletion> {
     const tools = Boolean(request.tools?.length);
-    const body = {
+    const asked = request.maxTokens ?? 4096;
+    let body: Record<string, unknown> & { max_tokens: number } = {
       model: request.model,
       messages: request.messages,
       ...(tools && { tools: request.tools, tool_choice: "auto" }),
-      max_tokens: request.maxTokens ?? 4096,
+      max_tokens: Math.min(asked, OUTPUT_LIMITS.get(request.model) ?? asked),
       ...(request.temperature !== undefined && { temperature: request.temperature }),
       ...(tools && NO_REASONING_WITH_TOOLS.has(request.model) && { reasoning_effort: "none" }),
     };
-    try {
-      return await this.send(request.model, body, request.signal);
-    } catch (error) {
-      // Some models reject tools while reasoning on chat completions and say
-      // to turn reasoning off; do that and remember it for the model.
-      if (!tools || NO_REASONING_WITH_TOOLS.has(request.model) || !needsReasoningOff(error)) throw error;
-      NO_REASONING_WITH_TOOLS.add(request.model);
-      return this.send(request.model, { ...body, reasoning_effort: "none" }, request.signal);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.send(request.model, body, request.signal);
+      } catch (error) {
+        if (attempt >= 2) throw error;
+        // Some models reject tools while reasoning on chat completions and say
+        // to turn reasoning off; do that and remember it for the model.
+        if (tools && body.reasoning_effort === undefined && needsReasoningOff(error)) {
+          NO_REASONING_WITH_TOOLS.add(request.model);
+          body = { ...body, reasoning_effort: "none" };
+          continue;
+        }
+        // A model with a lower output ceiling says what it is; use that, and remember it.
+        const limit = outputLimit(error, body.max_tokens);
+        if (!limit) throw error;
+        OUTPUT_LIMITS.set(request.model, limit);
+        body = { ...body, max_tokens: limit };
+      }
     }
   }
 

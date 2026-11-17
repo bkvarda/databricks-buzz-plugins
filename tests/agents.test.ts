@@ -4,7 +4,8 @@ import { runLoop, trimHistory } from "../plugins/agents/src/loop";
 import { plainText } from "../plugins/agents/src/state";
 import { normalizeDatabricks, summarize } from "../plugins/agents/src/types";
 import { filterOptions, modelOptions } from "../plugins/agents/src/ui";
-import { Ai, modelLabel } from "@dbx/core/api/ai";
+import { Ai, modelLabel, outputLimit } from "@dbx/core/api/ai";
+import { apiError } from "@dbx/core/client";
 import { fromCsv, parseCsv, RESULT_LANGUAGE, resultBlock, resultSet } from "@dbx/core/result";
 
 function fakeBuzz(log: unknown[]) {
@@ -76,6 +77,58 @@ describe("agent loop", () => {
     const controller = new AbortController();
     controller.abort();
     await expect(runLoop({ model: "m", system: "s", history: [], prompt: "p", chat: async () => looping, signal: controller.signal })).rejects.toThrow();
+  });
+
+  it("never keeps an empty response, and leaves out one saved by an earlier version", async () => {
+    // A saved session ending in an assistant message with no text and no tool calls: Claude rejects it ("messages.6.content: Input should be a valid list").
+    const history: ChatMessage[] = [
+      { role: "user", content: "check git" },
+      { role: "assistant", content: null, tool_calls: [{ id: "g", type: "function", function: { name: "databricks_genie_ask", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "g", content: "clean" },
+      { role: "assistant", content: null },
+    ];
+    const sent: (readonly ChatMessage[])[] = [];
+    const result = await runLoop({
+      model: "m", system: "s", history, prompt: "go on", buzz: fakeBuzz([]),
+      chat: async (request) => {
+        sent.push(request.messages);
+        return reply({ role: "assistant", content: [{ type: "reasoning" }] });
+      },
+      signal: new AbortController().signal,
+    });
+    expect(sent[0]?.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool", "user"]);
+    expect(result.messages).toEqual([{ role: "user", content: "go on" }]);
+    expect(trimHistory([...history, ...result.messages]).some((m) => m.role === "assistant" && !m.content && !m.tool_calls)).toBe(false);
+  });
+
+  it("goes on in smaller steps when a response stops at the output limit", async () => {
+    const cut = (content: ChatCompletion["choices"][number]["message"]["content"]): ChatCompletion => ({ choices: [{ finish_reason: "length", message: { role: "assistant", content } }] });
+    const seen: { messages: readonly ChatMessage[]; maxTokens: number }[] = [];
+    const script = [
+      // Writing a big file: cut off before the tool call was complete, so it arrives as nothing.
+      cut([{ type: "reasoning" }]),
+      reply({ role: "assistant", content: null, tool_calls: [{ id: "w", type: "function", function: { name: "databricks_genie_ask", arguments: "{}" } }] }),
+      // A long answer cut off, then finished.
+      cut("The first half, "),
+      reply({ role: "assistant", content: "and the rest." }),
+    ];
+    const result = await runLoop({
+      model: "m", system: "s", history: [], prompt: "write it", buzz: fakeBuzz([]),
+      chat: async (request) => {
+        seen.push({ messages: request.messages, maxTokens: request.maxTokens });
+        return script.shift()!;
+      },
+      signal: new AbortController().signal,
+    });
+    expect(seen[0]?.maxTokens).toBe(16_000);
+    expect(seen[1]?.messages.at(-1)).toMatchObject({ role: "user", content: expect.stringMatching(/output limit.*smaller steps/s) });
+    expect(seen[1]?.messages.some((m) => m.role === "assistant" && !m.content && !m.tool_calls)).toBe(false);
+    expect(seen[3]?.messages.slice(-2)).toEqual([{ role: "assistant", content: "The first half, " }, { role: "user", content: expect.stringMatching(/Continue exactly where it stopped/) }]);
+    expect(result.text).toBe("The first half, and the rest.");
+    // Cut off every time: it says so instead of going quiet.
+    await expect(
+      runLoop({ model: "m", system: "s", history: [], prompt: "p", chat: async () => cut([{ type: "reasoning" }]), signal: new AbortController().signal }),
+    ).rejects.toThrow(/output limit/);
   });
 
   it("trims history at user turns", () => {
@@ -283,6 +336,34 @@ describe("AI Gateway chat", () => {
     // Without tools nothing changes.
     await ai.chat({ model: "system.ai.test-reasoning", messages: [{ role: "user", content: "plain" }] });
     expect(bodies[3]?.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("AI Gateway output limits", () => {
+  it("reads the ceiling each model names", () => {
+    expect(outputLimit(new Error("max_tokens: 500000 > 128000, which is the maximum allowed number of output tokens for anthropic.claude-haiku-5-5"), 500_000)).toBe(128_000);
+    expect(outputLimit(new Error("max_tokens (16000) cannot exceed 8192. Please reduce the length of max output tokens generated."), 16_000)).toBe(8192);
+    expect(outputLimit(new Error("max_new_tokens 16000 cannot be greater than max_output_tokens 8192."), 16_000)).toBe(8192);
+    expect(outputLimit(new Error("messages.6.content: Input should be a valid list"), 16_000)).toBeUndefined();
+  });
+
+  it("asks again within a model's ceiling, and remembers it", async () => {
+    const asked: number[] = [];
+    const client = {
+      post: async (_path: string, body: { max_tokens: number }) => {
+        asked.push(body.max_tokens);
+        if (body.max_tokens > 8192) throw Object.assign(new Error("max_tokens (16000) cannot exceed 8192."), { status: 400 });
+        return { choices: [{ message: { role: "assistant", content: "ok" } }] };
+      },
+    };
+    await new Ai(client as never).chat({ model: "system.ai.test-small", messages: [{ role: "user", content: "hi" }], maxTokens: 16_000 });
+    await new Ai(client as never).chat({ model: "system.ai.test-small", messages: [{ role: "user", content: "again" }], maxTokens: 16_000 });
+    expect(asked).toEqual([16_000, 8192, 8192]);
+  });
+
+  it("shows the model's own error, not the gateway's wrapping of it", () => {
+    const error = apiError({ status: 400, headers: {}, body: JSON.stringify({ error_code: "BAD_REQUEST", message: JSON.stringify({ message: "messages.6.content: Input should be a valid list" }) }) });
+    expect(error.message).toBe("messages.6.content: Input should be a valid list");
   });
 });
 
