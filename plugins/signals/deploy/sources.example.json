@@ -1,0 +1,82 @@
+{
+  "hub": "https://<your-signals-hub-app-url>",
+  "sources": [
+    {
+      "name": "google_calendar",
+      "kind": "mcp",
+      "tool": "calendar_event_list",
+      "args": { "time_min": "{now}", "time_max": "{now+7d}", "max_results": 50, "query": "" },
+      "items": "items",
+      "map": {
+        "external_id": "id",
+        "title": "summary",
+        "url": "htmlLink",
+        "occurred_at": "{start.dateTime}{start.date}",
+        "payload": ["start", "end", "status", "attendeeCount", "location", "hangoutLink"]
+      }
+    },
+    {
+      "name": "gmail",
+      "kind": "mcp",
+      "tool": "gmail_search",
+      "args": { "query": "in:inbox after:{since_epoch}", "max_results": 50 },
+      "items": "items",
+      "lookback_hours": 24,
+      "map": {
+        "external_id": "id",
+        "title": "subject",
+        "actor": "from",
+        "group_key": "threadId",
+        "url": "https://mail.google.com/mail/u/0/#all/{threadId}",
+        "occurred_at": "date",
+        "payload": ["from", "to", "snippet", "labelIds"]
+      }
+    },
+    {
+      "name": "google_drive",
+      "kind": "mcp",
+      "tool": "google_drive_list_recent",
+      "args": { "days": 1, "max_results": 50 },
+      "items": "items",
+      "map": {
+        "external_id": "{id}:{modifiedTime}",
+        "group_key": "id",
+        "title": "name",
+        "url": "webViewLink",
+        "occurred_at": "modifiedTime",
+        "payload": ["mimeType", "modifiedTime"]
+      }
+    },
+    {
+      "name": "jira",
+      "kind": "mcp",
+      "service": "atlassian",
+      "tool": "searchJiraIssuesUsingJql",
+      "args": { "jql": "(assignee = currentUser() OR reporter = currentUser() OR watcher = currentUser()) AND updated >= \"{since_date}\" ORDER BY updated DESC", "maxResults": 50, "fields": ["summary", "status", "updated", "priority", "assignee"] },
+      "items": "issues",
+      "lookback_hours": 48,
+      "map": {
+        "external_id": "key",
+        "group_key": "key",
+        "title": "{key} {fields.summary}",
+        "occurred_at": "fields.updated",
+        "payload": { "status": "{fields.status.name}", "priority": "{fields.priority.name}", "assignee": "{fields.assignee.displayName}" }
+      }
+    },
+    {
+      "name": "table.support_cases",
+      "kind": "table",
+      "table": "main.support.cases",
+      "query": "SELECT case_id, subject, status, account_name, updated_at FROM main.support.cases WHERE updated_at > :since ORDER BY updated_at LIMIT 1000",
+      "watermark": "updated_at",
+      "map": {
+        "external_id": "case_id",
+        "group_key": "case_id",
+        "title": "{case_id} {subject}",
+        "account": "account_name",
+        "occurred_at": "updated_at",
+        "payload": ["status", "subject"]
+      }
+    }
+  ]
+}

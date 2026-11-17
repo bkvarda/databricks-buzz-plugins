@@ -100,6 +100,36 @@ async function appModule(dir) {
   return { sdk, starter, indexer, sha };
 }
 
+// A plugin with app/main.ts has a Databricks App of its own (the signals hub):
+// it's bundled with its Postgres driver into <plugin>/hub/app.mjs (outside dist/,
+// which Buzz installs), next to its
+// app.yaml and anything in deploy/ (a poller job, example configs), ready to
+// upload to a workspace folder and deploy.
+async function standaloneApp(dir) {
+  const entry = join(dir, "app/main.ts");
+  if (!(await exists(entry))) return undefined;
+  const target = join(dir, "hub");
+  await rm(target, { recursive: true, force: true });
+  await mkdir(target, { recursive: true });
+  await build({
+    entryPoints: [entry],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node20",
+    minify: true,
+    legalComments: "none",
+    outfile: join(target, "app.mjs"),
+    external: ["pg-native", "cloudflare:sockets"],
+    tsconfig: join(root, "tsconfig.json"),
+    banner: { js: "// Built by databricks-buzz-plugins. Apache-2.0.\nimport { createRequire as __buzzRequire } from 'node:module';\nconst require = __buzzRequire(import.meta.url);" },
+    logLevel: "silent",
+  });
+  const deploy = join(dir, "deploy");
+  if (await exists(deploy)) for (const file of await readdir(deploy)) if (!/^test_|__pycache__/.test(file)) await copyFile(join(deploy, file), join(target, file));
+  return (await stat(join(target, "app.mjs"))).size;
+}
+
 for (const name of plugins) {
   const dir = join(root, "plugins", name);
   const manifestPath = join(dir, "manifest.json");
@@ -155,11 +185,12 @@ for (const name of plugins) {
     if (output.imports.length) throw new Error(`plugin.js must not import anything: ${output.imports.map((i) => i.path).join(", ")}`);
     if (!output.exports.includes("apply") || !output.exports.includes("inject"))
       throw new Error("plugin.js must export inject and apply(ctx)");
+    const appSize = await standaloneApp(dir);
     const code = await readFile(join(out, "plugin.js"), "utf8");
     if (Buffer.byteLength(code) > 8 * 1024 * 1024) throw new Error("plugin.js exceeds Buzz's 8 MiB artifact limit");
     await writeFile(join(out, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
     for (const extra of ["README.md", "icon.png"]) if (await exists(join(dir, extra))) await copyFile(join(dir, extra), join(out, extra));
-    console.log(`✓ ${name.padEnd(20)} ${(Buffer.byteLength(code) / 1024).toFixed(1).padStart(7)} KiB  ${manifest.id}${runner ? ` (runner ${(Buffer.byteLength(runner.code) / 1024).toFixed(0)} KiB)` : ""}`);
+    console.log(`✓ ${name.padEnd(20)} ${(Buffer.byteLength(code) / 1024).toFixed(1).padStart(7)} KiB  ${manifest.id}${runner ? ` (runner ${(Buffer.byteLength(runner.code) / 1024).toFixed(0)} KiB)` : ""}${appSize ? ` (app ${(appSize / 1024).toFixed(0)} KiB)` : ""}`);
   } catch (error) {
     failed = true;
     console.error(`✗ ${name}: ${error.message ?? error}`);
