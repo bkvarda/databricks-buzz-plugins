@@ -88,7 +88,7 @@
         "group_key": "key",
         "title": "{key} {fields.summary}",
         "occurred_at": "fields.updated",
-        "payload": { "status": "{fields.status.name}", "priority": "{fields.priority.name}", "assignee": "{fields.assignee.displayName}" }
+        "payload": { "status": "{fields.status.name}", "status_category": "{fields.status.statusCategory.name}", "priority": "{fields.priority.name}", "assignee": "{fields.assignee.displayName}" }
       }
     },
     {

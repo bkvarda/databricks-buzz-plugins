@@ -2,8 +2,8 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { accountRule, configProblems, decide, doneReason, finishes, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -299,8 +299,8 @@ describe("the hub API", () => {
     await call("POST", "/api/events", { events: [{ source: "table.cases", external_id: "C-1", payload: { status: "Awaiting Confirmation" } }] });
     expect(posts).toEqual([]);
     fail = false;
-    expect(await hub.sweep()).toEqual({ posted: 1, nudged: 0 });
-    expect(await hub.sweep(Math.floor(Date.now() / 1000) + 80 * 3600)).toEqual({ posted: 0, nudged: 1 });
+    expect(await hub.sweep()).toEqual({ posted: 1, nudged: 0, finished: 0 });
+    expect(await hub.sweep(Math.floor(Date.now() / 1000) + 80 * 3600)).toEqual({ posted: 0, nudged: 1, finished: 0 });
     expect(posts.at(-1)).toEqual({ kind: "updated", task: 1, text: "⏰ Case C-1 has waited 80h for confirmation" });
   });
 });
@@ -821,5 +821,115 @@ describe("the board page's route", () => {
     expect(boardRoute({ kind: "page", route: { version: 1, params: { channel: "c1", name: "acme" } } })).toEqual({ channel: "c1", name: "acme" });
     expect(boardRoute({ kind: "page", route: { version: 1, params: null } })).toEqual({});
     expect(boardRoute(undefined)).toEqual({});
+  });
+});
+
+describe("tasks that finish themselves", () => {
+  it("checks done_when", () => {
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: {} }] })).toEqual(["rules[0].done_when needs when, after or idle_days"]);
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: { after: "", idle_days: 0, when: { x: "(" } } }] })).toEqual([
+      "rules[0].done_when.when.x isn't a valid regular expression",
+      "rules[0].done_when.after is an event field holding a time, like payload.end",
+      "rules[0].done_when.idle_days must be a positive number",
+    ]);
+    expect(configProblems({ version: 1, done_idle_days: -1, rules: [] })).toEqual(["done_idle_days must be a positive number"]);
+    expect(configProblems({ version: 1, done_idle_days: 14, rules: [{ id: "a", action: "task", done_when: { after: "payload.end", grace_hours: 2, note: "over" } }] })).toEqual([]);
+  });
+
+  it("reads times from ISO strings, Unix seconds and calendar objects", () => {
+    expect(timeOf("2026-11-20T17:00:00Z")).toBe(Date.parse("2026-11-20T17:00:00Z") / 1000);
+    expect(timeOf({ dateTime: "2026-11-20T09:00:00-08:00", timeZone: "America/Los_Angeles" })).toBe(Date.parse("2026-11-20T17:00:00Z") / 1000);
+    expect(timeOf({ date: "2026-11-20" })).toBe(Date.parse("2026-11-20") / 1000);
+    expect(timeOf(1795000000)).toBe(1795000000);
+    expect(timeOf(1795000000123)).toBe(1795000000);
+    expect(timeOf("soon")).toBeUndefined();
+    expect(timeOf("")).toBeUndefined();
+    expect(timeOf(undefined)).toBeUndefined();
+  });
+
+  it("says why a task is done", () => {
+    const meeting: EventInput = { source: "google_calendar", external_id: "m", title: "QBR", payload: { end: { dateTime: "2026-11-20T17:00:00Z" } } };
+    const end = Date.parse("2026-11-20T17:00:00Z") / 1000;
+    expect(doneReason({ after: "payload.end" }, meeting, { at: end - 1, sweep: true })).toBeUndefined();
+    expect(doneReason({ after: "payload.end" }, meeting, { at: end, sweep: true })).toBe("it ended 2026-11-20 17:00 UTC");
+    expect(doneReason({ after: "payload.end", grace_hours: 2 }, meeting, { at: end + 3600, sweep: true })).toBeUndefined();
+    expect(doneReason({ after: "payload.end", note: "{title} is over" }, meeting, { at: end + 1, sweep: true })).toBe("QBR is over");
+    // Times are only the sweep's.
+    expect(doneReason({ after: "payload.end" }, meeting, { at: end + 1, sweep: false })).toBeUndefined();
+    expect(doneReason({ idle_days: 3 }, meeting, { at: 10 * 86400, sweep: true, lastActive: 8 * 86400 })).toBeUndefined();
+    expect(doneReason({ idle_days: 3 }, meeting, { at: 10 * 86400, sweep: true, lastActive: 7 * 86400 })).toBe("nothing new in 3 days");
+    const ticket: EventInput = { source: "jira", external_id: "T-1", payload: { status: "Resolved", status_category: "Done" } };
+    expect(doneReason({ when: { "payload.status_category": ["Done"] } }, ticket, { at: 0, sweep: false })).toBe("its latest update says it's finished");
+    expect(doneReason({ when: { "payload.status_category": ["Done"] }, note: "{external_id} is {payload.status}" }, ticket, { at: 0, sweep: false })).toBe("T-1 is Resolved");
+  });
+
+  const rules: SignalsConfig = {
+    version: 1,
+    rules: [
+      { id: "prep", sources: ["google_calendar"], action: "task", title: "Prep: {title}", group_by: "external_id", done_when: { after: "payload.end", note: "the meeting has ended" } },
+      { id: "tickets", sources: ["jira"], unless: { "payload.status_category": ["Done"] }, action: "task", group_by: "external_id", done_when: { when: { "payload.status_category": ["Done"] }, note: "{external_id} is {payload.status}" } },
+      { id: "mail", sources: ["gmail"], action: "task", group_by: "group_key" },
+    ],
+  };
+
+  it("finds the tasks an event finishes, even when the rule skips it", () => {
+    const resolved: EventInput = { source: "jira", external_id: "T-1", payload: { status_category: "Done" } };
+    expect(decide(rules, resolved, { firstRun: false })).toMatchObject({ kind: "none" });
+    expect(finishes(rules, resolved).map((found) => [found.rule.id, found.group])).toEqual([["tickets", "tickets|T-1"]]);
+    expect(finishes(rules, { source: "jira", external_id: "T-1", payload: { status_category: "In Progress" } })).toEqual([]);
+    expect(finishes(rules, { source: "gmail", external_id: "x", payload: { status_category: "Done" } })).toEqual([]);
+  });
+
+  it("closes tickets when Jira resolves them, and meetings once they've ended, with a line in the thread", async () => {
+    const store = new SignalsStore(pglite(), "signals_done");
+    await store.setup();
+    const posts: { kind: string; task: number; text?: string }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => (posts.push({ kind: "opened", task: task.id }), `root-${task.id}`), updated: async (task, text) => void posts.push({ kind: "updated", task: task.id, text }) },
+      { defaultConfig: { ...rules, default_channel: "triage", done_idle_days: 14 } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    for (const source of ["jira", "google_calendar", "gmail"]) await call("/api/sources", { source, enabled: true });
+    await call("/api/events", { events: [{ source: "jira", external_id: "seed" }, { source: "google_calendar", external_id: "seed" }, { source: "gmail", external_id: "seed" }] });
+    const t = Math.floor(Date.now() / 1000);
+
+    // A ticket: open while in progress, done (and said so) when its status category is Done.
+    await call("/api/events", { events: [{ source: "jira", external_id: "T-1", title: "T-1 Broken", payload: { status: "In Progress", status_category: "In Progress" } }] });
+    expect((await store.task(1))!).toMatchObject({ status: "open" });
+    const resolved = await call("/api/events", { events: [{ source: "jira", external_id: "T-1", title: "T-1 Broken", payload: { status: "Resolved", status_category: "Done" } }] });
+    expect(resolved.json).toMatchObject({ created: [], updated: [] });
+    expect((await store.task(1))!).toMatchObject({ status: "done", event_count: 2 });
+    expect(posts.at(-1)).toEqual({ kind: "updated", task: 1, text: doneMessage("T-1 is Resolved") });
+    expect((await store.detail(1))!.activities.map((activity) => activity.text)).toContain("done: T-1 is Resolved");
+    // Seen again done: nothing more. Reopened in Jira: the task opens again.
+    await call("/api/events", { events: [{ source: "jira", external_id: "T-1", title: "T-1 Broken", payload: { status: "Closed", status_category: "Done" } }] });
+    expect(posts.filter((post) => post.task === 1 && post.text?.startsWith("✅"))).toHaveLength(1);
+    // A ticket first seen already resolved opens nothing.
+    await call("/api/events", { events: [{ source: "jira", external_id: "T-2", payload: { status_category: "Done" } }] });
+    expect(await store.tasks()).toHaveLength(1);
+
+    // A meeting: done by the sweep once its end has passed, not before.
+    const end = t + 3600;
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "m1", title: "QBR", payload: { end: { dateTime: new Date(end * 1000).toISOString() } } }] });
+    const meeting = (await store.tasks({ open: true }))[0]!;
+    expect(await hub.sweep(end - 60)).toMatchObject({ finished: 0 });
+    expect((await store.task(meeting.id))!.status).toBe("open");
+    expect(await hub.sweep(end + 60)).toMatchObject({ finished: 1 });
+    expect((await store.task(meeting.id))!.status).toBe("done");
+    expect(posts.at(-1)).toEqual({ kind: "updated", task: meeting.id, text: doneMessage("the meeting has ended") });
+    // A late change to the meeting (after it ended) doesn't reopen it.
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "m1", title: "QBR (notes)", payload: { end: { dateTime: new Date((t - 10) * 1000).toISOString() } } }] });
+    expect((await store.task(meeting.id))!.status).toBe("done");
+
+    // A task waiting on a question stays open; the config's done_idle_days closes anything else left idle.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "g1", title: "Hello", group_key: "th1" }, { source: "gmail", external_id: "g2", title: "Pricing?", group_key: "th2" }] });
+    const [mailA, mailB] = (await store.tasks({ open: true })).sort((a, b) => a.id - b.id);
+    await store.setQuestion(mailB!.id, "agent", { question: "Which plan?", options: [], by: "agent" });
+    expect(await hub.sweep(t + 13 * 86400)).toMatchObject({ finished: 0 });
+    expect(await hub.sweep(t + 15 * 86400)).toMatchObject({ finished: 1 });
+    expect((await store.task(mailA!.id))!.status).toBe("done");
+    expect(posts.at(-1)!.text).toBe(doneMessage("nothing new in 14 days"));
+    expect((await store.task(mailB!.id))!.status).toBe("waiting");
   });
 });

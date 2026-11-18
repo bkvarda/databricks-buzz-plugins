@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountRecord, contentKey, decide, type EventInput, isOpen, matches, type Mode, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountRecord, contentKey, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -78,6 +78,8 @@ export type IngestResult = Readonly<{
   created: Task[];
   /** Tasks an event of this post was added to. */
   updated: { task: Task; title?: string; url?: string }[];
+  /** Tasks an event of this post finished (its rule's done_when.when), and why. */
+  finished: { task: Task; reason: string }[];
   firstRun: boolean;
 }>;
 
@@ -277,7 +279,7 @@ export class SignalsStore {
    * are skipped (that's the opt-in). Returns what changed, for Buzz.
    */
   async ingest(owner: string, events: readonly EventInput[], config: SignalsConfig): Promise<IngestResult> {
-    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, errors: [], created: [], updated: [], firstRun: false };
+    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, errors: [], created: [], updated: [], finished: [], firstRun: false };
     const counts = result as { -readonly [K in keyof IngestResult]: IngestResult[K] };
     const consent = new Map<string, { enabled: boolean; firstRun: boolean }>();
     const touched = new Map<number, Task>();
@@ -295,10 +297,23 @@ export class SignalsStore {
         counts[recorded.outcome]++;
         if (recorded.outcome === "same") continue;
         const placed = await this.place(owner, event, recorded, config, state.firstRun);
-        if (!placed) continue;
+        // An event can finish a task even when its rule no longer matches it (a resolved ticket).
+        let finishedHere = false;
+        for (const { rule, group } of finishes(config, event)) {
+          const task = placed?.task.group_key === group ? placed.task : await this.taskByGroup(group);
+          if (!task || !isOpen(task.status) || (task.series && task.asked_by === SERIES_ASKER)) continue;
+          await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
+          const reason = doneReason(rule.done_when, event, { at: now(), sweep: false })!;
+          const done = await this.finish(task.id, reason);
+          if (task.id === placed?.task.id) finishedHere = true;
+          // A task its own first event finishes (a ticket already resolved) is never posted.
+          if (done && !(placed?.opened && task.id === placed.task.id)) result.finished.push({ task: done, reason });
+        }
+        if (!placed || finishedHere) continue;
         let task = placed.task;
         if (placed.opened) opened.add(task.id);
-        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new") {
+        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true })) {
+          // (A finished task stays done when a late event for it is itself past done, like a meeting's notes after it ended.)
           await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
         }
         await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
@@ -325,17 +340,18 @@ export class SignalsStore {
    * task asks the team, and the series' other events are held until they
    * answer; a series they said never to work on opens no tasks.
    */
-  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean): Promise<{ task: Task; opened: boolean; create: boolean } | undefined> {
+  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const decision = decide(config, event, { firstRun });
     if (decision.kind === "none") return undefined;
     const task = await this.taskByGroup(decision.group);
-    if (task) return { task, opened: false, create: decision.create };
+    const rule = decision.rule;
+    if (task) return { task, opened: false, create: decision.create, rule };
     if (!decision.create) return undefined;
     const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) };
-    if (!decision.series) return { task: await this.openTask(input), opened: true, create: true };
+    if (!decision.series) return { task: await this.openTask(input), opened: true, create: true, rule };
     const series = await this.seriesFor(decision.series);
     if (series?.answer === "never") return undefined;
-    if (series?.answer === "always") return { task: await this.openTask({ ...input, series: decision.series }), opened: true, create: true };
+    if (series?.answer === "always") return { task: await this.openTask({ ...input, series: decision.series }), opened: true, create: true, rule };
     if (series?.asked_task) {
       await this.q(`UPDATE $S.events SET held_series = $2 WHERE id = $1`, [recorded.id, decision.series]);
       return undefined;
@@ -347,7 +363,7 @@ export class SignalsStore {
        ON CONFLICT (key) DO UPDATE SET asked_task = EXCLUDED.asked_task, title = EXCLUDED.title, mode = EXCLUDED.mode`,
       [decision.series, decision.rule.id, decision.account?.name ?? null, decision.title, asking.id, decision.mode, now()],
     );
-    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(decision.title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true };
+    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(decision.title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
   }
 
   private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string }): Promise<Task> {
@@ -587,6 +603,41 @@ export class SignalsStore {
       }
     }
     return out;
+  }
+
+  /**
+   * Open tasks that are finished by their rule's `done_when` times: an
+   * `after` time that has passed (a meeting's end), or nothing new for
+   * `idle_days` (or the config's `done_idle_days`, for any rule's tasks, even
+   * a rule that's gone). Tasks asking the team a question are left open.
+   */
+  async finishable(config: SignalsConfig, at = now(), limit = 1000): Promise<{ task: Task; reason: string }[]> {
+    const rules = new Map(config.rules.map((rule) => [rule.id, rule]));
+    const found = await this.q(
+      `SELECT t.*, e.source AS e_source, e.external_id AS e_external_id, e.title AS e_title, e.url AS e_url, e.actor AS e_actor, e.account AS e_account, e.payload AS e_payload,
+         (SELECT max(a.at) FROM $S.activities a WHERE a.task_id = t.id AND a.kind <> 'nudge') AS last_activity
+       FROM $S.tasks t LEFT JOIN $S.events e ON e.id = t.latest_event
+       WHERE t.status NOT IN ('done', 'dismissed') AND t.question IS NULL ORDER BY t.id LIMIT ${limit}`,
+    );
+    const out: { task: Task; reason: string }[] = [];
+    for (const row of found.rows) {
+      const rule = rules.get(String(row.rule_id));
+      const done = rule ? doneWhenOf(config, rule) : config.done_idle_days ? { idle_days: config.done_idle_days } : undefined;
+      if (!done) continue;
+      const event: EventInput | undefined = row.e_source
+        ? { source: String(row.e_source), external_id: String(row.e_external_id), ...(row.e_title ? { title: String(row.e_title) } : {}), ...(row.e_url ? { url: String(row.e_url) } : {}), ...(row.e_actor ? { actor: String(row.e_actor) } : {}), ...(row.e_account ? { account: String(row.e_account) } : {}), ...(row.e_payload ? { payload: row.e_payload as Record<string, unknown> } : {}) }
+        : undefined;
+      const lastActive = Math.max(Number(row.last_event_at ?? 0), Number(row.created_at ?? 0), Number(row.last_activity ?? 0));
+      const reason = doneReason(done, event, { at, sweep: true, lastActive });
+      if (reason) out.push({ task: toTask(row), reason });
+    }
+    return out;
+  }
+
+  /** Marks a task done by its rule (not a person), clearing any question; undefined if it's gone. */
+  async finish(id: number, reason: string): Promise<Task | undefined> {
+    await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL WHERE id = $1`, [id]);
+    return this.setStatus(id, "done", "signals", reason);
   }
 
   async nudged(task: number, text: string, at = now()): Promise<void> {
