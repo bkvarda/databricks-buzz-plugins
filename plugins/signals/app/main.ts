@@ -1,7 +1,8 @@
 // The signals hub, a Databricks App with a Lakebase database.
 //
 // It takes events from each person's sources (their scheduled poller job, the
-// Signals plugin, agents) on POST /api/events, keeps one row per thing, and
+// Signals plugin, agents) on POST /api/events or, for poller jobs, through
+// the inbox table in Lakebase (see SignalsStore.setupInbox), keeps one row per thing, and
 // runs the rules to open and update tasks. As its own Buzz identity (when it
 // has one) it posts each new task in its account's channel and replies in the
 // task's thread as the task changes. Everything runs as the app's service
@@ -19,6 +20,7 @@ import { configProblems, type SignalsConfig } from "./model";
 import { schemaName, SignalsStore } from "./store";
 
 const SWEEP_MS = 5 * 60_000;
+const INBOX_MS = 30_000;
 
 const app = new BuzzApp({ about: "Turns events from your sources into tasks in your account channels. Mention me with “tasks” to see what's open." });
 const lakebase = new Lakebase(app.databricks);
@@ -51,7 +53,7 @@ const notifier: Notifier = {
   },
 };
 
-const state = { ready: false, setupError: undefined as string | undefined, lastSweep: undefined as string | undefined, stats: undefined as Awaited<ReturnType<SignalsStore["stats"]>> | undefined };
+const state = { ready: false, setupError: undefined as string | undefined, lastSweep: undefined as string | undefined, lastInbox: undefined as string | undefined, stats: undefined as Awaited<ReturnType<SignalsStore["stats"]>> | undefined };
 let hub: Hub | undefined;
 
 async function prepare() {
@@ -90,6 +92,7 @@ app.describe(() => ({
   hub: state.ready ? `ready (schema ${store.schema})` : (state.setupError ?? "setting up"),
   ...(state.stats && { tracked: `${state.stats.events} events, ${state.stats.open}/${state.stats.tasks} tasks open, ${state.stats.people} people with sources on` }),
   ...(state.lastSweep && { lastSweep: state.lastSweep }),
+  ...(state.lastInbox && { lastInbox: state.lastInbox }),
 }));
 
 setInterval(() => {
@@ -102,6 +105,21 @@ setInterval(() => {
     })
     .catch((error: Error) => (state.lastSweep = `failed: ${error.message}`));
 }, SWEEP_MS).unref();
+
+// Poller jobs that can't call the app (their tokens aren't OAuth) write to the inbox in Lakebase.
+let draining = false;
+setInterval(() => {
+  if (!hub || draining) return;
+  draining = true;
+  void hub
+    .drain()
+    .then((result) => {
+      if (result.handled || result.failed) state.lastInbox = `${new Date().toISOString()}: handled ${result.handled}, failed ${result.failed}`;
+    })
+    .catch((error: Error) => (state.lastInbox = `failed: ${error.message}`))
+    .finally(() => (draining = false));
+}, INBOX_MS).unref();
+setInterval(() => void store.pruneInbox().catch(() => {}), 6 * 3600_000).unref();
 
 void prepare();
 void app.start();

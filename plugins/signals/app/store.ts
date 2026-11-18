@@ -4,6 +4,7 @@
 // - sources: who turned on which source (the opt-in), and its last post.
 // - events: one row per (owner, source, external_id); a changed content hash
 //   is a new version, the same hash is only "seen again".
+// - inbox: posts from poller jobs that write to Lakebase as their owner.
 // - tasks: one per rule group across everyone (two people getting the same
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
@@ -91,6 +92,47 @@ export class SignalsStore {
     await this.q(`CREATE TABLE IF NOT EXISTS $S.activities (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, text text NOT NULL)`);
     await this.q(`CREATE INDEX IF NOT EXISTS activities_task ON $S.activities (task_id, at)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.artifacts (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, url text NOT NULL, title text)`);
+    await this.setupInbox();
+  }
+
+  /**
+   * The inbox: how a poller job reaches the hub when it can't call the app.
+   * Databricks Apps only take OAuth tokens, and a job's token isn't one, but
+   * the job can log in to Lakebase as its owner's own Postgres role. Each
+   * person may insert only `kind` and `body`, so `owner` is always their
+   * role (current_user), and row-level security shows them only their own
+   * inbox rows and sources. The hub owns the tables, so it reads them all.
+   */
+  private async setupInbox(): Promise<void> {
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.inbox (
+      id bigserial PRIMARY KEY, owner text NOT NULL DEFAULT current_user, kind text NOT NULL CHECK (kind IN ('events', 'cursor')),
+      body jsonb NOT NULL, at bigint NOT NULL DEFAULT extract(epoch FROM now())::bigint, done_at bigint, result jsonb)`);
+    await this.q(`CREATE INDEX IF NOT EXISTS inbox_todo ON $S.inbox (id) WHERE done_at IS NULL`);
+    await this.q(`ALTER TABLE $S.inbox ENABLE ROW LEVEL SECURITY`);
+    await this.q(`DROP POLICY IF EXISTS own_rows ON $S.inbox`);
+    await this.q(`CREATE POLICY own_rows ON $S.inbox USING (lower(owner) = lower(current_user)) WITH CHECK (lower(owner) = lower(current_user))`);
+    await this.q(`ALTER TABLE $S.sources ENABLE ROW LEVEL SECURITY`);
+    await this.q(`DROP POLICY IF EXISTS own_rows ON $S.sources`);
+    await this.q(`CREATE POLICY own_rows ON $S.sources FOR SELECT USING (owner = lower(current_user))`);
+    await this.q(`GRANT USAGE ON SCHEMA ${this.schema} TO PUBLIC`);
+    await this.q(`GRANT SELECT (id, kind, at, done_at, result), INSERT (kind, body) ON $S.inbox TO PUBLIC`);
+    await this.q(`GRANT USAGE ON SEQUENCE $S.inbox_id_seq TO PUBLIC`);
+    await this.q(`GRANT SELECT (source, enabled, cursor, last_post_at, last_error) ON $S.sources TO PUBLIC`);
+  }
+
+  /** Inbox posts the hub hasn't handled yet, oldest first. */
+  async inbox(limit = 20): Promise<{ id: number; owner: string; kind: "events" | "cursor"; body: unknown }[]> {
+    const found = await this.q<{ id: unknown; owner: string; kind: "events" | "cursor"; body: unknown }>(`SELECT id, owner, kind, body FROM $S.inbox WHERE done_at IS NULL ORDER BY id LIMIT $1`, [limit]);
+    return found.rows.map((row) => ({ ...row, id: Number(row.id) }));
+  }
+
+  async inboxDone(id: number, result: unknown, at = now()): Promise<void> {
+    await this.q(`UPDATE $S.inbox SET done_at = $2, result = $3 WHERE id = $1`, [id, at, JSON.stringify(result ?? null)]);
+  }
+
+  /** Deletes handled inbox posts older than `days`. */
+  async pruneInbox(days = 7, at = now()): Promise<void> {
+    await this.q(`DELETE FROM $S.inbox WHERE done_at IS NOT NULL AND done_at < $1`, [at - days * 86400]);
   }
 
   // --- config -------------------------------------------------------------

@@ -98,7 +98,11 @@ export type Rule = Readonly<{
   /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
   title?: string;
   workstream?: string;
-  /** Which events share a task: an event field (default group_key, else source+external_id). */
+  /**
+   * Which events share a task: an event field (`payload.workspace`), or a
+   * template of fields (`{payload.workspace}/{payload.model}`). Default
+   * group_key; when it's empty, the event's own source and external_id.
+   */
   group_by?: string;
   /** Rules with the same group share tasks (default: the rule's id). An `update` rule needs the group of the rule that opens the tasks. */
   group?: string;
@@ -187,6 +191,7 @@ export function configProblems(raw: unknown): string[] {
           } else if (!Array.isArray(condition)) problems.push(`${where}.${key}.${field} is a pattern or a list of values`);
         }
     }
+    if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
   }
   if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
@@ -253,9 +258,21 @@ export function accountFor(config: SignalsConfig, event: EventInput, rule?: Rule
   return accounts.find((account) => account.when && Object.keys(account.when).length && matches(account.when, event));
 }
 
+/** A group_by template filled in, or undefined when every field it names is empty. */
+function fillGroup(template: string, event: EventInput): string | undefined {
+  let any = false;
+  const filled = template.replace(/\{([a-z_][a-z0-9_.]*)\}/gi, (_, path: string) => {
+    const value = field(event, path);
+    if (value === undefined || value === null || value === "") return "";
+    any = true;
+    return typeof value === "object" ? JSON.stringify(value) : String(value).trim().toLowerCase();
+  });
+  return any ? filled : undefined;
+}
+
 /** Which task an event belongs to, for a rule. */
 export function groupKey(rule: Rule, event: EventInput): string {
-  const by = rule.group_by ? field(event, rule.group_by) : event.group_key;
+  const by = !rule.group_by ? event.group_key : rule.group_by.includes("{") ? fillGroup(rule.group_by, event) : field(event, rule.group_by);
   const group = by === undefined || by === null || by === "" ? `${event.source}:${event.external_id}` : String(by);
   return `${rule.group ?? rule.id}|${group}`;
 }

@@ -60,6 +60,63 @@ class Templates(unittest.TestCase):
         self.assertEqual(poller.tool_json({"structuredContent": {"a": 1}}), {"a": 1})
 
 
+class Extract(unittest.TestCase):
+    def test_match_takes_the_first_group_and_drops_misses(self):
+        item = {"key": "ES-9", "fields": {"summary": "Block: Auto increase for workspace 1234 / claude-sonnet-4"}}
+        mapping = {"external_id": "key", "payload": {"workspace": {"from": "fields.summary", "match": r"workspace (\d+)"}, "model": {"from": "fields.summary", "match": r"/ *([\w.-]+)"}, "other": {"from": "fields.summary", "match": "nope (x)"}}}
+        event = poller.to_event("jira", item, mapping, {"now": NOW, "since": NOW})
+        self.assertEqual(event["payload"], {"workspace": "1234", "model": "claude-sonnet-4", "other": None})
+        self.assertEqual(poller.extract("abc", "b"), "b")
+        self.assertIsNone(poller.extract(None, "b"))
+
+
+class FakeCursor:
+    def __init__(self, db):
+        self.db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, sql, params=()):
+        self.db.executed.append((sql, params))
+
+    def fetchall(self):
+        return [("gmail", True, "2026-11-17T10:00:00Z"), ("google_calendar", False, None)]
+
+
+class FakeDb:
+    def __init__(self):
+        self.executed = []
+
+    def cursor(self):
+        return FakeCursor(self)
+
+
+class Lakebase(unittest.TestCase):
+    def test_reads_sources_and_queues_events_then_the_cursor(self):
+        db = FakeDb()
+        inbox = poller.LakebaseInbox(None, {"schema": "signals_hub"}, connect=lambda: db)
+        ws = FakeWorkspace([], mcp={"gmail": {"items": [{"id": "m1", "subject": "Q", "threadId": "t1", "from": "x"}]}})
+        summary = poller.run(ws, {"sources": [MAIL, {**MAIL, "name": "google_calendar"}]}, None, None, log=lambda _: None, now=NOW, inbox=inbox)
+        self.assertEqual(summary, {"gmail": {"events": 1, "queued": 1}, "google_calendar": "off"})
+        self.assertFalse([c for c in ws.calls if c[0] == "hub"])
+        sql = [s for s, _ in db.executed]
+        self.assertEqual(sql[0], "SELECT source, enabled, cursor FROM signals_hub.sources")
+        self.assertEqual([p[0] for _, p in db.executed[1:]], ["events", "cursor"])
+        self.assertIn('"cursor": "2026-11-17T12:00:00Z"', db.executed[2][1][1])
+
+    def test_checks_its_settings(self):
+        with self.assertRaises(SystemExit):
+            poller.LakebaseInbox(None, {"schema": "x; drop"}, connect=lambda: FakeDb())
+        with self.assertRaises(SystemExit):
+            poller.LakebaseInbox(None, {})
+        with self.assertRaises(SystemExit):
+            poller.run(FakeWorkspace([]), {"sources": []}, None, None, log=lambda _: None, now=NOW)
+
+
 class Run(unittest.TestCase):
     def test_polls_only_sources_that_are_on_and_moves_cursors_after_posting(self):
         ws = FakeWorkspace(

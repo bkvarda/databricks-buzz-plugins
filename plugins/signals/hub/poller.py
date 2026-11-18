@@ -6,7 +6,21 @@ google_calendar, slack, ...) with their own sign-ins, and tables with their own
 grants. It keeps no state: the hub says which sources the person turned on and
 where each one stopped (its cursor).
 
-    python poller.py --config sources.json [--hub https://<app-url>] [--warehouse <id>] [--dry-run]
+    python poller.py --config sources.json [--hub https://<app-url> | --lakebase] [--warehouse <id>] [--dry-run]
+
+How it reaches the hub:
+
+- `--hub` calls the hub app's API. Databricks Apps only take OAuth tokens, so
+  this works from a laptop (`databricks auth login`) but not from a job, whose
+  token isn't one.
+- `--lakebase` (for jobs) writes to the hub's inbox table in Lakebase instead,
+  logged in as the job's owner's own Postgres role (a token from
+  /api/2.0/postgres/credentials). Row-level security lets each person write
+  only rows the hub reads as theirs, and read only their own sources. The hub
+  drains the inbox every half minute. Config: `"lakebase": {"endpoint":
+  "projects/<p>/branches/<b>/endpoints/<e>", "host": "<endpoint host>",
+  "database": "databricks_postgres", "schema": "signals_<app name>"}`. It
+  needs `psycopg[binary]` and a Postgres role for the person in the database.
 
 The config lists sources (see sources.example.json):
 
@@ -20,7 +34,11 @@ The config lists sources (see sources.example.json):
   `watermark` column seen.
 
 `map` turns an item into an event: external_id, title, url, actor, account,
-group_key, occurred_at, and payload (a list of fields, or "*" for the whole item).
+group_key, occurred_at, and payload (a list of fields, "*" for the whole item,
+or an object of specs). A spec is a path ("fields.summary"), a template
+("{key}: {fields.summary}"), or {"from": <spec>, "match": <regex>}, which takes
+the regex's first group (case-insensitive) and is left out without a match:
+{"from": "title", "match": "workspace (\\d+)"}.
 """
 
 from __future__ import annotations
@@ -104,10 +122,23 @@ def fill(template: Any, item: Any, clock: dict[str, dt.datetime]) -> Any:
     return re.sub(r"\{([A-Za-z0-9_.+-]+)\}", lambda m: "" if one(m.group(1)) is None else str(one(m.group(1))), template)
 
 
+def extract(found: Any, pattern: str) -> Any:
+    """The first capture group of `pattern` in `found` (or the whole match), case-insensitive; None without a match."""
+    if found in (None, ""):
+        return None
+    match = re.search(pattern, found if isinstance(found, str) else json.dumps(found, default=str), re.I)
+    if not match:
+        return None
+    groups = [group for group in match.groups() if group is not None]
+    return (groups[0] if groups else match.group(0)).strip()
+
+
 def to_event(source: str, item: dict, mapping: dict, clock: dict[str, dt.datetime]) -> dict | None:
     """An item as a hub event, or None without an external_id."""
 
     def value(spec: Any) -> Any:
+        if isinstance(spec, dict) and "match" in spec:
+            return extract(value(spec.get("from", "")), spec["match"])
         if isinstance(spec, str) and "{" not in spec:
             return get_path(item, spec)  # a plain path
         return fill(spec, item, clock)
@@ -244,6 +275,37 @@ class Workspace:
         return response.json()
 
 
+class LakebaseInbox:
+    """The hub's API, as far as a poller needs it, through the inbox table in Lakebase."""
+
+    def __init__(self, ws: Workspace, settings: dict, connect: Callable[[], Any] | None = None):
+        missing = [key for key in ("endpoint", "host", "schema") if not settings.get(key)]
+        if missing and connect is None:
+            raise SystemExit("--lakebase needs " + ", ".join(f"lakebase.{key}" for key in missing) + " in the config")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", settings.get("schema", "")):
+            raise SystemExit(f"lakebase.schema {settings.get('schema')!r} isn't a schema name")
+        self.schema = settings["schema"]
+        if connect is None:
+            import psycopg
+
+            user = ws.client.current_user.me().user_name
+            token = ws.client.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": settings["endpoint"]})["token"]
+            self.db = psycopg.connect(host=settings["host"], port=int(settings.get("port", 5432)), dbname=settings.get("database", "databricks_postgres"), user=user, password=token, sslmode="require", autocommit=True)
+        else:
+            self.db = connect()
+
+    def call(self, method: str, path: str, body: Any = None) -> Any:
+        with self.db.cursor() as cursor:
+            if (method, path) == ("GET", "/api/sources"):
+                # Row-level security returns only this person's sources.
+                cursor.execute(f"SELECT source, enabled, cursor FROM {self.schema}.sources")
+                return {"sources": [{"source": row[0], "enabled": row[1], "cursor": row[2]} for row in cursor.fetchall()]}
+            if method == "POST" and path in ("/api/events", "/api/cursor"):
+                cursor.execute(f"INSERT INTO {self.schema}.inbox (kind, body) VALUES (%s, %s)", ("events" if path == "/api/events" else "cursor", json.dumps(body, default=str)))
+                return {"queued": True}
+        raise RuntimeError(f"the inbox can't take {method} {path}")
+
+
 # ---------------------------------------------------------------------------
 # Polling
 
@@ -276,10 +338,17 @@ def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str 
     raise Unavailable(f"unknown kind {source['kind']}")
 
 
-def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry_run=False, log: Callable[[str], None] = print, now: dt.datetime | None = None) -> dict:
+def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry_run=False, log: Callable[[str], None] = print, now: dt.datetime | None = None, inbox: LakebaseInbox | None = None) -> dict:
+    """Polls the sources that are on. Reaches the hub at its URL, or through `inbox`."""
     now = now or dt.datetime.now(dt.timezone.utc)
     hub = hub or config.get("hub")
-    state = {} if dry_run or not hub else {s["source"]: s for s in ws.hub(hub, "GET", "/api/sources")["sources"]}
+    if not dry_run and not hub and not inbox:
+        raise SystemExit("Say where the hub is: --hub <app url> (or `hub` in the config), or --lakebase")
+
+    def call(method: str, path: str, body: Any = None) -> Any:
+        return inbox.call(method, path, body) if inbox else ws.hub(hub, method, path, body)
+
+    state = {} if dry_run else {s["source"]: s for s in call("GET", "/api/sources")["sources"]}
     summary: dict[str, Any] = {}
     for source in config.get("sources", []):
         name = source["name"]
@@ -293,25 +362,28 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
             summary[name] = f"unavailable: {error}"
             log(f"{name}: {summary[name]}")
             if not dry_run:
-                ws.hub(hub, "POST", "/api/cursor", {"source": name, "error": str(error)})
+                call("POST", "/api/cursor", {"source": name, "error": str(error)})
             continue
         except Exception as error:  # one source failing doesn't stop the others
             summary[name] = f"failed: {error}"
             log(f"{name}: {summary[name]}")
             if not dry_run:
-                ws.hub(hub, "POST", "/api/cursor", {"source": name, "error": f"failed: {error}"[:900]})
+                call("POST", "/api/cursor", {"source": name, "error": f"failed: {error}"[:900]})
             continue
         if dry_run:
             summary[name] = {"events": len(events), "sample": events[:3], "cursor": cursor}
             continue
-        totals = {"new": 0, "changed": 0, "same": 0, "created": 0}
+        totals = {"queued": 0} if inbox else {"new": 0, "changed": 0, "same": 0, "created": 0}
         for start in range(0, len(events), BATCH):
-            reply = ws.hub(hub, "POST", "/api/events", {"events": events[start : start + BATCH]})
+            reply = call("POST", "/api/events", {"events": events[start : start + BATCH]})
+            if inbox:  # the hub handles it within a minute
+                totals["queued"] += len(events[start : start + BATCH])
+                continue
             for key in ("new", "changed", "same"):
                 totals[key] += reply.get(key, 0)
             totals["created"] += len(reply.get("created", []))
-        # The cursor moves only once the hub has the events.
-        ws.hub(hub, "POST", "/api/cursor", {"source": name, "cursor": cursor, "error": ""})
+        # The cursor moves only once the hub has the events (the inbox keeps them in order).
+        call("POST", "/api/cursor", {"source": name, "cursor": cursor, "error": ""})
         summary[name] = {"events": len(events), **totals}
         log(f"{name}: {summary[name]}")
     return summary
@@ -321,12 +393,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--config", required=True, help="sources JSON (a workspace file or volume path)")
     parser.add_argument("--hub", help="the hub app's URL (or `hub` in the config)")
+    parser.add_argument("--lakebase", action="store_true", help="reach the hub through its inbox in Lakebase (for jobs; see `lakebase` in the config)")
     parser.add_argument("--warehouse", help="SQL warehouse id, for table sources")
     parser.add_argument("--dry-run", action="store_true", help="poll every source and print, without the hub")
     args = parser.parse_args(list(argv) if argv is not None else None)
     with open(args.config) as file:
         config = json.load(file)
-    summary = run(Workspace(), config, args.hub, args.warehouse, args.dry_run)
+    ws = Workspace()
+    inbox = LakebaseInbox(ws, config.get("lakebase") or {}) if args.lakebase and not args.dry_run else None
+    summary = run(ws, config, args.hub, args.warehouse, args.dry_run, inbox=inbox)
     print(json.dumps(summary, indent=2, default=str))
     return 0
 

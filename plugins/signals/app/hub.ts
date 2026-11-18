@@ -211,6 +211,26 @@ export class Hub {
     return { json: await this.store.detail(id) };
   }
 
+  /**
+   * Handles what poller jobs wrote to the inbox, in order, exactly as if they
+   * had posted it to /api/events or /api/cursor: the owner is the Postgres
+   * role that wrote the row. Run every half minute or so.
+   */
+  async drain(limit = 20): Promise<{ handled: number; failed: number }> {
+    let handled = 0;
+    let failed = 0;
+    for (const post of await this.store.inbox(limit)) {
+      const reply = await this.handle({ method: "POST", path: post.kind === "events" ? "/api/events" : "/api/cursor", query: new URLSearchParams(), user: post.owner, body: async () => JSON.stringify(post.body) });
+      const status = reply.status ?? 200;
+      if (status >= 400) {
+        failed++;
+        this.log(`inbox ${post.id} from ${post.owner} failed: ${(reply.json as { error?: string }).error ?? status}`);
+      } else handled++;
+      await this.store.inboxDone(post.id, { status, ...(reply.json as object) });
+    }
+    return { handled, failed };
+  }
+
   /** Posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
   async sweep(at?: number): Promise<{ posted: number; nudged: number }> {
     let posted = 0;

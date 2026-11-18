@@ -37,8 +37,19 @@ flowchart LR
 3. **Rules:** edit `signals.config.json` before deploying. Admins (set with `SIGNALS_ADMINS`) can also `POST /api/config`.
 4. **Each person:**
    1. Turn sources on in **Settings → Signals**.
-   2. Create a scheduled job (serverless, every 15 minutes, say) **owned by them** that runs `poller.py --config sources.json --hub <app url> [--warehouse <id>]`.
-   3. Try it first with `--dry-run`, which reads every source and prints the events without the hub.
+   2. Create a scheduled job (serverless, every 15 minutes, say) **owned by them** that runs `poller.py --config sources.json --lakebase [--warehouse <id>]`, with `psycopg[binary]` as a dependency. Give them a Postgres role in the hub's database (Lakebase → Roles → add their Databricks identity).
+   3. From a laptop signed in with `databricks auth login`, `--hub <app url>` works too, and replies with what each post did.
+   4. Try it first with `--dry-run`, which reads every source and prints the events without the hub.
+
+### How a job reaches the hub
+
+Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job can't call the hub's API. It can log in to Lakebase as its owner, though, so `--lakebase` writes to the hub's **inbox** table instead:
+
+- Each person can insert only `kind` and `body`. The row's `owner` is always their own Postgres role (`current_user`), so a post can't claim to be from someone else.
+- Row-level security shows each person only their own inbox rows and only their own `sources` rows (source, enabled, cursor, last post, last error). They can't change either table.
+- The hub drains the inbox every 30 seconds, through the same path as `POST /api/events` and `POST /api/cursor`, and deletes handled rows after a week.
+- Add to `sources.json`: `"lakebase": {"endpoint": "projects/<p>/branches/<b>/endpoints/<e>", "host": "<endpoint host>", "database": "databricks_postgres", "schema": "signals_<app name>"}`. The schema is on the hub's status page.
+- Roles with `BYPASSRLS` (Lakebase project owners) aren't limited by these policies. They can read the database anyway.
 
 ## Rules
 
@@ -65,7 +76,7 @@ flowchart LR
   - `task` opens or updates the task for the event's group.
   - `update` only adds the event to a task that already exists for its group.
   - `ignore` records the event and does nothing else.
-- **Groups:** events with the same `group_by` value share one task, across everyone. Rules with the same `group` (default: the rule's id) share tasks, so an `update` rule names the group of the rule that opens them. When two people get the same thread, it becomes one task.
+- **Groups:** events with the same `group_by` value share one task, across everyone. `group_by` is a field (`payload.workspace`) or a template (`{payload.workspace}/{payload.model}`; values are trimmed and lowercased, and an event whose fields are all empty is its own group). Rules with the same `group` (default: the rule's id) share tasks, so an `update` rule names the group of the rule that opens them. When two people get the same thread, it becomes one task.
 - **First run:** with `first_run_seen` on, a source's first post for a person only records what's already there, so turning a source on doesn't flood the channel.
 - **Nudges:** with `stale_after_hours`, an open task whose latest event still matches the rule after that many hours gets a nudge in its thread, at most once per period.
 - **Accounts:** the account comes from the rule's `account`, then the event's own `account` (matched by name or alias), then the first account whose `when` holds. The account's `channel` is where its tasks are posted; tasks without one go to `default_channel`.
@@ -82,7 +93,8 @@ flowchart LR
 - **`map`** turns an item into an event:
   - `external_id` (required)
   - `title`, `url`, `actor`, `account`, `group_key`, `occurred_at`
-  - `payload`: a list of fields, `"*"` for the whole item, or an object of templates
+  - `payload`: a list of fields, `"*"` for the whole item, or an object of specs
+  - Any spec can be `{"from": "<path or template>", "match": "<regex>"}`: the regex's first group (case-insensitive), or nothing without a match. For example, `{"from": "fields.summary", "match": "workspace (\\d+)"}` pulls a workspace id out of a ticket title.
 
 The hub keeps each source's cursor. The cursor only moves once the hub has the events.
 

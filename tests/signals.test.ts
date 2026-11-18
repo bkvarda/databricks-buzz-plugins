@@ -58,6 +58,22 @@ describe("events", () => {
     expect(decide(config, { source: "table.cases", external_id: "C-1", account: "acme corp", payload: { status: "Open" } }, { firstRun: false })).toMatchObject({ account: { name: "Acme", channel: "acme" } });
     expect(decide(config, { source: "table.quota", external_id: "q1", payload: { kind: "auto", workspace: "w1" } }, { firstRun: false })).toMatchObject({ create: false, group: "quota|w1" });
   });
+
+  it("groups by a template of fields, so new tickets for the same thing share a task", () => {
+    const rules: SignalsConfig = {
+      version: 1,
+      rules: [
+        { id: "auto", sources: ["jira"], when: { title: "auto.?increase" }, action: "update", group: "limits", group_by: "{payload.workspace}/{payload.model}" },
+        { id: "limits", sources: ["jira"], action: "task", group_by: "{payload.workspace}/{payload.model}" },
+      ],
+    };
+    expect(configProblems(rules)).toEqual([]);
+    const ticket = (key: string, title: string, payload?: Record<string, unknown>) => decide(rules, { source: "jira", external_id: key, title, ...(payload && { payload }) }, { firstRun: false });
+    expect(ticket("ES-1", "Rate limit increase", { workspace: "123", model: "Claude Sonnet" })).toMatchObject({ create: true, group: "limits|123/claude sonnet" });
+    expect(ticket("ES-2", "Auto increase", { workspace: "123", model: "claude sonnet " })).toMatchObject({ create: false, group: "limits|123/claude sonnet" });
+    // Without any of its fields, an event is its own group.
+    expect(ticket("ES-3", "Something else")).toMatchObject({ group: "limits|jira:ES-3" });
+  });
 });
 
 describe("the store", () => {
@@ -161,6 +177,44 @@ describe("the store", () => {
     expect(await store.ingest("alice@x.com", [mail("m2", "t2")], config)).toMatchObject({ skipped: 1 });
     expect((await store.sources("alice@x.com"))[0]).toMatchObject({ source: "gmail", enabled: false });
     expect(await store.stats()).toMatchObject({ events: 0, people: 0 });
+  });
+
+  it("keeps an inbox each person can write only as themselves, and read only their own sources from", async () => {
+    const pg = new PGlite();
+    const db: Db = { query: async (text, values) => ({ rows: (await pg.query(text, values)).rows as never[] }) };
+    const store = new SignalsStore(db, "signals_inbox");
+    await store.setup();
+    await store.setup();
+    await store.setSource("alice@x.com", "gmail", true);
+    await store.setSource("bob@x.com", "gmail", true);
+    await pg.exec(`CREATE ROLE "Alice@X.com"`);
+    await pg.exec(`SET ROLE "Alice@X.com"`);
+    try {
+      // Alice sees only her own sources, and only the columns a poller needs.
+      expect((await pg.query(`SELECT source, enabled, cursor FROM signals_inbox.sources`)).rows).toEqual([{ source: "gmail", enabled: true, cursor: null }]);
+      await expect(pg.query(`SELECT owner FROM signals_inbox.sources`)).rejects.toThrow(/permission/);
+      await pg.query(`INSERT INTO signals_inbox.inbox (kind, body) VALUES ('events', $1)`, [JSON.stringify({ events: [mail("m1", "t1")] })]);
+      // She can't post as anyone else, or mark a post handled.
+      await expect(pg.query(`INSERT INTO signals_inbox.inbox (owner, kind, body) VALUES ('bob@x.com', 'events', '{}')`)).rejects.toThrow(/permission/);
+      await expect(pg.query(`UPDATE signals_inbox.inbox SET done_at = 1`)).rejects.toThrow(/permission/);
+      await expect(pg.query(`UPDATE signals_inbox.sources SET enabled = true`)).rejects.toThrow(/permission/);
+    } finally {
+      await pg.exec(`RESET ROLE`);
+    }
+    const hub = new Hub(store, undefined, { defaultConfig: config });
+    expect(await store.inbox()).toMatchObject([{ owner: "Alice@X.com", kind: "events" }]);
+    expect(await hub.drain()).toEqual({ handled: 1, failed: 0 });
+    expect(await store.inbox()).toEqual([]);
+    expect(await store.stats()).toMatchObject({ events: 1 });
+    expect((await store.sources("alice@x.com"))[0]).toMatchObject({ last_count: 1 });
+    await pg.exec(`SET ROLE "Alice@X.com"`);
+    try {
+      expect((await pg.query(`SELECT kind, done_at IS NOT NULL AS done FROM signals_inbox.inbox`)).rows).toEqual([{ kind: "events", done: true }]);
+    } finally {
+      await pg.exec(`RESET ROLE`);
+    }
+    await store.pruneInbox(0, Math.floor(Date.now() / 1000) + 10);
+    expect((await pg.query(`SELECT count(*)::int AS n FROM signals_inbox.inbox`)).rows).toEqual([{ n: 0 }]);
   });
 
   it("keeps its config", async () => {
