@@ -92,7 +92,7 @@ export class HubClient {
 }
 
 export type AccountView = AccountRecord & Readonly<{ read: Preferences }>;
-export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; preferences?: string; profile?: string }>;
+export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string }>;
 
 export type TaskDetail = Readonly<{
   task: Task;

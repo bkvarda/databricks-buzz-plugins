@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, configProblems, decide, modeFor, parsePreferences, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { Hub, HUB_PATHS } from "../plugins/signals/app/hub";
+import { agentKey, Hub, HUB_PATHS, taskMessage } from "../plugins/signals/app/hub";
+import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 
@@ -316,7 +317,7 @@ describe("account channels", () => {
   });
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
-    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", updated_by: null, updated_at: null };
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", agents: [], updated_by: null, updated_at: null };
     expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], when: { actor: "@(acme\\.com|acme\\.co\\.uk)>?$" }, preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
@@ -368,6 +369,31 @@ describe("account channels", () => {
     expect((await call("POST", "/api/account", { name: "Initech", delete: true })).json).toEqual({ deleted: true });
     expect(await call("POST", "/api/account", { name: "Initech", delete: true })).toMatchObject({ status: 404 });
     expect(await store.task(1)).toMatchObject({ account: "Globex Inc", channel: "globex" });
+  });
+
+  it("asks the account's agents to work on new tasks in auto and draft mode, not in ask", async () => {
+    const store = new SignalsStore(pglite(), "signals_agents");
+    await store.setup();
+    const posts: { task: number; agents: readonly string[]; text: string }[] = [];
+    const hub = new Hub(store, { opened: async (task, agents = []) => (posts.push({ task: task.id, agents, text: taskMessage(task, { agents }) }), `root-${task.id}`), updated: async () => {} }, { defaultConfig: { version: 1, rules: [
+      { id: "mail", sources: ["gmail"], action: "task", workstream: "questions", group_by: "external_id" },
+      { id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" },
+    ] } });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const key = "ab".repeat(32);
+    expect(await call("/api/account", { name: "Globex", agents: ["not-a-key"] })).toMatchObject({ status: 400 });
+    const saved = await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [npubEncode(key)], preferences: "questions: ask\nmeeting prep: draft" });
+    expect(saved.json).toMatchObject({ account: { agents: [key] } });
+    for (const source of ["gmail", "google_calendar"]) {
+      await call("/api/sources", { source, enabled: true });
+      await call("/api/events", { events: [{ source, external_id: "seed" }] });
+    }
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?" }] });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
+    expect(posts.map(({ task, agents }) => ({ task, agents }))).toEqual([{ task: 1, agents: [] }, { task: 2, agents: [key] }]);
+    expect(posts[0]!.text).not.toContain("nostr:");
+    expect(posts[1]!.text).toContain(`nostr:${npubEncode(key)} please prepare this`);
+    expect(agentKey(` nostr:${npubEncode(key)}`)).toBe(key);
   });
 
   it("sends an account's open tasks without a channel to the channel it gets", async () => {

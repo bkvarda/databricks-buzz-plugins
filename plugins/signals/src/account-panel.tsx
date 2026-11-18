@@ -28,6 +28,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
   const [name, setName] = React.useState(account?.name ?? channel.name.replace(/[-_]+/g, " "));
   const [aliases, setAliases] = React.useState(account?.aliases.join(", ") ?? "");
   const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
+  const [agents, setAgents] = React.useState(account?.agents.join(", ") ?? "");
   const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -42,6 +43,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         channel: channel.id,
         aliases: splitList(aliases),
         domains: splitList(domains),
+        agents: splitList(agents),
         preferences,
       });
       props.onSaved(saved);
@@ -62,6 +64,9 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         </Field>
         <Field label="Customer email domains" hint="Mail and meetings from people at these domains go to this channel's tasks.">
           <input className="dbx-input" placeholder="example.com" value={domains} onChange={(event) => setDomains(event.target.value)} />
+        </Field>
+        <Field label="Agents that work on tasks" hint="Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel.">
+          <input className="dbx-input" placeholder="npub1…" value={agents} onChange={(event) => setAgents(event.target.value)} />
         </Field>
         <Field label="Team preferences" hint={<>Lines like <code>meeting prep: auto</code> set how agents handle that workstream (or rule); <code>everything:</code> sets the rest. Modes: {MODES.join(", ")}. Every other line is guidance agents follow.</>}>
           <textarea className="dbx-textarea" rows={12} value={preferences} onChange={(event) => setPreferences(event.target.value)} />
@@ -141,6 +146,7 @@ export function accountPanel(service: DatabricksService) {
                   <Button size="sm" onClick={() => setEditing(true)}>Edit</Button>
                 </Stack>
                 {account.domains.length > 0 && <Text size="sm" tone="subtle">Customer domains: {account.domains.join(", ")}</Text>}
+                <Text size="sm" tone="subtle">{account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"}</Text>
                 <Stack direction="row" gap={6} wrap>
                   {Object.entries(account.read.modes).map(([key, mode]) => <Badge key={key}>{`${key}: ${mode}`}</Badge>)}
                 </Stack>
