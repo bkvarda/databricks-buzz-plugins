@@ -474,6 +474,9 @@ function Badge(props) {
     props.children
   );
 }
+function Field(props) {
+  return /* @__PURE__ */ React.createElement("label", { style: { display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }, htmlFor: props.id }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, props.label), props.children, props.hint && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", as: "div" }, props.hint));
+}
 function SectionHeader(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500 }, props.title), props.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.description)), props.action);
 }
@@ -560,6 +563,140 @@ function MissingCore(props) {
     ") for sign-in. Add it, or turn it back on in Settings \u2192 Plugins.",
     message && /* @__PURE__ */ React.createElement("p", null, message)
   ));
+}
+
+// packages/core/src/ui/workspace.tsx
+var hostname = (host) => new URL(host).hostname;
+var ADD = "__add__";
+function useWorkspaceService(service, profile) {
+  return React.useMemo(() => profile && service.forProfile ? service.forProfile(profile) : service, [service, profile]);
+}
+function BrowserWait(props) {
+  const { cancelSignIn } = props.service;
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser", props.host ? ` (${hostname(props.host)})` : "", ".")), cancelSignIn && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => cancelSignIn() }, "Cancel"));
+}
+function WorkspaceStatus(props) {
+  const { service, snapshot } = props;
+  const signIn = (label) => service.reauthenticate ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => void service.reauthenticate() }, label) : void 0;
+  switch (snapshot.status) {
+    case "checking":
+    case "connecting":
+      return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Spinner, { size: 11 }), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Connecting\u2026"));
+    case "signing-in":
+      return /* @__PURE__ */ React.createElement(BrowserWait, { service, ...snapshot.host && { host: snapshot.host } });
+    case "connected":
+      return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Signed in to ", hostname(snapshot.profile.host), " as ", snapshot.user.userName, ".");
+    case "error":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn(snapshot.needsSignIn ? "Sign in again" : "Sign in") }, snapshot.needsSignIn ? "Your sign-in to this workspace has expired." : snapshot.message);
+    case "signed-out":
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "warning", action: signIn("Sign in") }, snapshot.error ?? "You're not signed in to this workspace.");
+    default:
+      return null;
+  }
+}
+function WorkspaceField(props) {
+  const main = useConnection(props.service);
+  const workspace = useWorkspaceService(props.service, props.profile);
+  const current = useConnection(workspace);
+  const [adding, setAdding] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [state, setState] = React.useState({});
+  if (!props.service.forProfile) return null;
+  const host = (snapshot) => "profile" in snapshot ? new URL(snapshot.profile.host).hostname : void 0;
+  const profiles = props.service.profiles();
+  const mainName = main.status === "connected" ? main.profile.name : void 0;
+  const signIn = async () => {
+    setState({ busy: true });
+    try {
+      const profile = await props.service.addWorkspace(url.trim() ? { host: url.trim() } : {});
+      props.onChange(profile === mainName ? void 0 : profile);
+      setAdding(false);
+      setUrl("");
+      setState({});
+    } catch (error) {
+      setState({ error: describeError(error) });
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Field, { label: "Workspace", hint: "Uses your Databricks CLI sign-in for that workspace." }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(
+    "select",
+    {
+      className: "dbx-select",
+      disabled: props.disabled,
+      value: adding ? ADD : props.profile ?? "",
+      onChange: (event) => {
+        const value = event.target.value;
+        if (value === ADD) return setAdding(true);
+        setAdding(false);
+        props.onChange(value && value !== mainName ? value : void 0);
+      }
+    },
+    /* @__PURE__ */ React.createElement("option", { value: "" }, "Same as Buzz", host(main) ? ` \xB7 ${host(main)}` : ""),
+    profiles.filter((profile) => profile.name !== mainName).map((profile) => /* @__PURE__ */ React.createElement("option", { key: profile.name, value: profile.name }, profile.name, " \xB7 ", new URL(profile.host).hostname)),
+    /* @__PURE__ */ React.createElement("option", { value: ADD }, "Sign in to another workspace\u2026")
+  ), adding && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "https://\u2026 (blank to choose in the browser)", value: url, onChange: (event) => setUrl(event.target.value), style: { flex: 1 } }), /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: state.busy, onClick: () => void signIn() }, state.busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Sign in")), state.busy && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Finish signing in in your browser."), state.error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, state.error), props.profile && !adding && /* @__PURE__ */ React.createElement(WorkspaceStatus, { service: workspace, snapshot: current })));
+}
+
+// packages/core/src/workspace-choice.ts
+function followWorkspace(main, key) {
+  const chosen = () => main.preferences.get(key) || void 0;
+  const target = () => {
+    const profile = chosen();
+    return profile && main.forProfile ? main.forProfile(profile) : main;
+  };
+  const listeners = /* @__PURE__ */ new Set();
+  const preferenceListeners = /* @__PURE__ */ new Set();
+  const notify = () => {
+    for (const listener of [...listeners]) listener();
+  };
+  const notifyPreferences = () => {
+    for (const listener of [...preferenceListeners]) listener();
+  };
+  let current = target();
+  let stop = current.subscribe(notify);
+  let stopPreferences = current.preferences.subscribe(notifyPreferences);
+  const follow = () => {
+    const next = target();
+    if (next === current) return;
+    stop();
+    stopPreferences();
+    current = next;
+    stop = current.subscribe(notify);
+    stopPreferences = current.preferences.subscribe(notifyPreferences);
+    notify();
+    notifyPreferences();
+  };
+  main.preferences.subscribe(follow);
+  main.subscribe(follow);
+  const preferences = {
+    get: (name) => current.preferences.get(name),
+    set: (name, value) => current.preferences.set(name, value),
+    subscribe: (listener) => {
+      preferenceListeners.add(listener);
+      return () => preferenceListeners.delete(listener);
+    }
+  };
+  return {
+    version: 1,
+    snapshot: () => current.snapshot(),
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    client: () => current.client(),
+    ready: (signal) => current.ready(signal),
+    workspaceUrl: (path) => current.workspaceUrl(path),
+    profiles: () => main.profiles(),
+    openSettings: () => main.openSettings(),
+    signIn: () => current.signIn(),
+    reauthenticate: () => current.reauthenticate ? current.reauthenticate() : current.signIn(),
+    cancelSignIn: () => current.cancelSignIn?.(),
+    preferences,
+    ...main.announce && { announce: main.announce },
+    ...main.forProfile && { forProfile: main.forProfile },
+    ...main.addWorkspace && { addWorkspace: main.addWorkspace },
+    profile: chosen,
+    setProfile: (profile) => main.preferences.set(key, profile || void 0)
+  };
 }
 
 // packages/core/src/api/apps.ts
@@ -841,6 +978,12 @@ function signalsTools(service) {
 
 // plugins/signals/src/index.tsx
 var inject = ["react", "settingsCards"];
+var WORKSPACE_PREF = "signalsWorkspace";
+function HubWorkspace(props) {
+  const [, setProfile] = usePreference(props.main, WORKSPACE_PREF);
+  const profile = props.service.profile();
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Workspace", description: "The workspace your signals hub runs in. Agents' signals tools use it too." }), /* @__PURE__ */ React.createElement(WorkspaceField, { service: props.main, ...profile && { profile }, onChange: setProfile }));
+}
 function SourceRow(props) {
   const { service, hub: hub2, info, state } = props;
   const [busy, setBusy] = React.useState(false);
@@ -864,10 +1007,11 @@ function SourceRow(props) {
 function SignalsSettings(props) {
   const { service } = props;
   const snapshot = useConnection(service);
+  const workspace = "profile" in snapshot ? snapshot.profile.host : void 0;
   const [picked, setPicked] = usePreference(service, HUB_PREFERENCE);
-  const hubs = useAsync(async (signal) => chosenHub(service, signal), [snapshot.status, picked]);
+  const hubs = useAsync(async (signal) => chosenHub(service, signal), [snapshot.status, workspace, picked]);
   const app = hubs.data?.app;
-  const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url, snapshot.status]);
+  const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url, snapshot.status, workspace]);
   const [sources, setSources] = React.useState();
   const loaded = useAsync(async (signal) => hub2 ? hub2.sources(signal) : void 0, [hub2]);
   React.useEffect(() => setSources(loaded.data?.sources), [loaded.data]);
@@ -889,22 +1033,24 @@ function SignalsSettings(props) {
 }
 function apply(ctx) {
   bindReact(ctx.react);
-  const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, databricks) => {
+  const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, main) => {
+    const databricks = followWorkspace(main, WORKSPACE_PREF);
     scope.inject(["agents"], (agents) => {
       for (const tool of signalsTools(databricks)) agents.agents.addTool(tool);
     });
-    return databricks;
+    return { main, databricks };
   });
   ctx.settingsCards.register({
     id: "signals",
     title: "Signals",
     component: () => {
-      const service = useLive(live);
-      return service ? /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(SignalsSettings, { service })) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Signals" });
+      const runtime = useLive(live);
+      return runtime ? /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement(Stack, { gap: 24 }, /* @__PURE__ */ React.createElement(HubWorkspace, { main: runtime.main, service: runtime.databricks }), /* @__PURE__ */ React.createElement(SignalsSettings, { service: runtime.databricks }))) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Signals" });
     }
   });
 }
 export {
+  WORKSPACE_PREF,
   apply,
   inject
 };
