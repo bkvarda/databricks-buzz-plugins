@@ -372,6 +372,22 @@ export class SignalsStore {
     return found.rows.map(toTask);
   }
 
+  /** The task's latest event, as it was posted (occurred_at in Unix seconds). */
+  async latestEvent(task: number): Promise<EventInput | undefined> {
+    const found = await this.q(`SELECT e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = $1`, [task]);
+    const row = found.rows[0];
+    if (!row) return undefined;
+    return {
+      source: String(row.source),
+      external_id: String(row.external_id),
+      occurred_at: Number(row.occurred_at),
+      ...(row.title ? { title: String(row.title) } : {}),
+      ...(row.url ? { url: String(row.url) } : {}),
+      ...(row.actor ? { actor: String(row.actor) } : {}),
+      ...(row.payload ? { payload: row.payload as Record<string, unknown> } : {}),
+    };
+  }
+
   async setAgentReply(task: number, reply: string): Promise<void> {
     await this.q(`UPDATE $S.tasks SET agent_reply = $2, updated_at = $3 WHERE id = $1`, [task, reply, now()]);
   }

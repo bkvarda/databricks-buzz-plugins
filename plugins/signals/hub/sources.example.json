@@ -7,12 +7,13 @@
       "tool": "calendar_event_list",
       "args": { "time_min": "{now}", "time_max": "{now+7d}", "max_results": 50, "query": "" },
       "items": "items",
+      "detail": { "tool": "calendar_event_get", "args": { "event_id": "{id}" }, "max": 50 },
       "map": {
         "external_id": "id",
         "title": "summary",
         "url": "htmlLink",
         "occurred_at": "{start.dateTime}{start.date}",
-        "payload": ["start", "end", "status", "attendeeCount", "location", "hangoutLink"]
+        "payload": ["start", "end", "status", "attendeeCount", "attendees", "organizer", "description", "location", "hangoutLink"]
       }
     },
     {

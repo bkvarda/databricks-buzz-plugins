@@ -401,7 +401,7 @@ describe("account channels", () => {
     await store.setup();
     await store.setup();
     const posts: { task: number; text: string }[] = [];
-    const hub = new Hub(store, { opened: async (task, agents = [], briefing) => (posts.push({ task: task.id, text: taskMessage(task, { agents, ...(briefing && { briefing }) }) }), "c".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } });
+    const hub = new Hub(store, { opened: async (task, agents = [], context = {}) => (posts.push({ task: task.id, text: taskMessage(task, { agents, ...context }) }), "c".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } });
     const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
     const agent = "ab".repeat(32);
     await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], preferences: "meeting prep: draft\nCopy the AE on everything.", profile: "## Team\nAE: Dana" });
@@ -412,6 +412,19 @@ describe("account channels", () => {
     expect(posts[0]!.text).toContain("Team guidance:\nCopy the AE on everything.");
     expect(posts[0]!.text).toContain("Profile:\n## Team\nAE: Dana");
 
+    // The source event's details, for agents to prepare from.
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "c2", actor: "ann@globex.io", title: "Roadmap", url: "https://cal/c2", payload: {
+      start: { dateTime: "2026-11-20T10:00:00-08:00", timeZone: "America/Los_Angeles" }, end: { dateTime: "2026-11-20T11:00:00-08:00" },
+      attendees: [{ email: "me@x.com", responseStatus: "accepted", organizer: true }, { email: "ann@globex.io", displayName: "Ann", responseStatus: "needsAction" }],
+      description: "<p>Agenda:</p><br>roadmap and pricing", status: "confirmed",
+    } }] });
+    const roadmap = posts[1]!.text;
+    expect(roadmap).toContain("**Source** (google_calendar): https://cal/c2");
+    expect(roadmap).toContain("When: 2026-11-20T10:00:00-08:00 (America/Los_Angeles) → 2026-11-20T11:00:00-08:00");
+    expect(roadmap).toContain("Attendees (2):\n- Ann <ann@globex.io> (customer)\n- me@x.com (organizer, accepted)");
+    expect(roadmap).toContain("Description:\nAgenda:");
+    expect(roadmap).toContain("Details: status: confirmed");
+
     const root = "c".repeat(63) + "1";
     const replies = [
       { id: "r0", pubkey: "cd".repeat(32), content: "Not the agent", created_at: 1, tags: [["e", root, "", "reply"]] },
@@ -420,7 +433,7 @@ describe("account channels", () => {
     ];
     let asked: unknown;
     expect(await hub.collect(async (filters) => ((asked = filters), replies))).toEqual({ recorded: 1 });
-    expect(asked).toMatchObject([{ kinds: [9], "#e": [root], authors: [agent] }]);
+    expect(asked).toMatchObject([{ kinds: [9], "#e": [root, "c".repeat(63) + "2"], authors: [agent] }]);
     const detail = await store.detail(1);
     expect(detail?.task).toMatchObject({ status: "in_progress" });
     expect(detail?.activities.map((a) => a.kind)).toEqual(["opened", "agent_reply", "status"]);
