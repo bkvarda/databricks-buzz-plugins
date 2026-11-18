@@ -110,7 +110,7 @@ export type Rule = Readonly<{
   workstream?: string;
   /**
    * Which events share a task: an event field (`payload.workspace`), or a
-   * template of fields (`{payload.workspace}/{payload.model}`). Default
+   * template of fields (`{payload.workspace}/{payload.region}`). Default
    * group_key; when it's empty, the event's own source and external_id.
    */
   group_by?: string;
