@@ -97,6 +97,8 @@ export class SignalsStore {
       name text PRIMARY KEY, channel text UNIQUE, aliases jsonb NOT NULL DEFAULT '[]', domains jsonb NOT NULL DEFAULT '[]',
       preferences text NOT NULL DEFAULT '', profile text NOT NULL DEFAULT '', updated_by text, updated_at bigint)`);
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS agents jsonb NOT NULL DEFAULT '[]'`);
+    // The first reply an account's agent posted in the task's thread, once the hub has recorded it.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS agent_reply text`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -358,6 +360,20 @@ export class SignalsStore {
 
   async setBuzzRoot(task: number, root: string): Promise<void> {
     await this.q(`UPDATE $S.tasks SET buzz_root = $2 WHERE id = $1`, [task, root]);
+  }
+
+  /** Posted tasks whose account's agents were asked to work on them, with no agent reply recorded yet (opened within `days`). */
+  async awaitingAgents(days = 7, at = now(), limit = 50): Promise<Task[]> {
+    const found = await this.q(
+      `SELECT * FROM $S.tasks WHERE buzz_root IS NOT NULL AND agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft')
+         AND status NOT IN ('done', 'dismissed') AND created_at >= $1 ORDER BY id LIMIT ${limit}`,
+      [at - days * 86400],
+    );
+    return found.rows.map(toTask);
+  }
+
+  async setAgentReply(task: number, reply: string): Promise<void> {
+    await this.q(`UPDATE $S.tasks SET agent_reply = $2, updated_at = $3 WHERE id = $1`, [task, reply, now()]);
   }
 
   /** Open tasks with a channel that aren't in Buzz yet (a post that failed, or a channel added later). */

@@ -42,9 +42,9 @@ async function startingConfig(): Promise<SignalsConfig | undefined> {
 }
 
 const notifier: Notifier = {
-  async opened(task, agents = []) {
+  async opened(task, agents = [], briefing) {
     if (!app.relay || !task.channel) return undefined;
-    const event = await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: taskMessage(task, { agents }), tags: [["h", task.channel], ...agents.map((key) => ["p", key])] });
+    const event = await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: taskMessage(task, { agents, ...(briefing && { briefing }) }), tags: [["h", task.channel], ...agents.map((key) => ["p", key])] });
     return event.id;
   },
   async updated(task, text) {
@@ -119,6 +119,17 @@ setInterval(() => {
     .catch((error: Error) => (state.lastInbox = `failed: ${error.message}`))
     .finally(() => (draining = false));
 }, INBOX_MS).unref();
+// Agents asked to work on a task reply in its thread; the hub records the first reply on the task.
+const COLLECT_MS = 60_000;
+setInterval(() => {
+  if (!hub || !app.relay) return;
+  void hub
+    .collect((filters) => app.query(filters))
+    .then((result) => {
+      if (result.recorded) console.log(`[signals] recorded ${result.recorded} agent repl${result.recorded === 1 ? "y" : "ies"}`);
+    })
+    .catch((error: Error) => console.log(`[signals] couldn't check agent replies: ${error.message}`));
+}, COLLECT_MS).unref();
 setInterval(() => void store.pruneInbox().catch(() => {}), 6 * 3600_000).unref();
 
 void prepare();

@@ -38,10 +38,13 @@ export type HubResponse = Readonly<{ status?: number; json: unknown }>;
 /** Where tasks go in Buzz. The hub works without it (tasks stay in Lakebase). */
 export type Notifier = Readonly<{
   /** Posts a new task at its channel's top level, mentioning `agents` (hex pubkeys); resolves with the message id. */
-  opened(task: Task, agents?: readonly string[]): Promise<string | undefined>;
+  opened(task: Task, agents?: readonly string[], briefing?: string): Promise<string | undefined>;
   /** Replies in the task's thread. */
   updated(task: Task, text: string): Promise<void>;
 }>;
+
+/** A chat message as the relay gives it: enough to tell who replied in which thread. */
+export type ThreadReply = Readonly<{ id: string; pubkey: string; content: string; created_at: number; tags: readonly (readonly string[])[] }>;
 
 export type HubOptions = Readonly<{
   /** Who may change the rules (the app's owner, say). Everyone may when empty. */
@@ -218,7 +221,7 @@ export class Hub {
       // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
       const agents = account && account.channel === task.channel ? account.agents : [];
-      const root = await this.notifier.opened(task, agents);
+      const root = await this.notifier.opened(task, agents, agents.length ? briefing(account!) : undefined);
       if (root) await this.store.setBuzzRoot(task.id, root);
     } catch (error) {
       this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
@@ -327,6 +330,41 @@ export class Hub {
   }
 
   /** Posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
+  /**
+   * Records the first reply each asked-for agent posts in a task's thread:
+   * as activity, as the task's artifact, and by moving an open task to
+   * in_progress. Agents without the Signals tools (remote ones) get their
+   * work on the task this way. `fetch` queries the relay.
+   */
+  async collect(fetch: (filters: { kinds: number[]; "#e": string[]; authors: string[]; since: number }[]) => Promise<readonly ThreadReply[]>): Promise<{ recorded: number }> {
+    const tasks = await this.store.awaitingAgents();
+    if (!tasks.length) return { recorded: 0 };
+    const accounts = new Map((await this.store.accounts()).map((account) => [account.name, account]));
+    const waiting = tasks.flatMap((task) => {
+      const account = accounts.get(task.account!);
+      return account?.agents.length && account.channel === task.channel ? [{ task, agents: account.agents }] : [];
+    });
+    if (!waiting.length) return { recorded: 0 };
+    const authors = [...new Set(waiting.flatMap((item) => item.agents))];
+    const since = Math.min(...waiting.map((item) => item.task.created_at)) - 60;
+    const replies = await fetch([{ kinds: [9], "#e": waiting.map((item) => item.task.buzz_root!), authors, since }]);
+    let recorded = 0;
+    for (const { task, agents } of waiting) {
+      const reply = replies
+        .filter((event) => agents.includes(event.pubkey) && event.id !== task.buzz_root && event.tags.some((tag) => tag[0] === "e" && tag[1] === task.buzz_root))
+        .sort((a, b) => a.created_at - b.created_at)[0];
+      if (!reply) continue;
+      const actor = `agent:${npub(reply.pubkey)}`;
+      const text = reply.content.replace(/\s+/g, " ").trim();
+      await this.store.activity(task.id, actor, "agent_reply", text.length > 500 ? `${text.slice(0, 497)}…` : text);
+      await this.store.artifact(task.id, actor, task.mode === "draft" ? "draft" : "reply", `buzz://message?channel=${task.channel}&id=${reply.id}`, `Agent reply in the task's thread`);
+      if (task.status === "open") await this.store.setStatus(task.id, "in_progress", actor, "an agent replied in the task's thread");
+      await this.store.setAgentReply(task.id, reply.id);
+      recorded++;
+    }
+    return { recorded };
+  }
+
   async sweep(at?: number): Promise<{ posted: number; nudged: number }> {
     let posted = 0;
     let nudged = 0;
@@ -353,12 +391,31 @@ const MODE_TEXT = { auto: "Mode: auto (agents do it and report)", draft: "Mode: 
 
 /** What the account's agents are asked to do with a new task, by its mode. */
 const AGENT_ASK = {
-  auto: "please work on this now: call signals_account for this channel, follow the team's guidance, do the work, report it here and record it with signals_task_update.",
-  draft: "please prepare this: call signals_account for this channel, follow the team's guidance, and post a draft here (a reply, a doc) for a person to send. Record it with signals_task_update; don't send anything yourself.",
+  auto: "please work on this now: follow the team's guidance below, do the work and report it in this thread.",
+  draft: "please prepare this: follow the team's guidance below and post a draft in this thread (a reply, a doc) for a person to send. Don't send anything yourself.",
 } as const;
+const AGENT_RECORD = "Your first reply in this thread is recorded on the task. If you have the Signals tools, signals_account gives the full account and signals_task_update records more.";
 
-export function taskMessage(task: Task, detail?: { url?: string; agents?: readonly string[] }): string {
-  const ask = detail?.agents?.length && (task.mode === "auto" || task.mode === "draft") ? `${detail.agents.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode]}` : "";
+const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
+
+/** What an agent woken on a task needs from the account, for agents without the Signals tools. */
+export function briefing(account: AccountRecord): string {
+  const read = parsePreferences(account.preferences);
+  const modes = Object.entries(read.modes).map(([key, mode]) => `${key}: ${mode}`).join("; ");
+  return [
+    `**For agents: ${account.name}**`,
+    modes && `Modes: ${modes}`,
+    account.domains.length ? `Customer domains: ${account.domains.join(", ")}` : "",
+    read.guidance && `Team guidance:\n${clip(read.guidance, 2000)}`,
+    account.profile.trim() && `Profile:\n${clip(account.profile.trim(), 3000)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function taskMessage(task: Task, detail?: { url?: string; agents?: readonly string[]; briefing?: string }): string {
+  const asking = Boolean(detail?.agents?.length && (task.mode === "auto" || task.mode === "draft"));
+  const ask = asking ? `${detail!.agents!.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode as "auto" | "draft"]} ${AGENT_RECORD}` : "";
   return [
     `📌 **Task ${task.id}: ${task.title}**`,
     [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
@@ -366,6 +423,7 @@ export function taskMessage(task: Task, detail?: { url?: string; agents?: readon
     detail?.url ? `Source: ${detail.url}` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
     ask,
+    asking && detail?.briefing ? `\n${detail.briefing}` : "",
   ]
     .filter(Boolean)
     .join("\n");

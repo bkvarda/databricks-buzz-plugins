@@ -396,6 +396,40 @@ describe("account channels", () => {
     expect(agentKey(` nostr:${npubEncode(key)}`)).toBe(key);
   });
 
+  it("briefs agents without the Signals tools in the wake, and records their first reply on the task", async () => {
+    const store = new SignalsStore(pglite(), "signals_remote");
+    await store.setup();
+    await store.setup();
+    const posts: { task: number; text: string }[] = [];
+    const hub = new Hub(store, { opened: async (task, agents = [], briefing) => (posts.push({ task: task.id, text: taskMessage(task, { agents, ...(briefing && { briefing }) }) }), "c".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const agent = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], preferences: "meeting prep: draft\nCopy the AE on everything.", profile: "## Team\nAE: Dana" });
+    await call("/api/sources", { source: "google_calendar", enabled: true });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
+    expect(posts[0]!.text).toContain("Modes: meeting prep: draft");
+    expect(posts[0]!.text).toContain("Team guidance:\nCopy the AE on everything.");
+    expect(posts[0]!.text).toContain("Profile:\n## Team\nAE: Dana");
+
+    const root = "c".repeat(63) + "1";
+    const replies = [
+      { id: "r0", pubkey: "cd".repeat(32), content: "Not the agent", created_at: 1, tags: [["e", root, "", "reply"]] },
+      { id: "r2", pubkey: agent, content: "Second", created_at: 3, tags: [["e", root, "", "reply"]] },
+      { id: "r1", pubkey: agent, content: "Draft:\n  agenda for the QBR", created_at: 2, tags: [["e", root, "", "reply"]] },
+    ];
+    let asked: unknown;
+    expect(await hub.collect(async (filters) => ((asked = filters), replies))).toEqual({ recorded: 1 });
+    expect(asked).toMatchObject([{ kinds: [9], "#e": [root], authors: [agent] }]);
+    const detail = await store.detail(1);
+    expect(detail?.task).toMatchObject({ status: "in_progress" });
+    expect(detail?.activities.map((a) => a.kind)).toEqual(["opened", "agent_reply", "status"]);
+    expect(detail?.activities[1]).toMatchObject({ text: "Draft: agenda for the QBR" });
+    expect(detail?.artifacts).toMatchObject([{ kind: "draft", url: "buzz://message?channel=globex&id=r1" }]);
+    // Recorded once.
+    expect(await hub.collect(async () => replies)).toEqual({ recorded: 0 });
+  });
+
   it("sends an account's open tasks without a channel to the channel it gets", async () => {
     const store = new SignalsStore(pglite(), "signals_late");
     await store.setup();
