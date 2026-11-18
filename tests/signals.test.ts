@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, configProblems, decide, type EventInput, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, Hub, HUB_PATHS, taskMessage } from "../plugins/signals/app/hub";
+import { agentKey, eventDetails, Hub, HUB_PATHS, taskMessage } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
@@ -394,6 +394,21 @@ describe("account channels", () => {
     expect(posts[0]!.text).not.toContain("nostr:");
     expect(posts[1]!.text).toContain(`nostr:${npubEncode(key)} please prepare this`);
     expect(agentKey(` nostr:${npubEncode(key)}`)).toBe(key);
+  });
+
+  it("doesn't mark a colleague's customer-domain address as a customer", () => {
+    const text = eventDetails({ source: "google_calendar", external_id: "c", payload: { attendees: [
+      { email: "dane.isburgh@x.com" }, { email: "disburgh@globex.io" },
+      { email: "Beth.Gregory@x.com" }, { email: "bgregory@sub.globex.io" },
+      { email: "pat.amons@x.com" }, { email: "pamons@globex.io", displayName: "Pat Amons" },
+      { email: "ann.lee@globex.io" }, { email: "bob@x.com" },
+    ] } }, ["globex.io"]);
+    expect(text).toContain("- ann.lee@globex.io (customer)");
+    expect(text).toContain("- disburgh@globex.io (customer-domain address of dane.isburgh@x.com, not a customer)");
+    expect(text).toContain("- bgregory@sub.globex.io (customer-domain address of Beth.Gregory@x.com, not a customer)");
+    expect(text).toContain("- Pat Amons <pamons@globex.io> (customer-domain address of pat.amons@x.com, not a customer)");
+    expect(text.indexOf("ann.lee@globex.io")).toBeLessThan(text.indexOf("disburgh"));
+    expect(text.match(/\(customer\)/g)).toHaveLength(1);
   });
 
   it("matches a rule on a calendar event's attendees, so only meetings with the customer open prep", () => {

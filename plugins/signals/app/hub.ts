@@ -468,6 +468,35 @@ function timeText(value: unknown): string | undefined {
 const SHOWN = new Set(["start", "end", "attendees", "description", "location", "hangoutLink", "organizer"]);
 const MAX_ATTENDEES = 30;
 
+const letters = (text: string) => text.toLowerCase().normalize("NFKD").replace(/[^a-z]/g, "");
+
+/** Ways a person's address is commonly spelled, from their name (`dane.isburgh` → daneisburgh, disburgh, danei, isburghd, …). */
+function spellings(person: Attendee): Set<string> {
+  const names = [person.name ?? "", (person.email ?? "").split("@")[0]!.replace(/\+.*$/, "")]
+    .map((text) => text.split(/[\s._-]+/).map(letters).filter(Boolean))
+    .filter((parts) => parts.length >= 2);
+  const out = new Set<string>();
+  for (const parts of names) {
+    const first = parts[0]!;
+    const last = parts[parts.length - 1]!;
+    for (const spelled of [first + last, last + first, first[0] + last, first + last[0], last + first[0]]) if (spelled.length >= 5) out.add(spelled);
+  }
+  return out;
+}
+
+/** The other attendee (outside the customer's domains) the same person is, by name or how their address is spelled. */
+function twinOf(person: Attendee, others: readonly Attendee[]): string | undefined {
+  const local = letters((person.email ?? "").split("@")[0]!.replace(/\+.*$/, ""));
+  const name = person.name ? letters(person.name) : "";
+  const mine = spellings(person);
+  const found = others.find((other) => {
+    if (name && other.name && letters(other.name) === name) return true;
+    const theirs = spellings(other);
+    return (local.length >= 5 && theirs.has(local)) || [...mine].some((spelled) => theirs.has(spelled));
+  });
+  return found?.email;
+}
+
 /**
  * The source event as a task's post shows it: its link, when, who (people
  * at the account's domains marked as customers), the description and a short
@@ -480,10 +509,18 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [])
   const start = timeText(payload.start);
   const end = timeText(payload.end);
   const when = start ? `When: ${start}${end ? ` → ${end}` : ""}` : typeof event.occurred_at === "number" && event.occurred_at > 0 ? `When: ${new Date(event.occurred_at * 1000).toISOString()}` : "";
-  const attendees = attendeesOf(payload.attendees).sort((a, b) => Number(customer(b.email)) - Number(customer(a.email)));
+  const listed = attendeesOf(payload.attendees);
+  // Your own people often have an address at the customer's domain too; it isn't a customer.
+  const twins = new Map(listed.filter((a) => customer(a.email)).flatMap((a) => {
+    const twin = twinOf(a, listed.filter((other) => other.email && !customer(other.email)));
+    return twin ? [[a.email!, twin] as const] : [];
+  }));
+  const isCustomer = (a: Attendee) => customer(a.email) && !twins.has(a.email!);
+  const attendees = listed.sort((a, b) => Number(isCustomer(b)) - Number(isCustomer(a)));
   const who = attendees.slice(0, MAX_ATTENDEES).map((a) => {
     const label = a.name && a.email ? `${a.name} <${a.email}>` : (a.email ?? a.name!);
-    const notes = [customer(a.email) && "customer", a.organizer && "organizer", a.status && a.status !== "needsAction" && a.status].filter(Boolean);
+    const twin = a.email ? twins.get(a.email) : undefined;
+    const notes = [isCustomer(a) && "customer", twin && `customer-domain address of ${twin}, not a customer`, a.organizer && "organizer", a.status && a.status !== "needsAction" && a.status].filter(Boolean);
     return `- ${label}${notes.length ? ` (${notes.join(", ")})` : ""}`;
   });
   if (attendees.length > MAX_ATTENDEES) who.push(`- …and ${attendees.length - MAX_ATTENDEES} more`);
