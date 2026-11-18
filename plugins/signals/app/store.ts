@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountRecord, contentKey, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountRecord, contentKey, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -416,7 +416,8 @@ export class SignalsStore {
     const events = await this.q(`SELECT e.id, e.source, e.external_id, e.title, e.url, e.actor, e.occurred_at, e.versions, e.owner FROM $S.events e WHERE e.task_id = $1 ORDER BY e.occurred_at DESC LIMIT 100`, [id]);
     const activities = await this.q(`SELECT at, actor, kind, text FROM $S.activities WHERE task_id = $1 ORDER BY at, id`, [id]);
     const artifacts = await this.q(`SELECT at, actor, kind, url, title FROM $S.artifacts WHERE task_id = $1 ORDER BY at, id`, [id]);
-    return { task, events: events.rows.map(numbers), activities: activities.rows.map(numbers), artifacts: artifacts.rows.map(numbers) };
+    const shown = (row: Row): Row => ({ ...numbers(row), ...(typeof row.title === "string" && { title: plainSlack(row.title) }), ...(typeof row.text === "string" && { text: plainSlack(row.text) }) });
+    return { task, events: events.rows.map(shown), activities: activities.rows.map(shown), artifacts: artifacts.rows.map(numbers) };
   }
 
   async setStatus(id: number, status: TaskStatus, actor: string, note?: string): Promise<Task | undefined> {
@@ -797,7 +798,7 @@ function toTask(row: Row): Task {
     id: Number(row.id),
     rule_id: String(row.rule_id),
     group_key: String(row.group_key),
-    title: String(row.title),
+    title: plainSlack(String(row.title)),
     account: (row.account as string | null) ?? null,
     channel: (row.channel as string | null) ?? null,
     workstream: (row.workstream as string | null) ?? null,

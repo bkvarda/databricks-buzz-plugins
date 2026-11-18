@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, doneReason, finishes, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
@@ -931,5 +931,44 @@ describe("tasks that finish themselves", () => {
     expect((await store.task(mailA!.id))!.status).toBe("done");
     expect(posts.at(-1)!.text).toBe(doneMessage("nothing new in 14 days"));
     expect((await store.task(mailB!.id))!.status).toBe("waiting");
+  });
+});
+
+describe("Slack markup", () => {
+  it("shows mentions, channels and links as people read them", () => {
+    expect(plainSlack("<@U029YEWF7V2|Brandon Kvarda> can you look? cc <@U12>")).toBe("@Brandon Kvarda can you look? cc @U12");
+    expect(plainSlack("in <#C0123|ext-globex> and <#C9|>, <!here> <!channel> <!subteam^S1|@eng> <!subteam^S2|ops> <!subteam^S3>")).toBe("in #ext-globex and #C9, @here @channel @eng @ops @team");
+    expect(plainSlack("see <https://x.io/a?b=1|the doc> or <https://y.io>")).toBe("see [the doc](https://x.io/a?b=1) or https://y.io");
+    expect(plainSlack("From: Ann <ann@globex.io>, 2 < 3")).toBe("From: Ann <ann@globex.io>, 2 < 3");
+    expect(plainSlack(null)).toBeNull();
+  });
+
+  it("shows tasks and their posts without the markup, and rules still see it", async () => {
+    const store = new SignalsStore(pglite(), "signals_slack");
+    await store.setup();
+    const posts: { kind: string; text: string }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task, agents = [], context = {}) => (posts.push({ kind: "opened", text: taskMessage(task, { agents, ...context }) }), `root-${task.id}`), updated: async (_task, text) => void posts.push({ kind: "updated", text }) },
+      { defaultConfig: { version: 1, default_channel: "triage", rules: [{ id: "asks", sources: ["slack"], when: { title: "<@U029YEWF7V2" }, action: "task", group_by: "group_key", title: "Answer: {title}" }] } },
+    );
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    await call("POST", "/api/sources", { source: "slack", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "slack", external_id: "seed" }] });
+    const raw = "<@U029YEWF7V2|Brandon Kvarda> can you check <#C1|ext-globex>?";
+    await call("POST", "/api/events", { events: [{ source: "slack", external_id: "s1", group_key: "t1", title: raw, payload: { text: raw } }] });
+    const task = (await store.task(1))!;
+    expect(task.title).toBe("Answer: @Brandon Kvarda can you check #ext-globex?");
+    expect(posts[0]!.text).toContain("📌 **Task 1: Answer: @Brandon Kvarda can you check #ext-globex?**");
+    expect(posts[0]!.text).toContain("text: @Brandon Kvarda can you check #ext-globex?");
+    expect(posts[0]!.text).not.toContain("<@U");
+    await call("POST", "/api/events", { events: [{ source: "slack", external_id: "s2", group_key: "t1", title: "<@U029YEWF7V2|Brandon Kvarda> any news?" }] });
+    expect(posts.at(-1)!.text).toBe("Update: @Brandon Kvarda any news?");
+    const detail = (await call("GET", "/api/task", undefined, "id=1")).json as { task: { title: string }; events: { title: string }[] };
+    expect(detail.task.title).not.toContain("<@");
+    expect(detail.events.map((event) => event.title)).toEqual(expect.arrayContaining(["@Brandon Kvarda any news?"]));
+    const board = (await call("GET", "/api/board", undefined, "channel=triage")).json as { tasks: { task: { title: string }; source?: { title?: string } }[] };
+    expect(board.tasks[0]!.task.title).toBe("Answer: @Brandon Kvarda can you check #ext-globex?");
+    expect(board.tasks[0]!.source!.title).toBe("@Brandon Kvarda any news?");
   });
 });

@@ -20,7 +20,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -231,7 +231,8 @@ export class Hub {
     for (const update of result.updated) {
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
       seen.add(update.task.id);
-      const text = `Update: ${update.url ? `[${update.title ?? "new event"}](${update.url})` : (update.title ?? "a new event")}`;
+      const title = update.title && plainSlack(update.title);
+      const text = `Update: ${update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event")}`;
       await this.notifier.updated(update.task, text).catch((error: Error) => this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`));
     }
   }
@@ -523,7 +524,7 @@ export class Hub {
       out.push({
         task,
         people: whoIsOn(people.get(task.id) ?? [], actors.get(task.id) ?? [], extra.event, await domainsOf(task.account), labels, rules.get(task.rule_id)),
-        ...(extra.event && { source: { source: extra.event.source, ...(extra.event.title && { title: extra.event.title }), ...(extra.event.url && { url: extra.event.url }), occurred_at: Number(extra.event.occurred_at ?? 0) } }),
+        ...(extra.event && { source: { source: extra.event.source, ...(extra.event.title && { title: plainSlack(extra.event.title) }), ...(extra.event.url && { url: extra.event.url }), occurred_at: Number(extra.event.occurred_at ?? 0) } }),
         artifacts: extra.artifacts.slice(0, 10),
         ...(extra.activity && { activity: extra.activity }),
         ...(task.buzz_root && { thread: `buzz://message?channel=${task.channel}&id=${task.buzz_root}` }),
@@ -765,7 +766,7 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [],
   const rest = Object.entries(payload).filter(([key, value]) => !SHOWN.has(key) && value !== null && value !== undefined && value !== "" && !(Array.isArray(value) && !value.length));
   const excerpt = rest.map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("; ");
   const place = [typeof payload.location === "string" && payload.location, typeof payload.hangoutLink === "string" && payload.hangoutLink].filter(Boolean).join(" · ");
-  return [
+  return plainSlack([
     `**Source** (${event.source})${event.url ? `: ${event.url}` : ""}`,
     when,
     event.actor ? `From: ${event.actor}` : "",
@@ -775,7 +776,7 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [],
     excerpt && `Details: ${clip(excerpt, 600)}`,
   ]
     .filter(Boolean)
-    .join("\n");
+    .join("\n"));
 }
 
 /** Someone on a task as the board shows them. */

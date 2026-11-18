@@ -388,6 +388,26 @@ export function doneWhenOf(config: SignalsConfig, rule: Rule): DoneWhen | undefi
   return { ...rule.done_when, idle_days: config.done_idle_days };
 }
 
+/**
+ * Slack's markup as people read it, for display: `<@U123|Ann Lee>` → `@Ann
+ * Lee` (a bare `<@U123>` → `@U123`), `<#C123|general>` → `#general`,
+ * `<!here>` → `@here`, `<!subteam^S1|@eng>` → `@eng`, and links
+ * `<https://x|label>` → `[label](https://x)`, `<https://x>` → the URL. Other
+ * angle brackets (an email address) are left alone. Rules still see the raw text.
+ */
+export function plainSlack(text: string): string;
+export function plainSlack(text: string | null): string | null;
+export function plainSlack(text: string | null): string | null {
+  if (!text || !text.includes("<")) return text;
+  return text
+    .replace(/<@([A-Z0-9]+)(?:\|([^>]+))?>/g, (_, id: string, name?: string) => `@${name?.trim() || id}`)
+    .replace(/<#([A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, name?: string) => `#${name?.trim() || id}`)
+    .replace(/<!subteam\^[A-Z0-9]+(?:\|([^>]+))?>/g, (_, name?: string) => (name?.trim() ? (name.trim().startsWith("@") ? name.trim() : `@${name.trim()}`) : "@team"))
+    .replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
+    .replace(/<(https?:\/\/[^|>\s]+)\|([^>]+)>/g, "[$2]($1)")
+    .replace(/<(https?:\/\/[^|>\s]+)>/g, "$1");
+}
+
 /** An event field: `title`, `payload.status`, `payload.case.owner`. */
 export function field(event: EventInput, path: string): unknown {
   const [head, ...rest] = path.split(".");
