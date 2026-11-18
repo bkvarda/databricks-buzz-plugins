@@ -2,7 +2,8 @@
 // like a Linear board, each with who's on it (agents, your team, the party
 // it sits with, like support, the customer, named as the hub's labels say), its source, what was made for it and
 // its latest activity. From a card you can add an agent, open its thread to
-// steer the agents there, and change its status or dismiss it.
+// steer the agents there, answer what an agent asked (Provide input), and
+// change its status or dismiss it.
 import type { Context } from "@buzz/author";
 import type { PanelProps } from "@dbx/core/host-types";
 import { optionalService } from "@dbx/core/host-types";
@@ -102,6 +103,56 @@ function AddAgent(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
   );
 }
 
+/** What a waiting task asks, with its choices and a box for any other answer; the answer goes to its thread. */
+export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
+  const { task } = props.task;
+  const [open, setOpen] = React.useState(false);
+  const [text, setText] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string>();
+  if (!task.question) return null;
+  const send = async (answer: string) => {
+    if (!answer.trim()) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await props.hub.updateTask({ id: task.id, input: answer.trim() });
+      setOpen(false);
+      setText("");
+      props.onDone();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div style={{ borderLeft: "3px solid var(--dbx-warning, var(--dbx-brand))", paddingLeft: 8 }}>
+      <Stack gap={6}>
+        <Text size="xs" weight={600}>Needs input</Text>
+        <Text size="sm">{task.question}</Text>
+        {!open ? (
+          <Button size="sm" variant="brand" onClick={() => setOpen(true)}>Provide input</Button>
+        ) : (
+          <Stack gap={6}>
+            {(task.options ?? []).length > 0 && (
+              <Stack direction="row" gap={6} wrap>
+                {task.options!.map((option) => <Button key={option} size="sm" disabled={busy} onClick={() => void send(option)}>{option}</Button>)}
+              </Stack>
+            )}
+            <textarea className="dbx-input" rows={2} placeholder={(task.options ?? []).length ? "Or write your answer" : "Your answer"} value={text} onChange={(event) => setText(event.target.value)} />
+            {error && <Text size="xs" tone="danger">{error}</Text>}
+            <Stack direction="row" gap={6}>
+              <Button size="sm" variant="brand" disabled={busy || !text.trim()} onClick={() => void send(text)}>{busy ? <Spinner size={10} /> : null}Send</Button>
+              <Button size="sm" onClick={() => setOpen(false)}>Cancel</Button>
+            </Stack>
+          </Stack>
+        )}
+      </Stack>
+    </div>
+  );
+}
+
 function TaskCard(props: { hub: HubClient; item: BoardTask; labels?: ResolvedLabels; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void }) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
@@ -139,6 +190,7 @@ function TaskCard(props: { hub: HubClient; item: BoardTask; labels?: ResolvedLab
             {item.people.map((person) => <Avatar key={`${person.kind}:${person.key}`} person={person} {...(props.labels && { labels: props.labels })} {...(person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key)! })} />)}
           </Stack>
         )}
+        {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
         {item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}…` : item.activity.text}</Text>}
         {item.artifacts.length > 0 && (
           <Stack gap={2}>

@@ -1068,6 +1068,30 @@ function AddAgent(props) {
   };
   return /* @__PURE__ */ React.createElement(Stack, { gap: 6, style: { width: "100%" } }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Agent npub1\u2026 (a member of this channel)", value: agent, onChange: (event) => setAgent(event.target.value) }), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "What to do (optional)", value: note, onChange: (event) => setNote(event.target.value) }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || !agent.trim(), onClick: () => void add() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Ask"), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setOpen(false) }, "Cancel")));
 }
+function ProvideInput(props) {
+  const { task } = props.task;
+  const [open, setOpen] = React.useState(false);
+  const [text, setText] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  if (!task.question) return null;
+  const send = async (answer) => {
+    if (!answer.trim()) return;
+    setBusy(true);
+    setError(void 0);
+    try {
+      await props.hub.updateTask({ id: task.id, input: answer.trim() });
+      setOpen(false);
+      setText("");
+      props.onDone();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "3px solid var(--dbx-warning, var(--dbx-brand))", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", weight: 600 }, "Needs input"), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, task.question), !open ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => setOpen(true) }, "Provide input") : /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, (task.options ?? []).length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, task.options.map((option) => /* @__PURE__ */ React.createElement(Button, { key: option, size: "sm", disabled: busy, onClick: () => void send(option) }, option))), /* @__PURE__ */ React.createElement("textarea", { className: "dbx-input", rows: 2, placeholder: (task.options ?? []).length ? "Or write your answer" : "Your answer", value: text, onChange: (event) => setText(event.target.value) }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || !text.trim(), onClick: () => void send(text) }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Send"), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setOpen(false) }, "Cancel")))));
+}
 function TaskCard(props) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
@@ -1085,7 +1109,7 @@ function TaskCard(props) {
     }
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
-  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "#", item.task.id, " ", item.task.title), /* @__PURE__ */ React.createElement(Badge, { tone: item.task.mode === "auto" ? "success" : "neutral" }, item.task.mode)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, item.task.workstream && /* @__PURE__ */ React.createElement(Badge, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, item.task.initiative), item.source && (item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: (event) => (event.preventDefault(), openExternal(item.source.url)), style: { fontSize: "0.75rem" } }, item.source.source) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source)), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3))), item.people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, wrap: true, align: "center" }, item.people.map((person) => /* @__PURE__ */ React.createElement(Avatar, { key: `${person.kind}:${person.key}`, person, ...props.labels && { labels: props.labels }, ...person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key) } }))), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}\u2026` : item.activity.text), item.artifacts.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, item.artifacts.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement(Text, { key: `${artifact.at}:${artifact.url}`, size: "xs" }, artifact.url.startsWith("http") ? /* @__PURE__ */ React.createElement("a", { href: artifact.url, onClick: (event) => (event.preventDefault(), openExternal(artifact.url)) }, artifact.title ?? artifact.kind) : artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss"))));
+  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "#", item.task.id, " ", item.task.title), /* @__PURE__ */ React.createElement(Badge, { tone: item.task.mode === "auto" ? "success" : "neutral" }, item.task.mode)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, item.task.workstream && /* @__PURE__ */ React.createElement(Badge, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, item.task.initiative), item.source && (item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: (event) => (event.preventDefault(), openExternal(item.source.url)), style: { fontSize: "0.75rem" } }, item.source.source) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source)), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3))), item.people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, wrap: true, align: "center" }, item.people.map((person) => /* @__PURE__ */ React.createElement(Avatar, { key: `${person.kind}:${person.key}`, person, ...props.labels && { labels: props.labels }, ...person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key) } }))), item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}\u2026` : item.activity.text), item.artifacts.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, item.artifacts.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement(Text, { key: `${artifact.at}:${artifact.url}`, size: "xs" }, artifact.url.startsWith("http") ? /* @__PURE__ */ React.createElement("a", { href: artifact.url, onClick: (event) => (event.preventDefault(), openExternal(artifact.url)) }, artifact.title ?? artifact.kind) : artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss"))));
 }
 function boardPanel(ctx, service) {
   return function BoardPanel({ channelContext, context }) {
@@ -1133,7 +1157,7 @@ async function hub(service) {
   if (!app) throw new Error(apps.length ? "Several signals hubs exist; the owner picks one in Settings \u2192 Signals." : "There's no signals hub in this workspace yet (Settings \u2192 Signals says how to deploy one).");
   return new HubClient(await service.ready(), app);
 }
-var line = (task) => `- #${task.id} [${task.status}, ${task.mode}] ${task.title}${task.account ? ` \xB7 ${task.account}` : ""}${task.workstream ? ` \xB7 ${task.workstream}` : ""}${task.initiative ? ` \xB7 initiative ${task.initiative}` : ""} \xB7 ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1e3).toISOString().slice(0, 16)}Z`;
+var line = (task) => `- #${task.id} [${task.status}, ${task.mode}] ${task.title}${task.question ? ` \xB7 needs input: ${task.question}${task.options?.length ? ` (${task.options.join(" / ")})` : ""}` : ""}${task.account ? ` \xB7 ${task.account}` : ""}${task.workstream ? ` \xB7 ${task.workstream}` : ""}${task.initiative ? ` \xB7 initiative ${task.initiative}` : ""} \xB7 ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1e3).toISOString().slice(0, 16)}Z`;
 function signalsTools(service) {
   return [
     {
@@ -1182,7 +1206,7 @@ function signalsTools(service) {
     },
     {
       name: "signals_task_update",
-      description: "Works on a signals task: set its status, add a note of what was done, file it under a workstream or initiative, or link an artifact (a draft doc, a demo, a PR). Its Buzz thread gets status changes and artifacts.",
+      description: "Works on a signals task: set its status, add a note of what was done, file it under a workstream or initiative, link an artifact (a draft doc, a demo, a PR), or ask for a person's input (question and options: the task waits, and their answer comes to its thread mentioning you). Its Buzz thread gets status changes, questions and artifacts.",
       inputSchema: schema.object(
         {
           id: schema.integer("Task id."),
@@ -1192,7 +1216,10 @@ function signalsTools(service) {
           initiative: schema.string('File it under this initiative ("" clears it).'),
           artifact_url: schema.string("A link to something made for the task."),
           artifact_title: schema.string("The artifact's title."),
-          artifact_kind: schema.string("doc, demo, code, email draft\u2026 (default link).")
+          artifact_kind: schema.string("doc, demo, code, email draft\u2026 (default link)."),
+          question: schema.string("Needs input: what you need a person to tell you. The task waits until they answer in its thread or on the Tasks board."),
+          options: schema.string(`The question's choices, separated by " / " (optional).`),
+          input: schema.string("Answers the task's question (as a person would).")
         },
         ["id"]
       ),
@@ -1204,6 +1231,8 @@ function signalsTools(service) {
           ...stringArg(args, "note", false) && { note: stringArg(args, "note") },
           ...typeof args.workstream === "string" && { workstream: args.workstream },
           ...typeof args.initiative === "string" && { initiative: args.initiative },
+          ...stringArg(args, "question", false) && { question: stringArg(args, "question"), ...stringArg(args, "options", false) && { options: stringArg(args, "options").split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).filter(Boolean) } },
+          ...stringArg(args, "input", false) && { input: stringArg(args, "input") },
           ...url && { artifact: { url, ...stringArg(args, "artifact_title", false) && { title: stringArg(args, "artifact_title") }, ...stringArg(args, "artifact_kind", false) && { kind: stringArg(args, "artifact_kind") } } }
         });
         return `Updated: ${line(detail.task)}`;

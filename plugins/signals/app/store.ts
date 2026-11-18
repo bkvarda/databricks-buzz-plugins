@@ -37,10 +37,14 @@ export type Task = Readonly<{
   nudged_at: number | null;
   /** The first agent reply the hub recorded in its thread (an event id). */
   agent_reply?: string | null;
+  /** While it's waiting on input: the question, its choices, and who asked (an agent's hex pubkey, or a person). */
+  question?: string | null;
+  options?: readonly string[] | null;
+  asked_by?: string | null;
 }>;
 
 /** Someone on a task: an agent (hex pubkey) asked to work on it, or a person (email) who changed it. */
-export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number }>;
+export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number }>;
 
 export type Outcome = "new" | "changed" | "same" | "skipped";
 export type IngestResult = Readonly<{
@@ -104,6 +108,10 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS agents jsonb NOT NULL DEFAULT '[]'`);
     // The first reply an account's agent posted in the task's thread, once the hub has recorded it.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS agent_reply text`);
+    // Needs input: what an agent (or a person) asked, its choices, and who asked (an agent's hex pubkey or a person).
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS question text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS options jsonb`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS asked_by text`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -113,6 +121,8 @@ export class SignalsStore {
     // Who works on a task: agents asked to (and when each first replied), and people who changed it.
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_people (
       task_id bigint NOT NULL, kind text NOT NULL, key text NOT NULL, label text, at bigint NOT NULL, replied_at bigint, PRIMARY KEY (task_id, kind, key))`);
+    // When an agent was asked again (given the input it asked for): only its replies after this count.
+    await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS asked_at bigint`);
     await this.setupInbox();
   }
 
@@ -381,14 +391,15 @@ export class SignalsStore {
   }
 
   /**
-   * Posted open tasks (opened within `days`) an agent may still reply to: no
-   * agent reply recorded yet, or an agent asked to work on it that hasn't replied.
+   * Posted open tasks an agent may still reply to: opened within `days` with no
+   * agent reply recorded yet, or with an agent asked (or asked again, given
+   * input) within `days` that hasn't replied since.
    */
   async awaitingAgents(days = 7, at = now(), limit = 50): Promise<Task[]> {
     const found = await this.q(
-      `SELECT * FROM $S.tasks t WHERE buzz_root IS NOT NULL AND status NOT IN ('done', 'dismissed') AND created_at >= $1
-         AND ((agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft'))
-           OR EXISTS (SELECT 1 FROM $S.task_people p WHERE p.task_id = t.id AND p.kind = 'agent' AND p.replied_at IS NULL))
+      `SELECT * FROM $S.tasks t WHERE buzz_root IS NOT NULL AND status NOT IN ('done', 'dismissed')
+         AND ((created_at >= $1 AND agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft'))
+           OR EXISTS (SELECT 1 FROM $S.task_people p WHERE p.task_id = t.id AND p.kind = 'agent' AND p.replied_at IS NULL AND COALESCE(p.asked_at, t.created_at) >= $1))
          ORDER BY id LIMIT ${limit}`,
       [at - days * 86400],
     );
@@ -414,10 +425,10 @@ export class SignalsStore {
   async people(tasks: readonly number[]): Promise<Map<number, TaskPerson[]>> {
     const out = new Map<number, TaskPerson[]>();
     if (!tasks.length) return out;
-    const found = await this.q(`SELECT task_id, kind, key, label, at, replied_at FROM $S.task_people WHERE task_id = ANY($1::bigint[]) ORDER BY at, key`, [tasks]);
+    const found = await this.q(`SELECT task_id, kind, key, label, at, replied_at, asked_at FROM $S.task_people WHERE task_id = ANY($1::bigint[]) ORDER BY at, key`, [tasks]);
     for (const row of found.rows) {
       const id = Number(row.task_id);
-      out.set(id, [...(out.get(id) ?? []), { kind: row.kind as TaskPerson["kind"], key: String(row.key), ...(row.label ? { label: String(row.label) } : {}), at: Number(row.at), ...(row.replied_at !== null && row.replied_at !== undefined && { replied_at: Number(row.replied_at) }) }]);
+      out.set(id, [...(out.get(id) ?? []), { kind: row.kind as TaskPerson["kind"], key: String(row.key), ...(row.label ? { label: String(row.label) } : {}), at: Number(row.at), ...(row.replied_at !== null && row.replied_at !== undefined && { replied_at: Number(row.replied_at) }), ...(row.asked_at !== null && row.asked_at !== undefined && { asked_at: Number(row.asked_at) }) }]);
     }
     return out;
   }
@@ -458,6 +469,29 @@ export class SignalsStore {
     const found = await this.q(`SELECT e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = $1`, [task]);
     const row = found.rows[0];
     return row ? toEvent(row) : undefined;
+  }
+
+  /**
+   * Puts a task on hold for input (status waiting, with the question and its
+   * choices), or, with no question, takes the question off.
+   */
+  async setQuestion(id: number, actor: string, ask?: Readonly<{ question: string; options: readonly string[]; by: string }>): Promise<Task | undefined> {
+    const found = ask
+      ? await this.q(`UPDATE $S.tasks SET status = 'waiting', question = $2, options = $3::jsonb, asked_by = $4, updated_at = $5 WHERE id = $1 RETURNING *`, [id, ask.question, JSON.stringify(ask.options), ask.by, now()])
+      : await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL, updated_at = $2 WHERE id = $1 RETURNING *`, [id, now()]);
+    if (!found.rows[0]) return undefined;
+    if (ask) await this.activity(id, actor, "question", `${ask.question}${ask.options.length ? ` (${ask.options.join(" / ")})` : ""}`);
+    return toTask(found.rows[0]);
+  }
+
+  /** Asks agents on a task again: the hub records each one's next reply after now, as it did their first. */
+  async askAgain(task: number, agents: readonly string[], at = now()): Promise<void> {
+    for (const key of agents)
+      await this.q(
+        `INSERT INTO $S.task_people (task_id, kind, key, at, asked_at) VALUES ($1, 'agent', $2, $3, $3)
+         ON CONFLICT (task_id, kind, key) DO UPDATE SET replied_at = NULL, asked_at = EXCLUDED.asked_at`,
+        [task, key, at],
+      );
   }
 
   async setAgentReply(task: number, reply: string): Promise<void> {
@@ -616,6 +650,9 @@ function toTask(row: Row): Task {
     buzz_root: (row.buzz_root as string | null) ?? null,
     nudged_at: num(row.nudged_at),
     agent_reply: (row.agent_reply as string | null) ?? null,
+    question: (row.question as string | null) ?? null,
+    options: row.options === null || row.options === undefined ? null : strings(typeof row.options === "string" ? JSON.parse(row.options) : row.options),
+    asked_by: (row.asked_by as string | null) ?? null,
   };
 }
 

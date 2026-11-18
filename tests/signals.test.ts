@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
@@ -552,6 +552,74 @@ describe("account channels", () => {
     expect(await store.task(1)).toMatchObject({ channel: "hooli-team" });
     expect(await hub.sweep()).toMatchObject({ posted: 1 });
     expect(posted).toEqual(["hooli-team"]);
+  });
+});
+
+describe("needs input", () => {
+  it("reads a question an agent marked in its reply", () => {
+    expect(markedQuestion("Here's the draft.\nNeeds input: Send it to Ann or to the whole team?\nOptions: Ann / Whole team")).toEqual({ question: "Send it to Ann or to the whole team?", options: ["Ann", "Whole team"] });
+    expect(markedQuestion("**Needs input:** Which region? \n- Options: us-east | eu-west")).toEqual({ question: "Which region?", options: ["us-east", "eu-west"] });
+    expect(markedQuestion("⏸️ needs input: Go ahead?")).toEqual({ question: "Go ahead?", options: [] });
+    expect(markedQuestion("This needs input from Dana later.")).toBeUndefined();
+    expect(markedQuestion("Done, no questions.")).toBeUndefined();
+    expect(readQuestion("", [])).toMatch(/question/);
+    expect(readQuestion("Which?", Array.from({ length: 9 }, (_, i) => `o${i}`))).toMatch(/options/);
+    expect(readQuestion(" Which? ", "A / B / A")).toEqual({ question: "Which?", options: ["A", "B"] });
+  });
+
+  it("puts a task on hold for input, takes the answer to its thread, and records the agent's next reply", async () => {
+    const store = new SignalsStore(pglite(), "signals_input");
+    await store.setup();
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "e".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules: [{ id: "mail", sources: ["gmail"], action: "task", workstream: "questions", group_by: "external_id" }] } },
+    );
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    const [genie, scout] = ["ab".repeat(32), "cd".repeat(32)];
+    await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [genie], preferences: "questions: draft" });
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?" }, { source: "gmail", external_id: "m2", actor: "ann@globex.io", title: "Renewal?" }] });
+    const root = (id: number) => "e".repeat(63) + id;
+
+    // A remote agent asks by marking a line in its reply: the task waits with the question.
+    const marked = { id: "r1", pubkey: genie, content: "Draft below.\nNeeds input: Quote list price or the discount?\nOptions: List / Discount", created_at: 100, tags: [["e", root(1), "", "reply"]] };
+    expect(await hub.collect(async () => [marked])).toEqual({ recorded: 1 });
+    let task = (await store.task(1))!;
+    expect(task).toMatchObject({ status: "waiting", question: "Quote list price or the discount?", options: ["List", "Discount"], asked_by: genie });
+    expect((await store.detail(1))!.activities.map((a) => a.kind)).toEqual(["opened", "agent_reply", "question"]);
+    const board = (await call("GET", "/api/board", undefined, "channel=globex")).json as { tasks: { task: { id: number; question?: string } }[] };
+    expect(board.tasks.find((item) => item.task.id === 1)?.task.question).toBe("Quote list price or the discount?");
+
+    // An agent with the tools asks through the API (as signals_task_update does).
+    expect(await call("POST", "/api/task", { id: 2, question: "" })).toMatchObject({ status: 400 });
+    expect(await call("POST", "/api/task", { id: 2, question: "Who signs?", options: [7] })).toMatchObject({ status: 400 });
+    expect((await call("POST", "/api/task", { id: 2, question: "Who signs?", options: ["Dana", "Lee"] })).json).toMatchObject({ task: { status: "waiting" } });
+    expect((await store.task(2))!).toMatchObject({ status: "waiting", question: "Who signs?", options: ["Dana", "Lee"], asked_by: "alice@x.com" });
+    expect(replies.at(-1)!.text).toContain("**Needs input**");
+    await call("POST", "/api/task", { id: 2, status: "in_progress" });
+    expect((await store.task(2))!).toMatchObject({ status: "in_progress", question: null });
+    expect(await call("POST", "/api/task", { id: 2, input: "Dana" })).toMatchObject({ status: 409 });
+
+    // Someone answers from the board: in the thread, mentioning the agent that asked, and the task resumes.
+    await call("POST", "/api/task", { id: 1, agents: [scout] });
+    expect(await call("POST", "/api/task", { id: 1, input: "  " })).toMatchObject({ status: 400 });
+    const answered = await call("POST", "/api/task", { id: 1, input: "Discount" });
+    expect(answered.json).toMatchObject({ task: { status: "in_progress", question: null, options: null }, activities: expect.arrayContaining([expect.objectContaining({ kind: "input", text: "Discount" })]) });
+    expect(replies.at(-1)).toMatchObject({ task: 1, agents: [genie, scout] });
+    expect(replies.at(-1)!.text).toContain("alice@x.com answered: Discount");
+    expect(replies.at(-1)!.text).toContain("> Quote list price or the discount?");
+
+    // Only the agents' replies after the answer count, once each; the old one doesn't count again.
+    expect(await hub.collect(async () => [marked])).toEqual({ recorded: 0 });
+    const after = { id: "r2", pubkey: genie, content: "Updated draft with the discount.", created_at: Math.floor(Date.now() / 1000) + 5, tags: [["e", root(1), "", "reply"]] };
+    expect(await hub.collect(async () => [marked, after])).toEqual({ recorded: 1 });
+    task = (await store.task(1))!;
+    expect(task).toMatchObject({ status: "in_progress", question: null, agent_reply: "r1" });
+    expect(await hub.collect(async () => [marked, after])).toEqual({ recorded: 0 });
   });
 });
 

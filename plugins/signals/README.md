@@ -128,6 +128,15 @@ When you add an agent to an account, the hub asks it to pick up the account's op
 
 Every task's post also shows its latest event: its link, when, who it's from, and where. For calendar events it lists the attendees, with people at the account's domains first and marked `customer`. Your own people often have an address at the customer's domain too. When a customer-domain address belongs to the same person as another attendee (the same name, or an address spelled from it, like `disburgh` for `dane.isburgh`), it is marked as theirs, not as a customer. It shows up to 1,500 characters of the description. It adds a short excerpt of the payload's other fields. A calendar source gets attendees and descriptions with `detail` (see `sources.example.json`), which fetches each event with `calendar_event_get`. Times show in the event's own time zone. A rule can match the attendees, with `when` on `payload.attendees`. For meeting prep, use `customer_attendees` instead, a pattern for the customer's email addresses, as the example `customer-meetings` rule does with `"customer_attendees": "@example\\.com$"`. The rule then applies only when the meeting has a real customer: someone the pattern matches who isn't also another attendee, so a team meeting that invites colleagues' customer-domain addresses doesn't open prep.
 
+**Needs input.** When an agent can't go on without a person, it puts the task on hold with a question and, optionally, choices. The task moves to `waiting`, its thread says what's asked, and its card on the Tasks board shows the question with a **Provide input** button. The answer (a choice, or your own words) is posted in the task's thread mentioning the agent that asked and the task's other agents, the question comes off, and the task goes back to `in_progress`. The hub then records each agent's next reply on the task, as it recorded its first. Agents with the Signals tools ask with `signals_task_update` (`question`, `options` separated by ` / `). Agents without them, such as remote ones, put a line in their reply in the task's thread:
+
+```text
+Needs input: Quote the list price or the discount?
+Options: List / Discount
+```
+
+The `Options:` line is optional. Moving a waiting task to another status by hand takes its question off. `POST /api/task` takes `{id, question, options?}` to ask and `{id, input}` to answer.
+
 **Agents** get `signals_account` (the account, its preferences and its profile) and `signals_account_learn`, which replaces the profile agents keep of the customer and the team. Every agent turn is told to read the account before working on a task and to record what it learns. That profile is how the channel gets better over time. Agents can also file a task under a workstream or initiative with `signals_task_update`.
 
 ## Sources (`sources.json`)

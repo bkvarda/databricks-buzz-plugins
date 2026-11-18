@@ -12,7 +12,7 @@ async function hub(service: DatabricksService): Promise<HubClient> {
   return new HubClient(await service.ready(), app);
 }
 
-const line = (task: Task) => `- #${task.id} [${task.status}, ${task.mode}] ${task.title}${task.account ? ` · ${task.account}` : ""}${task.workstream ? ` · ${task.workstream}` : ""}${task.initiative ? ` · initiative ${task.initiative}` : ""} · ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1000).toISOString().slice(0, 16)}Z`;
+const line = (task: Task) => `- #${task.id} [${task.status}, ${task.mode}] ${task.title}${task.question ? ` · needs input: ${task.question}${task.options?.length ? ` (${task.options.join(" / ")})` : ""}` : ""}${task.account ? ` · ${task.account}` : ""}${task.workstream ? ` · ${task.workstream}` : ""}${task.initiative ? ` · initiative ${task.initiative}` : ""} · ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1000).toISOString().slice(0, 16)}Z`;
 
 export function signalsTools(service: DatabricksService): AgentTool[] {
   return [
@@ -62,7 +62,7 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
     },
     {
       name: "signals_task_update",
-      description: "Works on a signals task: set its status, add a note of what was done, file it under a workstream or initiative, or link an artifact (a draft doc, a demo, a PR). Its Buzz thread gets status changes and artifacts.",
+      description: "Works on a signals task: set its status, add a note of what was done, file it under a workstream or initiative, link an artifact (a draft doc, a demo, a PR), or ask for a person's input (question and options: the task waits, and their answer comes to its thread mentioning you). Its Buzz thread gets status changes, questions and artifacts.",
       inputSchema: schema.object(
         {
           id: schema.integer("Task id."),
@@ -73,6 +73,9 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           artifact_url: schema.string("A link to something made for the task."),
           artifact_title: schema.string("The artifact's title."),
           artifact_kind: schema.string("doc, demo, code, email draft… (default link)."),
+          question: schema.string("Needs input: what you need a person to tell you. The task waits until they answer in its thread or on the Tasks board."),
+          options: schema.string("The question's choices, separated by \" / \" (optional)."),
+          input: schema.string("Answers the task's question (as a person would)."),
         },
         ["id"],
       ),
@@ -84,6 +87,8 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           ...(stringArg(args, "note", false) && { note: stringArg(args, "note") }),
           ...(typeof args.workstream === "string" && { workstream: args.workstream }),
           ...(typeof args.initiative === "string" && { initiative: args.initiative }),
+          ...(stringArg(args, "question", false) && { question: stringArg(args, "question"), ...(stringArg(args, "options", false) && { options: stringArg(args, "options").split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).filter(Boolean) }) }),
+          ...(stringArg(args, "input", false) && { input: stringArg(args, "input") }),
           ...(url && { artifact: { url, ...(stringArg(args, "artifact_title", false) && { title: stringArg(args, "artifact_title") }), ...(stringArg(args, "artifact_kind", false) && { kind: stringArg(args, "artifact_kind") }) } }),
         });
         return `Updated: ${line(detail.task)}`;
