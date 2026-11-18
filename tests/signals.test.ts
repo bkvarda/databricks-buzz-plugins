@@ -623,6 +623,76 @@ describe("needs input", () => {
   });
 });
 
+describe("recurring series", () => {
+  it("asks once about a new series, holds its other events, and keeps Always and Never", async () => {
+    const store = new SignalsStore(pglite(), "signals_series");
+    await store.setup();
+    await store.setup();
+    const opened: { id: number; mode: string; text: string; agents: readonly string[] }[] = [];
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(
+      store,
+      {
+        opened: async (task, agents = [], context = {}) => (opened.push({ id: task.id, mode: task.mode, text: taskMessage(task, { agents, ...context }), agents }), "f".repeat(60) + String(task.id).padStart(4, "0")),
+        updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }),
+      },
+      { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", title: "Prep: {title}", workstream: "meeting prep", group_by: "external_id", series: "payload.recurringEventId" }] } },
+    );
+    expect(configProblems({ version: 1, rules: [{ id: "m", action: "task", series: "" }] })).toEqual(["rules[0].series is a field or a {field} template"]);
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    const genie = "ab".repeat(32);
+    await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [genie], preferences: "meeting prep: draft" });
+    await call("POST", "/api/sources", { source: "google_calendar", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
+    const meeting = (id: string, series: string | undefined, title = "Weekly sync", at = 1000) => ({ source: "google_calendar", external_id: id, actor: "ann@globex.io", title, occurred_at: at, ...(series && { payload: { recurringEventId: series } }) });
+
+    // The series' first event asks, in ask mode (no agent starts), with the three choices.
+    await call("POST", "/api/events", { events: [meeting("w1", "weekly"), meeting("w2", "weekly", "Weekly sync", 2000)] });
+    let task = (await store.task(1))!;
+    expect(task).toMatchObject({ mode: "ask", status: "waiting", options: ["Always", "Just this one", "Never"], asked_by: "signals", series: "meetings|globex|weekly" });
+    expect(opened).toMatchObject([{ id: 1, mode: "ask", agents: [] }]);
+    expect(opened[0]!.text).toContain("**Needs input:** \"Prep: Weekly sync\" is part of a recurring series.");
+    expect(opened[0]!.text).toContain("Options: Always / Just this one / Never");
+    // Its other events wait for the answer.
+    expect(await store.tasks()).toHaveLength(1);
+    // A one-off meeting has no series and opens as usual.
+    await call("POST", "/api/events", { events: [meeting("o1", undefined, "Kickoff")] });
+    expect((await store.task(2))!).toMatchObject({ mode: "draft", status: "open", series: null, question: null });
+
+    // Always: this task goes ahead in the team's mode with the account's agents, and the held event opens its task.
+    const always = await call("POST", "/api/task", { id: 1, input: "Always" });
+    expect(always.json).toMatchObject({ task: { status: "open", mode: "draft", question: null } });
+    expect(replies.at(-1)).toMatchObject({ task: 1, agents: [genie] });
+    expect(replies.at(-1)!.text).toContain("alice@x.com answered: **Always**");
+    expect(replies.at(-1)!.text).toContain("please prepare this");
+    expect((await store.seriesFor("meetings|globex|weekly"))!).toMatchObject({ answer: "always", asked_task: null, answered_by: "alice@x.com" });
+    expect((await store.task(3))!).toMatchObject({ title: "Prep: Weekly sync", mode: "draft", status: "open", series: "meetings|globex|weekly", question: null });
+    expect(opened.at(-1)).toMatchObject({ id: 3, agents: [genie] });
+    // Later events of the series open tasks without asking.
+    await call("POST", "/api/events", { events: [meeting("w3", "weekly")] });
+    expect((await store.task(4))!).toMatchObject({ mode: "draft", question: null });
+
+    // Never: the task is dismissed, and the series' held and later events open nothing.
+    await call("POST", "/api/events", { events: [meeting("s1", "standup", "Standup"), meeting("s2", "standup", "Standup", 2000)] });
+    expect((await store.task(5))!).toMatchObject({ mode: "ask", status: "waiting" });
+    await call("POST", "/api/task", { id: 5, input: "Never" });
+    expect((await store.task(5))!).toMatchObject({ status: "dismissed", question: null });
+    await call("POST", "/api/events", { events: [meeting("s3", "standup", "Standup")] });
+    expect(await store.tasks()).toHaveLength(5);
+
+    // Just this one: the task goes ahead, and the series' next event asks again.
+    await call("POST", "/api/events", { events: [meeting("q1", "qbr", "QBR"), meeting("q2", "qbr", "QBR", 2000)] });
+    expect((await store.task(6))!).toMatchObject({ mode: "ask", status: "waiting" });
+    await call("POST", "/api/task", { id: 6, input: "Just this one" });
+    expect((await store.task(6))!).toMatchObject({ mode: "draft", status: "open", question: null });
+    expect((await store.seriesFor("meetings|globex|qbr"))!).toMatchObject({ answer: null });
+    expect((await store.task(7))!).toMatchObject({ mode: "ask", status: "waiting", question: expect.stringContaining("recurring series") });
+
+    // Each series keeps its own answer, under its account.
+    expect((await store.seriesList("globex")).map((series) => [series.key, series.answer])).toEqual(expect.arrayContaining([["meetings|globex|weekly", "always"], ["meetings|globex|standup", "never"], ["meetings|globex|qbr", null]]));
+  });
+});
+
 describe("who's on a task", () => {
   const ticket: EventInput = { source: "jira", external_id: "T-1", actor: "Ann <ann@acme.io>", payload: { assignee: "Bo <bo@us.io>" } };
   it("uses generic party names by default, and only a rule's party adds one", () => {

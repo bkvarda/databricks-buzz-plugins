@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountRecord, contentKey, decide, type EventInput, isOpen, matches, type Mode, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountRecord, contentKey, decide, type EventInput, isOpen, matches, type Mode, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -41,6 +41,26 @@ export type Task = Readonly<{
   question?: string | null;
   options?: readonly string[] | null;
   asked_by?: string | null;
+  /** The recurring series it's part of (see Rule.series), when its rule has one. */
+  series?: string | null;
+}>;
+
+/** A recurring series and what the team said about it. */
+export type Series = Readonly<{
+  key: string;
+  rule_id: string;
+  account: string | null;
+  /** The title of its first task, to show. */
+  title: string;
+  /** always: open tasks for its events; never: don't; null: not decided (it asks). */
+  answer: "always" | "never" | null;
+  /** The task asking about it, while nobody has answered. */
+  asked_task: number | null;
+  /** The mode its tasks get once the team says yes. */
+  mode: Mode;
+  answered_by: string | null;
+  answered_at: number | null;
+  created_at: number;
 }>;
 
 /** Someone on a task: an agent (hex pubkey) asked to work on it, or a person (email) who changed it. */
@@ -112,6 +132,14 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS question text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS options jsonb`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS asked_by text`);
+    // Recurring series (a rule's `series`): asked once, and the answer kept.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS series text`);
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.series (
+      key text PRIMARY KEY, rule_id text NOT NULL, account text, title text NOT NULL, answer text, asked_task bigint,
+      mode text NOT NULL DEFAULT 'draft', answered_by text, answered_at bigint, created_at bigint NOT NULL)`);
+    // An event of a series whose question is still open: held until the team answers.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS held_series text`);
+    await this.q(`CREATE INDEX IF NOT EXISTS events_held ON $S.events (held_series) WHERE held_series IS NOT NULL`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -264,16 +292,13 @@ export class SignalsStore {
         const recorded = await this.record(owner, event);
         counts[recorded.outcome]++;
         if (recorded.outcome === "same") continue;
-        const decision = decide(config, event, { firstRun: state.firstRun });
-        if (decision.kind === "none") continue;
-        let task = await this.taskByGroup(decision.group);
-        if (!task && decision.create) {
-          task = await this.openTask({ rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) });
-          opened.add(task.id);
-        } else if (task && !isOpen(task.status) && decision.create && recorded.outcome === "new") {
+        const placed = await this.place(owner, event, recorded, config, state.firstRun);
+        if (!placed) continue;
+        let task = placed.task;
+        if (placed.opened) opened.add(task.id);
+        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new") {
           await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
         }
-        if (!task) continue;
         await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
@@ -292,12 +317,43 @@ export class SignalsStore {
 
   // --- tasks --------------------------------------------------------------
 
-  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number }): Promise<Task> {
+  /**
+   * Runs the rules on a recorded event and finds (or opens) its task. A rule
+   * with `series` asks about a new recurring series once: its first event's
+   * task asks the team, and the series' other events are held until they
+   * answer; a series they said never to work on opens no tasks.
+   */
+  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean): Promise<{ task: Task; opened: boolean; create: boolean } | undefined> {
+    const decision = decide(config, event, { firstRun });
+    if (decision.kind === "none") return undefined;
+    const task = await this.taskByGroup(decision.group);
+    if (task) return { task, opened: false, create: decision.create };
+    if (!decision.create) return undefined;
+    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) };
+    if (!decision.series) return { task: await this.openTask(input), opened: true, create: true };
+    const series = await this.seriesFor(decision.series);
+    if (series?.answer === "never") return undefined;
+    if (series?.answer === "always") return { task: await this.openTask({ ...input, series: decision.series }), opened: true, create: true };
+    if (series?.asked_task) {
+      await this.q(`UPDATE $S.events SET held_series = $2 WHERE id = $1`, [recorded.id, decision.series]);
+      return undefined;
+    }
+    // A new (or undecided) series: this task asks the team, in ask mode so no agent starts on it yet.
+    const asking = await this.openTask({ ...input, mode: "ask", series: decision.series });
+    await this.q(
+      `INSERT INTO $S.series (key, rule_id, account, title, asked_task, mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (key) DO UPDATE SET asked_task = EXCLUDED.asked_task, title = EXCLUDED.title, mode = EXCLUDED.mode`,
+      [decision.series, decision.rule.id, decision.account?.name ?? null, decision.title, asking.id, decision.mode, now()],
+    );
+    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(decision.title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true };
+  }
+
+  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string }): Promise<Task> {
     const at = now();
     const found = await this.q(
-      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10) ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
-      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at],
+      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, series)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11) ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
+      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null],
     );
     const task = toTask(found.rows[0]!);
     await this.activity(task.id, "signals", "opened", `Opened by rule ${input.rule}.`);
@@ -536,6 +592,58 @@ export class SignalsStore {
     await this.activity(task, "signals", "nudge", text);
   }
 
+  // --- recurring series ---------------------------------------------------
+
+  async seriesFor(key: string): Promise<Series | undefined> {
+    const found = await this.q(`SELECT * FROM $S.series WHERE key = $1`, [key]);
+    return found.rows[0] ? toSeries(found.rows[0]) : undefined;
+  }
+
+  /** The series the team was asked about, for an account (or all), newest first. */
+  async seriesList(account?: string, limit = 100): Promise<Series[]> {
+    const found = account
+      ? await this.q(`SELECT * FROM $S.series WHERE lower(account) = lower($1) ORDER BY created_at DESC LIMIT ${limit}`, [account])
+      : await this.q(`SELECT * FROM $S.series ORDER BY created_at DESC LIMIT ${limit}`);
+    return found.rows.map(toSeries);
+  }
+
+  /**
+   * Records the team's answer about a series. `always` and `never` are kept
+   * for its later events; `once` (just this one) and null leave it undecided,
+   * so its next new event asks again. Either way the question is no longer
+   * open; `releaseHeld` then runs its held events through the rules again.
+   */
+  async answerSeries(key: string, answer: SeriesAnswer | null, by: string): Promise<Series | undefined> {
+    const kept = answer === "always" || answer === "never" ? answer : null;
+    const found = await this.q(`UPDATE $S.series SET answer = $2, asked_task = NULL, answered_by = $3, answered_at = $4 WHERE key = $1 RETURNING *`, [key, kept, by, now()]);
+    return found.rows[0] ? toSeries(found.rows[0]) : undefined;
+  }
+
+  /**
+   * Runs the rules again on the events held while a series' question was
+   * open (once it's answered), as their owners sent them: under `always`
+   * they open tasks, under `never` none, and after "just this one" the next
+   * of them asks again. Returns the tasks it opened.
+   */
+  async releaseHeld(key: string, config: SignalsConfig): Promise<Task[]> {
+    const found = await this.q(`UPDATE $S.events SET held_series = NULL WHERE held_series = $1 AND task_id IS NULL RETURNING *`, [key]);
+    const opened: Task[] = [];
+    for (const row of [...found.rows].sort((a, b) => Number(a.occurred_at) - Number(b.occurred_at))) {
+      const event = toEvent(row);
+      const placed = await this.place(String(row.owner), event, { id: Number(row.id) }, config, false);
+      if (!placed) continue;
+      await this.attach(placed.task.id, Number(row.id), Number(row.versions), toSeconds(event.occurred_at));
+      if (placed.opened) opened.push((await this.task(placed.task.id))!);
+    }
+    return opened;
+  }
+
+  /** Gives a task the mode its series' tasks get, once the team said to work on it. */
+  async setMode(id: number, mode: Mode): Promise<Task | undefined> {
+    const found = await this.q(`UPDATE $S.tasks SET mode = $2, updated_at = $3 WHERE id = $1 RETURNING *`, [id, mode, now()]);
+    return found.rows[0] ? toTask(found.rows[0]) : undefined;
+  }
+
   // --- accounts -----------------------------------------------------------
 
   async accounts(): Promise<AccountRecord[]> {
@@ -653,6 +761,22 @@ function toTask(row: Row): Task {
     question: (row.question as string | null) ?? null,
     options: row.options === null || row.options === undefined ? null : strings(typeof row.options === "string" ? JSON.parse(row.options) : row.options),
     asked_by: (row.asked_by as string | null) ?? null,
+    series: (row.series as string | null) ?? null,
+  };
+}
+
+function toSeries(row: Row): Series {
+  return {
+    key: String(row.key),
+    rule_id: String(row.rule_id),
+    account: (row.account as string | null) ?? null,
+    title: String(row.title),
+    answer: row.answer === "always" || row.answer === "never" ? row.answer : null,
+    asked_task: num(row.asked_task),
+    mode: ((row.mode as Mode | null) ?? "draft") as Mode,
+    answered_by: (row.answered_by as string | null) ?? null,
+    answered_at: num(row.answered_at),
+    created_at: Number(row.created_at),
   };
 }
 

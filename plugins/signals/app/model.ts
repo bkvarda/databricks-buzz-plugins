@@ -120,6 +120,13 @@ export type Rule = Readonly<{
   account?: string;
   /** Who tasks from this rule sit with on the tasks board: a key of labels.parties, like `support` (default: the source says). */
   party?: string;
+  /**
+   * What makes events one recurring series, like a meeting's
+   * `payload.recurringEventId` (a field or a `{field}` template). The first
+   * time a series shows up, its task asks the team once (Always / Just this
+   * one / Never), and the answer holds for the series' later events.
+   */
+  series?: string;
   /** Nudge when the event's latest version still matches `when` after this many hours. */
   stale_after_hours?: number;
   /** What the nudge says; `{field}` takes an event field. */
@@ -244,6 +251,7 @@ export function configProblems(raw: unknown): string[] {
         }
     }
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
+    if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
   }
   if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
@@ -360,9 +368,39 @@ export function groupKey(rule: Rule, event: EventInput): string {
   return `${rule.group ?? rule.id}|${group}`;
 }
 
+/**
+ * The recurring series an event is part of, for a rule with `series`: the
+ * rule's group, the account and the series id, so a team's answer holds for
+ * that series in that account. Undefined without one.
+ */
+export function seriesKey(rule: Rule, event: EventInput, account?: Pick<AccountRule, "name">): string | undefined {
+  if (!rule.series) return undefined;
+  const value = rule.series.includes("{") ? fillGroup(rule.series, event) : field(event, rule.series);
+  if (value === undefined || value === null || value === "") return undefined;
+  return `${rule.group ?? rule.id}|${(account?.name ?? "").toLowerCase()}|${typeof value === "object" ? JSON.stringify(value) : String(value).trim()}`;
+}
+
+/** How a team answers a new recurring series' question; Always and Never are kept for the series. */
+export const SERIES_OPTIONS = ["Always", "Just this one", "Never"] as const;
+export type SeriesAnswer = "always" | "once" | "never";
+/** Who asks a series' question (a task's asked_by). */
+export const SERIES_ASKER = "signals";
+
+/** An answer to a series' question as its choice, or undefined when it isn't one. */
+export function seriesAnswer(text: string): SeriesAnswer | undefined {
+  const lower = text.trim().toLowerCase().replace(/[.!]+$/, "");
+  if (lower === "always") return "always";
+  if (lower === "never") return "never";
+  if (lower === "just this one" || lower === "just this once" || lower === "once" || lower === "this one") return "once";
+  return undefined;
+}
+
+/** The question a new recurring series' first task asks. */
+export const seriesQuestion = (title: string) => `"${title}" is part of a recurring series. Should agents work on its events from now on?`;
+
 export type Decision =
   | Readonly<{ kind: "none"; reason: string }>
-  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode }>;
+  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string }>;
 
 /**
  * What to do with an event that is new or changed. `firstRun` is a source's
@@ -381,7 +419,8 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   // On a first run, existing things are seen; only updates to tasks that already exist go through.
   // A team that turned a kind of work off still gets updates on tasks already open.
   const create = rule.action === "task" && mode !== "off" && !(options.firstRun && config.first_run_seen !== false);
-  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode };
+  const series = seriesKey(rule, event, account);
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }) };
 }
 
 // ---------------------------------------------------------------------------
