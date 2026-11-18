@@ -520,6 +520,18 @@ describe("account channels", () => {
     expect((await call("/api/account", { name: "Globex", profile: "x" })).json).not.toHaveProperty("woken");
     expect(replies).toHaveLength(2);
 
+    // Anyone can ask agents on a task from the board: they're mentioned in its thread and shown on it.
+    const helper = "12".repeat(32);
+    expect(await call("/api/task", { id: 1, agents: [] })).toMatchObject({ status: 400 });
+    expect(await call("/api/task", { id: 1, agents: ["not-a-key"] })).toMatchObject({ status: 400 });
+    expect(await call("/api/task", { id: 1, agents: Array.from({ length: 11 }, (_, i) => i.toString(16).padStart(2, "0").repeat(32)) })).toMatchObject({ status: 400 });
+    const asked = await call("/api/task", { id: 1, agents: [npubEncode(helper), helper], note: "Check the pricing sheet" });
+    expect(asked.json).toMatchObject({ activities: expect.arrayContaining([expect.objectContaining({ kind: "agents_asked", text: expect.stringContaining("Check the pricing sheet") })]) });
+    expect(replies.at(-1)).toMatchObject({ task: 1, agents: [helper] });
+    expect(replies.at(-1)!.text).toContain("Check the pricing sheet");
+    const board = (await hub.handle({ method: "GET", path: "/api/board", query: new URLSearchParams("channel=globex"), user: "alice@x.com", body: async () => "" })).json as { tasks: { task: { id: number }; people: { kind: string; key: string }[] }[] };
+    expect(board.tasks.find((item) => item.task.id === 1)?.people).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "agent", key: helper })]));
+
     // Their reply is recorded as for a new task.
     const root = "d".repeat(63) + "1";
     expect(await hub.collect(async () => [{ id: "r1", pubkey: scout, content: "Draft", created_at: 2, tags: [["e", root, "", "reply"]] }])).toEqual({ recorded: 1 });
