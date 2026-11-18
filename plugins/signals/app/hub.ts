@@ -13,18 +13,32 @@
 //   POST /api/task {id, status?, note?, workstream?, initiative?, artifact?: {url, title?, kind?}}
 //   GET  /api/accounts                    the account channels teams set up
 //   GET  /api/account?channel=|name=      one, with its preferences read
-//   POST /api/account {name, rename?, channel?, aliases?, domains?, preferences?, profile?, delete?}
+//   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type AccountRecord, configProblems, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task } from "./store";
+import { decode, npubEncode } from "nostr-tools/nip19";
+
+const HEX64 = /^[0-9a-f]{64}$/;
+/** A Buzz pubkey as hex, from hex or an npub; "" when it's neither. */
+export function agentKey(value: string): string {
+  const bare = value.trim().replace(/^nostr:/, "").toLowerCase();
+  if (HEX64.test(bare)) return bare;
+  try {
+    const decoded = decode(bare);
+    if (decoded.type === "npub") return decoded.data;
+  } catch {}
+  return "";
+}
+const npub = (key: string) => npubEncode(key);
 
 export type HubRequest = Readonly<{ method: string; path: string; query: URLSearchParams; user?: string; body(): Promise<string> }>;
 export type HubResponse = Readonly<{ status?: number; json: unknown }>;
 
 /** Where tasks go in Buzz. The hub works without it (tasks stay in Lakebase). */
 export type Notifier = Readonly<{
-  /** Posts a new task at its channel's top level; resolves with the message id. */
-  opened(task: Task): Promise<string | undefined>;
+  /** Posts a new task at its channel's top level, mentioning `agents` (hex pubkeys); resolves with the message id. */
+  opened(task: Task, agents?: readonly string[]): Promise<string | undefined>;
   /** Replies in the task's thread. */
   updated(task: Task, text: string): Promise<void>;
 }>;
@@ -201,7 +215,10 @@ export class Hub {
   private async post(task: Task) {
     if (!this.notifier || !task.channel || task.buzz_root) return;
     try {
-      const root = await this.notifier.opened(task);
+      // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
+      const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
+      const agents = account && account.channel === task.channel ? account.agents : [];
+      const root = await this.notifier.opened(task, agents);
       if (root) await this.store.setBuzzRoot(task.id, root);
     } catch (error) {
       this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
@@ -241,6 +258,9 @@ export class Hub {
     if (input.channel !== undefined && input.channel !== null && (typeof input.channel !== "string" || !/^[\w-]{1,100}$/.test(input.channel))) return bad("channel is a Buzz channel id.");
     if (input.rename !== undefined && (typeof input.rename !== "string" || !input.rename.trim() || input.rename.length > 200)) return bad("rename is the account's new name (1-200 characters).");
     const aliases = list("aliases", 20);
+    const agents = list("agents", 10)?.map(agentKey);
+    const notAgent = agents?.find((key) => !key);
+    if (notAgent !== undefined) return bad("agents are Buzz pubkeys (64 hex characters or an npub).");
     const preferences = text("preferences", 8000);
     const profile = text("profile", 16000);
     const account = await this.store.saveAccount(
@@ -250,6 +270,7 @@ export class Hub {
         ...(input.channel !== undefined && { channel: (input.channel as string | null) || null }),
         ...(aliases && { aliases }),
         ...(domains && { domains }),
+        ...(agents && { agents: agents as string[] }),
         ...(preferences !== undefined && { preferences }),
         ...(profile !== undefined && { profile }),
       },
@@ -330,13 +351,21 @@ const withRead = (account: AccountRecord) => ({ ...account, read: parsePreferenc
 
 const MODE_TEXT = { auto: "Mode: auto (agents do it and report)", draft: "Mode: draft (agents prepare it; a person sends it)", ask: "Mode: ask (agents ask before doing anything)", off: "Mode: off" } as const;
 
-export function taskMessage(task: Task, detail?: { url?: string }): string {
+/** What the account's agents are asked to do with a new task, by its mode. */
+const AGENT_ASK = {
+  auto: "please work on this now: call signals_account for this channel, follow the team's guidance, do the work, report it here and record it with signals_task_update.",
+  draft: "please prepare this: call signals_account for this channel, follow the team's guidance, and post a draft here (a reply, a doc) for a person to send. Record it with signals_task_update; don't send anything yourself.",
+} as const;
+
+export function taskMessage(task: Task, detail?: { url?: string; agents?: readonly string[] }): string {
+  const ask = detail?.agents?.length && (task.mode === "auto" || task.mode === "draft") ? `${detail.agents.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode]}` : "";
   return [
     `📌 **Task ${task.id}: ${task.title}**`,
     [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
     MODE_TEXT[task.mode] ?? "",
     detail?.url ? `Source: ${detail.url}` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
+    ask,
   ]
     .filter(Boolean)
     .join("\n");

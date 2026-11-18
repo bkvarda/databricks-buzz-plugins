@@ -108,6 +108,13 @@ Keep customer replies short. Copy the AE on anything about pricing.
 
 Every other line is guidance that agents follow. A task keeps the mode it had when it opened, and its Buzz message shows it.
 
+**Agents that work on tasks.** List agents (npubs or hex pubkeys) in the account's setup, and each new task's message mentions them, which wakes them in the task's thread:
+- In `auto`, they are asked to do the work and report it.
+- In `draft`, they are asked to post a draft for a person to send.
+- In `ask` and `off`, nobody is mentioned, and a person starts the work.
+
+The agents must be members of the channel. The hub needs a Buzz identity to post at all.
+
 **Agents** get `signals_account` (the account, its preferences and its profile) and `signals_account_learn`, which replaces the profile agents keep of the customer and the team. Every agent turn is told to read the account before working on a task and to record what it learns. That profile is how the channel gets better over time. Agents can also file a task under a workstream or initiative with `signals_task_update`.
 
 ## Sources (`sources.json`)

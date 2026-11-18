@@ -42,9 +42,9 @@ async function startingConfig(): Promise<SignalsConfig | undefined> {
 }
 
 const notifier: Notifier = {
-  async opened(task) {
+  async opened(task, agents = []) {
     if (!app.relay || !task.channel) return undefined;
-    const event = await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: taskMessage(task), tags: [["h", task.channel]] });
+    const event = await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: taskMessage(task, { agents }), tags: [["h", task.channel], ...agents.map((key) => ["p", key])] });
     return event.id;
   },
   async updated(task, text) {

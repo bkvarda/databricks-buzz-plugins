@@ -378,6 +378,8 @@ export type AccountRecord = Readonly<{
   preferences: string;
   /** What agents have learned about the account, its team and its people. */
   profile: string;
+  /** Agents (hex pubkeys) woken on each new task here, to work on it in the team's mode. */
+  agents: readonly string[];
   updated_by: string | null;
   updated_at: number | null;
 }>;

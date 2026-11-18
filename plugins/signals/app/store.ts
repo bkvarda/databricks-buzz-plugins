@@ -96,6 +96,7 @@ export class SignalsStore {
     await this.q(`CREATE TABLE IF NOT EXISTS $S.accounts (
       name text PRIMARY KEY, channel text UNIQUE, aliases jsonb NOT NULL DEFAULT '[]', domains jsonb NOT NULL DEFAULT '[]',
       preferences text NOT NULL DEFAULT '', profile text NOT NULL DEFAULT '', updated_by text, updated_at bigint)`);
+    await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS agents jsonb NOT NULL DEFAULT '[]'`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -419,7 +420,7 @@ export class SignalsStore {
    * gives it a new name and moves its tasks along. A channel belongs to one
    * account at a time.
    */
-  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; preferences?: string; profile?: string }>, by: string): Promise<AccountRecord> {
+  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string }>, by: string): Promise<AccountRecord> {
     const at = now();
     const existing = await this.account({ name });
     const key = existing?.name ?? name.trim();
@@ -433,6 +434,7 @@ export class SignalsStore {
     }
     if (fields.aliases) set("aliases", JSON.stringify(fields.aliases));
     if (fields.domains) set("domains", JSON.stringify(fields.domains));
+    if (fields.agents) set("agents", JSON.stringify(fields.agents));
     if (fields.preferences !== undefined) set("preferences", fields.preferences);
     if (fields.profile !== undefined) set("profile", fields.profile);
     set("updated_by", by);
@@ -509,6 +511,7 @@ function toAccount(row: Row): AccountRecord {
     domains: strings(typeof row.domains === "string" ? JSON.parse(row.domains) : row.domains),
     preferences: String(row.preferences ?? ""),
     profile: String(row.profile ?? ""),
+    agents: strings(typeof row.agents === "string" ? JSON.parse(row.agents) : row.agents),
     updated_by: (row.updated_by as string | null) ?? null,
     updated_at: num(row.updated_at),
   };
