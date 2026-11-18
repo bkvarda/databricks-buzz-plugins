@@ -215,64 +215,203 @@ function TaskCard(props: { hub: HubClient; item: BoardTask; labels?: ResolvedLab
   );
 }
 
-/** The "Tasks board" channel panel. */
+/** The page's id, for opening the board in its own window-wide page. */
+export const BOARD_PAGE = "board";
+const PLUGIN_ID = "bkvarda.databricks-signals";
+
+/** A board page route: the channel it shows (and its name, for the title). */
+export type BoardRoute = Readonly<{ channel?: string; name?: string }>;
+export const validBoardRoute = (params: unknown): boolean =>
+  params === null ||
+  (typeof params === "object" && !Array.isArray(params) && ["channel", "name"].every((key) => (params as Record<string, unknown>)[key] === undefined || typeof (params as Record<string, unknown>)[key] === "string"));
+
+/** The channel a board page was opened with, from its route. */
+export function boardRoute(target: unknown): BoardRoute {
+  const t = target as { kind?: string; route?: { params?: unknown } } | undefined;
+  const params = t?.kind === "page" && t.route?.params && typeof t.route.params === "object" ? (t.route.params as Record<string, unknown>) : {};
+  return { ...(typeof params.channel === "string" && { channel: params.channel }), ...(typeof params.name === "string" && { name: params.name }) };
+}
+
+type Navigation = { open(target: unknown): Promise<unknown> };
+
+/**
+ * The columns side by side. The row scrolls sideways inside whatever holds it
+ * (every parent has minWidth 0, so it can't push the host wider than its
+ * tab), and ‹ › buttons show when columns are out of view, since some systems
+ * hide scrollbars until you scroll.
+ */
+function Columns(props: { children: React.ReactNode }) {
+  const row = React.useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = React.useState({ left: false, right: false });
+  const measure = React.useCallback(() => {
+    const el = row.current;
+    if (!el) return;
+    setEdges({ left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 });
+  }, []);
+  React.useEffect(() => {
+    measure();
+    const el = row.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [measure]);
+  const scroll = (direction: 1 | -1) => row.current?.scrollBy({ left: direction * (COLUMN_WIDTH + 12), behavior: "smooth" });
+  const arrow = (direction: 1 | -1): React.CSSProperties => ({ position: "absolute", top: 0, [direction < 0 ? "left" : "right"]: 0, zIndex: 1, boxShadow: "0 1px 4px rgba(0,0,0,0.15)" });
+  return (
+    <div style={{ position: "relative", minWidth: 0, maxWidth: "100%" }}>
+      {edges.left && <div style={arrow(-1)}><Button size="sm" title="Scroll left" aria-label="Scroll left" onClick={() => scroll(-1)}>‹</Button></div>}
+      {edges.right && <div style={arrow(1)}><Button size="sm" title="Scroll right" aria-label="Scroll right" onClick={() => scroll(1)}>›</Button></div>}
+      <div ref={row} onScroll={measure} style={{ display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start", minWidth: 0, maxWidth: "100%", paddingBottom: 8 }}>
+        {props.children}
+      </div>
+    </div>
+  );
+}
+
+const COLUMN_WIDTH = 260;
+
+/** A channel's board: shared by the channel tab and the full-window page. */
+function Board(props: {
+  ctx: Context;
+  service: DatabricksService;
+  channel?: { id: string; name?: string };
+  /** Opens a thread in place (the channel tab); otherwise the host navigates to it. */
+  openThread?(root: string): boolean;
+  /** Shown in the header beside Refresh: Open in full window, or the channel picker. */
+  action?: React.ReactNode;
+  /** What to say when there's no channel. */
+  noChannel?: React.ReactNode;
+}) {
+  const { ctx, service, channel } = props;
+  const connection = useConnection(service);
+  const hubs = useAsync(async (signal) => (connection.status === "connected" ? chosenHub(service, signal) : undefined), [connection.status]);
+  const app = hubs.data?.app;
+  const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url]);
+  const [version, refresh] = React.useReducer((n: number) => n + 1, 0);
+  const board = useAsync(async (signal) => (hub && channel ? hub.board(channel.id, signal) : undefined), [hub, channel?.id, version]);
+  const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
+  const profile = useProfiles(ctx, agents);
+  const steer = (item: BoardTask) => {
+    if (!item.thread || !channel || !item.task.buzz_root) return;
+    if (props.openThread?.(item.thread)) return;
+    const relay = optionalService<RelayView>(ctx, "relay")?.snapshot();
+    const navigation = optionalService<Navigation>(ctx, "navigation");
+    if (!relay?.viewer || !relay.origin || !navigation) return;
+    void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channel.id, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
+  };
+
+  let body: React.ReactNode;
+  if (connection.status !== "connected") body = <Notice title="Connect Databricks" action={<Button variant="brand" onClick={() => service.openSettings()}>Connect</Button>}>Tasks live in your team's signals hub, a Databricks App.</Notice>;
+  else if (!channel) body = props.noChannel ?? <Notice>Open this from a channel's menu.</Notice>;
+  else if (hubs.loading || (board.loading && !board.data)) body = <Spinner label="Loading tasks" />;
+  else if (hubs.error || board.error) body = <Notice tone="danger">{describeError((hubs.error ?? board.error)!)}</Notice>;
+  else if (!hub) body = <Notice title="No signals hub in this workspace">Deploy one first (see the Signals plugin's README).</Notice>;
+  else if (!board.data?.tasks.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
+  else {
+    const grouped = columns(board.data.tasks);
+    body = (
+      <Columns>
+        {COLUMNS.map((column) => (
+          <div key={column.status} style={{ flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0 }}>
+            <Stack gap={8}>
+              <Stack direction="row" gap={6} align="center">
+                <Text size="sm" weight={600}>{column.title}</Text>
+                <Badge>{grouped.get(column.status)!.length}</Badge>
+              </Stack>
+              {grouped.get(column.status)!.map((item) => <TaskCard key={item.task.id} hub={hub} item={item} {...(board.data?.labels && { labels: board.data.labels })} profile={profile} steer={steer} onChange={refresh} />)}
+            </Stack>
+          </div>
+        ))}
+      </Columns>
+    );
+  }
+  return (
+    <DbxRoot style={{ minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" }}>
+      <div style={{ padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}>
+        <Stack gap={16}>
+          <SectionHeader
+            title={channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"}
+            description={board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity."}
+            action={
+              <Stack direction="row" gap={6} align="center">
+                {props.action}
+                {hub && channel && <Button size="sm" disabled={board.loading} onClick={refresh}>{board.loading ? <Spinner size={10} /> : null}Refresh</Button>}
+              </Stack>
+            }
+          />
+          {body}
+        </Stack>
+      </div>
+    </DbxRoot>
+  );
+}
+
+/** The "Tasks board" channel panel (a tab), with a button to open it in a full-window page. */
 export function boardPanel(ctx: Context, service: DatabricksService) {
   return function BoardPanel({ channelContext, context }: PanelProps) {
-    const connection = useConnection(service);
-    const hubs = useAsync(async (signal) => (connection.status === "connected" ? chosenHub(service, signal) : undefined), [connection.status]);
-    const app = hubs.data?.app;
-    const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url]);
-    const [version, refresh] = React.useReducer((n: number) => n + 1, 0);
-    const board = useAsync(async (signal) => (hub && channelContext ? hub.board(channelContext.channelId, signal) : undefined), [hub, channelContext?.channelId, version]);
-    const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
-    const profile = useProfiles(ctx, agents);
-    const steer = (item: BoardTask) => {
-      if (!item.thread || !channelContext) return;
-      if (context?.canOpen(item.thread) && context.open(item.thread)) return;
-      const relay = optionalService<RelayView>(ctx, "relay")?.snapshot();
-      const navigation = optionalService<{ open(target: unknown): Promise<unknown> }>(ctx, "navigation");
-      if (!relay?.viewer || !relay.origin || !navigation) return;
-      void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channelContext.channelId, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
-    };
-
-    let body: React.ReactNode;
-    if (!channelContext) body = <Notice>Open this from a channel's menu.</Notice>;
-    else if (connection.status !== "connected") body = <Notice title="Connect Databricks" action={<Button variant="brand" onClick={() => service.openSettings()}>Connect</Button>}>Tasks live in your team's signals hub, a Databricks App.</Notice>;
-    else if (hubs.loading || (board.loading && !board.data)) body = <Spinner label="Loading tasks" />;
-    else if (hubs.error || board.error) body = <Notice tone="danger">{describeError((hubs.error ?? board.error)!)}</Notice>;
-    else if (!hub) body = <Notice title="No signals hub in this workspace">Deploy one first (see the Signals plugin's README).</Notice>;
-    else if (!board.data?.tasks.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
-    else {
-      const grouped = columns(board.data.tasks);
-      body = (
-        <div style={{ display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start" }}>
-          {COLUMNS.map((column) => (
-            <div key={column.status} style={{ flex: "0 0 280px" }}>
-              <Stack gap={8}>
-                <Stack direction="row" gap={6} align="center">
-                  <Text size="sm" weight={600}>{column.title}</Text>
-                  <Badge>{grouped.get(column.status)!.length}</Badge>
-                </Stack>
-                {grouped.get(column.status)!.map((item) => <TaskCard key={item.task.id} hub={hub} item={item} {...(board.data?.labels && { labels: board.data.labels })} profile={profile} steer={steer} onChange={refresh} />)}
-              </Stack>
-            </div>
-          ))}
-        </div>
-      );
-    }
+    const navigation = optionalService<Navigation>(ctx, "navigation");
+    const popOut = channelContext && navigation && (
+      <Button size="sm" title="Open the board in a full-window page" onClick={() => void navigation.open({ version: 1, kind: "page", pluginId: PLUGIN_ID, pageId: BOARD_PAGE, route: { version: 1, params: { channel: channelContext.channelId, name: channelContext.channelName } } })}>
+        Open in full window ↗
+      </Button>
+    );
     return (
-      <DbxRoot>
-        <div style={{ padding: 16 }}>
-          <Stack gap={16}>
-            <SectionHeader
-              title={channelContext ? `Tasks in #${channelContext.channelName}` : "Tasks"}
-              description={board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity."}
-              action={hub && <Button size="sm" disabled={board.loading} onClick={refresh}>{board.loading ? <Spinner size={10} /> : null}Refresh</Button>}
-            />
-            {body}
-          </Stack>
-        </div>
-      </DbxRoot>
+      <Board
+        ctx={ctx}
+        service={service}
+        {...(channelContext && { channel: { id: channelContext.channelId, name: channelContext.channelName } })}
+        openThread={(thread) => Boolean(context?.canOpen(thread) && context.open(thread))}
+        action={popOut}
+      />
+    );
+  };
+}
+
+/**
+ * The board as a full-window page. It shows the channel it was opened with
+ * (from the channel tab's Open in full window), or lets you pick one of the
+ * account channels set up in the hub.
+ */
+export function boardPage(ctx: Context, service: DatabricksService) {
+  return function BoardPage(props: { navigation?: { target: unknown } }) {
+    const opened = boardRoute(props.navigation?.target);
+    const [picked, setPicked] = React.useState<{ id: string; name?: string }>();
+    React.useEffect(() => setPicked(undefined), [opened.channel]);
+    const connection = useConnection(service);
+    const accounts = useAsync(async (signal) => {
+      if (connection.status !== "connected") return [];
+      const found = await chosenHub(service, signal);
+      return found?.app ? (await new HubClient(service.client()!, found.app).accounts(signal)).filter((account) => account.channel) : [];
+    }, [connection.status]);
+    const channel = picked ?? (opened.channel ? { id: opened.channel, ...(opened.name && { name: opened.name }) } : undefined);
+    const options = accounts.data ?? [];
+    const named = channel && !channel.name ? options.find((account) => account.channel === channel.id) : undefined;
+    const shown = channel && { id: channel.id, name: channel.name ?? named?.name ?? "channel" };
+    const picker = options.length > 0 && (
+      <select
+        className="dbx-input"
+        aria-label="Account channel"
+        value={channel?.id ?? ""}
+        onChange={(event) => {
+          const account = options.find((item) => item.channel === event.target.value);
+          if (account?.channel) setPicked({ id: account.channel, name: account.name });
+        }}
+        style={{ width: "auto", fontSize: "0.75rem" }}
+      >
+        {!channel && <option value="">Choose an account…</option>}
+        {channel && !options.some((account) => account.channel === channel.id) && <option value={channel.id}>#{channel.name ?? channel.id}</option>}
+        {options.map((account) => <option key={account.channel!} value={account.channel!}>{account.name}</option>)}
+      </select>
+    );
+    return (
+      <Board
+        ctx={ctx}
+        service={service}
+        {...(shown && { channel: shown })}
+        action={picker}
+        noChannel={accounts.loading ? <Spinner label="Loading accounts" /> : <Notice>{options.length ? "Choose an account to see its tasks." : "No account channels yet. Set one up from a channel's menu (Set up account)."}</Notice>}
+      />
     );
   };
 }

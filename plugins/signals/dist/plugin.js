@@ -1141,43 +1141,130 @@ function TaskCard(props) {
   const closed = item.task.status === "done" || item.task.status === "dismissed";
   return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "#", item.task.id, " ", item.task.title), /* @__PURE__ */ React.createElement(Badge, { tone: item.task.mode === "auto" ? "success" : "neutral" }, item.task.mode)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, item.task.workstream && /* @__PURE__ */ React.createElement(Badge, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, item.task.initiative), item.source && (item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: (event) => (event.preventDefault(), openExternal(item.source.url)), style: { fontSize: "0.75rem" } }, item.source.source) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source)), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3))), item.people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, wrap: true, align: "center" }, item.people.map((person) => /* @__PURE__ */ React.createElement(Avatar, { key: `${person.kind}:${person.key}`, person, ...props.labels && { labels: props.labels }, ...person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key) } }))), item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}\u2026` : item.activity.text), item.artifacts.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, item.artifacts.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement(Text, { key: `${artifact.at}:${artifact.url}`, size: "xs" }, artifact.url.startsWith("http") ? /* @__PURE__ */ React.createElement("a", { href: artifact.url, onClick: (event) => (event.preventDefault(), openExternal(artifact.url)) }, artifact.title ?? artifact.kind) : artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss"))));
 }
+var BOARD_PAGE = "board";
+var PLUGIN_ID = "bkvarda.databricks-signals";
+var validBoardRoute = (params) => params === null || typeof params === "object" && !Array.isArray(params) && ["channel", "name"].every((key) => params[key] === void 0 || typeof params[key] === "string");
+function boardRoute(target) {
+  const t = target;
+  const params = t?.kind === "page" && t.route?.params && typeof t.route.params === "object" ? t.route.params : {};
+  return { ...typeof params.channel === "string" && { channel: params.channel }, ...typeof params.name === "string" && { name: params.name } };
+}
+function Columns(props) {
+  const row = React.useRef(null);
+  const [edges, setEdges] = React.useState({ left: false, right: false });
+  const measure = React.useCallback(() => {
+    const el = row.current;
+    if (!el) return;
+    setEdges({ left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 });
+  }, []);
+  React.useEffect(() => {
+    measure();
+    const el = row.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [measure]);
+  const scroll = (direction) => row.current?.scrollBy({ left: direction * (COLUMN_WIDTH + 12), behavior: "smooth" });
+  const arrow = (direction) => ({ position: "absolute", top: 0, [direction < 0 ? "left" : "right"]: 0, zIndex: 1, boxShadow: "0 1px 4px rgba(0,0,0,0.15)" });
+  return /* @__PURE__ */ React.createElement("div", { style: { position: "relative", minWidth: 0, maxWidth: "100%" } }, edges.left && /* @__PURE__ */ React.createElement("div", { style: arrow(-1) }, /* @__PURE__ */ React.createElement(Button, { size: "sm", title: "Scroll left", "aria-label": "Scroll left", onClick: () => scroll(-1) }, "\u2039")), edges.right && /* @__PURE__ */ React.createElement("div", { style: arrow(1) }, /* @__PURE__ */ React.createElement(Button, { size: "sm", title: "Scroll right", "aria-label": "Scroll right", onClick: () => scroll(1) }, "\u203A")), /* @__PURE__ */ React.createElement("div", { ref: row, onScroll: measure, style: { display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start", minWidth: 0, maxWidth: "100%", paddingBottom: 8 } }, props.children));
+}
+var COLUMN_WIDTH = 260;
+function Board(props) {
+  const { ctx, service, channel } = props;
+  const connection = useConnection(service);
+  const hubs = useAsync(async (signal) => connection.status === "connected" ? chosenHub(service, signal) : void 0, [connection.status]);
+  const app = hubs.data?.app;
+  const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url]);
+  const [version, refresh] = React.useReducer((n) => n + 1, 0);
+  const board = useAsync(async (signal) => hub2 && channel ? hub2.board(channel.id, signal) : void 0, [hub2, channel?.id, version]);
+  const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
+  const profile = useProfiles(ctx, agents);
+  const steer = (item) => {
+    if (!item.thread || !channel || !item.task.buzz_root) return;
+    if (props.openThread?.(item.thread)) return;
+    const relay = optionalService(ctx, "relay")?.snapshot();
+    const navigation = optionalService(ctx, "navigation");
+    if (!relay?.viewer || !relay.origin || !navigation) return;
+    void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channel.id, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
+  };
+  let body;
+  if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Tasks live in your team's signals hub, a Databricks App.");
+  else if (!channel) body = props.noChannel ?? /* @__PURE__ */ React.createElement(Notice, null, "Open this from a channel's menu.");
+  else if (hubs.loading || board.loading && !board.data) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Loading tasks" });
+  else if (hubs.error || board.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? board.error));
+  else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
+  else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
+  else {
+    const grouped = columns(board.data.tasks);
+    body = /* @__PURE__ */ React.createElement(Columns, null, COLUMNS.map((column) => /* @__PURE__ */ React.createElement("div", { key: column.status, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, column.title), /* @__PURE__ */ React.createElement(Badge, null, grouped.get(column.status).length)), grouped.get(column.status).map((item) => /* @__PURE__ */ React.createElement(TaskCard, { key: item.task.id, hub: hub2, item, ...board.data?.labels && { labels: board.data.labels }, profile, steer, onChange: refresh }))))));
+  }
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
+    SectionHeader,
+    {
+      title: channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks",
+      description: board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity.",
+      action: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))
+    }
+  ), body)));
+}
 function boardPanel(ctx, service) {
   return function BoardPanel({ channelContext, context }) {
-    const connection = useConnection(service);
-    const hubs = useAsync(async (signal) => connection.status === "connected" ? chosenHub(service, signal) : void 0, [connection.status]);
-    const app = hubs.data?.app;
-    const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url]);
-    const [version, refresh] = React.useReducer((n) => n + 1, 0);
-    const board = useAsync(async (signal) => hub2 && channelContext ? hub2.board(channelContext.channelId, signal) : void 0, [hub2, channelContext?.channelId, version]);
-    const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
-    const profile = useProfiles(ctx, agents);
-    const steer = (item) => {
-      if (!item.thread || !channelContext) return;
-      if (context?.canOpen(item.thread) && context.open(item.thread)) return;
-      const relay = optionalService(ctx, "relay")?.snapshot();
-      const navigation = optionalService(ctx, "navigation");
-      if (!relay?.viewer || !relay.origin || !navigation) return;
-      void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channelContext.channelId, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
-    };
-    let body;
-    if (!channelContext) body = /* @__PURE__ */ React.createElement(Notice, null, "Open this from a channel's menu.");
-    else if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Tasks live in your team's signals hub, a Databricks App.");
-    else if (hubs.loading || board.loading && !board.data) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Loading tasks" });
-    else if (hubs.error || board.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? board.error));
-    else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
-    else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
-    else {
-      const grouped = columns(board.data.tasks);
-      body = /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start" } }, COLUMNS.map((column) => /* @__PURE__ */ React.createElement("div", { key: column.status, style: { flex: "0 0 280px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, column.title), /* @__PURE__ */ React.createElement(Badge, null, grouped.get(column.status).length)), grouped.get(column.status).map((item) => /* @__PURE__ */ React.createElement(TaskCard, { key: item.task.id, hub: hub2, item, ...board.data?.labels && { labels: board.data.labels }, profile, steer, onChange: refresh }))))));
-    }
-    return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement("div", { style: { padding: 16 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
-      SectionHeader,
+    const navigation = optionalService(ctx, "navigation");
+    const popOut = channelContext && navigation && /* @__PURE__ */ React.createElement(Button, { size: "sm", title: "Open the board in a full-window page", onClick: () => void navigation.open({ version: 1, kind: "page", pluginId: PLUGIN_ID, pageId: BOARD_PAGE, route: { version: 1, params: { channel: channelContext.channelId, name: channelContext.channelName } } }) }, "Open in full window \u2197");
+    return /* @__PURE__ */ React.createElement(
+      Board,
       {
-        title: channelContext ? `Tasks in #${channelContext.channelName}` : "Tasks",
-        description: board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity.",
-        action: hub2 && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh")
+        ctx,
+        service,
+        ...channelContext && { channel: { id: channelContext.channelId, name: channelContext.channelName } },
+        openThread: (thread) => Boolean(context?.canOpen(thread) && context.open(thread)),
+        action: popOut
       }
-    ), body)));
+    );
+  };
+}
+function boardPage(ctx, service) {
+  return function BoardPage(props) {
+    const opened = boardRoute(props.navigation?.target);
+    const [picked, setPicked] = React.useState();
+    React.useEffect(() => setPicked(void 0), [opened.channel]);
+    const connection = useConnection(service);
+    const accounts = useAsync(async (signal) => {
+      if (connection.status !== "connected") return [];
+      const found = await chosenHub(service, signal);
+      return found?.app ? (await new HubClient(service.client(), found.app).accounts(signal)).filter((account) => account.channel) : [];
+    }, [connection.status]);
+    const channel = picked ?? (opened.channel ? { id: opened.channel, ...opened.name && { name: opened.name } } : void 0);
+    const options = accounts.data ?? [];
+    const named = channel && !channel.name ? options.find((account) => account.channel === channel.id) : void 0;
+    const shown = channel && { id: channel.id, name: channel.name ?? named?.name ?? "channel" };
+    const picker = options.length > 0 && /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        className: "dbx-input",
+        "aria-label": "Account channel",
+        value: channel?.id ?? "",
+        onChange: (event) => {
+          const account = options.find((item) => item.channel === event.target.value);
+          if (account?.channel) setPicked({ id: account.channel, name: account.name });
+        },
+        style: { width: "auto", fontSize: "0.75rem" }
+      },
+      !channel && /* @__PURE__ */ React.createElement("option", { value: "" }, "Choose an account\u2026"),
+      channel && !options.some((account) => account.channel === channel.id) && /* @__PURE__ */ React.createElement("option", { value: channel.id }, "#", channel.name ?? channel.id),
+      options.map((account) => /* @__PURE__ */ React.createElement("option", { key: account.channel, value: account.channel }, account.name))
+    );
+    return /* @__PURE__ */ React.createElement(
+      Board,
+      {
+        ctx,
+        service,
+        ...shown && { channel: shown },
+        action: picker,
+        noChannel: accounts.loading ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading accounts" }) : /* @__PURE__ */ React.createElement(Notice, null, options.length ? "Choose an account to see its tasks." : "No account channels yet. Set one up from a channel's menu (Set up account).")
+      }
+    );
   };
 }
 
@@ -1341,7 +1428,7 @@ function signalsTools(service) {
 }
 
 // plugins/signals/src/index.tsx
-var inject = ["react", "settingsCards", "panels"];
+var inject = ["react", "settingsCards", "panels", "pages"];
 var WORKSPACE_PREF = "signalsWorkspace";
 function HubWorkspace(props) {
   const [, setProfile] = usePreference(props.main, WORKSPACE_PREF);
@@ -1420,7 +1507,17 @@ function apply(ctx) {
       channelPlacement: "tab",
       component: boardPanel(ctx, databricks)
     });
-    return { main, databricks };
+    return { main, databricks, BoardPage: boardPage(ctx, databricks) };
+  });
+  ctx.pages.register({
+    id: BOARD_PAGE,
+    title: "Tasks board",
+    layout: "workspace",
+    route: { version: 1, validate: validBoardRoute },
+    component: (props) => {
+      const runtime = useLive(live);
+      return runtime ? /* @__PURE__ */ React.createElement(runtime.BoardPage, { ...props.navigation && { navigation: props.navigation } }) : /* @__PURE__ */ React.createElement(MissingCore, { ctx, feature: "Tasks board" });
+    }
   });
   ctx.settingsCards.register({
     id: "signals",

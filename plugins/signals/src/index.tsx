@@ -13,10 +13,10 @@ import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choic
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, type SignIn, signInPath, signInState, type SourceState } from "./client";
 import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
-import { boardPanel } from "./board-panel";
+import { BOARD_PAGE, boardPage, boardPanel, validBoardRoute } from "./board-panel";
 import { signalsTools } from "./tools";
 
-export const inject = ["react", "settingsCards", "panels"];
+export const inject = ["react", "settingsCards", "panels", "pages"];
 
 /** In the main connection's preferences: the CLI profile the hub runs in. */
 export const WORKSPACE_PREF = "signalsWorkspace";
@@ -172,7 +172,18 @@ export function apply(ctx: Context) {
       channelPlacement: "tab",
       component: boardPanel(ctx, databricks),
     });
-    return { main, databricks };
+    return { main, databricks, BoardPage: boardPage(ctx, databricks) };
+  });
+  // The tasks board in a full-window page, opened from the channel tab (with the channel) or from search (pick an account).
+  ctx.pages.register({
+    id: BOARD_PAGE,
+    title: "Tasks board",
+    layout: "workspace",
+    route: { version: 1, validate: validBoardRoute },
+    component: (props) => {
+      const runtime = useLive(live);
+      return runtime ? <runtime.BoardPage {...(props.navigation && { navigation: props.navigation })} /> : <MissingCore ctx={ctx} feature="Tasks board" />;
+    },
   });
   ctx.settingsCards.register({
     id: "signals",
