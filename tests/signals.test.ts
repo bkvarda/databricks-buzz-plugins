@@ -1,8 +1,9 @@
 // Signals: events → dedupe → rules → tasks, on a real Postgres (PGlite).
+import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, configProblems, decide, modeFor, parsePreferences, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { Hub } from "../plugins/signals/app/hub";
+import { Hub, HUB_PATHS } from "../plugins/signals/app/hub";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 
@@ -393,5 +394,15 @@ describe("the plugin's sign-in check", () => {
     expect(rpcSignIn(401, "")).toBe("needed");
     expect(rpcSignIn(200, JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32003, message: "Tool not allowed" } }))).toBe("unknown");
     expect(rpcSignIn(500, "oops")).toBe("unknown");
+  });
+});
+
+describe("routes", () => {
+  it("routes every path the hub handles", () => {
+    // The app only sends HUB_PATHS to Hub.handle, so a case missing there is unreachable.
+    const source = readFileSync(new URL("../plugins/signals/app/hub.ts", import.meta.url), "utf8");
+    const handled = new Set([...source.matchAll(/case "(?:GET|POST) (\/api\/[a-z]+)"/g)].map((match) => match[1]!));
+    expect(handled.size).toBeGreaterThan(0);
+    expect([...handled].filter((path) => !(HUB_PATHS as readonly string[]).includes(path))).toEqual([]);
   });
 });

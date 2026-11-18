@@ -39,6 +39,9 @@ export type HubOptions = Readonly<{
 
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
+/** Every path Hub.handle serves; the app routes exactly these to it. */
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/config"] as const;
+
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
 
