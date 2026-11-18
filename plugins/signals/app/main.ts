@@ -47,9 +47,11 @@ const notifier: Notifier = {
     const event = await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: taskMessage(task, { agents, ...context }), tags: [["h", task.channel], ...agents.map((key) => ["p", key])] });
     return event.id;
   },
-  async updated(task, text) {
+  async updated(task, text, agents = []) {
     if (!app.relay || !task.channel || !task.buzz_root) return;
-    for (const part of splitMessage(text)) await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: part, tags: [["h", task.channel], ["e", task.buzz_root, "", "reply"]] });
+    // Only the first part mentions the agents, so a long message wakes them once.
+    for (const [n, part] of splitMessage(text).entries())
+      await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: part, tags: [["h", task.channel], ["e", task.buzz_root, "", "reply"], ...(n === 0 ? agents.map((key) => ["p", key]) : [])] });
   },
 };
 

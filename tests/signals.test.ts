@@ -476,6 +476,48 @@ describe("account channels", () => {
     expect(await hub.collect(async () => replies)).toEqual({ recorded: 0 });
   });
 
+  it("asks agents added to an account to work on its open tasks no agent has worked yet", async () => {
+    const store = new SignalsStore(pglite(), "signals_handoff");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "d".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const [genie, scout] = ["ab".repeat(32), "ef".repeat(32)];
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], preferences: "meeting prep: draft\nQBRs: ask" });
+    await call("/api/sources", { source: "google_calendar", enabled: true });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
+    await call("/api/events", { events: ["c1", "c2", "c3"].map((id) => ({ source: "google_calendar", external_id: id, actor: "ann@globex.io", title: id })) });
+    await call("/api/task", { id: 3, status: "dismissed" });
+    await store.setAgentReply(2, "someone-already");
+    replies.length = 0;
+
+    const saved = await call("/api/account", { name: "Globex", agents: [genie] });
+    expect(saved.json).toMatchObject({ woken: [1] });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+    expect(replies[0]!.text).toMatch(/^nostr:npub1\S+ you've been added to this account's agents/);
+    expect(replies[0]!.text).toContain("post a draft in this thread");
+    expect(replies[0]!.text).toContain("**For agents: Globex**");
+    expect((await store.detail(1))?.activities.map((a) => a.kind)).toEqual(["opened", "agents_asked"]);
+
+    // Saving the same agents again asks nobody; adding one asks only the new one.
+    expect((await call("/api/account", { name: "Globex", agents: [genie] })).json).not.toHaveProperty("woken");
+    expect((await call("/api/account", { name: "Globex", agents: [genie, scout] })).json).toMatchObject({ woken: [1] });
+    expect(replies.at(-1)).toMatchObject({ task: 1, agents: [scout] });
+    // Saving other fields doesn't ask anyone.
+    expect((await call("/api/account", { name: "Globex", profile: "x" })).json).not.toHaveProperty("woken");
+    expect(replies).toHaveLength(2);
+
+    // Their reply is recorded as for a new task.
+    const root = "d".repeat(63) + "1";
+    expect(await hub.collect(async () => [{ id: "r1", pubkey: scout, content: "Draft", created_at: 2, tags: [["e", root, "", "reply"]] }])).toEqual({ recorded: 1 });
+    expect((await store.task(1))?.status).toBe("in_progress");
+  });
+
   it("sends an account's open tasks without a channel to the channel it gets", async () => {
     const store = new SignalsStore(pglite(), "signals_late");
     await store.setup();

@@ -40,8 +40,8 @@ export type HubResponse = Readonly<{ status?: number; json: unknown }>;
 export type Notifier = Readonly<{
   /** Posts a new task at its channel's top level, mentioning `agents` (hex pubkeys); resolves with the message id. */
   opened(task: Task, agents?: readonly string[], context?: PostContext): Promise<string | undefined>;
-  /** Replies in the task's thread. */
-  updated(task: Task, text: string): Promise<void>;
+  /** Replies in the task's thread, mentioning `agents` (hex pubkeys). */
+  updated(task: Task, text: string, agents?: readonly string[]): Promise<void>;
 }>;
 
 /** What a task's post carries besides the task: the account briefing (for agents) and the source event's details. */
@@ -269,6 +269,8 @@ export class Hub {
     if (input.rename !== undefined && (typeof input.rename !== "string" || !input.rename.trim() || input.rename.length > 200)) return bad("rename is the account's new name (1-200 characters).");
     const aliases = list("aliases", 20);
     const agents = list("agents", 10)?.map(agentKey);
+    // Agents the save adds (none when it doesn't change the agents).
+    const before = agents && ((await this.store.account({ name }))?.agents ?? []);
     const notAgent = agents?.find((key) => !key);
     if (notAgent !== undefined) return bad("agents are Buzz pubkeys (64 hex characters or an npub).");
     const preferences = text("preferences", 8000);
@@ -288,7 +290,33 @@ export class Hub {
     );
     this.cached = undefined;
     this.log(`${user} saved the account ${account.name}`);
-    return { json: { account: withRead(account) } };
+    const added = before ? account.agents.filter((key) => !before.includes(key)) : [];
+    const woken = added.length ? await this.handOff(account, added) : [];
+    return { json: { account: withRead(account), ...(woken.length && { woken }) } };
+  }
+
+  /**
+   * Asks agents just added to an account to work on its open tasks that no
+   * agent has worked yet (posted in its channel, auto or draft): a reply in
+   * each task's thread, mentioning them, with the account's briefing. Their
+   * first reply is recorded as for a new task (see collect).
+   */
+  private async handOff(account: AccountRecord, agents: readonly string[]): Promise<number[]> {
+    if (!this.notifier || !account.channel) return [];
+    const lower = account.name.toLowerCase();
+    const tasks = (await this.store.awaitingAgents(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
+    const woken: number[] = [];
+    for (const task of tasks) {
+      try {
+        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account)), agents);
+        await this.store.activity(task.id, "hub", "agents_asked", `Asked ${agents.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
+        woken.push(task.id);
+      } catch (error) {
+        this.log(`couldn't ask agents to work on task ${task.id}: ${(error as Error).message}`);
+      }
+    }
+    if (woken.length) this.log(`asked ${agents.length} new agent(s) of ${account.name} to work on tasks ${woken.join(", ")}`);
+    return woken;
   }
 
   private async updateTask(user: string, input: Record<string, unknown>): Promise<HubResponse> {
@@ -402,6 +430,20 @@ const AGENT_ASK = {
   draft: "please prepare this: follow the team's guidance below and post a draft in this thread (a reply, a doc) for a person to send. Don't send anything yourself.",
 } as const;
 const AGENT_RECORD = "Your first reply in this thread is recorded on the task. If you have the Signals tools, signals_account gives the full account and signals_task_update records more.";
+
+/** How far back, and how many, open tasks an agent added to an account is asked to pick up. */
+const HAND_OFF_DAYS = 14;
+const HAND_OFF_MAX = 20;
+
+/** The reply that asks agents just added to an account to work on a task that's already posted. */
+export function handOffMessage(task: Task, agents: readonly string[], account?: string): string {
+  return [
+    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you've been added to this account's agents, and no agent has worked on this task yet: ${AGENT_ASK[task.mode as "auto" | "draft"]} The task and its source are in this thread's first message. ${AGENT_RECORD}`,
+    account ? `\n${account}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
 
