@@ -15,7 +15,7 @@ import { readFile } from "node:fs/promises";
 import { BuzzApp } from "../../agents/app/sdk";
 import { Lakebase } from "../../agents/app/index-store";
 import { splitMessage } from "../../agents/runner/buzz";
-import { Hub, type Notifier, taskMessage } from "./hub";
+import { Hub, HUB_PATHS, type Notifier, taskMessage } from "./hub";
 import { configProblems, type SignalsConfig } from "./model";
 import { schemaName, SignalsStore } from "./store";
 
@@ -73,7 +73,7 @@ async function prepare() {
   }
 }
 
-for (const path of ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/config"])
+for (const path of HUB_PATHS)
   app.route(path, async (request) => {
     if (!hub) return path === "/api/info" ? { json: { kind: "signals-hub", version: 1, ready: false } } : { status: 503, json: { error: state.setupError ?? "The hub is still setting up." } };
     const reply = await hub.handle({ method: request.method, path, query: request.url.searchParams, ...(request.user && { user: request.user }), body: request.body });
