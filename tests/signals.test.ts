@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, modeFor, parsePreferences, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, configProblems, decide, type EventInput, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, Hub, HUB_PATHS, taskMessage } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
@@ -396,6 +396,13 @@ describe("account channels", () => {
     expect(agentKey(` nostr:${npubEncode(key)}`)).toBe(key);
   });
 
+  it("matches a rule on a calendar event's attendees, so only meetings with the customer open prep", () => {
+    const config: SignalsConfig = { version: 1, rules: [{ id: "prep", sources: ["google_calendar"], when: { "payload.attendees": "@globex\\.io" }, action: "task" }] };
+    const meeting = (emails: string[]): EventInput => ({ source: "google_calendar", external_id: "c", payload: { attendees: emails.map((email) => ({ email, responseStatus: "accepted" })) } });
+    expect(ruleFor(config, meeting(["me@x.com", "ann@globex.io"]))?.id).toBe("prep");
+    expect(ruleFor(config, meeting(["me@x.com", "bob@x.com"]))).toBeUndefined();
+  });
+
   it("briefs agents without the Signals tools in the wake, and records their first reply on the task", async () => {
     const store = new SignalsStore(pglite(), "signals_remote");
     await store.setup();
@@ -414,13 +421,13 @@ describe("account channels", () => {
 
     // The source event's details, for agents to prepare from.
     await call("/api/events", { events: [{ source: "google_calendar", external_id: "c2", actor: "ann@globex.io", title: "Roadmap", url: "https://cal/c2", payload: {
-      start: { dateTime: "2026-11-20T10:00:00-08:00", timeZone: "America/Los_Angeles" }, end: { dateTime: "2026-11-20T11:00:00-08:00" },
+      start: { dateTime: "2026-11-20T10:00:00-08:00", timeZone: "America/New_York" }, end: { dateTime: "2026-11-20T11:00:00-08:00" },
       attendees: [{ email: "me@x.com", responseStatus: "accepted", organizer: true }, { email: "ann@globex.io", displayName: "Ann", responseStatus: "needsAction" }],
       description: "<p>Agenda:</p><br>roadmap and pricing", status: "confirmed",
     } }] });
     const roadmap = posts[1]!.text;
     expect(roadmap).toContain("**Source** (google_calendar): https://cal/c2");
-    expect(roadmap).toContain("When: 2026-11-20T10:00:00-08:00 (America/Los_Angeles) → 2026-11-20T11:00:00-08:00");
+    expect(roadmap).toContain("When: 2026-11-20 13:00 America/New_York (GMT-5) → 2026-11-20T11:00:00-08:00");
     expect(roadmap).toContain("Attendees (2):\n- Ann <ann@globex.io> (customer)\n- me@x.com (organizer, accepted)");
     expect(roadmap).toContain("Description:\nAgenda:");
     expect(roadmap).toContain("Details: status: confirmed");

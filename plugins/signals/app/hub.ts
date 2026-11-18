@@ -434,12 +434,32 @@ function attendeesOf(value: unknown): Attendee[] {
   });
 }
 
+/**
+ * A time in the event's own zone, labeled with it: calendars give the time in
+ * the reader's offset (`07:00-08:00`) and the zone it was set in
+ * (`America/New_York`) separately. Undefined for a time or zone it can't read.
+ */
+function inZone(time: string, zone: string): string | undefined {
+  const at = new Date(time);
+  if (Number.isNaN(at.getTime())) return undefined;
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "shortOffset" })
+        .formatToParts(at)
+        .map((part) => [part.type, part.value]),
+    );
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${zone} (${parts.timeZoneName})`;
+  } catch {
+    return undefined;
+  }
+}
+
 /** `2026-11-18T10:00:00-08:00`, `{dateTime, timeZone}` or `{date}` as text. */
 function timeText(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (value && typeof value === "object") {
     const t = value as Record<string, unknown>;
-    if (typeof t.dateTime === "string") return `${t.dateTime}${typeof t.timeZone === "string" && t.timeZone ? ` (${t.timeZone})` : ""}`;
+    if (typeof t.dateTime === "string") return typeof t.timeZone === "string" && t.timeZone ? (inZone(t.dateTime, t.timeZone) ?? t.dateTime) : t.dateTime;
     if (typeof t.date === "string") return `${t.date} (all day)`;
   }
   return undefined;

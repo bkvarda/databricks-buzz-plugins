@@ -8,7 +8,7 @@
   "rules": [
     { "id": "no-automated-mail", "sources": ["gmail"], "when": { "actor": "noreply|no-reply|notifications?@|calendar-notification|gemini-notes" }, "action": "ignore" },
     { "id": "customer-mail", "sources": ["gmail"], "when": { "actor": "@example\\.com" }, "action": "task", "title": "Reply: {title}", "workstream": "questions", "group_by": "group_key" },
-    { "id": "customer-meetings", "sources": ["google_calendar"], "when": { "title": "Example" }, "action": "task", "title": "Prep: {title}", "workstream": "meeting prep" },
+    { "id": "customer-meetings", "sources": ["google_calendar"], "when": { "payload.attendees": "@example\\.com" }, "action": "task", "title": "Prep: {title}", "workstream": "meeting prep" },
     { "id": "jira-updates", "sources": ["jira"], "unless": { "payload.status": ["Done", "Closed", "Resolved"] }, "action": "task", "group_by": "external_id", "workstream": "tickets", "stale_after_hours": 72, "nudge": "{title} hasn't changed in {hours}h ({payload.status})" }
   ]
 }
