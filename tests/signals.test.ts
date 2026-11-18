@@ -676,12 +676,14 @@ describe("recurring series", () => {
     await store.setup();
     await store.setup();
     const opened: { id: number; mode: string; text: string; agents: readonly string[] }[] = [];
+    const edits: { task: number; text: string }[] = [];
     const replies: { task: number; text: string; agents: readonly string[] }[] = [];
     const hub = new Hub(
       store,
       {
         opened: async (task, agents = [], context = {}) => (opened.push({ id: task.id, mode: task.mode, text: taskMessage(task, { agents, ...context }), agents }), "f".repeat(60) + String(task.id).padStart(4, "0")),
         updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }),
+        edited: async (task, text) => void edits.push({ task: task.id, text }),
       },
       { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", title: "Prep: {title}", workstream: "meeting prep", group_by: "external_id", series: "payload.recurringEventId" }] } },
     );
@@ -712,6 +714,13 @@ describe("recurring series", () => {
     expect(replies.at(-1)).toMatchObject({ task: 1, agents: [genie] });
     expect(replies.at(-1)!.text).toContain("alice@x.com answered: **Always**");
     expect(replies.at(-1)!.text).toContain("please prepare this");
+    // The first message is edited to the task's mode now, without the question or a mention.
+    expect(edits).toHaveLength(1);
+    expect(edits[0]!.task).toBe(1);
+    expect(edits[0]!.text).toContain("Mode: draft");
+    expect(edits[0]!.text).not.toContain("Mode: ask");
+    expect(edits[0]!.text).not.toContain("Needs input");
+    expect(edits[0]!.text).not.toContain("nostr:");
     expect((await store.seriesFor("meetings|globex|weekly"))!).toMatchObject({ answer: "always", asked_task: null, answered_by: "alice@x.com" });
     expect((await store.task(3))!).toMatchObject({ title: "Prep: Weekly sync", mode: "draft", status: "open", series: "meetings|globex|weekly", question: null });
     expect(opened.at(-1)).toMatchObject({ id: 3, agents: [genie] });
@@ -724,6 +733,9 @@ describe("recurring series", () => {
     expect((await store.task(5))!).toMatchObject({ mode: "ask", status: "waiting" });
     await call("POST", "/api/task", { id: 5, input: "Never" });
     expect((await store.task(5))!).toMatchObject({ status: "dismissed", question: null });
+    expect(edits.at(-1)!.task).toBe(5);
+    expect(edits.at(-1)!.text).not.toContain("Needs input");
+    expect(edits.at(-1)!.text).toContain("🚫 Dismissed: no tasks open for this series.");
     await call("POST", "/api/events", { events: [meeting("s3", "standup", "Standup")] });
     expect(await store.tasks()).toHaveLength(5);
 
@@ -732,6 +744,7 @@ describe("recurring series", () => {
     expect((await store.task(6))!).toMatchObject({ mode: "ask", status: "waiting" });
     await call("POST", "/api/task", { id: 6, input: "Just this one" });
     expect((await store.task(6))!).toMatchObject({ mode: "draft", status: "open", question: null });
+    expect(edits.at(-1)).toMatchObject({ task: 6, text: expect.stringContaining("Mode: draft") });
     expect((await store.seriesFor("meetings|globex|qbr"))!).toMatchObject({ answer: null });
     expect((await store.task(7))!).toMatchObject({ mode: "ask", status: "waiting", question: expect.stringContaining("recurring series") });
 

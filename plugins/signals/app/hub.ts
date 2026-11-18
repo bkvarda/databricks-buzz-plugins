@@ -46,6 +46,8 @@ export type Notifier = Readonly<{
   opened(task: Task, agents?: readonly string[], context?: PostContext): Promise<string | undefined>;
   /** Replies in the task's thread, mentioning `agents` (hex pubkeys). */
   updated(task: Task, text: string, agents?: readonly string[]): Promise<void>;
+  /** Replaces the text of the task's first message (an author edit; it mentions nobody). Optional. */
+  edited?(task: Task, text: string): Promise<void>;
 }>;
 
 /** What a task's post carries besides the task: the account briefing (for agents) and the source event's details. */
@@ -429,6 +431,24 @@ export class Hub {
   }
 
   /**
+   * Brings a task's first message up to date (its mode, its question) after
+   * it changed, by editing it. It mentions nobody: agents were already asked
+   * in the thread. Its source details stay as the post had them.
+   */
+  private async refresh(task: Task, note?: string) {
+    if (!this.notifier?.edited || !task.channel || !task.buzz_root) return;
+    try {
+      const event = await this.store.latestEvent(task.id);
+      const account = task.account ? await this.store.account({ name: task.account }) : undefined;
+      const labels = labelsOf(await this.config());
+      const text = taskMessage(task, event ? { source: eventDetails(event, account?.domains ?? [], labels) } : {});
+      await this.notifier.edited(task, note ? `${text}\n${note}` : text);
+    } catch (error) {
+      this.log(`couldn't update task ${task.id}'s first message: ${(error as Error).message}`);
+    }
+  }
+
+  /**
    * Answers a new recurring series' question (see Rule.series). Always:
    * the series' tasks open from now on, in the team's mode. Just this one:
    * this task goes ahead, and the series' next event asks again. Never: this
@@ -468,6 +488,7 @@ export class Hub {
         await this.store.askAgain(task.id, agents);
       }
     }
+    await this.refresh(resumed, choice === "never" ? "🚫 Dismissed: no tasks open for this series." : undefined);
     for (const opened of await this.store.releaseHeld(series, await this.config())) await this.post(opened);
     return resumed;
   }
