@@ -53,6 +53,11 @@ const notifier: Notifier = {
     for (const [n, part] of splitMessage(text).entries())
       await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: part, tags: [["h", task.channel], ["e", task.buzz_root, "", "reply"], ...(n === 0 ? agents.map((key) => ["p", key]) : [])] });
   },
+  // An author edit (kind 40003) of the task's first message: Buzz shows the latest one in its place.
+  async edited(task, text) {
+    if (!app.relay || !task.channel || !task.buzz_root) return;
+    await app.publish({ kind: 40003, created_at: Math.floor(Date.now() / 1000), content: text, tags: [["h", task.channel], ["e", task.buzz_root]] });
+  },
 };
 
 const state = { ready: false, setupError: undefined as string | undefined, lastSweep: undefined as string | undefined, lastInbox: undefined as string | undefined, stats: undefined as Awaited<ReturnType<SignalsStore["stats"]>> | undefined };
