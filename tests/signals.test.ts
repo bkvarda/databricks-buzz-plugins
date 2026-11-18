@@ -545,18 +545,23 @@ describe("account channels", () => {
 
 describe("who's on a task", () => {
   const ticket: EventInput = { source: "jira", external_id: "T-1", actor: "Ann <ann@acme.io>", payload: { assignee: "Bo <bo@us.io>" } };
-  it("uses generic party names by default", () => {
-    const people = whoIsOn([], [], ticket, ["acme.io"]);
+  it("uses generic party names by default, and only a rule's party adds one", () => {
+    const engineering = { party: "engineering" };
+    expect(labelsOf(undefined)).toEqual({ customer: "customer", parties: { engineering: "Engineering", support: "Support" } });
+    expect(configProblems({ version: 1, rules: [{ id: "r", action: "task", party: "support" }] })).toEqual([]);
+    const people = whoIsOn([], [], ticket, ["acme.io"], labelsOf(undefined), engineering);
     expect(people).toEqual(expect.arrayContaining([
       { kind: "team", key: "engineering", label: "Engineering", role: "jira" },
       { kind: "person", key: "bo@us.io", label: "Bo", role: "assignee" },
       { kind: "customer", key: "ann@acme.io", label: "Ann", role: "from" },
     ]));
-    expect(whoIsOn([], [], { source: "table.support_cases", external_id: "1", payload: { owner: "cy@us.io" } }, [])).toEqual([
+    expect(whoIsOn([], [], { source: "table.support_cases", external_id: "1", payload: { owner: "cy@us.io" } }, [], labelsOf(undefined), { party: "support" })).toEqual([
       { kind: "team", key: "support", label: "Support", role: "table.support_cases" },
       { kind: "person", key: "cy@us.io", label: "cy@us.io", role: "owner" },
     ]);
-    expect(whoIsOn([], [], { source: "gmail", external_id: "m" }, [])).toEqual([]);
+    // No rule party: nothing is guessed from a jira or case source.
+    expect(whoIsOn([], [], ticket, [])).toEqual([]);
+    expect(whoIsOn([], [], { source: "table.support_cases", external_id: "1", payload: { owner: "cy@us.io" } }, [])).toEqual([]);
   });
   it("names parties and customers as the config's labels say, and a rule's party wins", () => {
     const config: SignalsConfig = { version: 1, labels: { customer: "Client", parties: { support: "Customer Care", partner: "Partner team" } }, rules: [{ id: "r", action: "task", party: "partner" }] };
@@ -568,7 +573,7 @@ describe("who's on a task", () => {
     ]);
     const labels = labelsOf(config);
     expect(labels).toEqual({ customer: "client", parties: { engineering: "Engineering", support: "Customer Care", partner: "Partner team" } });
-    expect(whoIsOn([], [], { source: "zendesk.cases", external_id: "1" }, [], labels)).toEqual([{ kind: "team", key: "support", label: "Customer Care", role: "zendesk.cases" }]);
+    expect(whoIsOn([], [], { source: "zendesk.cases", external_id: "1" }, [], labels, { party: "support" })).toEqual([{ kind: "team", key: "support", label: "Customer Care", role: "zendesk.cases" }]);
     expect(whoIsOn([], [], ticket, [], labels, config.rules[0])[0]).toEqual({ kind: "team", key: "partner", label: "Partner team", role: "jira" });
     const text = eventDetails({ source: "google_calendar", external_id: "c", payload: { attendees: [{ email: "ann@acme.io" }, { email: "me@us.io" }] } }, ["acme.io"], labels);
     expect(text).toContain("- ann@acme.io (client)");
