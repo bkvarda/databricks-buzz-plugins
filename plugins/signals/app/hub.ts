@@ -269,7 +269,8 @@ export class Hub {
     const problem = await this.notifier.canPost?.(channel).catch(() => undefined);
     // It can post there now: the sweep posts what failed before.
     if (problem === null) return undefined;
-    return problem ?? this.postFailures.get(channel);
+    // A post that failed says exactly why; the notifier's check may only be a guess.
+    return this.postFailures.get(channel) ?? problem;
   }
 
   /**

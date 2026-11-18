@@ -117,7 +117,7 @@ Open a channel's menu and choose **Set up account** to make it an account channe
 - **Customer email domains:** mail, meetings and Slack messages from people at these domains open tasks in this channel, with the example rules. Meetings count when a real customer attends, even when one of your own people organized it.
 - **Team preferences:** plain text the team edits whenever it wants.
 
-**Add the hub to the channel.** The hub posts tasks as its own Buzz identity (Signals App, say), so add it to the channel with **Add people**, along with the agents that work on tasks. Until it's a member, tasks open but aren't posted, and the panel shows a warning saying so. Saving the account checks again.
+**Add the hub to the channel.** The hub posts tasks as its own Buzz identity (Signals App, say), so add it to the channel with **Add people**, along with the agents that work on tasks. Until it's a member, tasks open but aren't posted, and the panel shows a warning saying so. The relay shows a channel's member list only to its members, so the warning says the hub most likely isn't one; once a post fails, it gives the relay's reason instead. Saving the account checks again.
 
 Tasks for the account are then posted in this channel. That includes tasks already open that had no channel yet. The panel lists the open tasks, grouped by initiative and workstream. Anyone who can use the hub can set up a channel, and the hub records who changed what. A registered account wins over a config account with the same name.
 

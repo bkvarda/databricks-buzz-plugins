@@ -53,11 +53,12 @@ const notifier: Notifier = {
     for (const [n, part] of splitMessage(text).entries())
       await app.publish({ kind: 9, created_at: Math.floor(Date.now() / 1000), content: part, tags: [["h", task.channel], ["e", task.buzz_root, "", "reply"], ...(n === 0 ? agents.map((key) => ["p", key]) : [])] });
   },
-  // The channel's member list (kind 39002) names the hub when it can post there (null); no list means we can't tell (undefined).
+  // The channel's member list (kind 39002) names the hub when it can post there (null).
   async canPost(channel) {
     if (!app.relay || !app.pubkey) return "The hub isn't signed in to Buzz yet, so it can't post tasks. Check BUZZ_IDENTITY_SECRET in app.yaml and the app's status page.";
     const [members] = await app.query([{ kinds: [39002], "#d": [channel], limit: 1 }]);
-    if (!members) return undefined;
+    // The relay shows a channel's member list only to its members, so not seeing it most likely means the hub isn't one.
+    if (!members) return `${app.identity?.name || "The hub"} can't see this channel's member list, which usually means it isn't a member, so tasks won't be posted here. Add it to the channel (Add people), then save again.`;
     if (members.tags.some((tag) => tag[0] === "p" && tag[1] === app.pubkey)) return null;
     return `${app.identity?.name || "The hub"} isn't a member of this channel, so it can't post tasks here. Add it to the channel (Add people), then save again.`;
   },

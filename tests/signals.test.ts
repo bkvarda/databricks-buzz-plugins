@@ -1083,6 +1083,11 @@ describe("rules for every account", () => {
     await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
     await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Q", group_key: "t1" }] });
     expect((await call("GET", "/api/account", undefined, "channel=globex")).json).toMatchObject({ warning: "Task 1 couldn't be posted here: 403 not a member" });
+    // A failed post says more than the notifier's guess.
+    const guessing = new Hub(store, { opened: async () => { throw new Error("403 not a member"); }, updated: async () => {}, canPost: async () => "probably not a member" }, { defaultConfig: example });
+    expect((await guessing.handle({ method: "GET", path: "/api/account", query: new URLSearchParams("channel=globex"), user: "me@x.com", body: async () => "" })).json).toMatchObject({ warning: "probably not a member" });
+    await guessing.sweep();
+    expect((await guessing.handle({ method: "GET", path: "/api/account", query: new URLSearchParams("channel=globex"), user: "me@x.com", body: async () => "" })).json).toMatchObject({ warning: "Task 1 couldn't be posted here: 403 not a member" });
     fail = false;
     await hub.sweep();
     expect((await call("GET", "/api/account", undefined, "channel=globex")).json).not.toHaveProperty("warning");
