@@ -2,7 +2,7 @@
 // They run as the owner (their Databricks sign-in), so the hub knows who acted.
 import { type AgentTool, numberArg, schema, stringArg } from "@dbx/core/host-types";
 import type { DatabricksService } from "@dbx/core/service";
-import { capitalized, MODES, TASK_STATUSES } from "../app/model";
+import { capitalized, MODES, playbookFor, TASK_STATUSES } from "../app/model";
 import type { Task } from "../app/store";
 import { chosenHub, HubClient } from "./client";
 
@@ -96,15 +96,25 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
     },
     {
       name: "signals_account",
-      description: `Reads an account channel's setup in the signals hub: the account, its team's preferences (how agents handle each kind of work: ${MODES.join(", ")}, plus their guidance) and the profile agents keep of the account, its team and its people. Read it before working on a task in that channel, and follow it.`,
-      inputSchema: schema.object({ channel: schema.string("The Buzz channel id."), name: schema.string("Or the account's name.") }),
+      description: `Reads an account channel's setup in the signals hub: the account, its team's preferences (how agents handle each kind of work: ${MODES.join(", ")}, plus their guidance), the team's playbook for a workstream (how they like that work done), and the profile agents keep of the account, its team and its people. Read it before working on a task in that channel, with the task's workstream, and follow it.`,
+      inputSchema: schema.object({ channel: schema.string("The Buzz channel id."), name: schema.string("Or the account's name."), workstream: schema.string("The task's workstream (or rule id), for its playbook.") }),
       async call(_client, _context, args) {
         const channel = stringArg(args, "channel", false);
         const name = stringArg(args, "name", false);
+        const workstream = stringArg(args, "workstream", false);
         if (!channel && !name) throw new Error("Give channel or name.");
         const account = await (await hub(service)).account({ ...(channel && { channel }), ...(name && { name }) });
         if (!account) return "No account is set up for that. Someone in the channel can set one up from its menu: Set up account.";
         const modes = Object.entries(account.read.modes);
+        const names = Object.keys(account.playbooks ?? {});
+        const playbook = workstream ? playbookFor(account.playbooks, { rule_id: workstream, workstream }) : undefined;
+        const playbookText = workstream
+          ? playbook
+            ? [`Playbook for ${playbook.key} (how the team likes this done; follow it):`, playbook.text]
+            : [`No playbook for ${workstream}${names.length ? ` (the team has playbooks for ${names.join(", ")})` : ""}.`]
+          : names.length
+            ? [`Playbooks: ${names.join(", ")}. Read the one for your task's workstream with workstream.`]
+            : [];
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` · channel ${account.channel}` : ""}`,
           account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
@@ -115,6 +125,8 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           "Team guidance:",
           account.read.guidance || "(none)",
           "",
+          ...playbookText,
+          ...(playbookText.length ? [""] : []),
           "Profile (what agents have learned; update it with signals_account_learn):",
           account.profile || "(empty)",
         ]

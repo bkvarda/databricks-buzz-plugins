@@ -6,7 +6,7 @@ import type { PanelProps } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { ago, Badge, Button, Card, DbxRoot, Disclosure, Field, Notice, SectionHeader, Spinner, Stack, Text } from "@dbx/core/ui/components";
-import { capitalized, MODES, parsePreferences } from "../app/model";
+import { capitalized, MAX_PLAYBOOK, MODES, parsePreferences } from "../app/model";
 import type { Task } from "../app/store";
 import { type AccountView, chosenHub, HubClient } from "./client";
 
@@ -21,15 +21,52 @@ export const PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (
 Anything else you write here is guidance agents follow, for example:
 Keep customer replies short. Copy the account owner on anything about pricing.`;
 
+/**
+ * The team's playbooks, one per workstream: the config's workstreams first,
+ * then any others the team added. An empty playbook is dropped on save.
+ */
+function Playbooks(props: { workstreams: readonly string[]; value: Record<string, string>; onChange(next: Record<string, string>): void }) {
+  const { value, onChange } = props;
+  const [adding, setAdding] = React.useState("");
+  const known = new Set(props.workstreams.map((name) => name.toLowerCase()));
+  const names = [...props.workstreams, ...Object.keys(value).filter((name) => !known.has(name.toLowerCase()))];
+  const keyOf = (name: string) => Object.keys(value).find((key) => key.toLowerCase() === name.toLowerCase()) ?? name;
+  const add = () => {
+    const name = adding.trim();
+    if (!name) return;
+    if (!names.some((other) => other.toLowerCase() === name.toLowerCase())) onChange({ ...value, [name]: "" });
+    setAdding("");
+  };
+  return (
+    <Stack gap={8}>
+      {names.length === 0 && <Text size="xs" tone="subtle">No workstreams yet. Add one below (a workstream your rules use, or a rule id).</Text>}
+      {names.map((name) => {
+        const key = keyOf(name);
+        const text = value[key] ?? "";
+        return (
+          <Disclosure key={name} summary={`${name}${text.trim() ? "" : " (no playbook)"}`}>
+            <textarea className="dbx-textarea" rows={6} maxLength={MAX_PLAYBOOK} placeholder={`How you like ${name} done: steps, what to include, tone, who to copy…`} value={text} onChange={(event) => onChange({ ...value, [key]: event.target.value })} />
+          </Disclosure>
+        );
+      })}
+      <Stack direction="row" gap={6} align="center">
+        <input className="dbx-input" placeholder="Another workstream or rule id" value={adding} onChange={(event) => setAdding(event.target.value)} onKeyDown={(event) => event.key === "Enter" && add()} />
+        <Button size="sm" disabled={!adding.trim()} onClick={add}>Add playbook</Button>
+      </Stack>
+    </Stack>
+  );
+}
+
 const splitList = (text: string) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 
-function Form(props: { hub: HubClient; channel: { id: string; name: string }; account?: AccountView; onSaved(account: AccountView): void }) {
+function Form(props: { hub: HubClient; channel: { id: string; name: string }; account?: AccountView; workstreams?: readonly string[]; onSaved(account: AccountView): void }) {
   const { hub, channel, account } = props;
   const [name, setName] = React.useState(account?.name ?? channel.name.replace(/[-_]+/g, " "));
   const [aliases, setAliases] = React.useState(account?.aliases.join(", ") ?? "");
   const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
   const [agents, setAgents] = React.useState(account?.agents.join(", ") ?? "");
   const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
+  const [playbooks, setPlaybooks] = React.useState<Record<string, string>>({ ...(account?.playbooks ?? {}) });
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
   const read = React.useMemo(() => parsePreferences(preferences), [preferences]);
@@ -45,6 +82,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         domains: splitList(domains),
         agents: splitList(agents),
         preferences,
+        playbooks: Object.fromEntries(Object.entries(playbooks).filter(([, text]) => text.trim())),
       });
       props.onSaved(saved);
     } catch (problem) {
@@ -76,6 +114,9 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
           {Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => <Badge key={key} tone={mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning"}>{`${key}: ${mode}`}</Badge>) : <Text size="xs" tone="subtle">no modes (everything is draft)</Text>}
         </Stack>
         {read.problems.map((problem) => <Text key={problem} size="xs" tone="danger">{problem}</Text>)}
+        <Field label="Playbooks" hint="How your team likes each kind of work done. An agent working on a task gets only its workstream's playbook (or its rule's, when one is named by the rule id).">
+          <Playbooks workstreams={props.workstreams ?? account?.workstreams ?? []} value={playbooks} onChange={setPlaybooks} />
+        </Field>
         {error && <Text tone="danger" size="sm">{error}</Text>}
         <Stack direction="row" gap={8}>
           <Button variant="brand" disabled={busy || !name.trim()} onClick={() => void save()}>{busy ? <Spinner size={12} /> : null}{account ? "Save" : "Set up account"}</Button>
@@ -150,6 +191,7 @@ export function accountPanel(service: DatabricksService) {
                 <Stack direction="row" gap={6} wrap>
                   {Object.entries(account.read.modes).map(([key, mode]) => <Badge key={key}>{`${key}: ${mode}`}</Badge>)}
                 </Stack>
+                {Object.keys(account.playbooks ?? {}).length > 0 && <Text size="sm" tone="subtle">Playbooks: {Object.keys(account.playbooks).join(", ")}</Text>}
                 {account.updated_by && <Text size="xs" tone="tertiary">Changed by {account.updated_by}{account.updated_at ? ` ${ago(account.updated_at * 1000)}` : ""}</Text>}
               </Stack>
             </Card>
@@ -177,4 +219,4 @@ export function accountPanel(service: DatabricksService) {
 }
 
 /** Every agent's turn: a short pointer to the account tools, so they read the team's preferences first. */
-export const ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and follow its mode for the task's workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first) and the team's guidance. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
+export const ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and the task's workstream, and follow its mode for that workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first), the team's guidance and the workstream's playbook. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;

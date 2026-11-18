@@ -864,10 +864,10 @@ var HubClient = class {
   }
   /** The account set up for a channel (or by name), or null. */
   account(by, signal) {
-    return this.call("GET", "/api/account", { query: { ...by }, ...signal && { signal } }).then((reply) => reply.account ? { ...reply.account, ...reply.labels && { labels: reply.labels } } : null);
+    return this.call("GET", "/api/account", { query: { ...by }, ...signal && { signal } }).then((reply) => reply.account ? { ...reply.account, ...reply.labels && { labels: reply.labels }, ...reply.workstreams && { workstreams: reply.workstreams } } : null);
   }
   saveAccount(input) {
-    return this.call("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...reply.labels && { labels: reply.labels } }));
+    return this.call("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...reply.labels && { labels: reply.labels }, ...reply.workstreams && { workstreams: reply.workstreams } }));
   }
   deleteAccount(name) {
     return this.call("POST", "/api/account", { body: { name, delete: true } });
@@ -923,6 +923,16 @@ function parsePreferences(text) {
   }
   return { modes, guidance: guidance.join("\n").trim(), problems };
 }
+var MAX_PLAYBOOK = 6e3;
+function playbookFor(playbooks, task) {
+  const entries = Object.entries(playbooks ?? {}).filter(([, text]) => text.trim());
+  for (const wanted of [task.rule_id, task.workstream ?? void 0]) {
+    const lower = wanted?.trim().toLowerCase();
+    const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
+    if (found) return { key: found[0], text: found[1].trim() };
+  }
+  return void 0;
+}
 var TASK_STATUSES = ["open", "in_progress", "waiting", "done", "dismissed"];
 
 // plugins/signals/src/account-panel.tsx
@@ -935,6 +945,24 @@ var PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (do it and
 
 Anything else you write here is guidance agents follow, for example:
 Keep customer replies short. Copy the account owner on anything about pricing.`;
+function Playbooks(props) {
+  const { value, onChange } = props;
+  const [adding, setAdding] = React.useState("");
+  const known = new Set(props.workstreams.map((name) => name.toLowerCase()));
+  const names = [...props.workstreams, ...Object.keys(value).filter((name) => !known.has(name.toLowerCase()))];
+  const keyOf = (name) => Object.keys(value).find((key) => key.toLowerCase() === name.toLowerCase()) ?? name;
+  const add = () => {
+    const name = adding.trim();
+    if (!name) return;
+    if (!names.some((other) => other.toLowerCase() === name.toLowerCase())) onChange({ ...value, [name]: "" });
+    setAdding("");
+  };
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, names.length === 0 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No workstreams yet. Add one below (a workstream your rules use, or a rule id)."), names.map((name) => {
+    const key = keyOf(name);
+    const text = value[key] ?? "";
+    return /* @__PURE__ */ React.createElement(Disclosure, { key: name, summary: `${name}${text.trim() ? "" : " (no playbook)"}` }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 6, maxLength: MAX_PLAYBOOK, placeholder: `How you like ${name} done: steps, what to include, tone, who to copy\u2026`, value: text, onChange: (event) => onChange({ ...value, [key]: event.target.value }) }));
+  }), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Another workstream or rule id", value: adding, onChange: (event) => setAdding(event.target.value), onKeyDown: (event) => event.key === "Enter" && add() }), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !adding.trim(), onClick: add }, "Add playbook")));
+}
 var splitList = (text) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 function Form(props) {
   const { hub: hub2, channel, account } = props;
@@ -943,6 +971,7 @@ function Form(props) {
   const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
   const [agents, setAgents] = React.useState(account?.agents.join(", ") ?? "");
   const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
+  const [playbooks, setPlaybooks] = React.useState({ ...account?.playbooks ?? {} });
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState();
   const read = React.useMemo(() => parsePreferences(preferences), [preferences]);
@@ -957,7 +986,8 @@ function Form(props) {
         aliases: splitList(aliases),
         domains: splitList(domains),
         agents: splitList(agents),
-        preferences
+        preferences,
+        playbooks: Object.fromEntries(Object.entries(playbooks).filter(([, text]) => text.trim()))
       });
       props.onSaved(saved);
     } catch (problem) {
@@ -966,7 +996,7 @@ function Form(props) {
       setBusy(false);
     }
   };
-  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Account", hint: "As tasks show it. Sources that name the account (a table column, say) match it or one of its other names." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: name, onChange: (event) => setName(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Other names", hint: "Comma-separated, e.g. ACME Corp, Acme Inc." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: aliases, onChange: (event) => setAliases(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `${capitalized(account?.labels?.customer ?? "customer")} email domains`, hint: "Mail and meetings from people at these domains go to this channel's tasks." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "example.com", value: domains, onChange: (event) => setDomains(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Agents that work on tasks", hint: "Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "npub1\u2026", value: agents, onChange: (event) => setAgents(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Team preferences", hint: /* @__PURE__ */ React.createElement(React.Fragment, null, "Lines like ", /* @__PURE__ */ React.createElement("code", null, "meeting prep: auto"), " set how agents handle that workstream (or rule); ", /* @__PURE__ */ React.createElement("code", null, "everything:"), " sets the rest. Modes: ", MODES.join(", "), ". Every other line is guidance agents follow.") }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 12, value: preferences, onChange: (event) => setPreferences(event.target.value) })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Reads as:"), Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key, tone: mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning" }, `${key}: ${mode}`)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "no modes (everything is draft)")), read.problems.map((problem) => /* @__PURE__ */ React.createElement(Text, { key: problem, size: "xs", tone: "danger" }, problem)), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: busy || !name.trim(), onClick: () => void save() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, account ? "Save" : "Set up account"))));
+  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Account", hint: "As tasks show it. Sources that name the account (a table column, say) match it or one of its other names." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: name, onChange: (event) => setName(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Other names", hint: "Comma-separated, e.g. ACME Corp, Acme Inc." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: aliases, onChange: (event) => setAliases(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `${capitalized(account?.labels?.customer ?? "customer")} email domains`, hint: "Mail and meetings from people at these domains go to this channel's tasks." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "example.com", value: domains, onChange: (event) => setDomains(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Agents that work on tasks", hint: "Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "npub1\u2026", value: agents, onChange: (event) => setAgents(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Team preferences", hint: /* @__PURE__ */ React.createElement(React.Fragment, null, "Lines like ", /* @__PURE__ */ React.createElement("code", null, "meeting prep: auto"), " set how agents handle that workstream (or rule); ", /* @__PURE__ */ React.createElement("code", null, "everything:"), " sets the rest. Modes: ", MODES.join(", "), ". Every other line is guidance agents follow.") }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 12, value: preferences, onChange: (event) => setPreferences(event.target.value) })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Reads as:"), Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key, tone: mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning" }, `${key}: ${mode}`)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "no modes (everything is draft)")), read.problems.map((problem) => /* @__PURE__ */ React.createElement(Text, { key: problem, size: "xs", tone: "danger" }, problem)), /* @__PURE__ */ React.createElement(Field, { label: "Playbooks", hint: "How your team likes each kind of work done. An agent working on a task gets only its workstream's playbook (or its rule's, when one is named by the rule id)." }, /* @__PURE__ */ React.createElement(Playbooks, { workstreams: props.workstreams ?? account?.workstreams ?? [], value: playbooks, onChange: setPlaybooks })), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: busy || !name.trim(), onClick: () => void save() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, account ? "Save" : "Set up account"))));
 }
 function Tasks(props) {
   const tasks = useAsync(async (signal) => props.hub.tasks({ channel: props.channel, open: true, limit: 50 }, signal), [props.channel]);
@@ -998,12 +1028,12 @@ function accountPanel(service) {
     else {
       const account = saved ?? found.data ?? void 0;
       const channel = { id: channelContext.channelId, name: channelContext.channelName };
-      body = !account || editing ? /* @__PURE__ */ React.createElement(Form, { hub: hub2, channel, ...account && { account }, onSaved: (next) => (setSaved(next), setEditing(false)) }) : /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, account.name), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setEditing(true) }, "Edit")), account.domains.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, capitalized(account.labels?.customer ?? "customer"), " domains: ", account.domains.join(", ")), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, Object.entries(account.read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key }, `${key}: ${mode}`))), account.updated_by && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Changed by ", account.updated_by, account.updated_at ? ` ${ago(account.updated_at * 1e3)}` : ""))), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Open tasks", description: "From your team's sources, grouped by initiative and workstream. Work on them in their threads." }), /* @__PURE__ */ React.createElement(Tasks, { hub: hub2, channel: channel.id })), /* @__PURE__ */ React.createElement(Disclosure, { summary: "What agents have learned" }, account.profile ? /* @__PURE__ */ React.createElement(Text, { size: "sm", as: "div", style: { whiteSpace: "pre-wrap" } }, account.profile) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Nothing yet. Agents add to it as they work on this account's tasks.")));
+      body = !account || editing ? /* @__PURE__ */ React.createElement(Form, { hub: hub2, channel, ...account && { account }, onSaved: (next) => (setSaved(next), setEditing(false)) }) : /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, account.name), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setEditing(true) }, "Edit")), account.domains.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, capitalized(account.labels?.customer ?? "customer"), " domains: ", account.domains.join(", ")), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, Object.entries(account.read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key }, `${key}: ${mode}`))), Object.keys(account.playbooks ?? {}).length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Playbooks: ", Object.keys(account.playbooks).join(", ")), account.updated_by && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Changed by ", account.updated_by, account.updated_at ? ` ${ago(account.updated_at * 1e3)}` : ""))), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Open tasks", description: "From your team's sources, grouped by initiative and workstream. Work on them in their threads." }), /* @__PURE__ */ React.createElement(Tasks, { hub: hub2, channel: channel.id })), /* @__PURE__ */ React.createElement(Disclosure, { summary: "What agents have learned" }, account.profile ? /* @__PURE__ */ React.createElement(Text, { size: "sm", as: "div", style: { whiteSpace: "pre-wrap" } }, account.profile) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Nothing yet. Agents add to it as they work on this account's tasks.")));
     }
     return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement("div", { style: { padding: 16 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: channelContext ? `Account for #${channelContext.channelName}` : "Account", description: "Tasks for the account are posted here, and agents follow the team's preferences." }), body)));
   };
 }
-var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and follow its mode for the task's workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first) and the team's guidance. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
+var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and the task's workstream, and follow its mode for that workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first), the team's guidance and the workstream's playbook. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
 
 // plugins/signals/src/board-panel.tsx
 var COLUMNS = [
@@ -1240,15 +1270,19 @@ function signalsTools(service) {
     },
     {
       name: "signals_account",
-      description: `Reads an account channel's setup in the signals hub: the account, its team's preferences (how agents handle each kind of work: ${MODES.join(", ")}, plus their guidance) and the profile agents keep of the account, its team and its people. Read it before working on a task in that channel, and follow it.`,
-      inputSchema: schema.object({ channel: schema.string("The Buzz channel id."), name: schema.string("Or the account's name.") }),
+      description: `Reads an account channel's setup in the signals hub: the account, its team's preferences (how agents handle each kind of work: ${MODES.join(", ")}, plus their guidance), the team's playbook for a workstream (how they like that work done), and the profile agents keep of the account, its team and its people. Read it before working on a task in that channel, with the task's workstream, and follow it.`,
+      inputSchema: schema.object({ channel: schema.string("The Buzz channel id."), name: schema.string("Or the account's name."), workstream: schema.string("The task's workstream (or rule id), for its playbook.") }),
       async call(_client, _context, args) {
         const channel = stringArg(args, "channel", false);
         const name = stringArg(args, "name", false);
+        const workstream = stringArg(args, "workstream", false);
         if (!channel && !name) throw new Error("Give channel or name.");
         const account = await (await hub(service)).account({ ...channel && { channel }, ...name && { name } });
         if (!account) return "No account is set up for that. Someone in the channel can set one up from its menu: Set up account.";
         const modes = Object.entries(account.read.modes);
+        const names = Object.keys(account.playbooks ?? {});
+        const playbook = workstream ? playbookFor(account.playbooks, { rule_id: workstream, workstream }) : void 0;
+        const playbookText = workstream ? playbook ? [`Playbook for ${playbook.key} (how the team likes this done; follow it):`, playbook.text] : [`No playbook for ${workstream}${names.length ? ` (the team has playbooks for ${names.join(", ")})` : ""}.`] : names.length ? [`Playbooks: ${names.join(", ")}. Read the one for your task's workstream with workstream.`] : [];
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` \xB7 channel ${account.channel}` : ""}`,
           account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
@@ -1259,6 +1293,8 @@ function signalsTools(service) {
           "Team guidance:",
           account.read.guidance || "(none)",
           "",
+          ...playbookText,
+          ...playbookText.length ? [""] : [],
           "Profile (what agents have learned; update it with signals_account_learn):",
           account.profile || "(empty)"
         ].filter((part, index, all) => part !== "" || all[index - 1] !== "").join("\n");

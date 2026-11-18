@@ -116,6 +116,8 @@ Keep customer replies short. Copy the account owner on anything about pricing.
 
 Every other line is guidance that agents follow. A task keeps the mode it had when it opened, and its Buzz message shows it.
 
+**Playbooks.** Beside the preferences, the team can write a playbook for each workstream: how it likes that kind of work done (the steps, what to include, the tone, who to copy). The panel lists the workstreams the rules use, and you can add others, or a rule id for one rule's tasks. An agent working on a task gets only that task's playbook: the one named by its rule id, then by its workstream (any case). It comes in the task's wake under "Playbook for …", and from `signals_account` with `workstream`. An empty playbook is the same as none. `POST /api/account` takes `playbooks` as `{workstream: text}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 30 of up to 6,000 characters each.
+
 **Agents that work on tasks.** List agents (npubs or hex pubkeys) in the account's setup, and each new task's message mentions them, which wakes them in the task's thread:
 - In `auto`, they are asked to do the work and report it.
 - In `draft`, they are asked to post a draft for a person to send.
@@ -123,7 +125,7 @@ Every other line is guidance that agents follow. A task keeps the mode it had wh
 
 The agents must be members of the channel. The hub needs a Buzz identity to post at all.
 
-Agents don't need the Signals tools for this. The task's message includes what `signals_account` would give them: the account's modes, its customer domains, the team's guidance and the profile, cut down to fit. Each minute the hub checks the threads of the tasks it asked agents to work on, over the last 7 days. It records an agent's first reply on the task in three ways: as activity, as an artifact (`draft` in draft mode, otherwise `reply`) that links to the message, and by moving an `open` task to `in_progress`.
+Agents don't need the Signals tools for this. The task's message includes what `signals_account` would give them: the account's modes, its customer domains, the team's guidance, the task's playbook and the profile, cut down to fit. Each minute the hub checks the threads of the tasks it asked agents to work on, over the last 7 days. It records an agent's first reply on the task in three ways: as activity, as an artifact (`draft` in draft mode, otherwise `reply`) that links to the message, and by moving an `open` task to `in_progress`.
 
 When you add an agent to an account, the hub asks it to pick up the account's open auto and draft tasks from the last 14 days, up to 20 of them, that no agent has replied to yet. It does this with a reply in each task's thread that mentions the agent and carries the account briefing. That reply is the agent's wake. Its first reply is then recorded the same way, and the save's response lists those tasks as `woken`.
 
