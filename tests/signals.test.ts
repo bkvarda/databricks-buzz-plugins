@@ -6,6 +6,7 @@ import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor
 import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
+import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 
 const config: SignalsConfig = {
@@ -808,5 +809,17 @@ describe("routes", () => {
     const handled = new Set([...source.matchAll(/case "(?:GET|POST) (\/api\/[a-z]+)"/g)].map((match) => match[1]!));
     expect(handled.size).toBeGreaterThan(0);
     expect([...handled].filter((path) => !(HUB_PATHS as readonly string[]).includes(path))).toEqual([]);
+  });
+});
+
+describe("the board page's route", () => {
+  it("takes a channel and its name, and nothing else", () => {
+    expect(validBoardRoute(null)).toBe(true);
+    expect(validBoardRoute({ channel: "c1", name: "acme" })).toBe(true);
+    expect(validBoardRoute({ channel: 5 })).toBe(false);
+    expect(validBoardRoute(["c1"])).toBe(false);
+    expect(boardRoute({ kind: "page", route: { version: 1, params: { channel: "c1", name: "acme" } } })).toEqual({ channel: "c1", name: "acme" });
+    expect(boardRoute({ kind: "page", route: { version: 1, params: null } })).toEqual({});
+    expect(boardRoute(undefined)).toEqual({});
   });
 });
