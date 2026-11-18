@@ -65,16 +65,16 @@ describe("events", () => {
     const rules: SignalsConfig = {
       version: 1,
       rules: [
-        { id: "auto", sources: ["jira"], when: { title: "auto.?increase" }, action: "update", group: "limits", group_by: "{payload.workspace}/{payload.model}" },
-        { id: "limits", sources: ["jira"], action: "task", group_by: "{payload.workspace}/{payload.model}" },
+        { id: "auto", sources: ["jira"], when: { title: "auto.?approved" }, action: "update", group: "limits", group_by: "{payload.workspace}/{payload.region}" },
+        { id: "limits", sources: ["jira"], action: "task", group_by: "{payload.workspace}/{payload.region}" },
       ],
     };
     expect(configProblems(rules)).toEqual([]);
     const ticket = (key: string, title: string, payload?: Record<string, unknown>) => decide(rules, { source: "jira", external_id: key, title, ...(payload && { payload }) }, { firstRun: false });
-    expect(ticket("ES-1", "Rate limit increase", { workspace: "123", model: "Claude Sonnet" })).toMatchObject({ create: true, group: "limits|123/claude sonnet" });
-    expect(ticket("ES-2", "Auto increase", { workspace: "123", model: "claude sonnet " })).toMatchObject({ create: false, group: "limits|123/claude sonnet" });
+    expect(ticket("TKT-1", "Limit increase", { workspace: "123", region: "US East" })).toMatchObject({ create: true, group: "limits|123/us east" });
+    expect(ticket("TKT-2", "Auto-approved increase", { workspace: "123", region: "us east " })).toMatchObject({ create: false, group: "limits|123/us east" });
     // Without any of its fields, an event is its own group.
-    expect(ticket("ES-3", "Something else")).toMatchObject({ group: "limits|jira:ES-3" });
+    expect(ticket("TKT-3", "Something else")).toMatchObject({ group: "limits|jira:TKT-3" });
   });
 });
 

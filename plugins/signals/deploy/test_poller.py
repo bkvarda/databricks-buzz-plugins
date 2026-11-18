@@ -80,10 +80,10 @@ class Templates(unittest.TestCase):
 
 class Extract(unittest.TestCase):
     def test_match_takes_the_first_group_and_drops_misses(self):
-        item = {"key": "ES-9", "fields": {"summary": "Block: Auto increase for workspace 1234 / claude-sonnet-4"}}
-        mapping = {"external_id": "key", "payload": {"workspace": {"from": "fields.summary", "match": r"workspace (\d+)"}, "model": {"from": "fields.summary", "match": r"/ *([\w.-]+)"}, "other": {"from": "fields.summary", "match": "nope (x)"}}}
+        item = {"key": "TKT-9", "fields": {"summary": "Acme: limit increase for workspace 1234 / us-east-1"}}
+        mapping = {"external_id": "key", "payload": {"workspace": {"from": "fields.summary", "match": r"workspace (\d+)"}, "region": {"from": "fields.summary", "match": r"/ *([\w.-]+)"}, "other": {"from": "fields.summary", "match": "nope (x)"}}}
         event = poller.to_event("jira", item, mapping, {"now": NOW, "since": NOW})
-        self.assertEqual(event["payload"], {"workspace": "1234", "model": "claude-sonnet-4", "other": None})
+        self.assertEqual(event["payload"], {"workspace": "1234", "region": "us-east-1", "other": None})
         self.assertEqual(poller.extract("abc", "b"), "b")
         self.assertIsNone(poller.extract(None, "b"))
 
