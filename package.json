@@ -15,6 +15,7 @@
   },
   "devDependencies": {
     "@buzz/author": "file:vendor/buzz-author-0.0.0-preview.1.tgz",
+    "@electric-sql/pglite": "^0.5.16",
     "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.23.1",

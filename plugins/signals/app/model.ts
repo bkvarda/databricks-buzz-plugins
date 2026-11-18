@@ -1,0 +1,305 @@
+// Signals: the event model and the rules that turn events into tasks.
+//
+// Everything here is pure (no database, no network, no Node modules), so the
+// hub, the plugin and the tests share it. A source (a poller, the plugin, an agent) sends
+// events; the hub keeps one row per (owner, source, external_id), notices
+// when an event's content changed, and runs the rules to decide whether it
+// opens a task, updates one, or is only recorded.
+
+/** What a source sends. `external_id` is the source's own key for the thing (a message id, a ticket key, a table row's key). */
+export type EventInput = Readonly<{
+  source: string;
+  external_id: string;
+  /** When it happened at the source, ISO 8601 or Unix seconds. */
+  occurred_at?: string | number;
+  title?: string;
+  url?: string;
+  /** Who it's from at the source (an email, a name). */
+  actor?: string;
+  /** The account it's about, when the source knows (a table column, say). */
+  account?: string;
+  /** Events with the same group key belong to one task (a ticket and its updates, a thread). */
+  group_key?: string;
+  /** The source's fields. Rules match on them. */
+  payload?: Readonly<Record<string, unknown>>;
+}>;
+
+export type EventRecord = EventInput & Readonly<{ owner: string; content_hash: string }>;
+
+export const MAX_EVENTS_PER_POST = 500;
+
+const SOURCE = /^[a-z][a-z0-9_.-]{0,63}$/;
+
+/** Checks and trims a posted event; a string explains what's wrong. */
+export function validateEvent(raw: unknown): EventInput | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "an event is an object";
+  const event = raw as Record<string, unknown>;
+  if (typeof event.source !== "string" || !SOURCE.test(event.source)) return "source must be a lowercase name like gmail or table.support_cases";
+  if (typeof event.external_id !== "string" && typeof event.external_id !== "number") return "external_id is required";
+  const external = String(event.external_id).trim();
+  if (!external || external.length > 512) return "external_id must be 1-512 characters";
+  for (const field of ["title", "url", "actor", "account", "group_key"] as const)
+    if (event[field] !== undefined && event[field] !== null && typeof event[field] !== "string") return `${field} must be a string`;
+  if (event.payload !== undefined && event.payload !== null && (typeof event.payload !== "object" || Array.isArray(event.payload))) return "payload must be an object";
+  if (event.occurred_at !== undefined && event.occurred_at !== null && Number.isNaN(toSeconds(event.occurred_at as string | number))) return "occurred_at must be ISO 8601 or Unix seconds";
+  const text = (value: unknown, max: number) => (typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined);
+  const out: Record<string, unknown> = { source: event.source, external_id: external };
+  if (event.occurred_at !== undefined && event.occurred_at !== null) out.occurred_at = event.occurred_at;
+  for (const [field, max] of [["title", 500], ["url", 2000], ["actor", 320], ["account", 200], ["group_key", 512]] as const) {
+    const value = text(event[field], max);
+    if (value) out[field] = value;
+  }
+  if (event.payload) out.payload = event.payload;
+  return out as EventInput;
+}
+
+export function toSeconds(value: string | number | undefined): number {
+  if (value === undefined) return Math.floor(Date.now() / 1000);
+  if (typeof value === "number") return value > 1e12 ? Math.floor(value / 1000) : Math.floor(value);
+  if (/^\d+(\.\d+)?$/.test(value)) return toSeconds(Number(value));
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? Number.NaN : Math.floor(ms / 1000);
+}
+
+/** JSON with sorted keys, so the same content always hashes the same. */
+export function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .filter((key) => object[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`)
+    .join(",")}}`;
+}
+
+/** What makes an event "changed": its title, url, account, group and payload; not when it was seen. (Hashed by the store.) */
+export function contentKey(event: EventInput): string {
+  const { title, url, account, group_key, payload } = event;
+  return canonical({ title, url, account, group_key, payload });
+}
+
+// ---------------------------------------------------------------------------
+// Rules
+
+/** A condition on a field: a regular expression (case-insensitive), or a list of exact values. */
+export type Condition = string | readonly (string | number | boolean)[];
+
+export type Rule = Readonly<{
+  id: string;
+  /** Sources it applies to (exact names, or a prefix ending in `*`). All when omitted. */
+  sources?: readonly string[];
+  /** Field → condition. Fields are event fields (title, actor, account…) or `payload.<name>`. All must hold. */
+  when?: Readonly<Record<string, Condition>>;
+  /** Field → condition that must not hold. */
+  unless?: Readonly<Record<string, Condition>>;
+  /** task: open (or update) a task. update: only update a task that exists for the group. ignore: record the event, no task. */
+  action: "task" | "update" | "ignore";
+  /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
+  title?: string;
+  workstream?: string;
+  /**
+   * Which events share a task: an event field (`payload.workspace`), or a
+   * template of fields (`{payload.workspace}/{payload.model}`). Default
+   * group_key; when it's empty, the event's own source and external_id.
+   */
+  group_by?: string;
+  /** Rules with the same group share tasks (default: the rule's id). An `update` rule needs the group of the rule that opens the tasks. */
+  group?: string;
+  /** Overrides the account the event says (a fixed name or `{payload.account_name}`). */
+  account?: string;
+  /** Nudge when the event's latest version still matches `when` after this many hours. */
+  stale_after_hours?: number;
+  /** What the nudge says; `{field}` takes an event field. */
+  nudge?: string;
+}>;
+
+export type AccountRule = Readonly<{
+  /** The account's name, as tasks show it. */
+  name: string;
+  /** The Buzz channel tasks for it are posted in. */
+  channel?: string;
+  /** Field → condition that says an event is about this account (when the event doesn't name one). */
+  when?: Readonly<Record<string, Condition>>;
+  /** Other names sources use for it. */
+  aliases?: readonly string[];
+}>;
+
+/** A source people can turn on, as the Settings card lists it. */
+export type SourceInfo = Readonly<{
+  name: string;
+  label: string;
+  /** The system.ai MCP service it reads (gmail for gmail), for the sign-in check. */
+  service?: string;
+  /** A table it reads; it shows as unavailable where the table isn't. */
+  table?: string;
+  description?: string;
+}>;
+
+export const DEFAULT_SOURCES: readonly SourceInfo[] = [
+  { name: "gmail", label: "Gmail", service: "gmail", description: "Mail in your inbox." },
+  { name: "google_calendar", label: "Google Calendar", service: "google_calendar", description: "Your meetings in the next week." },
+  { name: "google_drive", label: "Google Drive", service: "google_drive", description: "Docs changed recently." },
+  { name: "jira", label: "Jira", service: "atlassian", description: "Issues you're assigned, reported or watching." },
+  { name: "slack", label: "Slack", service: "slack", description: "Messages that mention you." },
+];
+
+export type SignalsConfig = Readonly<{
+  version: 1;
+  /** The sources people can turn on (DEFAULT_SOURCES when omitted). */
+  sources?: readonly SourceInfo[];
+  /** On a source's first post for a person, record what's already there without opening tasks (default true). */
+  first_run_seen?: boolean;
+  rules: readonly Rule[];
+  accounts?: readonly AccountRule[];
+  /** Channel for tasks with no account channel. */
+  default_channel?: string;
+}>;
+
+export const EMPTY_CONFIG: SignalsConfig = { version: 1, first_run_seen: true, rules: [] };
+
+/** Checks a config; returns the problems, or none. */
+export function configProblems(raw: unknown): string[] {
+  const problems: string[] = [];
+  if (!raw || typeof raw !== "object") return ["the config is a JSON object"];
+  const config = raw as Record<string, unknown>;
+  if (config.version !== 1) problems.push("version must be 1");
+  if (!Array.isArray(config.rules)) return [...problems, "rules must be a list"];
+  const ids = new Set<string>();
+  for (const [n, rule] of (config.rules as Record<string, unknown>[]).entries()) {
+    const where = `rules[${n}]`;
+    if (!rule || typeof rule !== "object") {
+      problems.push(`${where} is an object`);
+      continue;
+    }
+    if (typeof rule.id !== "string" || !rule.id) problems.push(`${where}.id is required`);
+    else if (ids.has(rule.id)) problems.push(`${where}.id ${rule.id} is used twice`);
+    else ids.add(rule.id);
+    if (!["task", "update", "ignore"].includes(rule.action as string)) problems.push(`${where}.action must be task, update or ignore`);
+    for (const key of ["when", "unless"] as const) {
+      const conditions = rule[key];
+      if (conditions === undefined) continue;
+      if (!conditions || typeof conditions !== "object" || Array.isArray(conditions)) problems.push(`${where}.${key} is an object`);
+      else
+        for (const [field, condition] of Object.entries(conditions)) {
+          if (typeof condition === "string") {
+            try {
+              new RegExp(condition, "i");
+            } catch {
+              problems.push(`${where}.${key}.${field} isn't a valid regular expression`);
+            }
+          } else if (!Array.isArray(condition)) problems.push(`${where}.${key}.${field} is a pattern or a list of values`);
+        }
+    }
+    if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
+    if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
+  }
+  if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
+    problems.push("sources is a list of {name, label}");
+  if (config.accounts !== undefined && !Array.isArray(config.accounts)) problems.push("accounts must be a list");
+  for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries())
+    if (!account || typeof account.name !== "string" || !account.name) problems.push(`accounts[${n}].name is required`);
+  return problems;
+}
+
+/** An event field: `title`, `payload.status`, `payload.case.owner`. */
+export function field(event: EventInput, path: string): unknown {
+  const [head, ...rest] = path.split(".");
+  let value: unknown = head === "payload" ? event.payload : (event as Record<string, unknown>)[head!];
+  for (const part of head === "payload" ? rest : rest) {
+    if (value === null || typeof value !== "object") return undefined;
+    value = (value as Record<string, unknown>)[part];
+  }
+  return value;
+}
+
+const regexes = new Map<string, RegExp>();
+function holds(condition: Condition, value: unknown): boolean {
+  if (Array.isArray(condition)) return condition.some((option) => String(option) === String(value ?? ""));
+  if (value === undefined || value === null) return false;
+  let regex = regexes.get(condition as string);
+  if (!regex) regexes.set(condition as string, (regex = new RegExp(condition as string, "i")));
+  return regex.test(typeof value === "object" ? JSON.stringify(value) : String(value));
+}
+
+export function matches(conditions: Readonly<Record<string, Condition>> | undefined, event: EventInput): boolean {
+  return Object.entries(conditions ?? {}).every(([path, condition]) => holds(condition, field(event, path)));
+}
+
+const sourceMatches = (patterns: readonly string[] | undefined, source: string) =>
+  !patterns?.length || patterns.some((pattern) => (pattern.endsWith("*") ? source.startsWith(pattern.slice(0, -1)) : pattern === source));
+
+/** The first rule that applies to an event, in config order. */
+export function ruleFor(config: SignalsConfig, event: EventInput): Rule | undefined {
+  return config.rules.find((rule) => sourceMatches(rule.sources, event.source) && matches(rule.when, event) && !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)));
+}
+
+/** True when any one of the conditions holds (so `unless` excludes on any match). */
+function matchesAny(conditions: Readonly<Record<string, Condition>>, event: EventInput): boolean {
+  return Object.entries(conditions).some(([path, condition]) => holds(condition, field(event, path)));
+}
+
+/** `{field}` replaced with the event's field. */
+export function fill(template: string, event: EventInput): string {
+  return template.replace(/\{([a-z_][a-z0-9_.]*)\}/gi, (_, path: string) => {
+    const value = field(event, path);
+    return value === undefined || value === null ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
+  });
+}
+
+/** The account an event is about: the rule's, the event's (by name or alias), or the first account whose conditions hold. */
+export function accountFor(config: SignalsConfig, event: EventInput, rule?: Rule): AccountRule | undefined {
+  const named = rule?.account ? fill(rule.account, event).trim() : event.account;
+  const accounts = config.accounts ?? [];
+  if (named) {
+    const lower = named.toLowerCase();
+    return accounts.find((account) => account.name.toLowerCase() === lower || account.aliases?.some((alias) => alias.toLowerCase() === lower)) ?? { name: named };
+  }
+  return accounts.find((account) => account.when && Object.keys(account.when).length && matches(account.when, event));
+}
+
+/** A group_by template filled in, or undefined when every field it names is empty. */
+function fillGroup(template: string, event: EventInput): string | undefined {
+  let any = false;
+  const filled = template.replace(/\{([a-z_][a-z0-9_.]*)\}/gi, (_, path: string) => {
+    const value = field(event, path);
+    if (value === undefined || value === null || value === "") return "";
+    any = true;
+    return typeof value === "object" ? JSON.stringify(value) : String(value).trim().toLowerCase();
+  });
+  return any ? filled : undefined;
+}
+
+/** Which task an event belongs to, for a rule. */
+export function groupKey(rule: Rule, event: EventInput): string {
+  const by = !rule.group_by ? event.group_key : rule.group_by.includes("{") ? fillGroup(rule.group_by, event) : field(event, rule.group_by);
+  const group = by === undefined || by === null || by === "" ? `${event.source}:${event.external_id}` : String(by);
+  return `${rule.group ?? rule.id}|${group}`;
+}
+
+export type Decision =
+  | Readonly<{ kind: "none"; reason: string }>
+  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean }>;
+
+/**
+ * What to do with an event that is new or changed. `firstRun` is a source's
+ * first post for this person: it only records what's there. Rules decide the
+ * rest: `task` opens or updates the group's task, `update` only updates one.
+ */
+export function decide(config: SignalsConfig, event: EventInput, options: Readonly<{ firstRun: boolean }>): Decision {
+  const rule = ruleFor(config, event);
+  if (!rule) return { kind: "none", reason: "no rule matches" };
+  if (rule.action === "ignore") return { kind: "none", reason: `rule ${rule.id} ignores it` };
+  const account = accountFor(config, event, rule);
+  const channel = account?.channel ?? config.default_channel;
+  const group = groupKey(rule, event);
+  const title = (rule.title ? fill(rule.title, event) : event.title || `${event.source} ${event.external_id}`).trim().slice(0, 500);
+  // On a first run, existing things are seen; only updates to tasks that already exist go through.
+  const create = rule.action === "task" && !(options.firstRun && config.first_run_seen !== false);
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create };
+}
+
+/** A task's state. */
+export const TASK_STATUSES = ["open", "in_progress", "waiting", "done", "dismissed"] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+export const isOpen = (status: string) => status !== "done" && status !== "dismissed";

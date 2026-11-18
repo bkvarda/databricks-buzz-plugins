@@ -1,0 +1,13 @@
+# The signals hub as a Databricks App. Give the app a Lakebase database
+# resource named `postgres` (Can connect and create) and deploy this folder.
+command: ["node", "app.mjs"]
+env:
+  - name: LAKEBASE_ENDPOINT
+    valueFrom: postgres
+  # The Buzz identity it posts tasks as (from Buzz: Agents → New agent →
+  # Databricks App → Connect an app you have). Without it, tasks stay in Lakebase.
+  # - name: BUZZ_IDENTITY_SECRET
+  #   value: <catalog>.<schema>.<secret>
+  # Who may change the rules (comma-separated emails). Everyone may when unset.
+  # - name: SIGNALS_ADMINS
+  #   value: you@example.com
