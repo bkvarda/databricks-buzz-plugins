@@ -8,11 +8,29 @@ import { bindReact, React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
 import { ago, Badge, Button, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { WorkspaceField } from "@dbx/core/ui/workspace";
+import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choice";
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, type SignIn, signInPath, signInState, type SourceState } from "./client";
 import { signalsTools } from "./tools";
 
 export const inject = ["react", "settingsCards"];
+
+/** In the main connection's preferences: the CLI profile the hub runs in. */
+export const WORKSPACE_PREF = "signalsWorkspace";
+
+// Where the hub lives can differ from Buzz's workspace (a demo workspace with
+// Lakebase, say), so Signals has its own choice, "Same as Buzz" by default.
+function HubWorkspace(props: { main: DatabricksService; service: FollowedService }) {
+  const [, setProfile] = usePreference<string>(props.main, WORKSPACE_PREF);
+  const profile = props.service.profile();
+  return (
+    <Stack gap={8}>
+      <SectionHeader title="Workspace" description="The workspace your signals hub runs in. Agents' signals tools use it too." />
+      <WorkspaceField service={props.main} {...(profile && { profile })} onChange={setProfile} />
+    </Stack>
+  );
+}
 
 function SourceRow(props: { service: DatabricksService; hub: HubClient; info: SourceInfo; state?: SourceState; onChange(sources: SourceState[]): void }) {
   const { service, hub, info, state } = props;
@@ -78,10 +96,12 @@ function SourceRow(props: { service: DatabricksService; hub: HubClient; info: So
 function SignalsSettings(props: { service: DatabricksService }) {
   const { service } = props;
   const snapshot = useConnection(service);
+  // Changes when the workspace chosen above does, so the hub is found again.
+  const workspace = "profile" in snapshot ? snapshot.profile.host : undefined;
   const [picked, setPicked] = usePreference<string>(service, HUB_PREFERENCE);
-  const hubs = useAsync(async (signal) => chosenHub(service, signal), [snapshot.status, picked]);
+  const hubs = useAsync(async (signal) => chosenHub(service, signal), [snapshot.status, workspace, picked]);
   const app = hubs.data?.app;
-  const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url, snapshot.status]);
+  const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url, snapshot.status, workspace]);
   const [sources, setSources] = React.useState<SourceState[]>();
   const loaded = useAsync(async (signal) => (hub ? hub.sources(signal) : undefined), [hub]);
   React.useEffect(() => setSources(loaded.data?.sources), [loaded.data]);
@@ -125,20 +145,25 @@ function SignalsSettings(props: { service: DatabricksService }) {
 
 export function apply(ctx: Context) {
   bindReact(ctx.react);
-  const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, databricks) => {
+  const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, main) => {
+    // "Same as Buzz" unless chosen in Settings; the card and tools follow it.
+    const databricks = followWorkspace(main, WORKSPACE_PREF);
     scope.inject(["agents"], (agents: Context) => {
       for (const tool of signalsTools(databricks)) agents.agents.addTool(tool);
     });
-    return databricks;
+    return { main, databricks };
   });
   ctx.settingsCards.register({
     id: "signals",
     title: "Signals",
     component: () => {
-      const service = useLive(live);
-      return service ? (
+      const runtime = useLive(live);
+      return runtime ? (
         <DbxRoot>
-          <SignalsSettings service={service} />
+          <Stack gap={24}>
+            <HubWorkspace main={runtime.main} service={runtime.databricks} />
+            <SignalsSettings service={runtime.databricks} />
+          </Stack>
         </DbxRoot>
       ) : (
         <MissingCore ctx={ctx} feature="Signals" />

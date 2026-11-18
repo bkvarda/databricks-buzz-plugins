@@ -36,7 +36,7 @@ flowchart LR
    5. To post tasks to Buzz, give it a Buzz identity: in Buzz, go to **Agents → New agent → Databricks App → Connect an app you have** and set `BUZZ_IDENTITY_SECRET` in `app.yaml`.
 3. **Rules:** edit `signals.config.json` before deploying. Admins (set with `SIGNALS_ADMINS`) can also `POST /api/config`.
 4. **Each person:**
-   1. Turn sources on in **Settings → Signals**.
+   1. Turn sources on in **Settings → Signals**. If the hub runs in another workspace than Buzz's, pick it under **Workspace** there first; the agent tools follow that choice too.
    2. Create a scheduled job (serverless, every 15 minutes, say) **owned by them** that runs `poller.py --config sources.json --lakebase [--warehouse <id>]`, with `psycopg[binary]` as a dependency. Give them a Postgres role in the hub's database (Lakebase → Roles → add their Databricks identity).
    3. From a laptop signed in with `databricks auth login`, `--hub <app url>` works too, and replies with what each post did.
    4. Try it first with `--dry-run`, which reads every source and prints the events without the hub.
