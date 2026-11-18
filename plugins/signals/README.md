@@ -81,6 +81,13 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 - **Nudges:** with `stale_after_hours`, an open task whose latest event still matches the rule after that many hours gets a nudge in its thread, at most once per period.
 - **Accounts:** the account comes from the rule's `account`, then the event's own `account` (matched by name or alias), then the first account whose `when` holds. The account's `channel` is where its tasks are posted; tasks without one go to `default_channel`.
 
+- **Labels:** `labels` sets what your deployment calls things, so the public defaults stay generic. `labels.customer` is the word for the people at an account (default "customer"; say "client"), used in agents' briefings, meeting attendee notes and the account panel. `labels.parties` names who a task from outside sits with on the tasks board, by key: `engineering` and `support` are always there (default "Engineering" and "Support"), and you can rename them or add more. A rule's `party` says which one its tasks sit with; without it, a Jira or ticket source is `engineering` and a support or case source is `support`. The board also shows the source's `owner` or `assignee`. For example:
+
+  ```json
+  "labels": { "customer": "client", "parties": { "support": "Customer Care", "partner": "Partner team" } },
+  "rules": [{ "id": "partner-escalations", "sources": ["jira"], "party": "partner", "action": "task" }]
+  ```
+
 ## Account channels
 
 Open a channel's menu and choose **Set up account** to make it an account channel. You give it:
@@ -96,7 +103,7 @@ Tasks for the account are then posted in this channel. That includes tasks alrea
 - everything: draft
 - meeting prep: auto
 - tickets: off
-Keep customer replies short. Copy the AE on anything about pricing.
+Keep customer replies short. Copy the account owner on anything about pricing.
 ```
 
 | Mode | What agents do |

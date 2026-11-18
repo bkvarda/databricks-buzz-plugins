@@ -2,8 +2,8 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, type EventInput, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, eventDetails, Hub, HUB_PATHS, taskMessage } from "../plugins/signals/app/hub";
+import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
@@ -336,11 +336,11 @@ describe("account channels", () => {
 
     // Not an admin, but it's the team's channel: anyone who can use the hub sets it up.
     expect(await call("POST", "/api/account", { name: "Globex", domains: ["not a domain"] })).toMatchObject({ status: 400 });
-    const setUp = await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: "@globex.com, Globex.io", aliases: ["Globex Corp"], preferences: "questions: ask\nCopy the AE." });
-    expect(setUp.json).toMatchObject({ account: { name: "Globex", channel: "globex", domains: ["globex.com", "globex.io"], updated_by: "alice@x.com", read: { modes: { questions: "ask" }, guidance: "Copy the AE." } } });
+    const setUp = await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: "@globex.com, Globex.io", aliases: ["Globex Corp"], preferences: "questions: ask\nCopy the account owner." });
+    expect(setUp.json).toMatchObject({ account: { name: "Globex", channel: "globex", domains: ["globex.com", "globex.io"], updated_by: "alice@x.com", read: { modes: { questions: "ask" }, guidance: "Copy the account owner." } } });
     expect((await call("GET", "/api/account", undefined, "channel=globex")).json).toMatchObject({ account: { name: "Globex" } });
     expect((await call("GET", "/api/account", undefined, "name=globex corp")).json).toMatchObject({ account: { name: "Globex" } });
-    expect((await call("GET", "/api/account", undefined, "channel=nope")).json).toEqual({ account: null });
+    expect((await call("GET", "/api/account", undefined, "channel=nope")).json).toMatchObject({ account: null, labels: { customer: "customer" } });
 
     await call("POST", "/api/sources", { source: "gmail", enabled: true });
     await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
@@ -359,10 +359,18 @@ describe("account channels", () => {
     expect(((await call("GET", "/api/tasks", undefined, "initiative=q3 migration")).json as { tasks: unknown[] }).tasks).toHaveLength(1);
     expect(((await call("GET", "/api/tasks", undefined, "workstream=questions")).json as { tasks: unknown[] }).tasks).toHaveLength(0);
 
+    // The board shows the channel's tasks with who's on them, in the config's words.
+    expect(await call("GET", "/api/board")).toMatchObject({ status: 400 });
+    expect((await call("GET", "/api/board", undefined, "channel=globex")).json).toMatchObject({
+      account: "Globex",
+      labels: { customer: "customer", parties: { support: "Support" } },
+      tasks: [{ task: { id: 1 }, people: expect.arrayContaining([{ kind: "customer", key: "ann@globex.io", label: "Ann", role: "wrote" }]) }],
+    });
+
     // Renaming keeps its tasks; agents keep a profile; deleting forgets the setup, not the tasks.
-    await call("POST", "/api/account", { name: "Globex", rename: "Globex Inc", profile: "## Team\nAE: Dana" });
+    await call("POST", "/api/account", { name: "Globex", rename: "Globex Inc", profile: "## Team\nAccount owner: Dana" });
     expect((await call("GET", "/api/task", undefined, "id=1")).json).toMatchObject({ task: { account: "Globex Inc" } });
-    expect((await call("GET", "/api/accounts")).json).toMatchObject({ accounts: [{ name: "Globex Inc", profile: "## Team\nAE: Dana", aliases: ["Globex Corp"] }] });
+    expect((await call("GET", "/api/accounts")).json).toMatchObject({ accounts: [{ name: "Globex Inc", profile: "## Team\nAccount owner: Dana", aliases: ["Globex Corp"] }] });
     // A channel belongs to one account.
     await call("POST", "/api/account", { name: "Initech", channel: "globex" });
     expect((await call("GET", "/api/accounts")).json).toMatchObject({ accounts: [{ name: "Globex Inc", channel: null }, { name: "Initech", channel: "globex" }] });
@@ -437,13 +445,13 @@ describe("account channels", () => {
     const hub = new Hub(store, { opened: async (task, agents = [], context = {}) => (posts.push({ task: task.id, text: taskMessage(task, { agents, ...context }) }), "c".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } });
     const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
     const agent = "ab".repeat(32);
-    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], preferences: "meeting prep: draft\nCopy the AE on everything.", profile: "## Team\nAE: Dana" });
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], preferences: "meeting prep: draft\nCopy the account owner on everything.", profile: "## Team\nAccount owner: Dana" });
     await call("/api/sources", { source: "google_calendar", enabled: true });
     await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
     await call("/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
     expect(posts[0]!.text).toContain("Modes: meeting prep: draft");
-    expect(posts[0]!.text).toContain("Team guidance:\nCopy the AE on everything.");
-    expect(posts[0]!.text).toContain("Profile:\n## Team\nAE: Dana");
+    expect(posts[0]!.text).toContain("Team guidance:\nCopy the account owner on everything.");
+    expect(posts[0]!.text).toContain("Profile:\n## Team\nAccount owner: Dana");
 
     // The source event's details, for agents to prepare from.
     await call("/api/events", { events: [{ source: "google_calendar", external_id: "c2", actor: "ann@globex.io", title: "Roadmap", url: "https://cal/c2", payload: {
@@ -532,6 +540,39 @@ describe("account channels", () => {
     expect(await store.task(1)).toMatchObject({ channel: "hooli-team" });
     expect(await hub.sweep()).toMatchObject({ posted: 1 });
     expect(posted).toEqual(["hooli-team"]);
+  });
+});
+
+describe("who's on a task", () => {
+  const ticket: EventInput = { source: "jira", external_id: "T-1", actor: "Ann <ann@acme.io>", payload: { assignee: "Bo <bo@us.io>" } };
+  it("uses generic party names by default", () => {
+    const people = whoIsOn([], [], ticket, ["acme.io"]);
+    expect(people).toEqual(expect.arrayContaining([
+      { kind: "team", key: "engineering", label: "Engineering", role: "jira" },
+      { kind: "person", key: "bo@us.io", label: "Bo", role: "assignee" },
+      { kind: "customer", key: "ann@acme.io", label: "Ann", role: "from" },
+    ]));
+    expect(whoIsOn([], [], { source: "table.support_cases", external_id: "1", payload: { owner: "cy@us.io" } }, [])).toEqual([
+      { kind: "team", key: "support", label: "Support", role: "table.support_cases" },
+      { kind: "person", key: "cy@us.io", label: "cy@us.io", role: "owner" },
+    ]);
+    expect(whoIsOn([], [], { source: "gmail", external_id: "m" }, [])).toEqual([]);
+  });
+  it("names parties and customers as the config's labels say, and a rule's party wins", () => {
+    const config: SignalsConfig = { version: 1, labels: { customer: "Client", parties: { support: "Customer Care", partner: "Partner team" } }, rules: [{ id: "r", action: "task", party: "partner" }] };
+    expect(configProblems(config)).toEqual([]);
+    expect(configProblems({ version: 1, labels: { customer: "", parties: { x: 3 } }, rules: [{ id: "r", action: "task", party: "nobody" }] })).toEqual([
+      "labels.customer is a word, like client",
+      "labels.parties.x is a name",
+      "rules[0].party must be one of engineering, support (or a key you add in labels.parties)",
+    ]);
+    const labels = labelsOf(config);
+    expect(labels).toEqual({ customer: "client", parties: { engineering: "Engineering", support: "Customer Care", partner: "Partner team" } });
+    expect(whoIsOn([], [], { source: "zendesk.cases", external_id: "1" }, [], labels)).toEqual([{ kind: "team", key: "support", label: "Customer Care", role: "zendesk.cases" }]);
+    expect(whoIsOn([], [], ticket, [], labels, config.rules[0])[0]).toEqual({ kind: "team", key: "partner", label: "Partner team", role: "jira" });
+    const text = eventDetails({ source: "google_calendar", external_id: "c", payload: { attendees: [{ email: "ann@acme.io" }, { email: "me@us.io" }] } }, ["acme.io"], labels);
+    expect(text).toContain("- ann@acme.io (client)");
+    expect(briefing({ name: "Acme", channel: "c", aliases: [], domains: ["acme.io"], agents: [], preferences: "", profile: "" } as never, labels)).toContain("Client domains: acme.io");
   });
 });
 
