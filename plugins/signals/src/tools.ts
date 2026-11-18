@@ -2,7 +2,7 @@
 // They run as the owner (their Databricks sign-in), so the hub knows who acted.
 import { type AgentTool, numberArg, schema, stringArg } from "@dbx/core/host-types";
 import type { DatabricksService } from "@dbx/core/service";
-import { MODES, TASK_STATUSES } from "../app/model";
+import { capitalized, MODES, TASK_STATUSES } from "../app/model";
 import type { Task } from "../app/store";
 import { chosenHub, HubClient } from "./client";
 
@@ -102,7 +102,7 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
         const modes = Object.entries(account.read.modes);
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` · channel ${account.channel}` : ""}`,
-          account.domains.length ? `Customer domains: ${account.domains.join(", ")}` : "",
+          account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
           "",
           `Modes (default draft): ${modes.length ? modes.map(([key, mode]) => `${key}: ${mode}`).join("; ") : "none set"}`,
           "- auto: do the work and report it in the task's thread. draft: prepare it (a draft doc, a reply) for a person to send. ask: ask in the thread before doing anything. off: no tasks.",

@@ -13,6 +13,7 @@ import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choic
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, type SignIn, signInPath, signInState, type SourceState } from "./client";
 import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
+import { boardPanel } from "./board-panel";
 import { signalsTools } from "./tools";
 
 export const inject = ["react", "settingsCards", "panels"];
@@ -162,6 +163,14 @@ export function apply(ctx: Context) {
       channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
       channelPlacement: "side",
       component: accountPanel(databricks),
+    });
+    scope.panels.register({
+      id: "board",
+      title: "Tasks board",
+      matches: () => false,
+      channelMenu: { label: "Tasks board", eligible: (channel) => !channel.cached },
+      channelPlacement: "tab",
+      component: boardPanel(ctx, databricks),
     });
     return { main, databricks };
   });

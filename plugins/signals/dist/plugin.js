@@ -852,6 +852,10 @@ var HubClient = class {
   task(id) {
     return this.call("GET", "/api/task", { query: { id } });
   }
+  /** A channel's tasks for the board: who's on each, its source, artifacts and last activity. */
+  board(channel, signal) {
+    return this.call("GET", "/api/board", { query: { channel }, ...signal && { signal } });
+  }
   updateTask(input) {
     return this.call("POST", "/api/task", { body: input });
   }
@@ -860,10 +864,10 @@ var HubClient = class {
   }
   /** The account set up for a channel (or by name), or null. */
   account(by, signal) {
-    return this.call("GET", "/api/account", { query: { ...by }, ...signal && { signal } }).then((reply) => reply.account);
+    return this.call("GET", "/api/account", { query: { ...by }, ...signal && { signal } }).then((reply) => reply.account ? { ...reply.account, ...reply.labels && { labels: reply.labels } } : null);
   }
   saveAccount(input) {
-    return this.call("POST", "/api/account", { body: input }).then((reply) => reply.account);
+    return this.call("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...reply.labels && { labels: reply.labels } }));
   }
   deleteAccount(name) {
     return this.call("POST", "/api/account", { body: { name, delete: true } });
@@ -901,6 +905,7 @@ function rpcSignIn(status2, body) {
 var signInPath = (service) => `/explore/mcp-services/system/ai/${service}`;
 
 // plugins/signals/app/model.ts
+var capitalized = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 var MODES = ["auto", "draft", "ask", "off"];
 var MODE_LINE = /^\s*(?:[-*]\s*)?([^:#]{1,80}?)\s*:\s*(\S+)\s*$/;
 function parsePreferences(text) {
@@ -929,7 +934,7 @@ var PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (do it and
 - questions: draft
 
 Anything else you write here is guidance agents follow, for example:
-Keep customer replies short. Copy the AE on anything about pricing.`;
+Keep customer replies short. Copy the account owner on anything about pricing.`;
 var splitList = (text) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 function Form(props) {
   const { hub: hub2, channel, account } = props;
@@ -961,7 +966,7 @@ function Form(props) {
       setBusy(false);
     }
   };
-  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Account", hint: "As tasks show it. Sources that name the account (a table column, say) match it or one of its other names." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: name, onChange: (event) => setName(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Other names", hint: "Comma-separated, e.g. ACME Corp, Acme Inc." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: aliases, onChange: (event) => setAliases(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Customer email domains", hint: "Mail and meetings from people at these domains go to this channel's tasks." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "example.com", value: domains, onChange: (event) => setDomains(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Agents that work on tasks", hint: "Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "npub1\u2026", value: agents, onChange: (event) => setAgents(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Team preferences", hint: /* @__PURE__ */ React.createElement(React.Fragment, null, "Lines like ", /* @__PURE__ */ React.createElement("code", null, "meeting prep: auto"), " set how agents handle that workstream (or rule); ", /* @__PURE__ */ React.createElement("code", null, "everything:"), " sets the rest. Modes: ", MODES.join(", "), ". Every other line is guidance agents follow.") }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 12, value: preferences, onChange: (event) => setPreferences(event.target.value) })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Reads as:"), Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key, tone: mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning" }, `${key}: ${mode}`)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "no modes (everything is draft)")), read.problems.map((problem) => /* @__PURE__ */ React.createElement(Text, { key: problem, size: "xs", tone: "danger" }, problem)), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: busy || !name.trim(), onClick: () => void save() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, account ? "Save" : "Set up account"))));
+  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Account", hint: "As tasks show it. Sources that name the account (a table column, say) match it or one of its other names." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: name, onChange: (event) => setName(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Other names", hint: "Comma-separated, e.g. ACME Corp, Acme Inc." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: aliases, onChange: (event) => setAliases(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: `${capitalized(account?.labels?.customer ?? "customer")} email domains`, hint: "Mail and meetings from people at these domains go to this channel's tasks." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "example.com", value: domains, onChange: (event) => setDomains(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Agents that work on tasks", hint: "Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "npub1\u2026", value: agents, onChange: (event) => setAgents(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Team preferences", hint: /* @__PURE__ */ React.createElement(React.Fragment, null, "Lines like ", /* @__PURE__ */ React.createElement("code", null, "meeting prep: auto"), " set how agents handle that workstream (or rule); ", /* @__PURE__ */ React.createElement("code", null, "everything:"), " sets the rest. Modes: ", MODES.join(", "), ". Every other line is guidance agents follow.") }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 12, value: preferences, onChange: (event) => setPreferences(event.target.value) })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Reads as:"), Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key, tone: mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning" }, `${key}: ${mode}`)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "no modes (everything is draft)")), read.problems.map((problem) => /* @__PURE__ */ React.createElement(Text, { key: problem, size: "xs", tone: "danger" }, problem)), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: busy || !name.trim(), onClick: () => void save() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, account ? "Save" : "Set up account"))));
 }
 function Tasks(props) {
   const tasks = useAsync(async (signal) => props.hub.tasks({ channel: props.channel, open: true, limit: 50 }, signal), [props.channel]);
@@ -993,12 +998,134 @@ function accountPanel(service) {
     else {
       const account = saved ?? found.data ?? void 0;
       const channel = { id: channelContext.channelId, name: channelContext.channelName };
-      body = !account || editing ? /* @__PURE__ */ React.createElement(Form, { hub: hub2, channel, ...account && { account }, onSaved: (next) => (setSaved(next), setEditing(false)) }) : /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, account.name), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setEditing(true) }, "Edit")), account.domains.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Customer domains: ", account.domains.join(", ")), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, Object.entries(account.read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key }, `${key}: ${mode}`))), account.updated_by && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Changed by ", account.updated_by, account.updated_at ? ` ${ago(account.updated_at * 1e3)}` : ""))), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Open tasks", description: "From your team's sources, grouped by initiative and workstream. Work on them in their threads." }), /* @__PURE__ */ React.createElement(Tasks, { hub: hub2, channel: channel.id })), /* @__PURE__ */ React.createElement(Disclosure, { summary: "What agents have learned" }, account.profile ? /* @__PURE__ */ React.createElement(Text, { size: "sm", as: "div", style: { whiteSpace: "pre-wrap" } }, account.profile) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Nothing yet. Agents add to it as they work on this account's tasks.")));
+      body = !account || editing ? /* @__PURE__ */ React.createElement(Form, { hub: hub2, channel, ...account && { account }, onSaved: (next) => (setSaved(next), setEditing(false)) }) : /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, account.name), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setEditing(true) }, "Edit")), account.domains.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, capitalized(account.labels?.customer ?? "customer"), " domains: ", account.domains.join(", ")), /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, Object.entries(account.read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key }, `${key}: ${mode}`))), account.updated_by && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Changed by ", account.updated_by, account.updated_at ? ` ${ago(account.updated_at * 1e3)}` : ""))), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Open tasks", description: "From your team's sources, grouped by initiative and workstream. Work on them in their threads." }), /* @__PURE__ */ React.createElement(Tasks, { hub: hub2, channel: channel.id })), /* @__PURE__ */ React.createElement(Disclosure, { summary: "What agents have learned" }, account.profile ? /* @__PURE__ */ React.createElement(Text, { size: "sm", as: "div", style: { whiteSpace: "pre-wrap" } }, account.profile) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Nothing yet. Agents add to it as they work on this account's tasks.")));
     }
     return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement("div", { style: { padding: 16 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: channelContext ? `Account for #${channelContext.channelName}` : "Account", description: "Tasks for the account are posted here, and agents follow the team's preferences." }), body)));
   };
 }
 var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and follow its mode for the task's workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first) and the team's guidance. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
+
+// plugins/signals/src/board-panel.tsx
+var COLUMNS = [
+  { status: "open", title: "Open" },
+  { status: "in_progress", title: "In progress" },
+  { status: "waiting", title: "Waiting" },
+  { status: "done", title: "Done" },
+  { status: "dismissed", title: "Dismissed" }
+];
+function columns(tasks) {
+  const out = new Map(COLUMNS.map((column) => [column.status, []]));
+  for (const item of tasks) out.get(item.task.status)?.push(item);
+  return out;
+}
+function useProfiles(ctx, keys) {
+  const session = optionalService(ctx, "relay")?.snapshot().session;
+  const profiles = session?.profiles;
+  const [, bump] = React.useReducer((n) => n + 1, 0);
+  React.useEffect(() => profiles ? profiles.subscribe(bump) : void 0, [profiles]);
+  const wanted = keys.join(",");
+  React.useEffect(() => void profiles?.ensure(keys).catch(() => {
+  }), [profiles, wanted]);
+  return (key) => {
+    const found = profiles?.snapshot().get(key);
+    if (!found) return void 0;
+    const picture = found.picture && session?.media ? session.media(found.picture, "small") ?? found.picture : found.picture;
+    return { ...found.name && { name: found.name }, ...picture && { picture } };
+  };
+}
+var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
+var KIND_COLOR = { agent: "var(--dbx-brand-tint)", person: "var(--dbx-inset)", customer: "var(--dbx-warning-tint, var(--dbx-inset))", team: "var(--dbx-inset)" };
+var KIND_TEXT = { agent: "Agent", person: "Your team", customer: "Customer", team: "Team" };
+var kindText = (kind, labels) => kind === "customer" && labels ? capitalized(labels.customer) : KIND_TEXT[kind];
+function Avatar(props) {
+  const label = props.profile?.name ?? props.person.label;
+  const title = `${label}: ${kindText(props.person.kind, props.labels)}, ${props.person.role}`;
+  const size = 22;
+  const style = { width: size, height: size, borderRadius: props.person.kind === "agent" ? 6 : 999, flex: "none", border: "1px solid var(--dbx-border)" };
+  return props.profile?.picture ? /* @__PURE__ */ React.createElement("img", { src: props.profile.picture, alt: label, title, style: { ...style, objectFit: "cover" } }) : /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...style, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: KIND_COLOR[props.person.kind], color: "var(--dbx-subtle)" } }, initials(label));
+}
+function AddAgent(props) {
+  const [open, setOpen] = React.useState(false);
+  const [agent, setAgent] = React.useState("");
+  const [note, setNote] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  if (!open) return /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !props.task.thread, title: props.task.thread ? "Ask an agent to work on it in its thread" : "Not posted in Buzz yet", onClick: () => setOpen(true) }, "Add agent");
+  const add = async () => {
+    setBusy(true);
+    setError(void 0);
+    try {
+      await props.hub.updateTask({ id: props.task.task.id, agents: agent.split(/[,\s]+/).filter(Boolean), ...note.trim() && { note: note.trim() } });
+      setOpen(false);
+      setAgent("");
+      setNote("");
+      props.onDone();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6, style: { width: "100%" } }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Agent npub1\u2026 (a member of this channel)", value: agent, onChange: (event) => setAgent(event.target.value) }), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "What to do (optional)", value: note, onChange: (event) => setNote(event.target.value) }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || !agent.trim(), onClick: () => void add() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Ask"), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setOpen(false) }, "Cancel")));
+}
+function TaskCard(props) {
+  const { item } = props;
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  const setStatus = async (status2) => {
+    setBusy(true);
+    setError(void 0);
+    try {
+      await props.hub.updateTask({ id: item.task.id, status: status2 });
+      props.onChange();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "#", item.task.id, " ", item.task.title), /* @__PURE__ */ React.createElement(Badge, { tone: item.task.mode === "auto" ? "success" : "neutral" }, item.task.mode)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, item.task.workstream && /* @__PURE__ */ React.createElement(Badge, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, item.task.initiative), item.source && (item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: (event) => (event.preventDefault(), openExternal(item.source.url)), style: { fontSize: "0.75rem" } }, item.source.source) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source)), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3))), item.people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, wrap: true, align: "center" }, item.people.map((person) => /* @__PURE__ */ React.createElement(Avatar, { key: `${person.kind}:${person.key}`, person, ...props.labels && { labels: props.labels }, ...person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key) } }))), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}\u2026` : item.activity.text), item.artifacts.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, item.artifacts.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement(Text, { key: `${artifact.at}:${artifact.url}`, size: "xs" }, artifact.url.startsWith("http") ? /* @__PURE__ */ React.createElement("a", { href: artifact.url, onClick: (event) => (event.preventDefault(), openExternal(artifact.url)) }, artifact.title ?? artifact.kind) : artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss"))));
+}
+function boardPanel(ctx, service) {
+  return function BoardPanel({ channelContext, context }) {
+    const connection = useConnection(service);
+    const hubs = useAsync(async (signal) => connection.status === "connected" ? chosenHub(service, signal) : void 0, [connection.status]);
+    const app = hubs.data?.app;
+    const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url]);
+    const [version, refresh] = React.useReducer((n) => n + 1, 0);
+    const board = useAsync(async (signal) => hub2 && channelContext ? hub2.board(channelContext.channelId, signal) : void 0, [hub2, channelContext?.channelId, version]);
+    const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
+    const profile = useProfiles(ctx, agents);
+    const steer = (item) => {
+      if (!item.thread || !channelContext) return;
+      if (context?.canOpen(item.thread) && context.open(item.thread)) return;
+      const relay = optionalService(ctx, "relay")?.snapshot();
+      const navigation = optionalService(ctx, "navigation");
+      if (!relay?.viewer || !relay.origin || !navigation) return;
+      void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channelContext.channelId, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
+    };
+    let body;
+    if (!channelContext) body = /* @__PURE__ */ React.createElement(Notice, null, "Open this from a channel's menu.");
+    else if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Tasks live in your team's signals hub, a Databricks App.");
+    else if (hubs.loading || board.loading && !board.data) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Loading tasks" });
+    else if (hubs.error || board.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? board.error));
+    else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
+    else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
+    else {
+      const grouped = columns(board.data.tasks);
+      body = /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start" } }, COLUMNS.map((column) => /* @__PURE__ */ React.createElement("div", { key: column.status, style: { flex: "0 0 280px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, column.title), /* @__PURE__ */ React.createElement(Badge, null, grouped.get(column.status).length)), grouped.get(column.status).map((item) => /* @__PURE__ */ React.createElement(TaskCard, { key: item.task.id, hub: hub2, item, ...board.data?.labels && { labels: board.data.labels }, profile, steer, onChange: refresh }))))));
+    }
+    return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement("div", { style: { padding: 16 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
+      SectionHeader,
+      {
+        title: channelContext ? `Tasks in #${channelContext.channelName}` : "Tasks",
+        description: board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity.",
+        action: hub2 && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh")
+      }
+    ), body)));
+  };
+}
 
 // plugins/signals/src/tools.ts
 async function hub(service) {
@@ -1095,7 +1222,7 @@ function signalsTools(service) {
         const modes = Object.entries(account.read.modes);
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` \xB7 channel ${account.channel}` : ""}`,
-          account.domains.length ? `Customer domains: ${account.domains.join(", ")}` : "",
+          account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
           "",
           `Modes (default draft): ${modes.length ? modes.map(([key, mode]) => `${key}: ${mode}`).join("; ") : "none set"}`,
           "- auto: do the work and report it in the task's thread. draft: prepare it (a draft doc, a reply) for a person to send. ask: ask in the thread before doing anything. off: no tasks.",
@@ -1219,6 +1346,14 @@ function apply(ctx) {
       channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
       channelPlacement: "side",
       component: accountPanel(databricks)
+    });
+    scope.panels.register({
+      id: "board",
+      title: "Tasks board",
+      matches: () => false,
+      channelMenu: { label: "Tasks board", eligible: (channel) => !channel.cached },
+      channelPlacement: "tab",
+      component: boardPanel(ctx, databricks)
     });
     return { main, databricks };
   });

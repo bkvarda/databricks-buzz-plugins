@@ -14,10 +14,12 @@
 //   GET  /api/accounts                    the account channels teams set up
 //   GET  /api/account?channel=|name=      one, with its preferences read
 //   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
+//   GET  /api/board?channel=              a channel's tasks for the board: who's on each, its source, artifacts, last activity
+//   POST /api/task {id, agents: [...]}    asks agents to work on a task (in its thread)
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
-import { type Attendee, attendeesOf, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type EventInput, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
-import type { IngestResult, SignalsStore, Task } from "./store";
+import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
+import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -61,7 +63,7 @@ export type HubOptions = Readonly<{
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/config"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config"] as const;
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
@@ -82,7 +84,7 @@ export class Hub {
 
   async handle(request: HubRequest): Promise<HubResponse> {
     const user = request.user?.toLowerCase();
-    if (request.path === "/api/info") return { json: { kind: "signals-hub", version: 1, user: user ?? null } };
+    if (request.path === "/api/info") return { json: { kind: "signals-hub", version: 1, user: user ?? null, labels: labelsOf(await this.config().catch(() => undefined)) } };
     if (!user) return bad("Sign in through Databricks Apps: the hub needs to know who you are.", 401);
     const body = async () => {
       const text = await request.body();
@@ -138,11 +140,16 @@ export class Hub {
         }
         case "POST /api/task":
           return this.updateTask(user, await body());
+        case "GET /api/board": {
+          const channel = request.query.get("channel");
+          if (!channel) return bad("Send ?channel= (a Buzz channel id).");
+          return { json: await this.board(channel) };
+        }
         case "GET /api/accounts":
           return { json: { accounts: await this.store.accounts() } };
         case "GET /api/account": {
           const account = await this.store.account({ ...(request.query.get("name") && { name: request.query.get("name")! }), ...(request.query.get("channel") && { channel: request.query.get("channel")! }) });
-          return { json: { account: account ? withRead(account) : null } };
+          return { json: { account: account ? withRead(account) : null, labels: labelsOf(await this.config()) } };
         }
         case "POST /api/account":
           return this.saveAccount(user, await body());
@@ -226,10 +233,12 @@ export class Hub {
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
       const agents = account && account.channel === task.channel ? account.agents : [];
       const event = await this.store.latestEvent(task.id);
+      const labels = labelsOf(await this.config());
       const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
-      const context: PostContext = { ...(agents.length && { briefing: briefing(account!) }), ...(event && { source: eventDetails(event, domains) }) };
+      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels) }), ...(event && { source: eventDetails(event, domains, labels) }) };
       const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
+      if (root && agents.length) await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
     } catch (error) {
       this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
     }
@@ -292,7 +301,7 @@ export class Hub {
     this.log(`${user} saved the account ${account.name}`);
     const added = before ? account.agents.filter((key) => !before.includes(key)) : [];
     const woken = added.length ? await this.handOff(account, added) : [];
-    return { json: { account: withRead(account), ...(woken.length && { woken }) } };
+    return { json: { account: withRead(account), labels: labelsOf(await this.config()), ...(woken.length && { woken }) } };
   }
 
   /**
@@ -304,11 +313,14 @@ export class Hub {
   private async handOff(account: AccountRecord, agents: readonly string[]): Promise<number[]> {
     if (!this.notifier || !account.channel) return [];
     const lower = account.name.toLowerCase();
-    const tasks = (await this.store.awaitingAgents(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
+    const tasks = (await this.store.untouched(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
     const woken: number[] = [];
+    const labels = labelsOf(await this.config());
     for (const task of tasks) {
       try {
-        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account)), agents);
+        const event = await this.store.latestEvent(task.id);
+        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account, labels), event && eventDetails(event, account.domains, labels)), agents);
+        await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
         await this.store.activity(task.id, "hub", "agents_asked", `Asked ${agents.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
       } catch (error) {
@@ -331,7 +343,18 @@ export class Hub {
     if (input.status !== undefined) {
       if (!TASK_STATUSES.includes(input.status as TaskStatus)) return bad(`status must be one of ${TASK_STATUSES.join(", ")}`);
       task = (await this.store.setStatus(id, input.status as TaskStatus, user, note))!;
-    } else if (note) await this.store.activity(id, user, "note", note);
+    } else if (note && input.agents === undefined) await this.store.activity(id, user, "note", note);
+    if (input.agents !== undefined) {
+      const keys = Array.isArray(input.agents) ? [...new Set(input.agents.map((item) => agentKey(String(item))))] : [];
+      if (!keys.length || keys.some((key) => !key) || keys.length > 10) return bad("agents is a list of up to 10 Buzz pubkeys (hex or npub).");
+      if (!this.notifier || !task.buzz_root) return bad("The task isn't posted in Buzz yet, so there's no thread to ask agents in.", 409);
+      const account = task.account ? await this.store.account({ name: task.account }) : undefined;
+      const event = await this.store.latestEvent(id);
+      const labels = labelsOf(await this.config());
+      await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels), event && eventDetails(event, account?.domains ?? [], labels)), keys);
+      await this.store.addPeople(id, keys.map((key) => ({ kind: "agent", key })));
+      await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `agent:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
+    }
     const artifact = input.artifact as { url?: unknown; title?: unknown; kind?: unknown } | undefined;
     if (artifact) {
       if (typeof artifact.url !== "string" || !/^https?:\/\//.test(artifact.url)) return bad("artifact.url must be an http(s) link.");
@@ -342,6 +365,40 @@ export class Hub {
       await this.notifier.updated(task, parts.join("\n")).catch(() => {});
     }
     return { json: await this.store.detail(id) };
+  }
+
+  /**
+   * A channel's tasks for the board, newest activity first: every open one
+   * and those closed in the last two weeks, each with who's on it (see
+   * `whoIsOn`), its source, its artifacts and its latest activity.
+   */
+  async board(channel: string): Promise<{ account: string | null; labels: ResolvedLabels; tasks: BoardTask[] }> {
+    const tasks = await this.store.boardTasks(channel);
+    const ids = tasks.map((task) => task.id);
+    const [people, extras, actors] = await Promise.all([this.store.people(ids), this.store.extras(ids), this.store.actors(ids)]);
+    const account = await this.store.account({ channel });
+    const config = await this.config();
+    const labels = labelsOf(config);
+    const rules = new Map(config.rules.map((rule) => [rule.id, rule]));
+    const domains = new Map<string, readonly string[]>();
+    const domainsOf = async (name: string | null) => {
+      if (!name) return account?.domains ?? [];
+      if (!domains.has(name)) domains.set(name, (await this.store.account({ name }))?.domains ?? []);
+      return domains.get(name)!;
+    };
+    const out: BoardTask[] = [];
+    for (const task of tasks) {
+      const extra = extras.get(task.id) ?? { artifacts: [] };
+      out.push({
+        task,
+        people: whoIsOn(people.get(task.id) ?? [], actors.get(task.id) ?? [], extra.event, await domainsOf(task.account), labels, rules.get(task.rule_id)),
+        ...(extra.event && { source: { source: extra.event.source, ...(extra.event.title && { title: extra.event.title }), ...(extra.event.url && { url: extra.event.url }), occurred_at: Number(extra.event.occurred_at ?? 0) } }),
+        artifacts: extra.artifacts.slice(0, 10),
+        ...(extra.activity && { activity: extra.activity }),
+        ...(task.buzz_root && { thread: `buzz://message?channel=${task.channel}&id=${task.buzz_root}` }),
+      });
+    }
+    return { account: account?.name ?? null, labels, tasks: out };
   }
 
   /**
@@ -375,9 +432,15 @@ export class Hub {
     const tasks = await this.store.awaitingAgents();
     if (!tasks.length) return { recorded: 0 };
     const accounts = new Map((await this.store.accounts()).map((account) => [account.name, account]));
+    const people = await this.store.people(tasks.map((task) => task.id));
+    // The agents each task waits on: the account's, until one replies, and every agent asked to work on it that hasn't.
     const waiting = tasks.flatMap((task) => {
-      const account = accounts.get(task.account!);
-      return account?.agents.length && account.channel === task.channel ? [{ task, agents: account.agents }] : [];
+      const on = (people.get(task.id) ?? []).filter((person) => person.kind === "agent");
+      const account = task.account ? accounts.get(task.account) : undefined;
+      const fromAccount = !task.agent_reply && (task.mode === "auto" || task.mode === "draft") && account?.channel === task.channel ? (account?.agents ?? []) : [];
+      const done = new Set(on.filter((person) => person.replied_at).map((person) => person.key));
+      const agents = [...new Set([...fromAccount, ...on.filter((person) => !person.replied_at).map((person) => person.key)])].filter((key) => !done.has(key));
+      return agents.length ? [{ task, agents }] : [];
     });
     if (!waiting.length) return { recorded: 0 };
     const authors = [...new Set(waiting.flatMap((item) => item.agents))];
@@ -385,17 +448,28 @@ export class Hub {
     const replies = await fetch([{ kinds: [9], "#e": waiting.map((item) => item.task.buzz_root!), authors, since }]);
     let recorded = 0;
     for (const { task, agents } of waiting) {
-      const reply = replies
-        .filter((event) => agents.includes(event.pubkey) && event.id !== task.buzz_root && event.tags.some((tag) => tag[0] === "e" && tag[1] === task.buzz_root))
-        .sort((a, b) => a.created_at - b.created_at)[0];
-      if (!reply) continue;
-      const actor = `agent:${npub(reply.pubkey)}`;
-      const text = reply.content.replace(/\s+/g, " ").trim();
-      await this.store.activity(task.id, actor, "agent_reply", text.length > 500 ? `${text.slice(0, 497)}…` : text);
-      await this.store.artifact(task.id, actor, task.mode === "draft" ? "draft" : "reply", `buzz://message?channel=${task.channel}&id=${reply.id}`, `Agent reply in the task's thread`);
-      if (task.status === "open") await this.store.setStatus(task.id, "in_progress", actor, "an agent replied in the task's thread");
-      await this.store.setAgentReply(task.id, reply.id);
-      recorded++;
+      let first = !task.agent_reply;
+      let status = task.status;
+      for (const agent of agents) {
+        const reply = replies
+          .filter((event) => event.pubkey === agent && event.id !== task.buzz_root && event.tags.some((tag) => tag[0] === "e" && tag[1] === task.buzz_root))
+          .sort((a, b) => a.created_at - b.created_at)[0];
+        if (!reply) continue;
+        const actor = `agent:${npub(reply.pubkey)}`;
+        const text = reply.content.replace(/\s+/g, " ").trim();
+        await this.store.activity(task.id, actor, "agent_reply", text.length > 500 ? `${text.slice(0, 497)}…` : text);
+        await this.store.artifact(task.id, actor, task.mode === "draft" ? "draft" : "reply", `buzz://message?channel=${task.channel}&id=${reply.id}`, `Agent reply in the task's thread`);
+        await this.store.replied(task.id, agent, reply.created_at);
+        if (status === "open") {
+          await this.store.setStatus(task.id, "in_progress", actor, "an agent replied in the task's thread");
+          status = "in_progress";
+        }
+        if (first) {
+          await this.store.setAgentReply(task.id, reply.id);
+          first = false;
+        }
+        recorded++;
+      }
     }
     return { recorded };
   }
@@ -436,9 +510,11 @@ const HAND_OFF_DAYS = 14;
 const HAND_OFF_MAX = 20;
 
 /** The reply that asks agents just added to an account to work on a task that's already posted. */
-export function handOffMessage(task: Task, agents: readonly string[], account?: string): string {
+export function handOffMessage(task: Task, agents: readonly string[], account?: string, source?: string): string {
   return [
-    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you've been added to this account's agents, and no agent has worked on this task yet: ${AGENT_ASK[task.mode as "auto" | "draft"]} The task and its source are in this thread's first message. ${AGENT_RECORD}`,
+    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you've been added to this account's agents, and no agent has worked on this task yet: ${AGENT_ASK[task.mode as "auto" | "draft"]} The task is in this thread's first message${source ? " and its source is below" : ""}. ${AGENT_RECORD}`,
+    // Tasks posted before posts carried their source don't have it in the first message.
+    source ? `\n${source}` : "",
     account ? `\n${account}` : "",
   ]
     .filter(Boolean)
@@ -448,13 +524,13 @@ export function handOffMessage(task: Task, agents: readonly string[], account?: 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
 
 /** What an agent woken on a task needs from the account, for agents without the Signals tools. */
-export function briefing(account: AccountRecord): string {
+export function briefing(account: AccountRecord, labels: ResolvedLabels = labelsOf(undefined)): string {
   const read = parsePreferences(account.preferences);
   const modes = Object.entries(read.modes).map(([key, mode]) => `${key}: ${mode}`).join("; ");
   return [
     `**For agents: ${account.name}**`,
     modes && `Modes: ${modes}`,
-    account.domains.length ? `Customer domains: ${account.domains.join(", ")}` : "",
+    account.domains.length ? `${capitalized(labels.customer)} domains: ${account.domains.join(", ")}` : "",
     read.guidance && `Team guidance:\n${clip(read.guidance, 2000)}`,
     account.profile.trim() && `Profile:\n${clip(account.profile.trim(), 3000)}`,
   ]
@@ -502,7 +578,7 @@ const MAX_ATTENDEES = 30;
  * at the account's domains marked as customers), the description and a short
  * excerpt of its other fields.
  */
-export function eventDetails(event: EventInput, domains: readonly string[] = []): string {
+export function eventDetails(event: EventInput, domains: readonly string[] = [], labels: ResolvedLabels = labelsOf(undefined)): string {
   const payload = event.payload ?? {};
   const lower = domains.map((domain) => domain.toLowerCase());
   const customer = (email?: string) => Boolean(email && lower.some((domain) => email.toLowerCase().endsWith(`@${domain}`) || email.toLowerCase().endsWith(`.${domain}`)));
@@ -520,7 +596,7 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [])
   const who = attendees.slice(0, MAX_ATTENDEES).map((a) => {
     const label = a.name && a.email ? `${a.name} <${a.email}>` : (a.email ?? a.name!);
     const twin = a.email ? twins.get(a.email) : undefined;
-    const notes = [isCustomer(a) && "customer", twin && `customer-domain address of ${twin}, not a customer`, a.organizer && "organizer", a.status && a.status !== "needsAction" && a.status].filter(Boolean);
+    const notes = [isCustomer(a) && labels.customer, twin && `${labels.customer}-domain address of ${twin}, not a ${labels.customer}`, a.organizer && "organizer", a.status && a.status !== "needsAction" && a.status].filter(Boolean);
     return `- ${label}${notes.length ? ` (${notes.join(", ")})` : ""}`;
   });
   if (attendees.length > MAX_ATTENDEES) who.push(`- …and ${attendees.length - MAX_ATTENDEES} more`);
@@ -536,6 +612,94 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [])
     who.length ? `Attendees (${attendees.length}):\n${who.join("\n")}` : "",
     description && `Description:\n${clip(description, 1500)}`,
     excerpt && `Details: ${clip(excerpt, 600)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Someone on a task as the board shows them. */
+export type BoardPerson = Readonly<{
+  /** agent: a Buzz agent (key is its hex pubkey); person: someone on your team (email); customer: someone at the account (email); team: the party a task sits with, named as labels.parties says, like Support. */
+  kind: "agent" | "person" | "customer" | "team";
+  key: string;
+  label: string;
+  /** Why they're on it, e.g. "asked", "replied", "assignee", "changed it". */
+  role: string;
+}>;
+
+export type BoardTask = Readonly<{
+  task: Task;
+  people: readonly BoardPerson[];
+  source?: Readonly<{ source: string; title?: string; url?: string; occurred_at: number }>;
+  artifacts: readonly Readonly<{ at: number; actor: string; kind: string; url: string; title?: string }>[];
+  activity?: Readonly<{ at: number; actor: string; kind: string; text: string }>;
+  /** The task's Buzz thread, to steer its agents there. */
+  thread?: string;
+}>;
+
+const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** `Ann <ann@x.io>` or `ann@x.io` as its parts. */
+function mailbox(value: string): { email?: string; name?: string } {
+  const angle = /^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/.exec(value);
+  if (angle) return { email: angle[2]!.trim().toLowerCase(), ...(angle[1]!.trim() && { name: angle[1]!.trim() }) };
+  return EMAIL.test(value.trim()) ? { email: value.trim().toLowerCase() } : { name: value.trim() };
+}
+
+/**
+ * Who's on a task: agents asked to work on it (and whether they replied),
+ * people who changed it, and who its source says: the party it sits with
+ * (the rule's `party`, or engineering for a ticket and support for a case,
+ * named as `labels.parties` says) and its owner or assignee, and the
+ * customer's people who wrote or are in the meeting (at the account's domains).
+ */
+export function whoIsOn(people: readonly TaskPerson[], actors: readonly string[], event: EventInput | undefined, domains: readonly string[], labels: ResolvedLabels = labelsOf(undefined), rule?: Pick<Rule, "party">): BoardPerson[] {
+  const out = new Map<string, BoardPerson>();
+  const add = (person: BoardPerson) => {
+    const id = `${person.kind}:${person.key.toLowerCase()}`;
+    if (!out.has(id)) out.set(id, person);
+  };
+  for (const person of people) {
+    if (person.kind === "agent") add({ kind: "agent", key: person.key, label: person.label ?? npub(person.key).slice(0, 12) + "…", role: person.replied_at ? "replied" : "asked" });
+    else add({ kind: "person", key: person.key, label: person.label ?? person.key, role: "on it" });
+  }
+  for (const actor of actors) {
+    if (actor.startsWith("agent:")) {
+      const key = agentKey(actor.slice(6));
+      if (key) add({ kind: "agent", key, label: actor.slice(6, 18) + "…", role: "replied" });
+    } else if (EMAIL.test(actor)) add({ kind: "person", key: actor.toLowerCase(), label: actor, role: "changed it" });
+  }
+  if (!event) return [...out.values()];
+  const lower = domains.map((domain) => domain.toLowerCase());
+  const customer = (email?: string) => Boolean(email && lower.some((domain) => email.endsWith(`@${domain}`) || email.endsWith(`.${domain}`)));
+  const payload = event.payload ?? {};
+  const source = event.source.toLowerCase();
+  const party = partyFor(rule, event.source);
+  if (party) {
+    add({ kind: "team", key: party, label: labels.parties[party] ?? capitalized(party), role: event.source });
+    const owner = text(payload.owner) ?? text(payload.assignee);
+    if (owner) {
+      const who = mailbox(owner);
+      add({ kind: "person", key: who.email ?? who.name!, label: who.name ?? who.email!, role: text(payload.owner) ? "owner" : "assignee" });
+    }
+  }
+  if (event.actor) {
+    const who = mailbox(event.actor);
+    if (customer(who.email)) add({ kind: "customer", key: who.email!, label: who.name ?? who.email!, role: source === "gmail" ? "wrote" : "from" });
+  }
+  for (const attendee of realCustomers(payload.attendees, (email) => customer(email.toLowerCase())))
+    add({ kind: "customer", key: attendee.email!.toLowerCase(), label: attendee.name ?? attendee.email!, role: "attendee" });
+  return [...out.values()];
+}
+
+/** The reply that asks agents someone added to a task to work on it. */
+export function askMessage(task: Task, agents: readonly string[], user: string, note?: string, account?: string, source?: string): string {
+  const mode = task.mode === "auto" || task.mode === "draft" ? task.mode : "draft";
+  return [
+    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} ${user} asked you to work on this task: ${AGENT_ASK[mode]} The task is in this thread's first message. ${AGENT_RECORD}`,
+    note ? `\n${user}: ${note}` : "",
+    source ? `\n${source}` : "",
+    account ? `\n${account}` : "",
   ]
     .filter(Boolean)
     .join("\n");

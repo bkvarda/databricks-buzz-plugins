@@ -5,8 +5,11 @@ import { type DatabricksApp, Apps } from "@dbx/core/api/apps";
 import { gatewayMcpPath } from "@dbx/core/api/mcp";
 import type { DatabricksClient } from "@dbx/core/client";
 import type { DatabricksService } from "@dbx/core/service";
-import type { AccountRecord, Preferences, SourceInfo } from "../app/model";
+import type { AccountRecord, Preferences, ResolvedLabels, SourceInfo } from "../app/model";
+import type { BoardPerson, BoardTask } from "../app/hub";
 import type { Task } from "../app/store";
+
+export type { BoardPerson, BoardTask };
 
 /** Hub apps are made with this description, so the plugin can find them. */
 export const HUB_PREFIX = "Signals hub";
@@ -70,7 +73,11 @@ export class HubClient {
   task(id: number) {
     return this.call<TaskDetail>("GET", "/api/task", { query: { id } });
   }
-  updateTask(input: { id: number; status?: string; note?: string; workstream?: string; initiative?: string; artifact?: { url: string; title?: string; kind?: string } }) {
+  /** A channel's tasks for the board: who's on each, its source, artifacts and last activity. */
+  board(channel: string, signal?: AbortSignal) {
+    return this.call<{ account: string | null; labels?: ResolvedLabels; tasks: BoardTask[] }>("GET", "/api/board", { query: { channel }, ...(signal && { signal }) });
+  }
+  updateTask(input: { id: number; status?: string; note?: string; workstream?: string; initiative?: string; agents?: readonly string[]; artifact?: { url: string; title?: string; kind?: string } }) {
     return this.call<TaskDetail>("POST", "/api/task", { body: input });
   }
   accounts(signal?: AbortSignal) {
@@ -78,10 +85,10 @@ export class HubClient {
   }
   /** The account set up for a channel (or by name), or null. */
   account(by: { channel?: string; name?: string }, signal?: AbortSignal) {
-    return this.call<{ account: AccountView | null }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => reply.account);
+    return this.call<{ account: AccountView | null; labels?: ResolvedLabels }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => (reply.account ? { ...reply.account, ...(reply.labels && { labels: reply.labels }) } : null));
   }
   saveAccount(input: AccountInput) {
-    return this.call<{ account: AccountView }>("POST", "/api/account", { body: input }).then((reply) => reply.account);
+    return this.call<{ account: AccountView; labels?: ResolvedLabels }>("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...(reply.labels && { labels: reply.labels }) }));
   }
   deleteAccount(name: string) {
     return this.call<{ deleted: boolean }>("POST", "/api/account", { body: { name, delete: true } });
@@ -91,7 +98,8 @@ export class HubClient {
   }
 }
 
-export type AccountView = AccountRecord & Readonly<{ read: Preferences }>;
+/** An account as the hub shows it, with what the deployment calls the account's people (labels.customer). */
+export type AccountView = AccountRecord & Readonly<{ read: Preferences; labels?: ResolvedLabels }>;
 export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string }>;
 
 export type TaskDetail = Readonly<{

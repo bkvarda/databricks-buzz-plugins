@@ -6,7 +6,7 @@ import type { PanelProps } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { ago, Badge, Button, Card, DbxRoot, Disclosure, Field, Notice, SectionHeader, Spinner, Stack, Text } from "@dbx/core/ui/components";
-import { MODES, parsePreferences } from "../app/model";
+import { capitalized, MODES, parsePreferences } from "../app/model";
 import type { Task } from "../app/store";
 import { type AccountView, chosenHub, HubClient } from "./client";
 
@@ -19,7 +19,7 @@ export const PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (
 - questions: draft
 
 Anything else you write here is guidance agents follow, for example:
-Keep customer replies short. Copy the AE on anything about pricing.`;
+Keep customer replies short. Copy the account owner on anything about pricing.`;
 
 const splitList = (text: string) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 
@@ -62,7 +62,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         <Field label="Other names" hint="Comma-separated, e.g. ACME Corp, Acme Inc.">
           <input className="dbx-input" value={aliases} onChange={(event) => setAliases(event.target.value)} />
         </Field>
-        <Field label="Customer email domains" hint="Mail and meetings from people at these domains go to this channel's tasks.">
+        <Field label={`${capitalized(account?.labels?.customer ?? "customer")} email domains`} hint="Mail and meetings from people at these domains go to this channel's tasks.">
           <input className="dbx-input" placeholder="example.com" value={domains} onChange={(event) => setDomains(event.target.value)} />
         </Field>
         <Field label="Agents that work on tasks" hint="Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel.">
@@ -145,7 +145,7 @@ export function accountPanel(service: DatabricksService) {
                   <Text weight={500}>{account.name}</Text>
                   <Button size="sm" onClick={() => setEditing(true)}>Edit</Button>
                 </Stack>
-                {account.domains.length > 0 && <Text size="sm" tone="subtle">Customer domains: {account.domains.join(", ")}</Text>}
+                {account.domains.length > 0 && <Text size="sm" tone="subtle">{capitalized(account.labels?.customer ?? "customer")} domains: {account.domains.join(", ")}</Text>}
                 <Text size="sm" tone="subtle">{account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"}</Text>
                 <Stack direction="row" gap={6} wrap>
                   {Object.entries(account.read.modes).map(([key, mode]) => <Badge key={key}>{`${key}: ${mode}`}</Badge>)}

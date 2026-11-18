@@ -118,6 +118,8 @@ export type Rule = Readonly<{
   group?: string;
   /** Overrides the account the event says (a fixed name or `{payload.account_name}`). */
   account?: string;
+  /** Who tasks from this rule sit with on the tasks board: a key of labels.parties, like `support` (default: the source says). */
+  party?: string;
   /** Nudge when the event's latest version still matches `when` after this many hours. */
   stale_after_hours?: number;
   /** What the nudge says; `{field}` takes an event field. */
@@ -166,7 +168,43 @@ export type SignalsConfig = Readonly<{
   accounts?: readonly AccountRule[];
   /** Channel for tasks with no account channel. */
   default_channel?: string;
+  /** What this deployment calls things (see Labels); generic words when omitted. */
+  labels?: Labels;
 }>;
+
+/**
+ * What a deployment calls things, so each organization uses its own words:
+ * `customer` for the people at an account (say "client"), and `parties` for
+ * who a task from outside sits with on the tasks board, by key (a rule's
+ * `party`), like `{ "support": "Support" }`.
+ */
+export type Labels = Readonly<{ customer?: string; parties?: Readonly<Record<string, string>> }>;
+
+/** The parties every deployment has; `labels.parties` renames them or adds more. */
+export const DEFAULT_PARTIES: Readonly<Record<string, string>> = { engineering: "Engineering", support: "Support" };
+
+export type ResolvedLabels = Readonly<{ customer: string; parties: Readonly<Record<string, string>> }>;
+
+/** The config's labels with the defaults filled in. */
+export function labelsOf(config: SignalsConfig | undefined): ResolvedLabels {
+  const customer = config?.labels?.customer?.trim().toLowerCase() || "customer";
+  return { customer, parties: { ...DEFAULT_PARTIES, ...(config?.labels?.parties ?? {}) } };
+}
+
+/** "customer" → "Customer". */
+export const capitalized = (word: string) => word.charAt(0).toUpperCase() + word.slice(1);
+
+/**
+ * The party a task from this event sits with: the rule's `party`, else the
+ * source says (a Jira or ticket source is engineering's, a support or case
+ * source is support's), else none.
+ */
+export function partyFor(rule: Pick<Rule, "party"> | undefined, source: string): string | undefined {
+  if (rule?.party) return rule.party;
+  if (/(^|[._])(jira|tickets?|issues?)([._]|$)/i.test(source)) return "engineering";
+  if (/(^|[._])(support|cases?)([._]|$)/i.test(source)) return "support";
+  return undefined;
+}
 
 export const EMPTY_CONFIG: SignalsConfig = { version: 1, first_run_seen: true, rules: [] };
 
@@ -217,6 +255,25 @@ export function configProblems(raw: unknown): string[] {
   }
   if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
     problems.push("sources is a list of {name, label}");
+  const parties = { ...DEFAULT_PARTIES };
+  if (config.labels !== undefined) {
+    const labels = config.labels as Record<string, unknown>;
+    if (!labels || typeof labels !== "object" || Array.isArray(labels)) problems.push("labels is an object");
+    else {
+      if (labels.customer !== undefined && (typeof labels.customer !== "string" || !labels.customer.trim())) problems.push("labels.customer is a word, like client");
+      if (labels.parties !== undefined) {
+        if (!labels.parties || typeof labels.parties !== "object" || Array.isArray(labels.parties)) problems.push("labels.parties is an object of key → name");
+        else
+          for (const [key, name] of Object.entries(labels.parties as Record<string, unknown>)) {
+            if (typeof name !== "string" || !name.trim()) problems.push(`labels.parties.${key} is a name`);
+            else parties[key as keyof typeof parties] = name;
+          }
+      }
+    }
+  }
+  for (const [n, rule] of (config.rules as Record<string, unknown>[]).entries())
+    if (rule && typeof rule === "object" && rule.party !== undefined && (typeof rule.party !== "string" || !(rule.party in parties)))
+      problems.push(`rules[${n}].party must be one of ${Object.keys(parties).join(", ")} (or a key you add in labels.parties)`);
   if (config.accounts !== undefined && !Array.isArray(config.accounts)) problems.push("accounts must be a list");
   for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries())
     if (!account || typeof account.name !== "string" || !account.name) problems.push(`accounts[${n}].name is required`);
@@ -364,7 +421,7 @@ const MODE_LINE = /^\s*(?:[-*]\s*)?([^:#]{1,80}?)\s*:\s*(\S+)\s*$/;
  *
  *     - meeting prep: auto
  *     - tickets: off
- *     Keep replies to customers short, and cc the AE.
+ *     Keep replies to customers short, and cc the account owner.
  */
 export function parsePreferences(text: string | undefined): Preferences {
   const modes: Record<string, Mode> = {};

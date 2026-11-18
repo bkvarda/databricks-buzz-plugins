@@ -35,7 +35,12 @@ export type Task = Readonly<{
   event_count: number;
   buzz_root: string | null;
   nudged_at: number | null;
+  /** The first agent reply the hub recorded in its thread (an event id). */
+  agent_reply?: string | null;
 }>;
+
+/** Someone on a task: an agent (hex pubkey) asked to work on it, or a person (email) who changed it. */
+export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number }>;
 
 export type Outcome = "new" | "changed" | "same" | "skipped";
 export type IngestResult = Readonly<{
@@ -105,6 +110,9 @@ export class SignalsStore {
     await this.q(`CREATE TABLE IF NOT EXISTS $S.activities (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, text text NOT NULL)`);
     await this.q(`CREATE INDEX IF NOT EXISTS activities_task ON $S.activities (task_id, at)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.artifacts (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, url text NOT NULL, title text)`);
+    // Who works on a task: agents asked to (and when each first replied), and people who changed it.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.task_people (
+      task_id bigint NOT NULL, kind text NOT NULL, key text NOT NULL, label text, at bigint NOT NULL, replied_at bigint, PRIMARY KEY (task_id, kind, key))`);
     await this.setupInbox();
   }
 
@@ -362,8 +370,8 @@ export class SignalsStore {
     await this.q(`UPDATE $S.tasks SET buzz_root = $2 WHERE id = $1`, [task, root]);
   }
 
-  /** Posted tasks whose account's agents were asked to work on them, with no agent reply recorded yet (opened within `days`). */
-  async awaitingAgents(days = 7, at = now(), limit = 50): Promise<Task[]> {
+  /** Posted auto and draft tasks of an account with no agent reply recorded yet (opened within `days`). */
+  async untouched(days = 7, at = now(), limit = 50): Promise<Task[]> {
     const found = await this.q(
       `SELECT * FROM $S.tasks WHERE buzz_root IS NOT NULL AND agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft')
          AND status NOT IN ('done', 'dismissed') AND created_at >= $1 ORDER BY id LIMIT ${limit}`,
@@ -372,20 +380,84 @@ export class SignalsStore {
     return found.rows.map(toTask);
   }
 
+  /**
+   * Posted open tasks (opened within `days`) an agent may still reply to: no
+   * agent reply recorded yet, or an agent asked to work on it that hasn't replied.
+   */
+  async awaitingAgents(days = 7, at = now(), limit = 50): Promise<Task[]> {
+    const found = await this.q(
+      `SELECT * FROM $S.tasks t WHERE buzz_root IS NOT NULL AND status NOT IN ('done', 'dismissed') AND created_at >= $1
+         AND ((agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft'))
+           OR EXISTS (SELECT 1 FROM $S.task_people p WHERE p.task_id = t.id AND p.kind = 'agent' AND p.replied_at IS NULL))
+         ORDER BY id LIMIT ${limit}`,
+      [at - days * 86400],
+    );
+    return found.rows.map(toTask);
+  }
+
+  /** Adds people to a task (agents by hex pubkey, people by email); ones already on it stay as they were. */
+  async addPeople(task: number, people: readonly Readonly<{ kind: "agent" | "person"; key: string; label?: string }>[]): Promise<void> {
+    for (const person of people)
+      await this.q(`INSERT INTO $S.task_people (task_id, kind, key, label, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, [task, person.kind, person.key, person.label ?? null, now()]);
+  }
+
+  /** Records that an agent replied in the task's thread (adding it to the task if it wasn't on it). */
+  async replied(task: number, agent: string, at = now()): Promise<void> {
+    await this.q(
+      `INSERT INTO $S.task_people (task_id, kind, key, at, replied_at) VALUES ($1, 'agent', $2, $3, $3)
+       ON CONFLICT (task_id, kind, key) DO UPDATE SET replied_at = COALESCE($S.task_people.replied_at, EXCLUDED.replied_at)`,
+      [task, agent, at],
+    );
+  }
+
+  /** The people on each of the tasks. */
+  async people(tasks: readonly number[]): Promise<Map<number, TaskPerson[]>> {
+    const out = new Map<number, TaskPerson[]>();
+    if (!tasks.length) return out;
+    const found = await this.q(`SELECT task_id, kind, key, label, at, replied_at FROM $S.task_people WHERE task_id = ANY($1::bigint[]) ORDER BY at, key`, [tasks]);
+    for (const row of found.rows) {
+      const id = Number(row.task_id);
+      out.set(id, [...(out.get(id) ?? []), { kind: row.kind as TaskPerson["kind"], key: String(row.key), ...(row.label ? { label: String(row.label) } : {}), at: Number(row.at), ...(row.replied_at !== null && row.replied_at !== undefined && { replied_at: Number(row.replied_at) }) }]);
+    }
+    return out;
+  }
+
+  /** Each task's latest event, artifacts (newest first) and latest activity, for the tasks board. */
+  async extras(tasks: readonly number[]): Promise<Map<number, { event?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }>> {
+    const out = new Map(tasks.map((id) => [id, { artifacts: [] as { at: number; actor: string; kind: string; url: string; title?: string }[] } as { event?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }]));
+    if (!tasks.length) return out;
+    const events = await this.q(`SELECT t.id AS task_id, e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = ANY($1::bigint[])`, [tasks]);
+    for (const row of events.rows) out.get(Number(row.task_id))!.event = toEvent(row);
+    const artifacts = await this.q(`SELECT task_id, at, actor, kind, url, title FROM $S.artifacts WHERE task_id = ANY($1::bigint[]) ORDER BY at DESC, id DESC`, [tasks]);
+    for (const row of artifacts.rows) out.get(Number(row.task_id))!.artifacts.push({ at: Number(row.at), actor: String(row.actor), kind: String(row.kind), url: String(row.url), ...(row.title ? { title: String(row.title) } : {}) });
+    const activities = await this.q(`SELECT DISTINCT ON (task_id) task_id, at, actor, kind, text FROM $S.activities WHERE task_id = ANY($1::bigint[]) ORDER BY task_id, at DESC, id DESC`, [tasks]);
+    for (const row of activities.rows) out.get(Number(row.task_id))!.activity = { at: Number(row.at), actor: String(row.actor), kind: String(row.kind), text: String(row.text) };
+    return out;
+  }
+
+  /** Who changed each task (activity actors other than the hub), first first. */
+  async actors(tasks: readonly number[]): Promise<Map<number, string[]>> {
+    const out = new Map<number, string[]>();
+    if (!tasks.length) return out;
+    const found = await this.q(`SELECT task_id, actor, min(at) AS at FROM $S.activities WHERE task_id = ANY($1::bigint[]) AND actor NOT IN ('hub', 'signals') GROUP BY task_id, actor ORDER BY task_id, at`, [tasks]);
+    for (const row of found.rows) out.set(Number(row.task_id), [...(out.get(Number(row.task_id)) ?? []), String(row.actor)]);
+    return out;
+  }
+
+  /** A channel's tasks for the board: every open one, and those done or dismissed within `days`. */
+  async boardTasks(channel: string, days = 14, at = now(), limit = 200): Promise<Task[]> {
+    const found = await this.q(
+      `SELECT * FROM $S.tasks WHERE channel = $1 AND (status NOT IN ('done', 'dismissed') OR updated_at >= $2) ORDER BY last_event_at DESC, id DESC LIMIT ${limit}`,
+      [channel, at - days * 86400],
+    );
+    return found.rows.map(toTask);
+  }
+
   /** The task's latest event, as it was posted (occurred_at in Unix seconds). */
   async latestEvent(task: number): Promise<EventInput | undefined> {
     const found = await this.q(`SELECT e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = $1`, [task]);
     const row = found.rows[0];
-    if (!row) return undefined;
-    return {
-      source: String(row.source),
-      external_id: String(row.external_id),
-      occurred_at: Number(row.occurred_at),
-      ...(row.title ? { title: String(row.title) } : {}),
-      ...(row.url ? { url: String(row.url) } : {}),
-      ...(row.actor ? { actor: String(row.actor) } : {}),
-      ...(row.payload ? { payload: row.payload as Record<string, unknown> } : {}),
-    };
+    return row ? toEvent(row) : undefined;
   }
 
   async setAgentReply(task: number, reply: string): Promise<void> {
@@ -511,6 +583,19 @@ const fillText = (template: string, event: EventInput, hours: number) => templat
 const num = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
 const numbers = (row: Row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, typeof value === "bigint" || (/^(at|id|occurred_at|versions)$/.test(key) && value !== null) ? Number(value) : value]));
 
+function toEvent(row: Row): EventInput {
+  return {
+    source: String(row.source),
+    external_id: String(row.external_id),
+    occurred_at: Number(row.occurred_at),
+    ...(row.title ? { title: String(row.title) } : {}),
+    ...(row.url ? { url: String(row.url) } : {}),
+    ...(row.actor ? { actor: String(row.actor) } : {}),
+    ...(row.account ? { account: String(row.account) } : {}),
+    ...(row.payload ? { payload: row.payload as Record<string, unknown> } : {}),
+  };
+}
+
 function toTask(row: Row): Task {
   return {
     id: Number(row.id),
@@ -530,6 +615,7 @@ function toTask(row: Row): Task {
     event_count: Number(row.event_count),
     buzz_root: (row.buzz_root as string | null) ?? null,
     nudged_at: num(row.nudged_at),
+    agent_reply: (row.agent_reply as string | null) ?? null,
   };
 }
 
