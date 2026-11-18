@@ -81,6 +81,35 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 - **Nudges:** with `stale_after_hours`, an open task whose latest event still matches the rule after that many hours gets a nudge in its thread, at most once per period.
 - **Accounts:** the account comes from the rule's `account`, then the event's own `account` (matched by name or alias), then the first account whose `when` holds. The account's `channel` is where its tasks are posted; tasks without one go to `default_channel`.
 
+## Account channels
+
+Open a channel's menu and choose **Set up account** to make it an account channel. You give it:
+- **Account:** the name tasks show, plus any other names sources use for it.
+- **Customer email domains:** mail and meetings from people at these domains go to this channel's tasks.
+- **Team preferences:** plain text the team edits whenever it wants.
+
+Tasks for the account are then posted in this channel. That includes tasks already open that had no channel yet. The panel lists the open tasks, grouped by initiative and workstream. Anyone who can use the hub can set up a channel, and the hub records who changed what. A registered account wins over a config account with the same name.
+
+**Preferences.** A line `<workstream or rule id>: <mode>` sets how agents handle that kind of work, and `everything: <mode>` sets the default (`draft` when nothing says):
+
+```text
+- everything: draft
+- meeting prep: auto
+- tickets: off
+Keep customer replies short. Copy the AE on anything about pricing.
+```
+
+| Mode | What agents do |
+|---|---|
+| `auto` | Do the work and report it in the task's thread. |
+| `draft` | Prepare it (a draft doc, a reply) for a person to send. |
+| `ask` | Ask in the thread before doing anything. |
+| `off` | No new tasks open. Tasks already open still get updates. |
+
+Every other line is guidance that agents follow. A task keeps the mode it had when it opened, and its Buzz message shows it.
+
+**Agents** get `signals_account` (the account, its preferences and its profile) and `signals_account_learn`, which replaces the profile agents keep of the customer and the team. Every agent turn is told to read the account before working on a task and to record what it learns. That profile is how the channel gets better over time. Agents can also file a task under a workstream or initiative with `signals_task_update`.
+
 ## Sources (`sources.json`)
 
 - **`mcp` sources** call a tool of a `system.ai` service.

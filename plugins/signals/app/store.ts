@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { contentKey, decide, type EventInput, isOpen, matches, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountRecord, contentKey, decide, type EventInput, isOpen, matches, type Mode, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -23,6 +23,10 @@ export type Task = Readonly<{
   account: string | null;
   channel: string | null;
   workstream: string | null;
+  /** The initiative it's part of, when someone said. */
+  initiative: string | null;
+  /** How agents handle it, from the team's preferences when it opened. */
+  mode: Mode;
   status: TaskStatus;
   created_by: string;
   created_at: number;
@@ -86,6 +90,12 @@ export class SignalsStore {
       account text, channel text, workstream text, status text NOT NULL DEFAULT 'open', created_by text NOT NULL,
       created_at bigint NOT NULL, updated_at bigint NOT NULL, last_event_at bigint NOT NULL, event_count int NOT NULL DEFAULT 0,
       latest_event bigint, buzz_root text, nudged_at bigint)`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS initiative text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'draft'`);
+    // Account channels as their teams set them up (Set up account): names, domains, preferences, what agents learned.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.accounts (
+      name text PRIMARY KEY, channel text UNIQUE, aliases jsonb NOT NULL DEFAULT '[]', domains jsonb NOT NULL DEFAULT '[]',
+      preferences text NOT NULL DEFAULT '', profile text NOT NULL DEFAULT '', updated_by text, updated_at bigint)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -237,7 +247,7 @@ export class SignalsStore {
         if (decision.kind === "none") continue;
         let task = await this.taskByGroup(decision.group);
         if (!task && decision.create) {
-          task = await this.openTask({ rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, by: owner, at: toSeconds(event.occurred_at) });
+          task = await this.openTask({ rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) });
           opened.add(task.id);
         } else if (task && !isOpen(task.status) && decision.create && recorded.outcome === "new") {
           await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
@@ -261,12 +271,12 @@ export class SignalsStore {
 
   // --- tasks --------------------------------------------------------------
 
-  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; by: string; at: number }): Promise<Task> {
+  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number }): Promise<Task> {
     const at = now();
     const found = await this.q(
-      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, created_by, created_at, updated_at, last_event_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9) ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
-      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.by, at, Number.isNaN(input.at) ? at : input.at],
+      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10) ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
+      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at],
     );
     const task = toTask(found.rows[0]!);
     await this.activity(task.id, "signals", "opened", `Opened by rule ${input.rule}.`);
@@ -290,9 +300,11 @@ export class SignalsStore {
     return found.rows[0] ? toTask(found.rows[0]) : undefined;
   }
 
-  async tasks(filter: Readonly<{ status?: string; account?: string; channel?: string; open?: boolean; limit?: number }> = {}): Promise<Task[]> {
+  async tasks(filter: Readonly<{ status?: string; account?: string; channel?: string; workstream?: string; initiative?: string; open?: boolean; limit?: number }> = {}): Promise<Task[]> {
     const where: string[] = [];
     const values: unknown[] = [];
+    if (filter.workstream) where.push(`lower(workstream) = lower($${values.push(filter.workstream)})`);
+    if (filter.initiative) where.push(`lower(initiative) = lower($${values.push(filter.initiative)})`);
     if (filter.status) where.push(`status = $${values.push(filter.status)}`);
     if (filter.open) where.push(`status NOT IN ('done', 'dismissed')`);
     if (filter.account) where.push(`lower(account) = lower($${values.push(filter.account)})`);
@@ -318,6 +330,20 @@ export class SignalsStore {
     if (!found.rows[0]) return undefined;
     await this.activity(id, actor, "status", note ? `${status}: ${note}` : status);
     return toTask(found.rows[0]);
+  }
+
+  /** Files a task under a workstream or initiative ("" clears it). */
+  async file(id: number, actor: string, fields: Readonly<{ workstream?: string; initiative?: string }>): Promise<Task | undefined> {
+    let task: Task | undefined;
+    for (const key of ["workstream", "initiative"] as const) {
+      const value = fields[key];
+      if (value === undefined) continue;
+      const found = await this.q(`UPDATE $S.tasks SET ${key} = $2, updated_at = $3 WHERE id = $1 RETURNING *`, [id, value.trim().slice(0, 200) || null, now()]);
+      if (!found.rows[0]) return undefined;
+      task = toTask(found.rows[0]);
+      await this.activity(id, actor, key, value.trim() ? `${key}: ${value.trim()}` : `${key} cleared`);
+    }
+    return task ?? (await this.task(id));
   }
 
   async activity(task: number, actor: string, kind: string, text: string): Promise<void> {
@@ -371,6 +397,65 @@ export class SignalsStore {
     await this.activity(task, "signals", "nudge", text);
   }
 
+  // --- accounts -----------------------------------------------------------
+
+  async accounts(): Promise<AccountRecord[]> {
+    return (await this.q(`SELECT * FROM $S.accounts ORDER BY name`)).rows.map(toAccount);
+  }
+
+  /** The account by name or alias (any case), or by its channel. */
+  async account(by: Readonly<{ name?: string; channel?: string }>): Promise<AccountRecord | undefined> {
+    if (by.channel) {
+      const found = await this.q(`SELECT * FROM $S.accounts WHERE channel = $1`, [by.channel]);
+      if (found.rows[0]) return toAccount(found.rows[0]);
+    }
+    if (!by.name) return undefined;
+    const lower = by.name.trim().toLowerCase();
+    return (await this.accounts()).find((account) => account.name.toLowerCase() === lower || account.aliases.some((alias) => alias.toLowerCase() === lower));
+  }
+
+  /**
+   * Creates or changes an account. Only the fields given change; `rename`
+   * gives it a new name and moves its tasks along. A channel belongs to one
+   * account at a time.
+   */
+  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; preferences?: string; profile?: string }>, by: string): Promise<AccountRecord> {
+    const at = now();
+    const existing = await this.account({ name });
+    const key = existing?.name ?? name.trim();
+    if (!existing) await this.q(`INSERT INTO $S.accounts (name, updated_by, updated_at) VALUES ($1, $2, $3)`, [key, by, at]);
+    const sets: string[] = [];
+    const values: unknown[] = [key];
+    const set = (column: string, value: unknown) => sets.push(`${column} = $${values.push(value)}`);
+    if (fields.channel !== undefined) {
+      if (fields.channel) await this.q(`UPDATE $S.accounts SET channel = NULL WHERE channel = $1 AND name <> $2`, [fields.channel, key]);
+      set("channel", fields.channel || null);
+    }
+    if (fields.aliases) set("aliases", JSON.stringify(fields.aliases));
+    if (fields.domains) set("domains", JSON.stringify(fields.domains));
+    if (fields.preferences !== undefined) set("preferences", fields.preferences);
+    if (fields.profile !== undefined) set("profile", fields.profile);
+    set("updated_by", by);
+    set("updated_at", at);
+    await this.q(`UPDATE $S.accounts SET ${sets.join(", ")} WHERE name = $1`, values);
+    const renamed = fields.rename?.trim();
+    if (renamed && renamed !== key) {
+      await this.q(`UPDATE $S.accounts SET name = $2 WHERE name = $1`, [key, renamed]);
+      await this.q(`UPDATE $S.tasks SET account = $2 WHERE account = $1`, [key, renamed]);
+    }
+    // Open tasks for the account without a channel go to its channel now (the sweep posts them).
+    const account = (await this.account({ name: renamed || key }))!;
+    if (account.channel) await this.q(`UPDATE $S.tasks SET channel = $2 WHERE lower(account) = lower($1) AND channel IS NULL AND buzz_root IS NULL`, [account.name, account.channel]);
+    return account;
+  }
+
+  async deleteAccount(name: string): Promise<boolean> {
+    const found = await this.account({ name });
+    if (!found) return false;
+    await this.q(`DELETE FROM $S.accounts WHERE name = $1`, [found.name]);
+    return true;
+  }
+
   async stats() {
     const found = await this.q<{ events: unknown; tasks: unknown; open: unknown; people: unknown }>(
       `SELECT (SELECT count(*) FROM $S.events) AS events, (SELECT count(*) FROM $S.tasks) AS tasks,
@@ -401,6 +486,8 @@ function toTask(row: Row): Task {
     account: (row.account as string | null) ?? null,
     channel: (row.channel as string | null) ?? null,
     workstream: (row.workstream as string | null) ?? null,
+    initiative: (row.initiative as string | null) ?? null,
+    mode: ((row.mode as Mode | null) ?? "draft") as Mode,
     status: row.status as TaskStatus,
     created_by: String(row.created_by),
     created_at: Number(row.created_at),
@@ -409,5 +496,20 @@ function toTask(row: Row): Task {
     event_count: Number(row.event_count),
     buzz_root: (row.buzz_root as string | null) ?? null,
     nudged_at: num(row.nudged_at),
+  };
+}
+
+const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
+
+function toAccount(row: Row): AccountRecord {
+  return {
+    name: String(row.name),
+    channel: (row.channel as string | null) ?? null,
+    aliases: strings(typeof row.aliases === "string" ? JSON.parse(row.aliases) : row.aliases),
+    domains: strings(typeof row.domains === "string" ? JSON.parse(row.domains) : row.domains),
+    preferences: String(row.preferences ?? ""),
+    profile: String(row.profile ?? ""),
+    updated_by: (row.updated_by as string | null) ?? null,
+    updated_at: num(row.updated_at),
   };
 }

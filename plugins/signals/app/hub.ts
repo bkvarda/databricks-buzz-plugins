@@ -8,11 +8,14 @@
 //   POST /api/sources {source, enabled, scope?, forget?}
 //   POST /api/cursor  {source, cursor?, error?}  where a poller stopped, and its problem
 //   POST /api/events  {events: [...]}     ingest (dedupe, rules, tasks)
-//   GET  /api/tasks?status=&account=&channel=&open=1&limit=
+//   GET  /api/tasks?status=&account=&channel=&workstream=&initiative=&open=1&limit=
 //   GET  /api/task?id=                    a task with its events, activity and artifacts
-//   POST /api/task {id, status?, note?, artifact?: {url, title?, kind?}}
+//   POST /api/task {id, status?, note?, workstream?, initiative?, artifact?: {url, title?, kind?}}
+//   GET  /api/accounts                    the account channels teams set up
+//   GET  /api/account?channel=|name=      one, with its preferences read
+//   POST /api/account {name, rename?, channel?, aliases?, domains?, preferences?, profile?, delete?}
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
-import { configProblems, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, type SignalsConfig, TASK_STATUSES, type TaskStatus, validateEvent } from "./model";
+import { type AccountRecord, configProblems, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task } from "./store";
 
 export type HubRequest = Readonly<{ method: string; path: string; query: URLSearchParams; user?: string; body(): Promise<string> }>;
@@ -45,9 +48,10 @@ export class Hub {
     private readonly options: HubOptions = {},
   ) {}
 
+  /** The saved rules (or the starting ones), with the accounts teams set up. */
   async config(): Promise<SignalsConfig> {
     if (this.cached && Date.now() - this.cached.at < 30_000) return this.cached.config;
-    const config = (await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG;
+    const config = withAccounts((await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, await this.store.accounts());
     this.cached = { at: Date.now(), config };
     return config;
   }
@@ -96,6 +100,8 @@ export class Hub {
                 ...(status && { status }),
                 ...(q.get("account") && { account: q.get("account")! }),
                 ...(q.get("channel") && { channel: q.get("channel")! }),
+                ...(q.get("workstream") && { workstream: q.get("workstream")! }),
+                ...(q.get("initiative") && { initiative: q.get("initiative")! }),
                 open: q.get("open") === "1" || q.get("open") === "true",
                 limit: Number(q.get("limit") ?? 50) || 50,
               }),
@@ -108,8 +114,17 @@ export class Hub {
         }
         case "POST /api/task":
           return this.updateTask(user, await body());
+        case "GET /api/accounts":
+          return { json: { accounts: await this.store.accounts() } };
+        case "GET /api/account": {
+          const account = await this.store.account({ ...(request.query.get("name") && { name: request.query.get("name")! }), ...(request.query.get("channel") && { channel: request.query.get("channel")! }) });
+          return { json: { account: account ? withRead(account) : null } };
+        }
+        case "POST /api/account":
+          return this.saveAccount(user, await body());
         case "GET /api/config":
-          return { json: { config: await this.config(), canEdit: this.isAdmin(user) } };
+          // The rules as saved; accounts teams set up are under /api/accounts.
+          return { json: { config: (await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, canEdit: this.isAdmin(user) } };
         case "POST /api/config": {
           if (!this.isAdmin(user)) return bad("Only the hub's admins can change its rules.", 403);
           const input = await body();
@@ -190,10 +205,66 @@ export class Hub {
     }
   }
 
+  /**
+   * Sets up or changes an account channel. Anyone who can use the hub may:
+   * it's the team's own channel, and every change records who made it.
+   */
+  private async saveAccount(user: string, input: Record<string, unknown>): Promise<HubResponse> {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!name || name.length > 200) return bad("Send {name} (1-200 characters).");
+    if (input.delete === true) {
+      if (!(await this.store.deleteAccount(name))) return bad("No such account.", 404);
+      this.cached = undefined;
+      this.log(`${user} deleted the account ${name}`);
+      return { json: { deleted: true } };
+    }
+    const list = (key: string, max: number) => {
+      const value = input[key];
+      if (value === undefined) return undefined;
+      const items = (Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,\n]/) : undefined)?.map((item) => String(item).trim()).filter(Boolean);
+      if (!items) throw Object.assign(new Error(`${key} is a list of names.`), { status: 400 });
+      return [...new Set(items)].slice(0, max);
+    };
+    const text = (key: string, max: number) => {
+      const value = input[key];
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") throw Object.assign(new Error(`${key} must be text.`), { status: 400 });
+      if (value.length > max) throw Object.assign(new Error(`${key} is at most ${max} characters.`), { status: 400 });
+      return value;
+    };
+    const domains = list("domains", 20)?.map((domain) => domain.toLowerCase().replace(/^@/, ""));
+    const wrong = domains?.find((domain) => !validDomain(domain));
+    if (wrong) return bad(`${wrong} isn't an email domain (like example.com).`);
+    if (input.channel !== undefined && input.channel !== null && (typeof input.channel !== "string" || !/^[\w-]{1,100}$/.test(input.channel))) return bad("channel is a Buzz channel id.");
+    if (input.rename !== undefined && (typeof input.rename !== "string" || !input.rename.trim() || input.rename.length > 200)) return bad("rename is the account's new name (1-200 characters).");
+    const aliases = list("aliases", 20);
+    const preferences = text("preferences", 8000);
+    const profile = text("profile", 16000);
+    const account = await this.store.saveAccount(
+      name,
+      {
+        ...(typeof input.rename === "string" && { rename: input.rename }),
+        ...(input.channel !== undefined && { channel: (input.channel as string | null) || null }),
+        ...(aliases && { aliases }),
+        ...(domains && { domains }),
+        ...(preferences !== undefined && { preferences }),
+        ...(profile !== undefined && { profile }),
+      },
+      user,
+    );
+    this.cached = undefined;
+    this.log(`${user} saved the account ${account.name}`);
+    return { json: { account: withRead(account) } };
+  }
+
   private async updateTask(user: string, input: Record<string, unknown>): Promise<HubResponse> {
     const id = Number(input.id);
     let task = await this.store.task(id);
     if (!task) return bad("No such task.", 404);
+    for (const key of ["workstream", "initiative"] as const)
+      if (input[key] !== undefined && (typeof input[key] !== "string" || (input[key] as string).length > 200)) return bad(`${key} is a name (at most 200 characters), or "" to clear it.`);
+    if (input.workstream !== undefined || input.initiative !== undefined)
+      task = (await this.store.file(id, user, { ...(input.workstream !== undefined && { workstream: input.workstream as string }), ...(input.initiative !== undefined && { initiative: input.initiative as string }) }))!;
     const note = typeof input.note === "string" && input.note.trim() ? input.note.trim() : undefined;
     if (input.status !== undefined) {
       if (!TASK_STATUSES.includes(input.status as TaskStatus)) return bad(`status must be one of ${TASK_STATUSES.join(", ")}`);
@@ -251,10 +322,16 @@ export class Hub {
 }
 
 /** A task as its Buzz message shows it. */
+/** An account as the API gives it: with its preferences read, so the UI and agents see what took. */
+const withRead = (account: AccountRecord) => ({ ...account, read: parsePreferences(account.preferences) });
+
+const MODE_TEXT = { auto: "Mode: auto (agents do it and report)", draft: "Mode: draft (agents prepare it; a person sends it)", ask: "Mode: ask (agents ask before doing anything)", off: "Mode: off" } as const;
+
 export function taskMessage(task: Task, detail?: { url?: string }): string {
   return [
     `📌 **Task ${task.id}: ${task.title}**`,
-    [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
+    [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
+    MODE_TEXT[task.mode] ?? "",
     detail?.url ? `Source: ${detail.url}` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
   ]

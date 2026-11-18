@@ -1,7 +1,7 @@
 // Signals: events → dedupe → rules → tasks, on a real Postgres (PGlite).
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { configProblems, decide, type SignalsConfig, validateEvent } from "../plugins/signals/app/model";
+import { accountRule, configProblems, decide, modeFor, parsePreferences, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { Hub } from "../plugins/signals/app/hub";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
@@ -299,6 +299,90 @@ describe("the hub API", () => {
     expect(await hub.sweep()).toEqual({ posted: 1, nudged: 0 });
     expect(await hub.sweep(Math.floor(Date.now() / 1000) + 80 * 3600)).toEqual({ posted: 0, nudged: 1 });
     expect(posts.at(-1)).toEqual({ kind: "updated", task: 1, text: "⏰ Case C-1 has waited 80h for confirmation" });
+  });
+});
+
+describe("account channels", () => {
+  it("reads a team's preferences: modes per workstream or rule, the rest is guidance", () => {
+    const read = parsePreferences("How we work:\n- meeting prep: auto\n* Tickets: OFF\ncustomer-mail: ask\neverything: draft.\nquestions: sometimes\nreplies: manual\nKeep replies short: two lines.");
+    expect(read.modes).toEqual({ "meeting prep": "auto", tickets: "off", "customer-mail": "ask", everything: "draft" });
+    expect(read.guidance).toBe("How we work:\nquestions: sometimes\nreplies: manual\nKeep replies short: two lines.");
+    expect(read.problems).toEqual(['"replies: manual": the mode is one of auto, draft, ask, off']);
+    expect(modeFor("customer-mail: ask\nquestions: auto", { id: "customer-mail", workstream: "questions" })).toBe("ask");
+    expect(modeFor("questions: auto", { id: "customer-mail", workstream: "questions" })).toBe("auto");
+    expect(modeFor("everything: ask", { id: "x" })).toBe("ask");
+    expect(modeFor(undefined, { id: "x" })).toBe("draft");
+  });
+
+  it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", updated_by: null, updated_at: null };
+    expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], when: { actor: "@(acme\\.com|acme\\.co\\.uk)>?$" }, preferences: "questions: auto" });
+    const merged = withAccounts(config, [record]);
+    expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
+    const mail = { source: "gmail", external_id: "m1", actor: "sam@acme.com", title: "Q", group_key: "t" };
+    expect(decide(merged, mail, { firstRun: false })).toMatchObject({ account: { name: "Acme" }, channel: "acme-2", mode: "auto", create: true });
+    expect(decide(withAccounts(config, [{ ...record, preferences: "questions: off" }]), mail, { firstRun: false })).toMatchObject({ kind: "task", create: false, mode: "off" });
+  });
+
+  it("sets up an account for a channel, opens its tasks there in the team's mode, and files them", async () => {
+    const posts: { task: number; channel: string | null; mode: string }[] = [];
+    const store = new SignalsStore(pglite(), "signals_accounts");
+    await store.setup();
+    await store.setup();
+    const hub = new Hub(store, { opened: async (task) => (posts.push({ task: task.id, channel: task.channel, mode: task.mode }), `root-${task.id}`), updated: async () => {} }, { admins: ["admin@x.com"], defaultConfig: { ...config, accounts: [] } });
+    const call = (method: string, path: string, body?: unknown, query = "", user = "alice@x.com") => hub.handle({ method, path, query: new URLSearchParams(query), user, body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+
+    // Not an admin, but it's the team's channel: anyone who can use the hub sets it up.
+    expect(await call("POST", "/api/account", { name: "Globex", domains: ["not a domain"] })).toMatchObject({ status: 400 });
+    const setUp = await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: "@globex.com, Globex.io", aliases: ["Globex Corp"], preferences: "questions: ask\nCopy the AE." });
+    expect(setUp.json).toMatchObject({ account: { name: "Globex", channel: "globex", domains: ["globex.com", "globex.io"], updated_by: "alice@x.com", read: { modes: { questions: "ask" }, guidance: "Copy the AE." } } });
+    expect((await call("GET", "/api/account", undefined, "channel=globex")).json).toMatchObject({ account: { name: "Globex" } });
+    expect((await call("GET", "/api/account", undefined, "name=globex corp")).json).toMatchObject({ account: { name: "Globex" } });
+    expect((await call("GET", "/api/account", undefined, "channel=nope")).json).toEqual({ account: null });
+
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    // The config's customer-mail rule only knows acme.com; Globex's people match its own domains.
+    const rules = { ...config, accounts: [], rules: [{ id: "customer-mail", sources: ["gmail"], when: { actor: "@" }, action: "task" as const, title: "Reply: {title}", workstream: "questions", group_by: "group_key" }] };
+    expect(await call("POST", "/api/config", { config: rules }, "", "admin@x.com")).toMatchObject({ json: { config: { rules: [{ id: "customer-mail" }] } } });
+    const opened = await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "t1" }] });
+    expect(opened.json).toMatchObject({ created: [1] });
+    expect(posts).toEqual([{ task: 1, channel: "globex", mode: "ask" }]);
+    // /api/config shows the rules as saved, without the accounts teams set up.
+    expect((await call("GET", "/api/config")).json).toMatchObject({ config: { accounts: [] } });
+
+    expect(await call("POST", "/api/task", { id: 1, initiative: 7 })).toMatchObject({ status: 400 });
+    const filed = await call("POST", "/api/task", { id: 1, initiative: "Q3 migration", workstream: "pricing" });
+    expect(filed.json).toMatchObject({ task: { initiative: "Q3 migration", workstream: "pricing" }, activities: [{ kind: "opened" }, { text: "workstream: pricing" }, { text: "initiative: Q3 migration" }] });
+    expect(((await call("GET", "/api/tasks", undefined, "initiative=q3 migration")).json as { tasks: unknown[] }).tasks).toHaveLength(1);
+    expect(((await call("GET", "/api/tasks", undefined, "workstream=questions")).json as { tasks: unknown[] }).tasks).toHaveLength(0);
+
+    // Renaming keeps its tasks; agents keep a profile; deleting forgets the setup, not the tasks.
+    await call("POST", "/api/account", { name: "Globex", rename: "Globex Inc", profile: "## Team\nAE: Dana" });
+    expect((await call("GET", "/api/task", undefined, "id=1")).json).toMatchObject({ task: { account: "Globex Inc" } });
+    expect((await call("GET", "/api/accounts")).json).toMatchObject({ accounts: [{ name: "Globex Inc", profile: "## Team\nAE: Dana", aliases: ["Globex Corp"] }] });
+    // A channel belongs to one account.
+    await call("POST", "/api/account", { name: "Initech", channel: "globex" });
+    expect((await call("GET", "/api/accounts")).json).toMatchObject({ accounts: [{ name: "Globex Inc", channel: null }, { name: "Initech", channel: "globex" }] });
+    expect((await call("POST", "/api/account", { name: "Initech", delete: true })).json).toEqual({ deleted: true });
+    expect(await call("POST", "/api/account", { name: "Initech", delete: true })).toMatchObject({ status: 404 });
+    expect(await store.task(1)).toMatchObject({ account: "Globex Inc", channel: "globex" });
+  });
+
+  it("sends an account's open tasks without a channel to the channel it gets", async () => {
+    const store = new SignalsStore(pglite(), "signals_late");
+    await store.setup();
+    const posted: (string | null)[] = [];
+    const hub = new Hub(store, { opened: async (task) => (posted.push(task.channel), "root"), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "cases", sources: ["table.cases"], action: "task", group_by: "external_id" }] } });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "C-1", account: "Hooli" }] });
+    expect(await store.task(1)).toMatchObject({ account: "Hooli", channel: null });
+    await call("/api/account", { name: "hooli", channel: "hooli-team" });
+    expect(await store.task(1)).toMatchObject({ channel: "hooli-team" });
+    expect(await hub.sweep()).toMatchObject({ posted: 1 });
+    expect(posted).toEqual(["hooli-team"]);
   });
 });
 

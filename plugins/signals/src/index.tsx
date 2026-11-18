@@ -12,9 +12,10 @@ import { WorkspaceField } from "@dbx/core/ui/workspace";
 import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choice";
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, type SignIn, signInPath, signInState, type SourceState } from "./client";
+import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
 import { signalsTools } from "./tools";
 
-export const inject = ["react", "settingsCards"];
+export const inject = ["react", "settingsCards", "panels"];
 
 /** In the main connection's preferences: the CLI profile the hub runs in. */
 export const WORKSPACE_PREF = "signalsWorkspace";
@@ -150,6 +151,17 @@ export function apply(ctx: Context) {
     const databricks = followWorkspace(main, WORKSPACE_PREF);
     scope.inject(["agents"], (agents: Context) => {
       for (const tool of signalsTools(databricks)) agents.agents.addTool(tool);
+      // Hosts without addInstructions still have the tools, whose descriptions say the same.
+      (agents.agents as { addInstructions?(input: { id: string; text: string }): void }).addInstructions?.({ id: "accounts", text: ACCOUNT_INSTRUCTIONS });
+    });
+    scope.panels.register({
+      id: "account",
+      title: "Account",
+      // Opened from the channel menu only, never from a link.
+      matches: () => false,
+      channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
+      channelPlacement: "side",
+      component: accountPanel(databricks),
     });
     return { main, databricks };
   });
