@@ -590,6 +590,10 @@ describe("needs input", () => {
     expect(await hub.collect(async () => [marked])).toEqual({ recorded: 1 });
     let task = (await store.task(1))!;
     expect(task).toMatchObject({ status: "waiting", question: "Quote list price or the discount?", options: ["List", "Discount"], asked_by: genie });
+    // The hub says so in the thread too, as it does when asked through the API.
+    expect(replies.at(-1)).toMatchObject({ task: 1 });
+    expect(replies.at(-1)!.text).toContain("⏸️ **Needs input** (asked by nostr:");
+    expect(replies.at(-1)!.text).toContain("Options: List / Discount");
     expect((await store.detail(1))!.activities.map((a) => a.kind)).toEqual(["opened", "agent_reply", "question"]);
     const board = (await call("GET", "/api/board", undefined, "channel=globex")).json as { tasks: { task: { id: number; question?: string } }[] };
     expect(board.tasks.find((item) => item.task.id === 1)?.task.question).toBe("Quote list price or the discount?");

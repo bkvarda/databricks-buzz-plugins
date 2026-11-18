@@ -554,7 +554,8 @@ export class Hub {
         // Agents without the Signals tools ask for input by marking a line in their reply.
         const ask = !question ? markedQuestion(reply.content) : undefined;
         if (ask) {
-          await this.store.setQuestion(task.id, actor, { ...ask, by: agent });
+          const asked = await this.store.setQuestion(task.id, actor, { ...ask, by: agent });
+          if (asked && this.notifier && asked.buzz_root) await this.notifier.updated(asked, questionMessage(asked, agent)).catch(() => {});
           question = ask.question;
           status = "waiting";
         }
