@@ -6,7 +6,7 @@
 // when an event's content changed, and runs the rules to decide whether it
 // opens a task, updates one, or is only recorded.
 
-import { realCustomers } from "./attendees";
+import { attendeesOf, realCustomers } from "./attendees";
 
 /** What a source sends. `external_id` is the source's own key for the thing (a message id, a ticket key, a table row's key). */
 export type EventInput = Readonly<{
@@ -96,13 +96,25 @@ export type Rule = Readonly<{
   /** Field → condition that must not hold. */
   unless?: Readonly<Record<string, Condition>>;
   /**
-   * A pattern for the customer's email addresses (`@(globex\\.io|globex\\.com)$`).
-   * The rule applies only when `payload.attendees` has someone it matches who
-   * isn't the same person as an attendee it doesn't match (see attendees.ts),
-   * so a meeting of your own team that invites their customer-domain
-   * addresses doesn't count.
+   * The meeting has the customer in it: `true` for people at any account's
+   * email domains (the domains a team gives when it sets up its account
+   * channel), or a pattern for the customer's email addresses
+   * (`@(globex\\.io|globex\\.com)$`). The rule applies only when
+   * `payload.attendees` has someone it matches who isn't the same person as an
+   * attendee it doesn't match (see attendees.ts), so a meeting of your own
+   * team that invites their customer-domain addresses doesn't count.
    */
-  customer_attendees?: string;
+  customer_attendees?: true | string;
+  /** The event is from the customer: `true` for an `actor` at any account's email domains, or a pattern for the actor's email address. */
+  customer_actor?: true | string;
+  /**
+   * The event names an account in this field (like a Slack message's
+   * `payload.channel`, `ext-globex-team`, or a doc's `title`): the account's
+   * name or one of its other names appears in it as whole words.
+   */
+  account_named_in?: string;
+  /** Skip events whose `actor` is the person whose source sent them (your own Slack messages, mail you sent). */
+  skip_own?: boolean;
   /** task: open (or update) a task. update: only update a task that exists for the group. ignore: record the event, no task. */
   action: "task" | "update" | "ignore";
   /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
@@ -165,6 +177,8 @@ export type AccountRule = Readonly<{
   channel?: string;
   /** Field → condition that says an event is about this account (when the event doesn't name one). */
   when?: Readonly<Record<string, Condition>>;
+  /** The email domains of the account's people: an event's actor or a meeting's (real) attendees at one of them make it about this account. */
+  domains?: readonly string[];
   /** Other names sources use for it. */
   aliases?: readonly string[];
   /** The team's preferences, as they wrote them (see parsePreferences). */
@@ -268,15 +282,19 @@ export function configProblems(raw: unknown): string[] {
           } else if (!Array.isArray(condition)) problems.push(`${where}.${key}.${field} is a pattern or a list of values`);
         }
     }
-    if (rule.customer_attendees !== undefined) {
-      if (typeof rule.customer_attendees !== "string" || !rule.customer_attendees) problems.push(`${where}.customer_attendees is a pattern for the customer's email addresses`);
+    for (const key of ["customer_attendees", "customer_actor"] as const) {
+      const value = rule[key];
+      if (value === undefined || value === true) continue;
+      if (typeof value !== "string" || !value) problems.push(`${where}.${key} is true (any account's domains) or a pattern for the customer's email addresses`);
       else
         try {
-          new RegExp(rule.customer_attendees, "i");
+          new RegExp(value, "i");
         } catch {
-          problems.push(`${where}.customer_attendees isn't a valid regular expression`);
+          problems.push(`${where}.${key} isn't a valid regular expression`);
         }
     }
+    if (rule.account_named_in !== undefined && (typeof rule.account_named_in !== "string" || !rule.account_named_in)) problems.push(`${where}.account_named_in is a field, like payload.channel`);
+    if (rule.skip_own !== undefined && typeof rule.skip_own !== "boolean") problems.push(`${where}.skip_own is true or false`);
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
@@ -305,8 +323,10 @@ export function configProblems(raw: unknown): string[] {
       problems.push(`rules[${n}].party must be one of ${Object.keys(parties).join(", ")} (or a key you add in labels.parties)`);
   if (config.done_idle_days !== undefined && !(typeof config.done_idle_days === "number" && config.done_idle_days > 0)) problems.push("done_idle_days must be a positive number");
   if (config.accounts !== undefined && !Array.isArray(config.accounts)) problems.push("accounts must be a list");
-  for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries())
+  for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries()) {
     if (!account || typeof account.name !== "string" || !account.name) problems.push(`accounts[${n}].name is required`);
+    else if (account.domains !== undefined && (!Array.isArray(account.domains) || account.domains.some((domain) => typeof domain !== "string" || !validDomain(domain.toLowerCase())))) problems.push(`accounts[${n}].domains is a list of email domains, like example.com`);
+  }
   return problems;
 }
 
@@ -435,21 +455,79 @@ export function matches(conditions: Readonly<Record<string, Condition>> | undefi
 const sourceMatches = (patterns: readonly string[] | undefined, source: string) =>
   !patterns?.length || patterns.some((pattern) => (pattern.endsWith("*") ? source.startsWith(pattern.slice(0, -1)) : pattern === source));
 
-/** The first rule that applies to an event, in config order. */
-export function ruleFor(config: SignalsConfig, event: EventInput): Rule | undefined {
+/**
+ * The first rule that applies to an event, in config order. `owner` is whose
+ * source sent it (their email), for `skip_own`.
+ */
+export function ruleFor(config: SignalsConfig, event: EventInput, owner?: string): Rule | undefined {
   return config.rules.find(
     (rule) =>
       sourceMatches(rule.sources, event.source) &&
       matches(rule.when, event) &&
       !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)) &&
-      (!rule.customer_attendees || hasCustomer(rule.customer_attendees, event)),
+      !(rule.skip_own && owner && emailOf(event.actor) === owner.toLowerCase()) &&
+      aboutCustomer(config, rule, event),
   );
 }
 
-function hasCustomer(pattern: string, event: EventInput): boolean {
+/** A rule's customer conditions: with any of them, at least one must hold (they're all ways to say the event is about a customer). */
+function aboutCustomer(config: SignalsConfig, rule: Rule, event: EventInput): boolean {
+  const { customer_actor: actor, customer_attendees: attendees, account_named_in: named } = rule;
+  if (actor === undefined && attendees === undefined && named === undefined) return true;
+  const accounts = config.accounts ?? [];
+  if (actor === true ? Boolean(byActor(accounts, event)) : actor !== undefined && Boolean(emailOf(event.actor) && regexFor(actor).test(emailOf(event.actor)!))) return true;
+  if (attendees === true ? Boolean(byAttendees(accounts, event)) : attendees !== undefined && realCustomers(field(event, "payload.attendees"), (email) => regexFor(attendees).test(email)).length > 0) return true;
+  return named !== undefined && Boolean(byName(accounts, field(event, named)));
+}
+
+function regexFor(pattern: string): RegExp {
   let regex = regexes.get(pattern);
   if (!regex) regexes.set(pattern, (regex = new RegExp(pattern, "i")));
-  return realCustomers(field(event, "payload.attendees"), (email) => regex.test(email)).length > 0;
+  return regex;
+}
+
+/** The email address in an actor (`Ann Lee <ann@globex.io>` or `ann@globex.io`), lowercased. */
+export function emailOf(actor: unknown): string | undefined {
+  if (typeof actor !== "string") return undefined;
+  const found = /<?([^\s<>"]+@[^\s<>"]+\.[^\s<>"]+)>?\s*$/.exec(actor.trim());
+  return found?.[1]!.toLowerCase();
+}
+
+/** True when an email address is at one of these domains (or a subdomain of one). */
+export const atDomains = (email: string, domains: readonly string[]) => domains.some((domain) => email.endsWith(`@${domain.toLowerCase()}`) || email.endsWith(`.${domain.toLowerCase()}`));
+
+/** The account whose domains the event's actor is at. */
+function byActor(accounts: readonly AccountRule[], event: EventInput): AccountRule | undefined {
+  const email = emailOf(event.actor);
+  return email ? accounts.find((account) => account.domains?.length && atDomains(email, account.domains)) : undefined;
+}
+
+/** The account with the most real customers among a meeting's attendees (colleagues' customer-domain addresses don't count). */
+function byAttendees(accounts: readonly AccountRule[], event: EventInput): AccountRule | undefined {
+  const attendees = field(event, "payload.attendees");
+  if (!attendeesOf(attendees).length) return undefined;
+  let best: { account: AccountRule; count: number } | undefined;
+  for (const account of accounts) {
+    if (!account.domains?.length) continue;
+    const count = realCustomers(attendees, (email) => atDomains(email.toLowerCase(), account.domains!)).length;
+    if (count && (!best || count > best.count)) best = { account, count };
+  }
+  return best?.account;
+}
+
+const words = (text: string) => text.toLowerCase().normalize("NFKD").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+
+/** The account whose name or one of its other names appears in a field's text as whole words (the longest name wins). */
+function byName(accounts: readonly AccountRule[], value: unknown): AccountRule | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const text = ` ${words(value).join(" ")} `;
+  let best: { account: AccountRule; length: number } | undefined;
+  for (const account of accounts)
+    for (const name of [account.name, ...(account.aliases ?? [])]) {
+      const spelled = words(name).join(" ");
+      if (spelled && text.includes(` ${spelled} `) && (!best || spelled.length > best.length)) best = { account, length: spelled.length };
+    }
+  return best?.account;
 }
 
 /** True when any one of the conditions holds (so `unless` excludes on any match). */
@@ -465,7 +543,12 @@ export function fill(template: string, event: EventInput): string {
   });
 }
 
-/** The account an event is about: the rule's, the event's (by name or alias), or the first account whose conditions hold. */
+/**
+ * The account an event is about: the rule's, the event's (by name or alias),
+ * then the account whose domains the actor is at, the first whose `when`
+ * holds, the one with the meeting's real customers among its attendees, and
+ * (with the rule's `account_named_in`) the one that field names.
+ */
 export function accountFor(config: SignalsConfig, event: EventInput, rule?: Rule): AccountRule | undefined {
   const named = rule?.account ? fill(rule.account, event).trim() : event.account;
   const accounts = config.accounts ?? [];
@@ -473,7 +556,12 @@ export function accountFor(config: SignalsConfig, event: EventInput, rule?: Rule
     const lower = named.toLowerCase();
     return accounts.find((account) => account.name.toLowerCase() === lower || account.aliases?.some((alias) => alias.toLowerCase() === lower)) ?? { name: named };
   }
-  return accounts.find((account) => account.when && Object.keys(account.when).length && matches(account.when, event));
+  return (
+    byActor(accounts, event) ??
+    accounts.find((account) => account.when && Object.keys(account.when).length && matches(account.when, event)) ??
+    byAttendees(accounts, event) ??
+    (rule?.account_named_in ? byName(accounts, field(event, rule.account_named_in)) : undefined)
+  );
 }
 
 /** A group_by template filled in, or undefined when every field it names is empty. */
@@ -534,8 +622,8 @@ export type Decision =
  * first post for this person: it only records what's there. Rules decide the
  * rest: `task` opens or updates the group's task, `update` only updates one.
  */
-export function decide(config: SignalsConfig, event: EventInput, options: Readonly<{ firstRun: boolean }>): Decision {
-  const rule = ruleFor(config, event);
+export function decide(config: SignalsConfig, event: EventInput, options: Readonly<{ firstRun: boolean; owner?: string }>): Decision {
+  const rule = ruleFor(config, event, options.owner);
   if (!rule) return { kind: "none", reason: "no rule matches" };
   if (rule.action === "ignore") return { kind: "none", reason: `rule ${rule.id} ignores it` };
   const account = accountFor(config, event, rule);
@@ -658,16 +746,15 @@ export type AccountRecord = Readonly<{
 
 const DOMAIN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 export const validDomain = (domain: string) => DOMAIN.test(domain);
-const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** A registered account as a rule's account: its domains match an event's actor or attendees. */
 export function accountRule(record: AccountRecord): AccountRule {
-  const domains = record.domains.filter(validDomain);
+  const domains = record.domains.map((domain) => domain.toLowerCase()).filter(validDomain);
   return {
     name: record.name,
     ...(record.channel && { channel: record.channel }),
     ...(record.aliases.length && { aliases: record.aliases }),
-    ...(domains.length && { when: { actor: `@(${domains.map(escape).join("|")})>?$` } }),
+    ...(domains.length && { domains }),
     ...(record.preferences && { preferences: record.preferences }),
   };
 }

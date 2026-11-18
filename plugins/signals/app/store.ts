@@ -341,7 +341,7 @@ export class SignalsStore {
    * answer; a series they said never to work on opens no tasks.
    */
   private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
-    const decision = decide(config, event, { firstRun });
+    const decision = decide(config, event, { firstRun, owner });
     if (decision.kind === "none") return undefined;
     const task = await this.taskByGroup(decision.group);
     const rule = decision.rule;

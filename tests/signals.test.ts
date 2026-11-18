@@ -319,7 +319,7 @@ describe("account channels", () => {
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
     const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null };
-    expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], when: { actor: "@(acme\\.com|acme\\.co\\.uk)>?$" }, preferences: "questions: auto" });
+    expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk"], preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
     const mail = { source: "gmail", external_id: "m1", actor: "sam@acme.com", title: "Q", group_key: "t" };
@@ -970,5 +970,122 @@ describe("Slack markup", () => {
     const board = (await call("GET", "/api/board", undefined, "channel=triage")).json as { tasks: { task: { title: string }; source?: { title?: string } }[] };
     expect(board.tasks[0]!.task.title).toBe("Answer: @Brandon Kvarda can you check #ext-globex?");
     expect(board.tasks[0]!.source!.title).toBe("@Brandon Kvarda any news?");
+  });
+});
+
+describe("rules for every account", () => {
+  const example = JSON.parse(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")) as SignalsConfig;
+  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, preferences: "", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null });
+  const accounts = [record("Globex", "globex", ["globex.io"], ["Globex Corp"]), record("Initech", "initech", ["initech.com"])];
+  const config = withAccounts(example, accounts);
+
+  it("the example config is valid and names no account or domain", () => {
+    expect(configProblems(example)).toEqual([]);
+    const text = JSON.stringify(example.rules);
+    expect(text).not.toMatch(/"account"|example\\\\\.com|<@U/);
+    expect(example.accounts).toBeUndefined();
+  });
+
+  it("opens mail from any registered account's people in that account's channel", () => {
+    expect(decide(config, { source: "gmail", external_id: "m1", actor: "Ann Lee <ann@globex.io>", title: "Pricing?", group_key: "t1" }, { firstRun: false })).toMatchObject({ kind: "task", rule: { id: "customer-mail" }, account: { name: "Globex" }, channel: "globex", title: "Reply: Pricing?" });
+    expect(decide(config, { source: "gmail", external_id: "m2", actor: "bob@eu.initech.com", title: "Hi", group_key: "t2" }, { firstRun: false })).toMatchObject({ account: { name: "Initech" }, channel: "initech" });
+    expect(decide(config, { source: "gmail", external_id: "m3", actor: "vendor@else.com", title: "Deal", group_key: "t3" }, { firstRun: false })).toMatchObject({ kind: "none" });
+    expect(decide(config, { source: "gmail", external_id: "m4", actor: "noreply@globex.io", title: "Receipt" }, { firstRun: false })).toMatchObject({ kind: "none" });
+  });
+
+  it("finds a meeting's account by its real customers, not its organizer or colleagues' customer-domain addresses", () => {
+    const meeting = (emails: string[]): EventInput => ({ source: "google_calendar", external_id: `c-${emails.join()}`, actor: "me@x.com", title: "Sync", payload: { attendees: emails.map((email, n) => ({ email, ...(n === 0 && { organizer: true }) })) } });
+    expect(decide(config, meeting(["me@x.com", "ann@globex.io"]), { firstRun: false })).toMatchObject({ rule: { id: "customer-meetings" }, account: { name: "Globex" }, channel: "globex", title: "Prep: Sync" });
+    // The most customers wins.
+    expect(decide(config, meeting(["me@x.com", "ann@globex.io", "pat@initech.com", "lee@initech.com"]), { firstRun: false })).toMatchObject({ account: { name: "Initech" } });
+    // dane.isburgh's Globex address is a colleague, not a customer.
+    expect(decide(config, meeting(["dane.isburgh@x.com", "disburgh@globex.io", "me@x.com"]), { firstRun: false })).toMatchObject({ kind: "none" });
+  });
+
+  it("opens Slack mentions from a customer's address or in a channel named for the account, but not your own", () => {
+    const slack = (payload: Record<string, unknown>, actor?: string): EventInput => ({ source: "slack", external_id: `s-${JSON.stringify(payload)}${actor}`, title: "<@U1|Me> can you look?", group_key: "1795000000", ...(actor && { actor }), payload });
+    expect(decide(config, slack({ channel: "ext-globex-corp-team" }), { firstRun: false })).toMatchObject({ rule: { id: "customer-slack" }, account: { name: "Globex" }, channel: "globex" });
+    expect(decide(config, slack({ channel: "general" }, "pat@initech.com"), { firstRun: false })).toMatchObject({ account: { name: "Initech" } });
+    expect(decide(config, slack({ channel: "team-internal" }, "me@x.com"), { firstRun: false })).toMatchObject({ kind: "none" });
+    // Whole words only: "globexx" isn't Globex.
+    expect(decide(config, slack({ channel: "globexx-fans" }), { firstRun: false })).toMatchObject({ kind: "none" });
+    // Your own message in the account's channel.
+    expect(decide(config, slack({ channel: "ext-globex" }, "Me <me@x.com>"), { firstRun: false, owner: "me@x.com" })).toMatchObject({ kind: "none" });
+    expect(decide(config, slack({ channel: "ext-globex" }, "Me <me@x.com>"), { firstRun: false, owner: "you@x.com" })).toMatchObject({ kind: "task" });
+  });
+
+  it("opens follow-ups for meeting notes whose title names an account", () => {
+    expect(decide(config, { source: "google_drive", external_id: "d1", title: "Initech QBR - 2026/11/18 - Notes by Gemini", group_key: "d1" }, { firstRun: false })).toMatchObject({ rule: { id: "meeting-notes" }, account: { name: "Initech" }, title: "Follow up: Initech QBR - 2026/11/18 - Notes by Gemini" });
+    expect(decide(config, { source: "google_drive", external_id: "d2", title: "Team standup - Notes by Gemini", group_key: "d2" }, { firstRun: false })).toMatchObject({ kind: "none" });
+    expect(decide(config, { source: "google_drive", external_id: "d3", title: "Globex plan", group_key: "d3" }, { firstRun: false })).toMatchObject({ kind: "none" });
+  });
+
+  it("still takes patterns, a rule's account, and config accounts with domains", () => {
+    const rules: SignalsConfig = {
+      version: 1,
+      accounts: [{ name: "Hooli", channel: "hooli", domains: ["hooli.xyz"] }],
+      rules: [
+        { id: "pinned", sources: ["gmail"], customer_actor: "@special\\.org$", account: "Globex", action: "task" },
+        { id: "any", sources: ["gmail"], customer_actor: true, action: "task" },
+      ],
+    };
+    const merged = withAccounts(rules, accounts);
+    expect(decide(merged, { source: "gmail", external_id: "1", actor: "a@special.org" }, { firstRun: false })).toMatchObject({ rule: { id: "pinned" }, account: { name: "Globex" }, channel: "globex" });
+    expect(decide(merged, { source: "gmail", external_id: "2", actor: "a@hooli.xyz" }, { firstRun: false })).toMatchObject({ rule: { id: "any" }, account: { name: "Hooli" }, channel: "hooli" });
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", customer_actor: "(", account_named_in: "", skip_own: "yes" }] })).toEqual([
+      "rules[0].customer_actor isn't a valid regular expression",
+      "rules[0].account_named_in is a field, like payload.channel",
+      "rules[0].skip_own is true or false",
+    ]);
+    expect(configProblems({ version: 1, rules: [], accounts: [{ name: "A", domains: ["not a domain"] }] })).toEqual(["accounts[0].domains is a list of email domains, like example.com"]);
+  });
+
+  it("an account set up in the panel opens and posts tasks with no rule changes, and warns when the hub can't post there", async () => {
+    const store = new SignalsStore(pglite(), "signals_every");
+    await store.setup();
+    const posted: number[] = [];
+    let member = false;
+    const hub = new Hub(
+      store,
+      {
+        opened: async (task) => {
+          if (!member) throw new Error("not a member of the channel");
+          posted.push(task.id);
+          return `root-${task.id}`;
+        },
+        updated: async () => {},
+        canPost: async () => (member ? null : "Signals App isn't a member of this channel."),
+      },
+      { defaultConfig: example },
+    );
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "me@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    const saved = await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"] });
+    expect(saved.json).toMatchObject({ account: { name: "Globex" }, warning: "Signals App isn't a member of this channel." });
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?", group_key: "t1" }] });
+    expect((await store.task(1))!).toMatchObject({ account: "Globex", channel: "globex", rule_id: "customer-mail" });
+    expect(posted).toEqual([]);
+    member = true;
+    expect((await call("GET", "/api/account", undefined, "channel=globex")).json).not.toHaveProperty("warning");
+    expect(await hub.sweep()).toMatchObject({ posted: 1 });
+    expect(posted).toEqual([1]);
+  });
+
+  it("remembers a failed post when the notifier can't check membership", async () => {
+    const store = new SignalsStore(pglite(), "signals_every_fail");
+    await store.setup();
+    let fail = true;
+    const hub = new Hub(store, { opened: async (task) => { if (fail) throw new Error("403 not a member"); return `root-${task.id}`; }, updated: async () => {} }, { defaultConfig: example });
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "me@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"] });
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Q", group_key: "t1" }] });
+    expect((await call("GET", "/api/account", undefined, "channel=globex")).json).toMatchObject({ warning: "Task 1 couldn't be posted here: 403 not a member" });
+    fail = false;
+    await hub.sweep();
+    expect((await call("GET", "/api/account", undefined, "channel=globex")).json).not.toHaveProperty("warning");
+    expect((await new Hub(store, undefined, { defaultConfig: example }).handle({ method: "GET", path: "/api/account", query: new URLSearchParams("channel=globex"), user: "me@x.com", body: async () => "" })).json).toMatchObject({ warning: expect.stringContaining("no Buzz identity") });
   });
 });

@@ -100,7 +100,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         <Field label="Other names" hint="Comma-separated, e.g. ACME Corp, Acme Inc.">
           <input className="dbx-input" value={aliases} onChange={(event) => setAliases(event.target.value)} />
         </Field>
-        <Field label={`${capitalized(account?.labels?.customer ?? "customer")} email domains`} hint="Mail and meetings from people at these domains go to this channel's tasks.">
+        <Field label={`${capitalized(account?.labels?.customer ?? "customer")} email domains`} hint="Mail, meetings and mentions from people at these domains open tasks in this channel (with the hub's shared rules). Colleagues' addresses at these domains don't count.">
           <input className="dbx-input" placeholder="example.com" value={domains} onChange={(event) => setDomains(event.target.value)} />
         </Field>
         <Field label="Agents that work on tasks" hint="Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel.">
@@ -180,6 +180,7 @@ export function accountPanel(service: DatabricksService) {
           <Form hub={hub} channel={channel} {...(account && { account })} onSaved={(next) => (setSaved(next), setEditing(false))} />
         ) : (
           <Stack gap={16}>
+            {account.warning && <Notice tone="warning">{account.warning}</Notice>}
             <Card>
               <Stack gap={8}>
                 <Stack direction="row" gap={8} align="center" justify="space-between">
