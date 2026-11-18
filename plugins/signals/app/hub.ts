@@ -13,14 +13,14 @@
 //   POST /api/task {id, status?, note?, workstream?, initiative?, artifact?: {url, title?, kind?}}
 //   GET  /api/accounts                    the account channels teams set up
 //   GET  /api/account?channel=|name=      one, with its preferences read
-//   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
+//   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, playbooks?, delete?}
 //   GET  /api/board?channel=              a channel's tasks for the board: who's on each, its source, artifacts, last activity
 //   POST /api/task {id, agents: [...]}    asks agents to work on a task (in its thread)
 //   POST /api/task {id, question, options?}  needs input: waiting, with the question (agents ask this way)
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -151,7 +151,8 @@ export class Hub {
           return { json: { accounts: await this.store.accounts() } };
         case "GET /api/account": {
           const account = await this.store.account({ ...(request.query.get("name") && { name: request.query.get("name")! }), ...(request.query.get("channel") && { channel: request.query.get("channel")! }) });
-          return { json: { account: account ? withRead(account) : null, labels: labelsOf(await this.config()) } };
+          const config = await this.config();
+          return { json: { account: account ? withRead(account) : null, labels: labelsOf(config), workstreams: workstreamsOf(config) } };
         }
         case "POST /api/account":
           return this.saveAccount(user, await body());
@@ -237,7 +238,7 @@ export class Hub {
       const event = await this.store.latestEvent(task.id);
       const labels = labelsOf(await this.config());
       const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
-      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels) }), ...(event && { source: eventDetails(event, domains, labels) }) };
+      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels) }) };
       const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
       if (root && agents.length) await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
@@ -286,6 +287,22 @@ export class Hub {
     if (notAgent !== undefined) return bad("agents are Buzz pubkeys (64 hex characters or an npub).");
     const preferences = text("preferences", 8000);
     const profile = text("profile", 16000);
+    let playbooks: Record<string, string> | undefined;
+    if (input.playbooks !== undefined) {
+      const given = input.playbooks;
+      if (!given || typeof given !== "object" || Array.isArray(given)) return bad("playbooks maps a workstream (or rule id) to how the team likes that work done.");
+      playbooks = {};
+      for (const [key, value] of Object.entries(given as Record<string, unknown>)) {
+        const name = key.trim();
+        if (!name || name.length > 80) return bad("A playbook's workstream is 1-80 characters.");
+        if (typeof value !== "string") return bad(`The ${name} playbook must be text.`);
+        if (value.length > MAX_PLAYBOOK) return bad(`The ${name} playbook is at most ${MAX_PLAYBOOK} characters.`);
+        if (Object.keys(playbooks).some((other) => other.toLowerCase() === name.toLowerCase())) return bad(`There are two playbooks for ${name}.`);
+        // An empty playbook is the same as none.
+        if (value.trim()) playbooks[name] = value;
+      }
+      if (Object.keys(playbooks).length > MAX_PLAYBOOKS) return bad(`An account keeps at most ${MAX_PLAYBOOKS} playbooks.`);
+    }
     const account = await this.store.saveAccount(
       name,
       {
@@ -296,6 +313,7 @@ export class Hub {
         ...(agents && { agents: agents as string[] }),
         ...(preferences !== undefined && { preferences }),
         ...(profile !== undefined && { profile }),
+        ...(playbooks && { playbooks }),
       },
       user,
     );
@@ -303,7 +321,8 @@ export class Hub {
     this.log(`${user} saved the account ${account.name}`);
     const added = before ? account.agents.filter((key) => !before.includes(key)) : [];
     const woken = added.length ? await this.handOff(account, added) : [];
-    return { json: { account: withRead(account), labels: labelsOf(await this.config()), ...(woken.length && { woken }) } };
+    const config = await this.config();
+    return { json: { account: withRead(account), labels: labelsOf(config), workstreams: workstreamsOf(config), ...(woken.length && { woken }) } };
   }
 
   /**
@@ -321,7 +340,7 @@ export class Hub {
     for (const task of tasks) {
       try {
         const event = await this.store.latestEvent(task.id);
-        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account, labels), event && eventDetails(event, account.domains, labels)), agents);
+        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account, labels, task), event && eventDetails(event, account.domains, labels)), agents);
         await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
         await this.store.activity(task.id, "hub", "agents_asked", `Asked ${agents.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
@@ -363,7 +382,7 @@ export class Hub {
       const account = task.account ? await this.store.account({ name: task.account }) : undefined;
       const event = await this.store.latestEvent(id);
       const labels = labelsOf(await this.config());
-      await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels), event && eventDetails(event, account?.domains ?? [], labels)), keys);
+      await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels, task), event && eventDetails(event, account?.domains ?? [], labels)), keys);
       await this.store.addPeople(id, keys.map((key) => ({ kind: "agent", key })));
       await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `agent:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
     }
@@ -441,7 +460,7 @@ export class Hub {
       if (this.notifier && resumed.buzz_root) {
         const labels = labelsOf(await this.config());
         const event = await this.store.latestEvent(task.id);
-        const ask = agents.length ? `\n\n${askMessage(resumed, agents, user, choice ? undefined : text, account && briefing(account, labels), event && eventDetails(event, account?.domains ?? [], labels))}` : "";
+        const ask = agents.length ? `\n\n${askMessage(resumed, agents, user, choice ? undefined : text, account && briefing(account, labels, resumed), event && eventDetails(event, account?.domains ?? [], labels))}` : "";
         await this.notifier.updated(resumed, `${user} answered: ${said}${ask}`, agents).catch((error) => this.log(`couldn't post the series answer on task ${task.id}: ${(error as Error).message}`));
       }
       if (agents.length) {
@@ -622,15 +641,21 @@ export function handOffMessage(task: Task, agents: readonly string[], account?: 
 
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
 
-/** What an agent woken on a task needs from the account, for agents without the Signals tools. */
-export function briefing(account: AccountRecord, labels: ResolvedLabels = labelsOf(undefined)): string {
+/**
+ * What an agent woken on a task needs from the account, for agents without the
+ * Signals tools. With a task, it carries that task's playbook (by its rule id,
+ * then its workstream) and no other.
+ */
+export function briefing(account: AccountRecord, labels: ResolvedLabels = labelsOf(undefined), task?: Readonly<{ rule_id: string; workstream: string | null }>): string {
   const read = parsePreferences(account.preferences);
+  const playbook = task && playbookFor(account.playbooks, task);
   const modes = Object.entries(read.modes).map(([key, mode]) => `${key}: ${mode}`).join("; ");
   return [
     `**For agents: ${account.name}**`,
     modes && `Modes: ${modes}`,
     account.domains.length ? `${capitalized(labels.customer)} domains: ${account.domains.join(", ")}` : "",
     read.guidance && `Team guidance:\n${clip(read.guidance, 2000)}`,
+    playbook && `Playbook for ${playbook.key} (how the team likes this done; follow it):\n${clip(playbook.text, 3000)}`,
     account.profile.trim() && `Profile:\n${clip(account.profile.trim(), 3000)}`,
   ]
     .filter(Boolean)

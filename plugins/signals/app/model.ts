@@ -488,6 +488,29 @@ export function modeFor(preferences: string | undefined, rule: Pick<Rule, "id" |
   return modes[rule.id.toLowerCase()] ?? (rule.workstream ? modes[rule.workstream.toLowerCase()] : undefined) ?? modes.everything ?? DEFAULT_MODE;
 }
 
+/** How many playbooks an account keeps, and how long each is. */
+export const MAX_PLAYBOOKS = 30;
+export const MAX_PLAYBOOK = 6000;
+
+/**
+ * The playbook for a task: the one named by its rule id, then by its
+ * workstream (any case), as modes are found. Undefined when there's none.
+ */
+export function playbookFor(playbooks: Readonly<Record<string, string>> | undefined, task: Readonly<{ rule_id?: string; workstream?: string | null }>): { key: string; text: string } | undefined {
+  const entries = Object.entries(playbooks ?? {}).filter(([, text]) => text.trim());
+  for (const wanted of [task.rule_id, task.workstream ?? undefined]) {
+    const lower = wanted?.trim().toLowerCase();
+    const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
+    if (found) return { key: found[0], text: found[1].trim() };
+  }
+  return undefined;
+}
+
+/** The workstreams a config's rules file tasks under, in rule order. */
+export function workstreamsOf(config: SignalsConfig | undefined): string[] {
+  return [...new Set((config?.rules ?? []).map((rule) => rule.workstream?.trim()).filter((name): name is string => Boolean(name)))];
+}
+
 /** What a team registers for its account channel (the hub's accounts table). */
 export type AccountRecord = Readonly<{
   name: string;
@@ -500,6 +523,8 @@ export type AccountRecord = Readonly<{
   profile: string;
   /** Agents (hex pubkeys) woken on each new task here, to work on it in the team's mode. */
   agents: readonly string[];
+  /** How the team likes each kind of work done: workstream (or rule id) → playbook text. */
+  playbooks: Readonly<Record<string, string>>;
   updated_by: string | null;
   updated_at: number | null;
 }>;

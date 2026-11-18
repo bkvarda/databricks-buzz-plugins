@@ -126,6 +126,8 @@ export class SignalsStore {
       name text PRIMARY KEY, channel text UNIQUE, aliases jsonb NOT NULL DEFAULT '[]', domains jsonb NOT NULL DEFAULT '[]',
       preferences text NOT NULL DEFAULT '', profile text NOT NULL DEFAULT '', updated_by text, updated_at bigint)`);
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS agents jsonb NOT NULL DEFAULT '[]'`);
+    // Playbooks: how the team likes each workstream's work done (workstream → text).
+    await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS playbooks jsonb NOT NULL DEFAULT '{}'`);
     // The first reply an account's agent posted in the task's thread, once the hub has recorded it.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS agent_reply text`);
     // Needs input: what an agent (or a person) asked, its choices, and who asked (an agent's hex pubkey or a person).
@@ -666,7 +668,7 @@ export class SignalsStore {
    * gives it a new name and moves its tasks along. A channel belongs to one
    * account at a time.
    */
-  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string }>, by: string): Promise<AccountRecord> {
+  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>> }>, by: string): Promise<AccountRecord> {
     const at = now();
     const existing = await this.account({ name });
     const key = existing?.name ?? name.trim();
@@ -683,6 +685,7 @@ export class SignalsStore {
     if (fields.agents) set("agents", JSON.stringify(fields.agents));
     if (fields.preferences !== undefined) set("preferences", fields.preferences);
     if (fields.profile !== undefined) set("profile", fields.profile);
+    if (fields.playbooks) set("playbooks", JSON.stringify(fields.playbooks));
     set("updated_by", by);
     set("updated_at", at);
     await this.q(`UPDATE $S.accounts SET ${sets.join(", ")} WHERE name = $1`, values);
@@ -782,6 +785,9 @@ function toSeries(row: Row): Series {
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
 
+const texts = (value: unknown): Record<string, string> =>
+  value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {};
+
 function toAccount(row: Row): AccountRecord {
   return {
     name: String(row.name),
@@ -791,6 +797,7 @@ function toAccount(row: Row): AccountRecord {
     preferences: String(row.preferences ?? ""),
     profile: String(row.profile ?? ""),
     agents: strings(typeof row.agents === "string" ? JSON.parse(row.agents) : row.agents),
+    playbooks: texts(typeof row.playbooks === "string" ? JSON.parse(row.playbooks) : row.playbooks),
     updated_by: (row.updated_by as string | null) ?? null,
     updated_at: num(row.updated_at),
   };

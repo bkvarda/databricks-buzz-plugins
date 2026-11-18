@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor, parsePreferences, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, configProblems, decide, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
@@ -317,7 +317,7 @@ describe("account channels", () => {
   });
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
-    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", agents: [], updated_by: null, updated_at: null };
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null };
     expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], when: { actor: "@(acme\\.com|acme\\.co\\.uk)>?$" }, preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
@@ -435,6 +435,49 @@ describe("account channels", () => {
     const meeting = (emails: string[]): EventInput => ({ source: "google_calendar", external_id: "c", payload: { attendees: emails.map((email) => ({ email, responseStatus: "accepted" })) } });
     expect(ruleFor(config, meeting(["me@x.com", "ann@globex.io"]))?.id).toBe("prep");
     expect(ruleFor(config, meeting(["me@x.com", "bob@x.com"]))).toBeUndefined();
+  });
+
+  it("gives each task only its own workstream's playbook", async () => {
+    expect(playbookFor({ "Meeting Prep": "Agenda first.", mail: "Short." }, { rule_id: "meetings", workstream: "meeting prep" })).toEqual({ key: "Meeting Prep", text: "Agenda first." });
+    // A playbook named by the rule id wins over the workstream's.
+    expect(playbookFor({ "meeting prep": "Agenda first.", meetings: "QBR deck." }, { rule_id: "meetings", workstream: "meeting prep" })?.text).toBe("QBR deck.");
+    expect(playbookFor({ mail: "Short.", "meeting prep": "  " }, { rule_id: "meetings", workstream: "meeting prep" })).toBeUndefined();
+
+    const store = new SignalsStore(pglite(), "signals_playbooks");
+    await store.setup();
+    const posts: { task: number; text: string }[] = [];
+    const rules = [
+      { id: "meetings", sources: ["google_calendar"], action: "task" as const, workstream: "meeting prep", group_by: "external_id" },
+      { id: "mail", sources: ["gmail"], action: "task" as const, workstream: "questions", group_by: "external_id" },
+    ];
+    const hub = new Hub(store, { opened: async (task, agents = [], context = {}) => (posts.push({ task: task.id, text: taskMessage(task, { agents, ...context }) }), "d".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules } });
+    const call = (method: "GET" | "POST", path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => JSON.stringify(body ?? {}) });
+    const agent = "ab".repeat(32);
+    const saved = await call("POST", "/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], playbooks: { "Meeting Prep": "Open with the agenda.\nList open tickets.", questions: "Answer in three lines.", empty: "  " } });
+    expect(saved.json).toMatchObject({ account: { playbooks: { "Meeting Prep": "Open with the agenda.\nList open tickets.", questions: "Answer in three lines." } }, workstreams: ["meeting prep", "questions"] });
+    expect(Object.keys((saved.json as { account: { playbooks: object } }).account.playbooks)).not.toContain("empty");
+    expect((await call("GET", "/api/account", undefined, "channel=globex")).json).toMatchObject({ account: { playbooks: { questions: "Answer in three lines." } }, workstreams: ["meeting prep", "questions"] });
+
+    await call("POST", "/api/sources", { source: "google_calendar", enabled: true });
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "google_calendar", external_id: "seed" }, { source: "gmail", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?" }] });
+    expect(posts[0]!.text).toContain("Playbook for Meeting Prep (how the team likes this done; follow it):\nOpen with the agenda.\nList open tickets.");
+    expect(posts[0]!.text).not.toContain("Answer in three lines.");
+    expect(posts[1]!.text).toContain("Playbook for questions (how the team likes this done; follow it):\nAnswer in three lines.");
+    expect(posts[1]!.text).not.toContain("Open with the agenda.");
+
+    // Saving without playbooks keeps them; bad ones are refused.
+    await call("POST", "/api/account", { name: "Globex", preferences: "everything: draft" });
+    expect((await store.account({ name: "Globex" }))!.playbooks).toMatchObject({ questions: "Answer in three lines." });
+    expect((await call("POST", "/api/account", { name: "Globex", playbooks: ["x"] })).status).toBe(400);
+    expect((await call("POST", "/api/account", { name: "Globex", playbooks: { a: 1 } })).status).toBe(400);
+    expect((await call("POST", "/api/account", { name: "Globex", playbooks: { a: "x", A: "y" } })).status).toBe(400);
+    expect((await call("POST", "/api/account", { name: "Globex", playbooks: { a: "x".repeat(6001) } })).status).toBe(400);
+    // An empty map clears them.
+    await call("POST", "/api/account", { name: "Globex", playbooks: {} });
+    expect((await store.account({ name: "Globex" }))!.playbooks).toEqual({});
   });
 
   it("briefs agents without the Signals tools in the wake, and records their first reply on the task", async () => {
