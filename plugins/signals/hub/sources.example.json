@@ -49,6 +49,33 @@
       }
     },
     {
+      "name": "slack",
+      "kind": "mcp",
+      "tool": "slack_search_public_and_private",
+      "args": { "keywords": ["<@YOUR_SLACK_USER_ID>"], "filters": "", "natural_language_query": "", "after": "{since_epoch}", "limit": 20, "include_bots": false },
+      "items": "results",
+      "sections": {
+        "split": "^### Result \\d+ of \\d+\\s*$",
+        "keys": ["Channel", "Participants", "From", "Time", "Message_ts", "Reply count", "Permalink", "Text", "Context before", "Context after"]
+      },
+      "lookback_hours": 24,
+      "map": {
+        "external_id": { "from": "permalink", "match": "\\((https://[^)?]+)" },
+        "url": { "from": "permalink", "match": "\\((https://[^)]+)\\)" },
+        "group_key": { "from": "permalink", "match": "thread_ts=(\\d{10})|/p(\\d{10})" },
+        "title": { "from": "text", "match": "^\\s*([^\\n]{1,140})" },
+        "actor": { "from": "from", "match": "<([^>\\s]+@[^>\\s]+)>" },
+        "occurred_at": "message_ts",
+        "payload": {
+          "channel": { "from": "channel", "match": "^(.*?)\\s*\\(ID:" },
+          "channel_id": { "from": "channel", "match": "\\(ID: ([A-Z0-9]+)\\)" },
+          "from": { "from": "from", "match": "^(.*?)\\s*\\(ID:" },
+          "text": "text",
+          "context_before": "context_before"
+        }
+      }
+    },
+    {
       "name": "jira",
       "kind": "mcp",
       "service": "atlassian",

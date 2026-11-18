@@ -73,6 +73,29 @@ class Templates(unittest.TestCase):
         self.assertEqual(poller.to_event("cal", item, {"external_id": "id", "occurred_at": "{start.dateTime}{start.date}"}, clock)["occurred_at"], "2026-11-18")
         self.assertIsNone(poller.to_event("gmail", {"subject": "no id"}, MAIL["map"], clock))
 
+    def test_sections_turn_markdown_results_into_items(self):
+        text = (
+            "# Search Results\n\n## Messages (2 results)\n### Result 1 of 2\n"
+            "Channel: #ext-globex (ID: C1)\nFrom: Ann <ann@globex.io> (ID: U1) \nMessage_ts: 1795000000.000100\n"
+            "Permalink: [link](https://x.slack.com/archives/C1/p1795000000000100)\nText: \n<@U9|Me> can you look?\nNote: still in the text\n"
+            "Context after: \n- From: Bob (ID: U2) \n  Message_ts: 1795000001.000200\n  me too\n\n---\n\n"
+            "### Result 2 of 2\nChannel: DM (ID: D2)\nText: hi\n\n---\n"
+        )
+        keys = ["Channel", "From", "Message_ts", "Permalink", "Text", "Context after"]
+        items = poller.sections(text, r"^### Result \d+ of \d+\s*$", keys)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["text"], "<@U9|Me> can you look?\nNote: still in the text")
+        self.assertEqual(items[0]["message_ts"], "1795000000.000100")
+        self.assertEqual(items[0]["context_after"], "- From: Bob (ID: U2)\n  Message_ts: 1795000001.000200\n  me too")
+        self.assertEqual(items[1], {"channel": "DM (ID: D2)", "text": "hi"})
+        self.assertEqual(poller.sections(text, r"^### Result \d+ of \d+\s*$")[0]["note"], "still in the text")  # without keys, any Key: line
+        self.assertEqual(poller.sections(None, "x"), [])
+
+        source = {"name": "slack", "kind": "mcp", "tool": "search", "items": "results", "sections": {"split": r"^### Result \d+ of \d+\s*$", "keys": keys},
+                  "map": {"external_id": {"from": "permalink", "match": r"\((https://[^)?]+)"}, "actor": {"from": "from", "match": r"<([^>\s]+@[^>\s]+)>"}, "occurred_at": "message_ts", "payload": ["text"]}}
+        events, _ = poller.poll_source(FakeWorkspace([], mcp={"slack": {"results": text}}), source, None, None, NOW)
+        self.assertEqual(events, [{"source": "slack", "external_id": "https://x.slack.com/archives/C1/p1795000000000100", "actor": "ann@globex.io", "occurred_at": "1795000000.000100", "payload": {"text": "<@U9|Me> can you look?\nNote: still in the text"}}])
+
     def test_tool_json(self):
         self.assertEqual(poller.tool_json({"content": [{"type": "text", "text": "not json"}, {"type": "text", "text": '{"items": [1]}'}]}), {"items": [1]})
         self.assertEqual(poller.tool_json({"structuredContent": {"a": 1}}), {"a": 1})

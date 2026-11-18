@@ -149,6 +149,8 @@ The `Options:` line is optional. Moving a waiting task to another status by hand
 - **`mcp` sources** call a tool of a `system.ai` service.
   - `args` and `map` are templates: `{since}` (the source's cursor, or `lookback_hours` back), `{now}`, `{now+7d}`, `{since_epoch}`, `{since_date}`, and `{field.path}` for a field of the item.
   - `items` is where the list sits in the tool's JSON.
+  - `sections` is for tools that answer with Markdown instead of a list, like Slack's search. `{"split": "<regex for a heading line>", "keys": [...]}` cuts the text at `items` into one item per section. Each `Key: value` line starts a field, named in lowercase with `_` for spaces, that runs to the next one. With `keys`, only those keys start a field, so a `Note:` line in a message stays part of its text.
+  - The example `slack` source finds messages that mention you. Replace `YOUR_SLACK_USER_ID` with your own id; the `slack_search_public_and_private` tool's description names it ("Current logged in user's user_id is U…").
   - When you aren't signed in, the source is reported as unavailable, with the sign-in link.
 - **`table` sources** run a query with a `:since` parameter.
   - `table` is checked first. A table that's missing, or one you can't read, makes the source unavailable instead of failing.
