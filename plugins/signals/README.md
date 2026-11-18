@@ -34,7 +34,7 @@ flowchart LR
    3. Upload `hub/` and deploy it.
    4. Give the people who'll use it **Can Use** on the app.
    5. To post tasks to Buzz, give it a Buzz identity: in Buzz, go to **Agents → New agent → Databricks App → Connect an app you have** and set `BUZZ_IDENTITY_SECRET` in `app.yaml`.
-3. **Rules:** edit `signals.config.json` before deploying. Admins (set with `SIGNALS_ADMINS`) can also `POST /api/config`.
+3. **Rules:** the example `signals.config.json` works for any account a team sets up (see [Rules for every account](#rules-for-every-account)), so a new account needs no rule changes. Edit it before deploying for your own kinds of work. Admins (set with `SIGNALS_ADMINS`) can also `POST /api/config`.
 4. **Each person:**
    1. Turn sources on in **Settings → Signals**. If the hub runs in another workspace than Buzz's, pick it under **Workspace** there first; the agent tools follow that choice too.
    2. Create a scheduled job (serverless, every 15 minutes, say) **owned by them** that runs `poller.py --config sources.json --lakebase [--warehouse <id>]`, with `psycopg[binary]` as a dependency. Give them a Postgres role in the hub's database (Lakebase → Roles → add their Databricks identity).
@@ -51,16 +51,31 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 - Add to `sources.json`: `"lakebase": {"endpoint": "projects/<p>/branches/<b>/endpoints/<e>", "host": "<endpoint host>", "database": "databricks_postgres", "schema": "signals_<app name>"}`. The schema is on the hub's status page.
 - Roles with `BYPASSRLS` (Lakebase project owners) aren't limited by these policies. They can read the database anyway.
 
+## Rules for every account
+
+The example rules don't name an account. They say "from the customer", and the accounts teams set up in their channels say who the customer is:
+
+- `customer_actor: true`: the event's `actor` is at one of an account's email domains (mail from the customer, a Slack message from a customer address).
+- `customer_attendees: true`: the meeting has a real customer among its attendees, at one of an account's domains. A colleague's address at the customer's domain doesn't count (see below).
+- `account_named_in: "<field>"`: the field names an account, by its name or one of its other names, as whole words. `payload.channel` finds `ext-globex-team` for Globex, which helps in shared Slack channels where the customer's people show no email; `title` finds a meeting's notes, `Globex sync - Notes by Gemini`.
+- `skip_own: true`: skip events whose `actor` is the person whose source sent them, like your own Slack messages.
+
+A rule with one or more of the first three applies when any of them holds. The task then goes to that account, and to its channel. With `true`, these rules apply to every account set up in the panel, and to config accounts with `domains`. They can still be patterns instead (`"customer_attendees": "@example\\.com$"`), which apply only to addresses that match. A rule's `account` still overrides the account it finds.
+
+**Sources that know the account.** A table or ticket source that's about one account should say which in the event's `account` (its `map` has `"account": "account_name"`, say). The account's name or other names (an id from another system works as an other name) then match it, with no rule naming the account. A source's query can cover all your accounts instead of one: select the account column, map it to `account`, and give each account that value as one of its other names. A query that only fits one account (`WHERE account_id = '...'`) means every person edits it for each new account.
+
+**Slack.** The example `slack` source fetches only the messages that mention whoever runs it, so its rule needn't name anyone. Don't put a person's Slack id in a shared rule: it would only match that person's mentions.
+
 ## Rules
 
 ```json
 {
   "version": 1,
   "first_run_seen": true,
-  "accounts": [{ "name": "Example Co", "channel": "<buzz channel id>", "aliases": ["Example"], "when": { "actor": "@example\\.com" } }],
+  "accounts": [{ "name": "Example Co", "channel": "<buzz channel id>", "aliases": ["Example", "EX-1001"], "domains": ["example.com"] }],
   "rules": [
     { "id": "no-automated-mail", "sources": ["gmail"], "when": { "actor": "noreply" }, "action": "ignore" },
-    { "id": "customer-mail", "sources": ["gmail"], "when": { "actor": "@example\\.com" }, "action": "task", "title": "Reply: {title}", "group_by": "group_key" },
+    { "id": "customer-mail", "sources": ["gmail"], "customer_actor": true, "action": "task", "title": "Reply: {title}", "group_by": "group_key" },
     { "id": "cases", "sources": ["table.*"], "when": { "payload.status": ["Awaiting Confirmation"] }, "action": "task", "group_by": "external_id", "stale_after_hours": 72, "nudge": "{external_id} has waited {hours}h" },
     { "id": "auto-increases", "sources": ["table.quota"], "when": { "payload.kind": "auto" }, "action": "update", "group": "quota", "group_by": "payload.workspace" },
     { "id": "quota-requests", "sources": ["table.quota"], "action": "task", "group": "quota", "group_by": "payload.workspace" }
@@ -86,7 +101,7 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 
   `note` says what the thread is told (`{field}` takes an event field). The sweep checks `after` and `idle_days` every few minutes. Tasks still waiting on a question are left open, and a new event reopens a done task as usual, unless that event is itself past done (notes for a meeting that's over). For example, `"done_when": { "after": "payload.end", "note": "the meeting has ended" }` for meeting prep, and `"done_when": { "when": { "payload.status_category": ["Done"] }, "note": "{external_id} is {payload.status}" }` for Jira (map `status_category` from `fields.status.statusCategory.name`, as `sources.example.json` does).
 - **Nudges:** with `stale_after_hours`, an open task whose latest event still matches the rule after that many hours gets a nudge in its thread, at most once per period.
-- **Accounts:** the account comes from the rule's `account`, then the event's own `account` (matched by name or alias), then the first account whose `when` holds. The account's `channel` is where its tasks are posted; tasks without one go to `default_channel`.
+- **Accounts:** the account comes from the rule's `account`, then the event's own `account` (matched by name or alias), then the account whose `domains` the actor is at, then the first account whose `when` holds, then the account with the most real customers among a meeting's attendees, and last, with the rule's `account_named_in`, the account that field names. The account's `channel` is where its tasks are posted; tasks without one go to `default_channel`. Config accounts take `domains` like the accounts teams set up: `{ "name": "Example Co", "domains": ["example.com"] }`.
 
 - **Labels:** `labels` sets what your deployment calls things, so the public defaults stay generic. `labels.customer` is the word for the people at an account (default "customer"; say "client"), used in agents' briefings, meeting attendee notes and the account panel. `labels.parties` names who a task from outside sits with on the tasks board, by key: `engineering` and `support` are always there (default "Engineering" and "Support"), and you can rename them or add more. A rule's `party` says which one its tasks sit with; without it, the board shows no party (parties are never guessed from the source's name). With a party, the board also shows the event's `owner` or `assignee`. For example:
 
@@ -99,8 +114,10 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 
 Open a channel's menu and choose **Set up account** to make it an account channel. You give it:
 - **Account:** the name tasks show, plus any other names sources use for it.
-- **Customer email domains:** mail and meetings from people at these domains go to this channel's tasks.
+- **Customer email domains:** mail, meetings and Slack messages from people at these domains open tasks in this channel, with the example rules. Meetings count when a real customer attends, even when one of your own people organized it.
 - **Team preferences:** plain text the team edits whenever it wants.
+
+**Add the hub to the channel.** The hub posts tasks as its own Buzz identity (Signals App, say), so add it to the channel with **Add people**, along with the agents that work on tasks. Until it's a member, tasks open but aren't posted, and the panel shows a warning saying so. Saving the account checks again.
 
 Tasks for the account are then posted in this channel. That includes tasks already open that had no channel yet. The panel lists the open tasks, grouped by initiative and workstream. Anyone who can use the hub can set up a channel, and the hub records who changed what. A registered account wins over a config account with the same name.
 
@@ -135,7 +152,7 @@ Agents don't need the Signals tools for this. The task's message includes what `
 
 When you add an agent to an account, the hub asks it to pick up the account's open auto and draft tasks from the last 14 days, up to 20 of them, that no agent has replied to yet. It does this with a reply in each task's thread that mentions the agent and carries the account briefing. That reply is the agent's wake. Its first reply is then recorded the same way, and the save's response lists those tasks as `woken`.
 
-Every task's post also shows its latest event: its link, when, who it's from, and where. For calendar events it lists the attendees, with people at the account's domains first and marked `customer`. Your own people often have an address at the customer's domain too. When a customer-domain address belongs to the same person as another attendee (the same name, or an address spelled from it, like `disburgh` for `dane.isburgh`), it is marked as theirs, not as a customer. It shows up to 1,500 characters of the description. It adds a short excerpt of the payload's other fields. A calendar source gets attendees and descriptions with `detail` (see `sources.example.json`), which fetches each event with `calendar_event_get`. Times show in the event's own time zone. A rule can match the attendees, with `when` on `payload.attendees`. For meeting prep, use `customer_attendees` instead, a pattern for the customer's email addresses, as the example `customer-meetings` rule does with `"customer_attendees": "@example\\.com$"`. The rule then applies only when the meeting has a real customer: someone the pattern matches who isn't also another attendee, so a team meeting that invites colleagues' customer-domain addresses doesn't open prep.
+Every task's post also shows its latest event: its link, when, who it's from, and where. For calendar events it lists the attendees, with people at the account's domains first and marked `customer`. Your own people often have an address at the customer's domain too. When a customer-domain address belongs to the same person as another attendee (the same name, or an address spelled from it, like `disburgh` for `dane.isburgh`), it is marked as theirs, not as a customer. It shows up to 1,500 characters of the description. It adds a short excerpt of the payload's other fields. A calendar source gets attendees and descriptions with `detail` (see `sources.example.json`), which fetches each event with `calendar_event_get`. Times show in the event's own time zone. A rule can match the attendees, with `when` on `payload.attendees`. For meeting prep, use `customer_attendees` instead, as the example `customer-meetings` rule does with `"customer_attendees": true` (any account's domains) or a pattern for the customer's email addresses. The rule then applies only when the meeting has a real customer: someone at those domains who isn't also another attendee, so a team meeting that invites colleagues' customer-domain addresses doesn't open prep.
 
 **Tasks board.** Open it from a channel's menu (Tasks board). Its columns scroll sideways, with ‹ › buttons when some are out of view, and **Open in full window ↗** shows it as a full-window page, where you can also switch to another account channel.
 
@@ -156,6 +173,7 @@ The `Options:` line is optional. Moving a waiting task to another status by hand
   - `args` and `map` are templates: `{since}` (the source's cursor, or `lookback_hours` back), `{now}`, `{now+7d}`, `{since_epoch}`, `{since_date}`, and `{field.path}` for a field of the item.
   - `items` is where the list sits in the tool's JSON.
   - `sections` is for tools that answer with Markdown instead of a list, like Slack's search. `{"split": "<regex for a heading line>", "keys": [...]}` cuts the text at `items` into one item per section. Each `Key: value` line starts a field, named in lowercase with `_` for spaces, that runs to the next one. With `keys`, only those keys start a field, so a `Note:` line in a message stays part of its text.
+  - The example `google_drive` source lists docs changed in the last day; the example `meeting-notes` rule opens a "Follow up:" task for Gemini notes whose title names an account.
   - The example `slack` source finds messages that mention you. Replace `YOUR_SLACK_USER_ID` with your own id; the `slack_search_public_and_private` tool's description names it ("Current logged in user's user_id is U…").
   - When you aren't signed in, the source is reported as unavailable, with the sign-in link.
 - **`table` sources** run a query with a `:since` parameter.

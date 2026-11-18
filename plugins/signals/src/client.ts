@@ -85,10 +85,10 @@ export class HubClient {
   }
   /** The account set up for a channel (or by name), or null. */
   account(by: { channel?: string; name?: string }, signal?: AbortSignal) {
-    return this.call<{ account: AccountView | null; labels?: ResolvedLabels; workstreams?: string[] }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => (reply.account ? { ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }) } : null));
+    return this.call<{ account: AccountView | null; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => (reply.account ? { ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) } : null));
   }
   saveAccount(input: AccountInput) {
-    return this.call<{ account: AccountView; labels?: ResolvedLabels; workstreams?: string[] }>("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }) }));
+    return this.call<{ account: AccountView; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) }));
   }
   deleteAccount(name: string) {
     return this.call<{ deleted: boolean }>("POST", "/api/account", { body: { name, delete: true } });
@@ -99,7 +99,8 @@ export class HubClient {
 }
 
 /** An account as the hub shows it, with what the deployment calls the account's people (labels.customer). */
-export type AccountView = AccountRecord & Readonly<{ read: Preferences; labels?: ResolvedLabels; workstreams?: readonly string[] }>;
+/** `warning`: why the hub can't post tasks in the account's channel (it isn't a member, say). */
+export type AccountView = AccountRecord & Readonly<{ read: Preferences; labels?: ResolvedLabels; workstreams?: readonly string[]; warning?: string }>;
 export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>> }>;
 
 export type TaskDetail = Readonly<{

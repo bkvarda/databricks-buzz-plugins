@@ -48,6 +48,8 @@ export type Notifier = Readonly<{
   updated(task: Task, text: string, agents?: readonly string[]): Promise<void>;
   /** Replaces the text of the task's first message (an author edit; it mentions nobody). Optional. */
   edited?(task: Task, text: string): Promise<void>;
+  /** Why the hub can't post in a channel (it isn't a member, it has no Buzz identity); null when it can, undefined when it can't tell. Optional. */
+  canPost?(channel: string): Promise<string | null | undefined>;
 }>;
 
 /** What a task's post carries besides the task: the account briefing (for agents) and the source event's details. */
@@ -71,6 +73,8 @@ export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/even
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
+  /** The last failure to post a task in each channel, until a post there works. */
+  private readonly postFailures = new Map<string, string>();
 
   constructor(
     readonly store: SignalsStore,
@@ -154,7 +158,8 @@ export class Hub {
         case "GET /api/account": {
           const account = await this.store.account({ ...(request.query.get("name") && { name: request.query.get("name")! }), ...(request.query.get("channel") && { channel: request.query.get("channel")! }) });
           const config = await this.config();
-          return { json: { account: account ? withRead(account) : null, labels: labelsOf(config), workstreams: workstreamsOf(config) } };
+          const warning = account ? await this.postProblem(account.channel) : undefined;
+          return { json: { account: account ? withRead(account) : null, labels: labelsOf(config), workstreams: workstreamsOf(config), ...(warning && { warning }) } };
         }
         case "POST /api/account":
           return this.saveAccount(user, await body());
@@ -249,10 +254,22 @@ export class Hub {
       const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels) }) };
       const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
+      if (root) this.postFailures.delete(task.channel);
       if (root && agents.length) await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
     } catch (error) {
+      this.postFailures.set(task.channel, `Task ${task.id} couldn't be posted here: ${(error as Error).message}`);
       this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
     }
+  }
+
+  /** Why tasks can't be posted in a channel: the notifier's check, else the last failed post there. */
+  async postProblem(channel: string | null | undefined): Promise<string | undefined> {
+    if (!channel) return undefined;
+    if (!this.notifier) return "The hub has no Buzz identity, so it can't post tasks. Give it one (see the README).";
+    const problem = await this.notifier.canPost?.(channel).catch(() => undefined);
+    // It can post there now: the sweep posts what failed before.
+    if (problem === null) return undefined;
+    return problem ?? this.postFailures.get(channel);
   }
 
   /**
@@ -330,7 +347,8 @@ export class Hub {
     const added = before ? account.agents.filter((key) => !before.includes(key)) : [];
     const woken = added.length ? await this.handOff(account, added) : [];
     const config = await this.config();
-    return { json: { account: withRead(account), labels: labelsOf(config), workstreams: workstreamsOf(config), ...(woken.length && { woken }) } };
+    const warning = await this.postProblem(account.channel);
+    return { json: { account: withRead(account), labels: labelsOf(config), workstreams: workstreamsOf(config), ...(woken.length && { woken }), ...(warning && { warning }) } };
   }
 
   /**

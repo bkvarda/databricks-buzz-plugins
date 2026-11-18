@@ -3,13 +3,12 @@
   "first_run_seen": true,
   "done_idle_days": 14,
   "default_channel": "",
-  "accounts": [
-    { "name": "Example Co", "channel": "", "aliases": ["Example"], "when": { "actor": "@example\\.com" } }
-  ],
   "rules": [
     { "id": "no-automated-mail", "sources": ["gmail"], "when": { "actor": "noreply|no-reply|notifications?@|calendar-notification|gemini-notes" }, "action": "ignore" },
-    { "id": "customer-mail", "sources": ["gmail"], "when": { "actor": "@example\\.com" }, "action": "task", "title": "Reply: {title}", "workstream": "questions", "group_by": "group_key" },
-    { "id": "customer-meetings", "sources": ["google_calendar"], "customer_attendees": "@example\\.com$", "action": "task", "title": "Prep: {title}", "workstream": "meeting prep", "series": "payload.recurringEventId", "done_when": { "after": "payload.end", "note": "the meeting has ended" } },
-    { "id": "jira-updates", "sources": ["jira"], "unless": { "payload.status_category": ["Done"], "payload.status": ["Done", "Closed", "Resolved"] }, "action": "task", "group_by": "external_id", "workstream": "tickets", "stale_after_hours": 72, "nudge": "{title} hasn't changed in {hours}h ({payload.status})", "done_when": { "when": { "payload.status_category": ["Done"] }, "note": "{external_id} is {payload.status}" } }
+    { "id": "customer-mail", "sources": ["gmail"], "customer_actor": true, "action": "task", "title": "Reply: {title}", "workstream": "questions", "group_by": "group_key" },
+    { "id": "customer-meetings", "sources": ["google_calendar"], "customer_attendees": true, "action": "task", "title": "Prep: {title}", "workstream": "meeting prep", "series": "payload.recurringEventId", "done_when": { "after": "payload.end", "note": "the meeting has ended" } },
+    { "id": "customer-slack", "sources": ["slack"], "customer_actor": true, "account_named_in": "payload.channel", "skip_own": true, "action": "task", "title": "Slack: {title}", "workstream": "questions", "group_by": "group_key" },
+    { "id": "meeting-notes", "sources": ["google_drive"], "when": { "title": "Notes by Gemini" }, "account_named_in": "title", "action": "task", "title": "Follow up: {title}", "workstream": "meeting follow-up", "group_by": "group_key" },
+    { "id": "jira-updates", "sources": ["jira"], "unless": { "payload.status_category": ["Done"], "payload.status": ["Done", "Closed", "Resolved"] }, "action": "task", "group_by": "external_id", "workstream": "tickets", "stale_after_hours": 72, "nudge": "{external_id} hasn't changed in {hours}h ({payload.status})", "done_when": { "when": { "payload.status_category": ["Done"] }, "note": "{external_id} is {payload.status}" } }
   ]
 }
