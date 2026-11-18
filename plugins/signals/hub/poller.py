@@ -33,6 +33,12 @@ The config lists sources (see sources.example.json):
   leave fields out (calendar_event_list has no attendees or description):
   {"tool": "calendar_event_get", "args": {"event_id": "{id}"}, "max": 50}.
   A detail call that fails leaves the item as the list gave it.
+  `sections` (optional) is for tools that answer with Markdown instead of a JSON
+  list (Slack search): {"split": "^### Result \\d+ of \\d+$"} cuts the text at
+  `items` into one item per section, and each "Key: value" line starts a field
+  (`key` lowercased, spaces as _) that runs until the next one. `keys` (optional)
+  lists the only keys that start a field, so a "Note: ..." line inside a
+  message's text stays in the text.
 - kind "table": a SQL query with :since (the watermark) as a parameter.
   `table` is checked first; a table that isn't there (or can't be read) makes
   the source "unavailable" and it is skipped. The cursor is the largest
@@ -136,6 +142,34 @@ def extract(found: Any, pattern: str) -> Any:
         return None
     groups = [group for group in match.groups() if group is not None]
     return (groups[0] if groups else match.group(0)).strip()
+
+
+_FIELD = re.compile(r"^([A-Z][A-Za-z_ ]{0,30}):[ \t]?(.*)$")
+
+
+def sections(text: Any, split: str, keys: Iterable[str] | None = None) -> list[dict]:
+    """Markdown results as items: the text cut at `split` (a regex for a line), each "Key: value" line a field (only `keys`, when given)."""
+    allowed = {key.lower() for key in keys} if keys else None
+    if not isinstance(text, str):
+        return []
+    items = []
+    for part in re.split(f"(?m){split}", text)[1:]:
+        item: dict[str, str] = {}
+        key = None
+        for line in part.strip("\n").splitlines():
+            if line.strip() == "---":
+                continue
+            found = _FIELD.match(line)
+            if found and allowed is not None and found.group(1).strip().lower() not in allowed:
+                found = None
+            if found:
+                key = found.group(1).strip().lower().replace(" ", "_")
+                item[key] = found.group(2).strip()
+            elif key:
+                item[key] = (item[key] + "\n" + line.rstrip()).strip("\n")
+        if item:
+            items.append({k: v.strip() for k, v in item.items()})
+    return items
 
 
 def to_event(source: str, item: dict, mapping: dict, clock: dict[str, dt.datetime]) -> dict | None:
@@ -337,6 +371,8 @@ def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str 
         clock = {"now": now, "since": since}
         data = ws.mcp(source.get("service", name), source["tool"], fill(source.get("args", {}), None, clock))
         items = get_path(data, source.get("items", "items")) if source.get("items", "items") else data
+        if source.get("sections"):
+            items = sections(items, source["sections"].get("split", r"^#+ .*$"), source["sections"].get("keys"))
         items = [item for item in items or [] if isinstance(item, dict)]
         detail = source.get("detail")
         if detail:
