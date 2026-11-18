@@ -123,6 +123,8 @@ export type AccountRule = Readonly<{
   when?: Readonly<Record<string, Condition>>;
   /** Other names sources use for it. */
   aliases?: readonly string[];
+  /** The team's preferences, as they wrote them (see parsePreferences). */
+  preferences?: string;
 }>;
 
 /** A source people can turn on, as the Settings card lists it. */
@@ -279,7 +281,7 @@ export function groupKey(rule: Rule, event: EventInput): string {
 
 export type Decision =
   | Readonly<{ kind: "none"; reason: string }>
-  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean }>;
+  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode }>;
 
 /**
  * What to do with an event that is new or changed. `firstRun` is a source's
@@ -294,9 +296,113 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const channel = account?.channel ?? config.default_channel;
   const group = groupKey(rule, event);
   const title = (rule.title ? fill(rule.title, event) : event.title || `${event.source} ${event.external_id}`).trim().slice(0, 500);
+  const mode = modeFor(account?.preferences, rule);
   // On a first run, existing things are seen; only updates to tasks that already exist go through.
-  const create = rule.action === "task" && !(options.firstRun && config.first_run_seen !== false);
-  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create };
+  // A team that turned a kind of work off still gets updates on tasks already open.
+  const create = rule.action === "task" && mode !== "off" && !(options.firstRun && config.first_run_seen !== false);
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode };
+}
+
+// ---------------------------------------------------------------------------
+// Team preferences
+
+/**
+ * How agents handle a kind of work: `auto` (do it and say so), `draft`
+ * (prepare it for a person to send), `ask` (ask before doing anything), or
+ * `off` (don't open tasks for it).
+ */
+export const MODES = ["auto", "draft", "ask", "off"] as const;
+export type Mode = (typeof MODES)[number];
+export const DEFAULT_MODE: Mode = "draft";
+
+export type Preferences = Readonly<{
+  /** Lowercased workstream or rule id (or `everything`) → mode. */
+  modes: Readonly<Record<string, Mode>>;
+  /** Everything else the team wrote: guidance for agents, word for word. */
+  guidance: string;
+  /** Lines that look like a mode setting but aren't one. */
+  problems: readonly string[];
+}>;
+
+const MODE_LINE = /^\s*(?:[-*]\s*)?([^:#]{1,80}?)\s*:\s*(\S+)\s*$/;
+
+/**
+ * Reads a team's preferences. A line `<workstream or rule id>: <mode>`
+ * (optionally a list item) sets a mode; `everything: <mode>` sets the
+ * default. Every other line is guidance for agents.
+ *
+ *     - meeting prep: auto
+ *     - tickets: off
+ *     Keep replies to customers short, and cc the AE.
+ */
+export function parsePreferences(text: string | undefined): Preferences {
+  const modes: Record<string, Mode> = {};
+  const guidance: string[] = [];
+  const problems: string[] = [];
+  for (const line of (text ?? "").split(/\r?\n/)) {
+    const found = MODE_LINE.exec(line);
+    const value = found?.[2]!.toLowerCase().replace(/[.,;]$/, "");
+    if (found && MODES.includes(value as Mode)) modes[found[1]!.trim().toLowerCase()] = value as Mode;
+    else {
+      if (found && /^(auto|draft|ask|off|on|manual|skip|none)\b/i.test(found[2]!)) problems.push(`"${line.trim()}": the mode is one of ${MODES.join(", ")}`);
+      guidance.push(line);
+    }
+  }
+  return { modes, guidance: guidance.join("\n").trim(), problems };
+}
+
+const parsed = new Map<string, Preferences>();
+function preferencesOf(text: string | undefined): Preferences {
+  const key = text ?? "";
+  let found = parsed.get(key);
+  if (!found) {
+    if (parsed.size > 200) parsed.clear();
+    parsed.set(key, (found = parsePreferences(key)));
+  }
+  return found;
+}
+
+/** A rule's mode under a team's preferences: its id, then its workstream, then `everything`. */
+export function modeFor(preferences: string | undefined, rule: Pick<Rule, "id" | "workstream">): Mode {
+  const { modes } = preferencesOf(preferences);
+  return modes[rule.id.toLowerCase()] ?? (rule.workstream ? modes[rule.workstream.toLowerCase()] : undefined) ?? modes.everything ?? DEFAULT_MODE;
+}
+
+/** What a team registers for its account channel (the hub's accounts table). */
+export type AccountRecord = Readonly<{
+  name: string;
+  channel: string | null;
+  aliases: readonly string[];
+  /** Email domains of the customer's people, so their mail and meetings find the account. */
+  domains: readonly string[];
+  preferences: string;
+  /** What agents have learned about the account, its team and its people. */
+  profile: string;
+  updated_by: string | null;
+  updated_at: number | null;
+}>;
+
+const DOMAIN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
+export const validDomain = (domain: string) => DOMAIN.test(domain);
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** A registered account as a rule's account: its domains match an event's actor or attendees. */
+export function accountRule(record: AccountRecord): AccountRule {
+  const domains = record.domains.filter(validDomain);
+  return {
+    name: record.name,
+    ...(record.channel && { channel: record.channel }),
+    ...(record.aliases.length && { aliases: record.aliases }),
+    ...(domains.length && { when: { actor: `@(${domains.map(escape).join("|")})>?$` } }),
+    ...(record.preferences && { preferences: record.preferences }),
+  };
+}
+
+/** The config with registered accounts first: they win over a config account with the same name. */
+export function withAccounts(config: SignalsConfig, records: readonly AccountRecord[]): SignalsConfig {
+  if (!records.length) return config;
+  const names = new Set(records.map((record) => record.name.toLowerCase()));
+  return { ...config, accounts: [...records.map(accountRule), ...(config.accounts ?? []).filter((account) => !names.has(account.name.toLowerCase()))] };
 }
 
 /** A task's state. */

@@ -391,6 +391,9 @@ function Text(props) {
     props.children
   );
 }
+function Card(props) {
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.padding ?? 16, ...props.style } }, props.children);
+}
 function openExternal(url, doc = document) {
   const link = doc.createElement("a");
   link.href = url;
@@ -479,6 +482,9 @@ function Field(props) {
 }
 function SectionHeader(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500 }, props.title), props.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.description)), props.action);
+}
+function Disclosure(props) {
+  return /* @__PURE__ */ React.createElement("details", { open: props.defaultOpen }, /* @__PURE__ */ React.createElement("summary", { style: { cursor: "pointer", fontSize: "0.75rem", color: "var(--dbx-subtle)", userSelect: "none" } }, props.summary), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8 } }, props.children));
 }
 function ago(ms, now = Date.now()) {
   const s = Math.max(0, Math.round((now - ms) / 1e3));
@@ -832,7 +838,15 @@ var HubClient = class {
     return this.call("POST", "/api/sources", { body: { source, enabled, forget } });
   }
   tasks(filter = {}, signal) {
-    const query = { ...filter.open && { open: "1" }, ...filter.account && { account: filter.account }, ...filter.channel && { channel: filter.channel }, ...filter.status && { status: filter.status }, limit: filter.limit ?? 50 };
+    const query = {
+      ...filter.open && { open: "1" },
+      ...filter.account && { account: filter.account },
+      ...filter.channel && { channel: filter.channel },
+      ...filter.status && { status: filter.status },
+      ...filter.workstream && { workstream: filter.workstream },
+      ...filter.initiative && { initiative: filter.initiative },
+      limit: filter.limit ?? 50
+    };
     return this.call("GET", "/api/tasks", { query, ...signal && { signal } }).then((reply) => reply.tasks);
   }
   task(id) {
@@ -840,6 +854,19 @@ var HubClient = class {
   }
   updateTask(input) {
     return this.call("POST", "/api/task", { body: input });
+  }
+  accounts(signal) {
+    return this.call("GET", "/api/accounts", { ...signal && { signal } }).then((reply) => reply.accounts);
+  }
+  /** The account set up for a channel (or by name), or null. */
+  account(by, signal) {
+    return this.call("GET", "/api/account", { query: { ...by }, ...signal && { signal } }).then((reply) => reply.account);
+  }
+  saveAccount(input) {
+    return this.call("POST", "/api/account", { body: input }).then((reply) => reply.account);
+  }
+  deleteAccount(name) {
+    return this.call("POST", "/api/account", { body: { name, delete: true } });
   }
   events(events) {
     return this.call("POST", "/api/events", { body: { events } });
@@ -874,7 +901,102 @@ function rpcSignIn(status2, body) {
 var signInPath = (service) => `/explore/mcp-services/system/ai/${service}`;
 
 // plugins/signals/app/model.ts
+var MODES = ["auto", "draft", "ask", "off"];
+var MODE_LINE = /^\s*(?:[-*]\s*)?([^:#]{1,80}?)\s*:\s*(\S+)\s*$/;
+function parsePreferences(text) {
+  const modes = {};
+  const guidance = [];
+  const problems = [];
+  for (const line2 of (text ?? "").split(/\r?\n/)) {
+    const found = MODE_LINE.exec(line2);
+    const value = found?.[2].toLowerCase().replace(/[.,;]$/, "");
+    if (found && MODES.includes(value)) modes[found[1].trim().toLowerCase()] = value;
+    else {
+      if (found && /^(auto|draft|ask|off|on|manual|skip|none)\b/i.test(found[2])) problems.push(`"${line2.trim()}": the mode is one of ${MODES.join(", ")}`);
+      guidance.push(line2);
+    }
+  }
+  return { modes, guidance: guidance.join("\n").trim(), problems };
+}
 var TASK_STATUSES = ["open", "in_progress", "waiting", "done", "dismissed"];
+
+// plugins/signals/src/account-panel.tsx
+var PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (do it and report), draft (prepare it for one of us to send), ask (ask first) or off (no tasks).
+
+- everything: draft
+- meeting prep: auto
+- tickets: draft
+- questions: draft
+
+Anything else you write here is guidance agents follow, for example:
+Keep customer replies short. Copy the AE on anything about pricing.`;
+var splitList = (text) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
+function Form(props) {
+  const { hub: hub2, channel, account } = props;
+  const [name, setName] = React.useState(account?.name ?? channel.name.replace(/[-_]+/g, " "));
+  const [aliases, setAliases] = React.useState(account?.aliases.join(", ") ?? "");
+  const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
+  const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  const read = React.useMemo(() => parsePreferences(preferences), [preferences]);
+  const save = async () => {
+    setBusy(true);
+    setError(void 0);
+    try {
+      const saved = await hub2.saveAccount({
+        name: account?.name ?? name.trim(),
+        ...account && name.trim() !== account.name && { rename: name.trim() },
+        channel: channel.id,
+        aliases: splitList(aliases),
+        domains: splitList(domains),
+        preferences
+      });
+      props.onSaved(saved);
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Field, { label: "Account", hint: "As tasks show it. Sources that name the account (a table column, say) match it or one of its other names." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: name, onChange: (event) => setName(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Other names", hint: "Comma-separated, e.g. ACME Corp, Acme Inc." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", value: aliases, onChange: (event) => setAliases(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Customer email domains", hint: "Mail and meetings from people at these domains go to this channel's tasks." }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "example.com", value: domains, onChange: (event) => setDomains(event.target.value) })), /* @__PURE__ */ React.createElement(Field, { label: "Team preferences", hint: /* @__PURE__ */ React.createElement(React.Fragment, null, "Lines like ", /* @__PURE__ */ React.createElement("code", null, "meeting prep: auto"), " set how agents handle that workstream (or rule); ", /* @__PURE__ */ React.createElement("code", null, "everything:"), " sets the rest. Modes: ", MODES.join(", "), ". Every other line is guidance agents follow.") }, /* @__PURE__ */ React.createElement("textarea", { className: "dbx-textarea", rows: 12, value: preferences, onChange: (event) => setPreferences(event.target.value) })), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Reads as:"), Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key, tone: mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning" }, `${key}: ${mode}`)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "no modes (everything is draft)")), read.problems.map((problem) => /* @__PURE__ */ React.createElement(Text, { key: problem, size: "xs", tone: "danger" }, problem)), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement(Button, { variant: "brand", disabled: busy || !name.trim(), onClick: () => void save() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, account ? "Save" : "Set up account"))));
+}
+function Tasks(props) {
+  const tasks = useAsync(async (signal) => props.hub.tasks({ channel: props.channel, open: true, limit: 50 }, signal), [props.channel]);
+  if (tasks.loading) return /* @__PURE__ */ React.createElement(Spinner, { label: "Loading tasks" });
+  if (tasks.error) return /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(tasks.error));
+  if (!tasks.data?.length) return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No open tasks in this channel.");
+  const groups = /* @__PURE__ */ new Map();
+  for (const task of tasks.data) {
+    const key = task.initiative ? `Initiative: ${task.initiative}` : task.workstream ?? "Other";
+    groups.set(key, [...groups.get(key) ?? [], task]);
+  }
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, [...groups].map(([group, list]) => /* @__PURE__ */ React.createElement(Stack, { key: group, gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, group), list.map((task) => /* @__PURE__ */ React.createElement(Stack, { key: task.id, direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "#", task.id, " ", task.title), /* @__PURE__ */ React.createElement(Badge, null, task.status), /* @__PURE__ */ React.createElement(Badge, { tone: task.mode === "auto" ? "success" : "neutral" }, task.mode), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(task.last_event_at * 1e3)))))));
+}
+function accountPanel(service) {
+  return function AccountPanel({ channelContext }) {
+    const connection = useConnection(service);
+    const hubs = useAsync(async (signal) => connection.status === "connected" ? chosenHub(service, signal) : void 0, [connection.status]);
+    const app = hubs.data?.app;
+    const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url]);
+    const found = useAsync(async (signal) => hub2 && channelContext ? hub2.account({ channel: channelContext.channelId }, signal) : void 0, [hub2, channelContext?.channelId]);
+    const [saved, setSaved] = React.useState();
+    const [editing, setEditing] = React.useState(false);
+    let body;
+    if (!channelContext) body = /* @__PURE__ */ React.createElement(Notice, null, "Open this from a channel's menu.");
+    else if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Account channels live in your team's signals hub, a Databricks App.");
+    else if (hubs.loading || found.loading) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Looking for this channel's account" });
+    else if (hubs.error || found.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? found.error));
+    else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README), then set up account channels here.");
+    else {
+      const account = saved ?? found.data ?? void 0;
+      const channel = { id: channelContext.channelId, name: channelContext.channelName };
+      body = !account || editing ? /* @__PURE__ */ React.createElement(Form, { hub: hub2, channel, ...account && { account }, onSaved: (next) => (setSaved(next), setEditing(false)) }) : /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, account.name), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setEditing(true) }, "Edit")), account.domains.length > 0 && /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Customer domains: ", account.domains.join(", ")), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, Object.entries(account.read.modes).map(([key, mode]) => /* @__PURE__ */ React.createElement(Badge, { key }, `${key}: ${mode}`))), account.updated_by && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Changed by ", account.updated_by, account.updated_at ? ` ${ago(account.updated_at * 1e3)}` : ""))), /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Open tasks", description: "From your team's sources, grouped by initiative and workstream. Work on them in their threads." }), /* @__PURE__ */ React.createElement(Tasks, { hub: hub2, channel: channel.id })), /* @__PURE__ */ React.createElement(Disclosure, { summary: "What agents have learned" }, account.profile ? /* @__PURE__ */ React.createElement(Text, { size: "sm", as: "div", style: { whiteSpace: "pre-wrap" } }, account.profile) : /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle" }, "Nothing yet. Agents add to it as they work on this account's tasks.")));
+    }
+    return /* @__PURE__ */ React.createElement(DbxRoot, null, /* @__PURE__ */ React.createElement("div", { style: { padding: 16 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: channelContext ? `Account for #${channelContext.channelName}` : "Account", description: "Tasks for the account are posted here, and agents follow the team's preferences." }), body)));
+  };
+}
+var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and follow its mode for the task's workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first) and the team's guidance. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
 
 // plugins/signals/src/tools.ts
 async function hub(service) {
@@ -882,7 +1004,7 @@ async function hub(service) {
   if (!app) throw new Error(apps.length ? "Several signals hubs exist; the owner picks one in Settings \u2192 Signals." : "There's no signals hub in this workspace yet (Settings \u2192 Signals says how to deploy one).");
   return new HubClient(await service.ready(), app);
 }
-var line = (task) => `- #${task.id} [${task.status}] ${task.title}${task.account ? ` \xB7 ${task.account}` : ""}${task.workstream ? ` \xB7 ${task.workstream}` : ""} \xB7 ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1e3).toISOString().slice(0, 16)}Z`;
+var line = (task) => `- #${task.id} [${task.status}, ${task.mode}] ${task.title}${task.account ? ` \xB7 ${task.account}` : ""}${task.workstream ? ` \xB7 ${task.workstream}` : ""}${task.initiative ? ` \xB7 initiative ${task.initiative}` : ""} \xB7 ${task.event_count} event${task.event_count === 1 ? "" : "s"}, last ${new Date(task.last_event_at * 1e3).toISOString().slice(0, 16)}Z`;
 function signalsTools(service) {
   return [
     {
@@ -891,6 +1013,8 @@ function signalsTools(service) {
       inputSchema: schema.object({
         account: schema.string("Account name."),
         channel: schema.string("Buzz channel id the tasks are posted in."),
+        workstream: schema.string("Workstream, e.g. meeting prep."),
+        initiative: schema.string("Initiative."),
         status: schema.string(`One of ${TASK_STATUSES.join(", ")}.`),
         all: { type: "boolean", description: "Include done and dismissed tasks." },
         limit: schema.integer("Max tasks (default 30, max 200).")
@@ -902,6 +1026,8 @@ function signalsTools(service) {
           ...stringArg(args, "account", false) && { account: stringArg(args, "account") },
           ...stringArg(args, "channel", false) && { channel: stringArg(args, "channel") },
           ...stringArg(args, "status", false) && { status: stringArg(args, "status") },
+          ...stringArg(args, "workstream", false) && { workstream: stringArg(args, "workstream") },
+          ...stringArg(args, "initiative", false) && { initiative: stringArg(args, "initiative") },
           limit: numberArg(args, "limit", 30, 1, 200)
         });
         return tasks.length ? tasks.map(line).join("\n") : "No tasks match.";
@@ -927,12 +1053,14 @@ function signalsTools(service) {
     },
     {
       name: "signals_task_update",
-      description: "Works on a signals task: set its status, add a note of what was done, or link an artifact (a draft doc, a demo, a PR). Its Buzz thread gets status changes and artifacts.",
+      description: "Works on a signals task: set its status, add a note of what was done, file it under a workstream or initiative, or link an artifact (a draft doc, a demo, a PR). Its Buzz thread gets status changes and artifacts.",
       inputSchema: schema.object(
         {
           id: schema.integer("Task id."),
           status: schema.string(`One of ${TASK_STATUSES.join(", ")}.`),
           note: schema.string("What was done, or why the status changed."),
+          workstream: schema.string('File it under this workstream ("" clears it).'),
+          initiative: schema.string('File it under this initiative ("" clears it).'),
           artifact_url: schema.string("A link to something made for the task."),
           artifact_title: schema.string("The artifact's title."),
           artifact_kind: schema.string("doc, demo, code, email draft\u2026 (default link).")
@@ -945,9 +1073,51 @@ function signalsTools(service) {
           id: numberArg(args, "id", 0, 0, Number.MAX_SAFE_INTEGER),
           ...stringArg(args, "status", false) && { status: stringArg(args, "status") },
           ...stringArg(args, "note", false) && { note: stringArg(args, "note") },
+          ...typeof args.workstream === "string" && { workstream: args.workstream },
+          ...typeof args.initiative === "string" && { initiative: args.initiative },
           ...url && { artifact: { url, ...stringArg(args, "artifact_title", false) && { title: stringArg(args, "artifact_title") }, ...stringArg(args, "artifact_kind", false) && { kind: stringArg(args, "artifact_kind") } } }
         });
         return `Updated: ${line(detail.task)}`;
+      }
+    },
+    {
+      name: "signals_account",
+      description: `Reads an account channel's setup in the signals hub: the account, its team's preferences (how agents handle each kind of work: ${MODES.join(", ")}, plus their guidance) and the profile agents keep of the account, its team and its people. Read it before working on a task in that channel, and follow it.`,
+      inputSchema: schema.object({ channel: schema.string("The Buzz channel id."), name: schema.string("Or the account's name.") }),
+      async call(_client, _context, args) {
+        const channel = stringArg(args, "channel", false);
+        const name = stringArg(args, "name", false);
+        if (!channel && !name) throw new Error("Give channel or name.");
+        const account = await (await hub(service)).account({ ...channel && { channel }, ...name && { name } });
+        if (!account) return "No account is set up for that. Someone in the channel can set one up from its menu: Set up account.";
+        const modes = Object.entries(account.read.modes);
+        return [
+          `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` \xB7 channel ${account.channel}` : ""}`,
+          account.domains.length ? `Customer domains: ${account.domains.join(", ")}` : "",
+          "",
+          `Modes (default draft): ${modes.length ? modes.map(([key, mode]) => `${key}: ${mode}`).join("; ") : "none set"}`,
+          "- auto: do the work and report it in the task's thread. draft: prepare it (a draft doc, a reply) for a person to send. ask: ask in the thread before doing anything. off: no tasks.",
+          "",
+          "Team guidance:",
+          account.read.guidance || "(none)",
+          "",
+          "Profile (what agents have learned; update it with signals_account_learn):",
+          account.profile || "(empty)"
+        ].filter((part, index, all) => part !== "" || all[index - 1] !== "").join("\n");
+      }
+    },
+    {
+      name: "signals_account_learn",
+      description: "Updates the profile agents keep of an account: what you learned about the customer, the account team, how they like to work, open initiatives. Send the whole new profile (short Markdown sections; at most 16,000 characters), not only what's new: read it first with signals_account. Never put secrets or a mail's body in it.",
+      inputSchema: schema.object({ channel: schema.string("The account channel's Buzz id."), name: schema.string("Or the account's name."), profile: schema.string("The new profile.") }, ["profile"]),
+      async call(_client, _context, args) {
+        const client = await hub(service);
+        const channel = stringArg(args, "channel", false);
+        const name = stringArg(args, "name", false);
+        const account = await client.account({ ...channel && { channel }, ...name && { name } });
+        if (!account) throw new Error("No account is set up for that channel yet.");
+        const saved = await client.saveAccount({ name: account.name, profile: stringArg(args, "profile") });
+        return `Saved the profile of ${saved.name} (${saved.profile.length} characters).`;
       }
     },
     {
@@ -977,7 +1147,7 @@ function signalsTools(service) {
 }
 
 // plugins/signals/src/index.tsx
-var inject = ["react", "settingsCards"];
+var inject = ["react", "settingsCards", "panels"];
 var WORKSPACE_PREF = "signalsWorkspace";
 function HubWorkspace(props) {
   const [, setProfile] = usePreference(props.main, WORKSPACE_PREF);
@@ -1037,6 +1207,16 @@ function apply(ctx) {
     const databricks = followWorkspace(main, WORKSPACE_PREF);
     scope.inject(["agents"], (agents) => {
       for (const tool of signalsTools(databricks)) agents.agents.addTool(tool);
+      agents.agents.addInstructions?.({ id: "accounts", text: ACCOUNT_INSTRUCTIONS });
+    });
+    scope.panels.register({
+      id: "account",
+      title: "Account",
+      // Opened from the channel menu only, never from a link.
+      matches: () => false,
+      channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
+      channelPlacement: "side",
+      component: accountPanel(databricks)
     });
     return { main, databricks };
   });

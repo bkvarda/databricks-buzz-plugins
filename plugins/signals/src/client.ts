@@ -5,7 +5,7 @@ import { type DatabricksApp, Apps } from "@dbx/core/api/apps";
 import { gatewayMcpPath } from "@dbx/core/api/mcp";
 import type { DatabricksClient } from "@dbx/core/client";
 import type { DatabricksService } from "@dbx/core/service";
-import type { SourceInfo } from "../app/model";
+import type { AccountRecord, Preferences, SourceInfo } from "../app/model";
 import type { Task } from "../app/store";
 
 /** Hub apps are made with this description, so the plugin can find them. */
@@ -55,20 +55,44 @@ export class HubClient {
   setSource(source: string, enabled: boolean, forget = false) {
     return this.call<{ sources: SourceState[] }>("POST", "/api/sources", { body: { source, enabled, forget } });
   }
-  tasks(filter: { open?: boolean; account?: string; channel?: string; status?: string; limit?: number } = {}, signal?: AbortSignal) {
-    const query = { ...(filter.open && { open: "1" }), ...(filter.account && { account: filter.account }), ...(filter.channel && { channel: filter.channel }), ...(filter.status && { status: filter.status }), limit: filter.limit ?? 50 };
+  tasks(filter: { open?: boolean; account?: string; channel?: string; status?: string; workstream?: string; initiative?: string; limit?: number } = {}, signal?: AbortSignal) {
+    const query = {
+      ...(filter.open && { open: "1" }),
+      ...(filter.account && { account: filter.account }),
+      ...(filter.channel && { channel: filter.channel }),
+      ...(filter.status && { status: filter.status }),
+      ...(filter.workstream && { workstream: filter.workstream }),
+      ...(filter.initiative && { initiative: filter.initiative }),
+      limit: filter.limit ?? 50,
+    };
     return this.call<{ tasks: Task[] }>("GET", "/api/tasks", { query, ...(signal && { signal }) }).then((reply) => reply.tasks);
   }
   task(id: number) {
     return this.call<TaskDetail>("GET", "/api/task", { query: { id } });
   }
-  updateTask(input: { id: number; status?: string; note?: string; artifact?: { url: string; title?: string; kind?: string } }) {
+  updateTask(input: { id: number; status?: string; note?: string; workstream?: string; initiative?: string; artifact?: { url: string; title?: string; kind?: string } }) {
     return this.call<TaskDetail>("POST", "/api/task", { body: input });
+  }
+  accounts(signal?: AbortSignal) {
+    return this.call<{ accounts: AccountRecord[] }>("GET", "/api/accounts", { ...(signal && { signal }) }).then((reply) => reply.accounts);
+  }
+  /** The account set up for a channel (or by name), or null. */
+  account(by: { channel?: string; name?: string }, signal?: AbortSignal) {
+    return this.call<{ account: AccountView | null }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => reply.account);
+  }
+  saveAccount(input: AccountInput) {
+    return this.call<{ account: AccountView }>("POST", "/api/account", { body: input }).then((reply) => reply.account);
+  }
+  deleteAccount(name: string) {
+    return this.call<{ deleted: boolean }>("POST", "/api/account", { body: { name, delete: true } });
   }
   events(events: readonly unknown[]) {
     return this.call<{ new: number; changed: number; same: number; skipped: number; created: number[]; updated: number[]; errors: { index: number; error: string }[] }>("POST", "/api/events", { body: { events } });
   }
 }
+
+export type AccountView = AccountRecord & Readonly<{ read: Preferences }>;
+export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; preferences?: string; profile?: string }>;
 
 export type TaskDetail = Readonly<{
   task: Task;
