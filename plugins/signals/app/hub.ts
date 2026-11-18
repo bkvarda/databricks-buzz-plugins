@@ -16,6 +16,8 @@
 //   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
 //   GET  /api/board?channel=              a channel's tasks for the board: who's on each, its source, artifacts, last activity
 //   POST /api/task {id, agents: [...]}    asks agents to work on a task (in its thread)
+//   POST /api/task {id, question, options?}  needs input: waiting, with the question (agents ask this way)
+//   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
@@ -343,6 +345,8 @@ export class Hub {
     if (input.status !== undefined) {
       if (!TASK_STATUSES.includes(input.status as TaskStatus)) return bad(`status must be one of ${TASK_STATUSES.join(", ")}`);
       task = (await this.store.setStatus(id, input.status as TaskStatus, user, note))!;
+      // Moving it on from waiting by hand takes its question off.
+      if (task.question && input.status !== "waiting" && input.question === undefined) task = (await this.store.setQuestion(id, user))!;
     } else if (note && input.agents === undefined) await this.store.activity(id, user, "note", note);
     if (input.agents !== undefined) {
       const keys = Array.isArray(input.agents) ? [...new Set(input.agents.map((item) => agentKey(String(item))))] : [];
@@ -355,6 +359,17 @@ export class Hub {
       await this.store.addPeople(id, keys.map((key) => ({ kind: "agent", key })));
       await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `agent:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
     }
+    if (input.question !== undefined) {
+      const ask = readQuestion(input.question, input.options);
+      if (typeof ask === "string") return bad(ask);
+      task = (await this.store.setQuestion(id, user, { ...ask, by: user }))!;
+      if (this.notifier && task.buzz_root) await this.notifier.updated(task, questionMessage(task, user)).catch(() => {});
+    }
+    if (input.input !== undefined) {
+      if (typeof input.input !== "string" || !input.input.trim() || input.input.length > 4000) return bad("input is the answer (text, at most 4000 characters).");
+      if (!task.question) return bad("The task isn't waiting on input.", 409);
+      task = await this.answer(task, user, input.input.trim());
+    }
     const artifact = input.artifact as { url?: unknown; title?: unknown; kind?: unknown } | undefined;
     if (artifact) {
       if (typeof artifact.url !== "string" || !/^https?:\/\//.test(artifact.url)) return bad("artifact.url must be an http(s) link.");
@@ -365,6 +380,24 @@ export class Hub {
       await this.notifier.updated(task, parts.join("\n")).catch(() => {});
     }
     return { json: await this.store.detail(id) };
+  }
+
+  /**
+   * Answers a task's question: posts the answer in its thread, mentioning its
+   * agents (the one that asked first), takes the question off, moves it back to
+   * in_progress, and asks the agents again, so each one's next reply is
+   * recorded as their first was (see collect).
+   */
+  private async answer(task: Task, user: string, text: string): Promise<Task> {
+    const people = (await this.store.people([task.id])).get(task.id) ?? [];
+    const asker = task.asked_by && HEX64.test(task.asked_by) ? [task.asked_by] : [];
+    const agents = [...new Set([...asker, ...people.filter((person) => person.kind === "agent").map((person) => person.key)])];
+    await this.store.activity(task.id, user, "input", text);
+    await this.store.setQuestion(task.id, user);
+    const resumed = (await this.store.setStatus(task.id, "in_progress", user, "input given"))!;
+    if (agents.length) await this.store.askAgain(task.id, agents);
+    if (this.notifier && task.buzz_root) await this.notifier.updated(resumed, answerMessage(task, user, text, agents), agents).catch((error) => this.log(`couldn't post input on task ${task.id}: ${(error as Error).message}`));
+    return resumed;
   }
 
   /**
@@ -426,7 +459,8 @@ export class Hub {
    * Records the first reply each asked-for agent posts in a task's thread:
    * as activity, as the task's artifact, and by moving an open task to
    * in_progress. Agents without the Signals tools (remote ones) get their
-   * work on the task this way. `fetch` queries the relay.
+   * work on the task this way, and ask for input with a marked line (see
+   * markedQuestion), which puts the task on hold. `fetch` queries the relay.
    */
   async collect(fetch: (filters: { kinds: number[]; "#e": string[]; authors: string[]; since: number }[]) => Promise<readonly ThreadReply[]>): Promise<{ recorded: number }> {
     const tasks = await this.store.awaitingAgents();
@@ -440,19 +474,23 @@ export class Hub {
       const fromAccount = !task.agent_reply && (task.mode === "auto" || task.mode === "draft") && account?.channel === task.channel ? (account?.agents ?? []) : [];
       const done = new Set(on.filter((person) => person.replied_at).map((person) => person.key));
       const agents = [...new Set([...fromAccount, ...on.filter((person) => !person.replied_at).map((person) => person.key)])].filter((key) => !done.has(key));
-      return agents.length ? [{ task, agents }] : [];
+      // An agent asked again (given input) counts only its replies since.
+      const since = new Map(on.filter((person) => person.asked_at).map((person) => [person.key, person.asked_at!]));
+      return agents.length ? [{ task, agents, since }] : [];
     });
     if (!waiting.length) return { recorded: 0 };
     const authors = [...new Set(waiting.flatMap((item) => item.agents))];
-    const since = Math.min(...waiting.map((item) => item.task.created_at)) - 60;
+    const since = Math.min(...waiting.flatMap((item) => [item.task.created_at, ...item.since.values()])) - 60;
     const replies = await fetch([{ kinds: [9], "#e": waiting.map((item) => item.task.buzz_root!), authors, since }]);
     let recorded = 0;
-    for (const { task, agents } of waiting) {
+    for (const { task, agents, since: askedAt } of waiting) {
       let first = !task.agent_reply;
       let status = task.status;
+      let question = task.question;
       for (const agent of agents) {
+        const after = askedAt.get(agent) ?? 0;
         const reply = replies
-          .filter((event) => event.pubkey === agent && event.id !== task.buzz_root && event.tags.some((tag) => tag[0] === "e" && tag[1] === task.buzz_root))
+          .filter((event) => event.pubkey === agent && event.id !== task.buzz_root && event.created_at >= after && event.tags.some((tag) => tag[0] === "e" && tag[1] === task.buzz_root))
           .sort((a, b) => a.created_at - b.created_at)[0];
         if (!reply) continue;
         const actor = `agent:${npub(reply.pubkey)}`;
@@ -460,6 +498,13 @@ export class Hub {
         await this.store.activity(task.id, actor, "agent_reply", text.length > 500 ? `${text.slice(0, 497)}…` : text);
         await this.store.artifact(task.id, actor, task.mode === "draft" ? "draft" : "reply", `buzz://message?channel=${task.channel}&id=${reply.id}`, `Agent reply in the task's thread`);
         await this.store.replied(task.id, agent, reply.created_at);
+        // Agents without the Signals tools ask for input by marking a line in their reply.
+        const ask = !question ? markedQuestion(reply.content) : undefined;
+        if (ask) {
+          await this.store.setQuestion(task.id, actor, { ...ask, by: agent });
+          question = ask.question;
+          status = "waiting";
+        }
         if (status === "open") {
           await this.store.setStatus(task.id, "in_progress", actor, "an agent replied in the task's thread");
           status = "in_progress";
@@ -503,7 +548,7 @@ const AGENT_ASK = {
   auto: "please work on this now: follow the team's guidance below, do the work and report it in this thread.",
   draft: "please prepare this: follow the team's guidance below and post a draft in this thread (a reply, a doc) for a person to send. Don't send anything yourself.",
 } as const;
-const AGENT_RECORD = "Your first reply in this thread is recorded on the task. If you have the Signals tools, signals_account gives the full account and signals_task_update records more.";
+const AGENT_RECORD = "Your first reply in this thread is recorded on the task. If you have the Signals tools, signals_account gives the full account and signals_task_update records more. If you need a person's input to go on, ask with signals_task_update (question, options), or start a line of your reply with \"Needs input:\" and the question, optionally followed by a line \"Options: A / B / C\".";
 
 /** How far back, and how many, open tasks an agent added to an account is asked to pick up. */
 const HAND_OFF_DAYS = 14;
@@ -689,6 +734,55 @@ export function whoIsOn(people: readonly TaskPerson[], actors: readonly string[]
   for (const attendee of realCustomers(payload.attendees, (email) => customer(email.toLowerCase())))
     add({ kind: "customer", key: attendee.email!.toLowerCase(), label: attendee.name ?? attendee.email!, role: "attendee" });
   return [...out.values()];
+}
+
+/** At most this many choices for a question; each at most 200 characters. */
+const MAX_OPTIONS = 8;
+
+/** A question as the API or a tool gives it: its text and choices, or what's wrong. */
+export function readQuestion(question: unknown, options: unknown): { question: string; options: string[] } | string {
+  if (typeof question !== "string" || !question.trim() || question.length > 2000) return "question is what you need to know (text, at most 2000 characters).";
+  const list = options === undefined ? [] : Array.isArray(options) ? options : typeof options === "string" ? splitOptions(options) : null;
+  if (!list || list.some((item) => typeof item !== "string" || !item.trim() || item.length > 200) || list.length > MAX_OPTIONS)
+    return `options is a list of up to ${MAX_OPTIONS} choices (text, at most 200 characters each).`;
+  return { question: question.trim(), options: [...new Set((list as string[]).map((item) => item.trim()))] };
+}
+
+const splitOptions = (text: string) => text.split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).map((item) => item.trim()).filter(Boolean);
+const MARKED = /^[\s>*_~`-]*(?:\p{Extended_Pictographic}\uFE0F?\s*)?needs input[*_]*\s*:[*_]*\s*(.+)$/iu;
+const OPTIONS_LINE = /^[\s>*_~`-]*options[*_]*\s*:[*_]*\s*(.+)$/iu;
+
+/**
+ * The question an agent marked in its reply, for agents without the Signals
+ * tools: a line starting "Needs input:", and optionally the next line
+ * "Options: A / B / C" (or separated by | or ;).
+ */
+export function markedQuestion(text: string): { question: string; options: string[] } | undefined {
+  const lines = text.split(/\r?\n/);
+  for (const [n, line] of lines.entries()) {
+    const found = MARKED.exec(line);
+    if (!found) continue;
+    const options = OPTIONS_LINE.exec(lines[n + 1] ?? "");
+    const read = readQuestion(found[1]!.replace(/[*_]+$/, "").trim(), options ? splitOptions(options[1]!).slice(0, MAX_OPTIONS).map((item) => item.slice(0, 200)) : []);
+    return typeof read === "string" ? undefined : read;
+  }
+  return undefined;
+}
+
+/** The thread reply when a task goes on hold for input. */
+export function questionMessage(task: Task, by: string): string {
+  return [`⏸️ **Needs input** (asked by ${HEX64.test(by) ? `nostr:${npub(by)}` : by}): ${task.question}`, task.options?.length ? `Options: ${task.options.join(" / ")}` : "", "Answer from the Tasks board (Provide input on its card)."].filter(Boolean).join("\n");
+}
+
+/** The thread reply with a person's answer, asking the task's agents to go on. */
+export function answerMessage(task: Task, user: string, text: string, agents: readonly string[]): string {
+  return [
+    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")}${agents.length ? " " : ""}${user} answered: ${text}`.trim(),
+    `\n> ${task.question}`,
+    agents.length ? "\nPlease go on with the task. Your next reply in this thread is recorded on it." : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /** The reply that asks agents someone added to a task to work on it. */
