@@ -15,7 +15,7 @@
 //   GET  /api/account?channel=|name=      one, with its preferences read
 //   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
-import { type AccountRecord, configProblems, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type EventInput, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -38,10 +38,13 @@ export type HubResponse = Readonly<{ status?: number; json: unknown }>;
 /** Where tasks go in Buzz. The hub works without it (tasks stay in Lakebase). */
 export type Notifier = Readonly<{
   /** Posts a new task at its channel's top level, mentioning `agents` (hex pubkeys); resolves with the message id. */
-  opened(task: Task, agents?: readonly string[], briefing?: string): Promise<string | undefined>;
+  opened(task: Task, agents?: readonly string[], context?: PostContext): Promise<string | undefined>;
   /** Replies in the task's thread. */
   updated(task: Task, text: string): Promise<void>;
 }>;
+
+/** What a task's post carries besides the task: the account briefing (for agents) and the source event's details. */
+export type PostContext = Readonly<{ briefing?: string; source?: string }>;
 
 /** A chat message as the relay gives it: enough to tell who replied in which thread. */
 export type ThreadReply = Readonly<{ id: string; pubkey: string; content: string; created_at: number; tags: readonly (readonly string[])[] }>;
@@ -221,7 +224,10 @@ export class Hub {
       // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
       const agents = account && account.channel === task.channel ? account.agents : [];
-      const root = await this.notifier.opened(task, agents, agents.length ? briefing(account!) : undefined);
+      const event = await this.store.latestEvent(task.id);
+      const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
+      const context: PostContext = { ...(agents.length && { briefing: briefing(account!) }), ...(event && { source: eventDetails(event, domains) }) };
+      const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
     } catch (error) {
       this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
@@ -413,14 +419,79 @@ export function briefing(account: AccountRecord): string {
     .join("\n");
 }
 
-export function taskMessage(task: Task, detail?: { url?: string; agents?: readonly string[]; briefing?: string }): string {
+type Attendee = Readonly<{ email?: string; name?: string; status?: string; organizer?: boolean }>;
+
+function attendeesOf(value: unknown): Attendee[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): Attendee[] => {
+    if (typeof item === "string") return item.trim() ? [{ email: item.trim() }] : [];
+    if (!item || typeof item !== "object") return [];
+    const a = item as Record<string, unknown>;
+    const email = typeof a.email === "string" ? a.email : undefined;
+    const name = typeof a.displayName === "string" && a.displayName ? a.displayName : typeof a.name === "string" && a.name ? a.name : undefined;
+    if (!email && !name) return [];
+    return [{ ...(email && { email }), ...(name && { name }), ...(typeof a.responseStatus === "string" && { status: a.responseStatus }), ...(a.organizer === true && { organizer: true }) }];
+  });
+}
+
+/** `2026-11-18T10:00:00-08:00`, `{dateTime, timeZone}` or `{date}` as text. */
+function timeText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const t = value as Record<string, unknown>;
+    if (typeof t.dateTime === "string") return `${t.dateTime}${typeof t.timeZone === "string" && t.timeZone ? ` (${t.timeZone})` : ""}`;
+    if (typeof t.date === "string") return `${t.date} (all day)`;
+  }
+  return undefined;
+}
+
+const SHOWN = new Set(["start", "end", "attendees", "description", "location", "hangoutLink", "organizer"]);
+const MAX_ATTENDEES = 30;
+
+/**
+ * The source event as a task's post shows it: its link, when, who (people
+ * at the account's domains marked as customers), the description and a short
+ * excerpt of its other fields.
+ */
+export function eventDetails(event: EventInput, domains: readonly string[] = []): string {
+  const payload = event.payload ?? {};
+  const lower = domains.map((domain) => domain.toLowerCase());
+  const customer = (email?: string) => Boolean(email && lower.some((domain) => email.toLowerCase().endsWith(`@${domain}`) || email.toLowerCase().endsWith(`.${domain}`)));
+  const start = timeText(payload.start);
+  const end = timeText(payload.end);
+  const when = start ? `When: ${start}${end ? ` → ${end}` : ""}` : typeof event.occurred_at === "number" && event.occurred_at > 0 ? `When: ${new Date(event.occurred_at * 1000).toISOString()}` : "";
+  const attendees = attendeesOf(payload.attendees).sort((a, b) => Number(customer(b.email)) - Number(customer(a.email)));
+  const who = attendees.slice(0, MAX_ATTENDEES).map((a) => {
+    const label = a.name && a.email ? `${a.name} <${a.email}>` : (a.email ?? a.name!);
+    const notes = [customer(a.email) && "customer", a.organizer && "organizer", a.status && a.status !== "needsAction" && a.status].filter(Boolean);
+    return `- ${label}${notes.length ? ` (${notes.join(", ")})` : ""}`;
+  });
+  if (attendees.length > MAX_ATTENDEES) who.push(`- …and ${attendees.length - MAX_ATTENDEES} more`);
+  const description = typeof payload.description === "string" ? payload.description.replace(/<[^>]+>/g, " ").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim() : "";
+  const rest = Object.entries(payload).filter(([key, value]) => !SHOWN.has(key) && value !== null && value !== undefined && value !== "" && !(Array.isArray(value) && !value.length));
+  const excerpt = rest.map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("; ");
+  const place = [typeof payload.location === "string" && payload.location, typeof payload.hangoutLink === "string" && payload.hangoutLink].filter(Boolean).join(" · ");
+  return [
+    `**Source** (${event.source})${event.url ? `: ${event.url}` : ""}`,
+    when,
+    event.actor ? `From: ${event.actor}` : "",
+    place && `Where: ${place}`,
+    who.length ? `Attendees (${attendees.length}):\n${who.join("\n")}` : "",
+    description && `Description:\n${clip(description, 1500)}`,
+    excerpt && `Details: ${clip(excerpt, 600)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function taskMessage(task: Task, detail?: { agents?: readonly string[]; briefing?: string; source?: string }): string {
   const asking = Boolean(detail?.agents?.length && (task.mode === "auto" || task.mode === "draft"));
   const ask = asking ? `${detail!.agents!.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode as "auto" | "draft"]} ${AGENT_RECORD}` : "";
   return [
     `📌 **Task ${task.id}: ${task.title}**`,
     [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
     MODE_TEXT[task.mode] ?? "",
-    detail?.url ? `Source: ${detail.url}` : "",
+    detail?.source ? `\n${detail.source}\n` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
     ask,
     asking && detail?.briefing ? `\n${detail.briefing}` : "",

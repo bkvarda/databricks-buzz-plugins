@@ -48,6 +48,24 @@ class Templates(unittest.TestCase):
         clock = {"now": NOW, "since": NOW - dt.timedelta(hours=1)}
         self.assertEqual(poller.fill({"a": "{since_epoch}", "b": ["{now+7d}"], "c": "x {since}"}, None, clock), {"a": int((NOW - dt.timedelta(hours=1)).timestamp()), "b": ["2026-11-24T12:00:00Z"], "c": "x 2026-11-17T11:00:00Z"})
 
+    def test_detail_merges_each_items_full_record(self):
+        class Detailed(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "calendar_event_get":
+                    if args["event_id"] == "bad":
+                        raise RuntimeError("boom")
+                    return {"id": args["event_id"], "attendees": [{"email": "a@globex.io"}], "description": "Agenda"}
+                return {"items": [{"id": "e1", "summary": "QBR"}, {"id": "bad", "summary": "B"}, {"id": "e3", "summary": "C"}]}
+
+        source = {"name": "google_calendar", "kind": "mcp", "tool": "calendar_event_list", "detail": {"tool": "calendar_event_get", "args": {"event_id": "{id}"}, "max": 2}, "map": {"external_id": "id", "title": "summary", "payload": ["attendees", "description"]}}
+        ws = Detailed([])
+        events, _ = poller.poll_source(ws, source, None, None, NOW)
+        self.assertEqual(events[0]["payload"], {"attendees": [{"email": "a@globex.io"}], "description": "Agenda"})
+        self.assertEqual(events[1]["payload"], {"attendees": None, "description": None})
+        self.assertEqual(events[2]["payload"], {"attendees": None, "description": None})
+        self.assertEqual([c[2] for c in ws.calls], ["calendar_event_list", "calendar_event_get", "calendar_event_get"])
+
     def test_to_event_maps_paths_templates_and_payload(self):
         item = {"id": 7, "subject": "Hi", "threadId": "t", "from": "a@b", "start": {"date": "2026-11-18"}}
         clock = {"now": NOW, "since": NOW}

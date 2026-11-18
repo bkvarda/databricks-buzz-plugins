@@ -28,6 +28,11 @@ The config lists sources (see sources.example.json):
   "{since}" (the cursor, or `lookback_hours` ago, ISO 8601), "{now}", "{now+7d}",
   "{since_epoch}", and "{field}" for a field of the item being mapped.
   `items` is the path to the list in the tool's JSON result.
+  `detail` (optional) fetches each item's full record with another tool of the
+  same service and merges it into the item before mapping, for list tools that
+  leave fields out (calendar_event_list has no attendees or description):
+  {"tool": "calendar_event_get", "args": {"event_id": "{id}"}, "max": 50}.
+  A detail call that fails leaves the item as the list gave it.
 - kind "table": a SQL query with :since (the watermark) as a parameter.
   `table` is checked first; a table that isn't there (or can't be read) makes
   the source "unavailable" and it is skipped. The cursor is the largest
@@ -310,6 +315,17 @@ class LakebaseInbox:
 # Polling
 
 
+def with_detail(ws: Workspace, service: str, detail: dict, item: dict, clock: dict[str, dt.datetime]) -> dict:
+    """The item with its full record (from `detail`'s tool) merged in; the item as it was when that fails."""
+    try:
+        found = ws.mcp(service, detail["tool"], fill(detail.get("args", {}), item, clock))
+    except NotSignedIn:
+        raise
+    except Exception:
+        return item
+    return {**item, **found} if isinstance(found, dict) else item
+
+
 def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str | None, now: dt.datetime) -> tuple[list[dict], str]:
     """One source's events since its cursor, and its next cursor."""
     lookback = dt.timedelta(hours=float(source.get("lookback_hours", 24)))
@@ -321,7 +337,11 @@ def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str 
         clock = {"now": now, "since": since}
         data = ws.mcp(source.get("service", name), source["tool"], fill(source.get("args", {}), None, clock))
         items = get_path(data, source.get("items", "items")) if source.get("items", "items") else data
-        events = [e for e in (to_event(name, item, source.get("map", {}), clock) for item in items or [] if isinstance(item, dict)) if e]
+        items = [item for item in items or [] if isinstance(item, dict)]
+        detail = source.get("detail")
+        if detail:
+            items = [with_detail(ws, source.get("service", name), detail, item, clock) if i < int(detail.get("max", 50)) else item for i, item in enumerate(items)]
+        events = [e for e in (to_event(name, item, source.get("map", {}), clock) for item in items) if e]
         return events, iso(now)
     if source["kind"] == "table":
         if not warehouse:
