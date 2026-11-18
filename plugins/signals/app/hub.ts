@@ -20,7 +20,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -346,7 +346,15 @@ export class Hub {
       if (!TASK_STATUSES.includes(input.status as TaskStatus)) return bad(`status must be one of ${TASK_STATUSES.join(", ")}`);
       task = (await this.store.setStatus(id, input.status as TaskStatus, user, note))!;
       // Moving it on from waiting by hand takes its question off.
-      if (task.question && input.status !== "waiting" && input.question === undefined) task = (await this.store.setQuestion(id, user))!;
+      if (task.question && input.status !== "waiting" && input.question === undefined) {
+        const asking = task.series && task.asked_by === SERIES_ASKER ? task.series : undefined;
+        task = (await this.store.setQuestion(id, user))!;
+        // A series' question taken off by hand decides nothing: its held events go on, and its next new one asks again.
+        if (asking) {
+          await this.store.answerSeries(asking, null, user);
+          for (const opened of await this.store.releaseHeld(asking, await this.config())) await this.post(opened);
+        }
+      }
     } else if (note && input.agents === undefined) await this.store.activity(id, user, "note", note);
     if (input.agents !== undefined) {
       const keys = Array.isArray(input.agents) ? [...new Set(input.agents.map((item) => agentKey(String(item))))] : [];
@@ -389,6 +397,7 @@ export class Hub {
    * recorded as their first was (see collect).
    */
   private async answer(task: Task, user: string, text: string): Promise<Task> {
+    if (task.series && task.asked_by === SERIES_ASKER) return this.answerSeries(task, user, text);
     const people = (await this.store.people([task.id])).get(task.id) ?? [];
     const asker = task.asked_by && HEX64.test(task.asked_by) ? [task.asked_by] : [];
     const agents = [...new Set([...asker, ...people.filter((person) => person.kind === "agent").map((person) => person.key)])];
@@ -397,6 +406,50 @@ export class Hub {
     const resumed = (await this.store.setStatus(task.id, "in_progress", user, "input given"))!;
     if (agents.length) await this.store.askAgain(task.id, agents);
     if (this.notifier && task.buzz_root) await this.notifier.updated(resumed, answerMessage(task, user, text, agents), agents).catch((error) => this.log(`couldn't post input on task ${task.id}: ${(error as Error).message}`));
+    return resumed;
+  }
+
+  /**
+   * Answers a new recurring series' question (see Rule.series). Always:
+   * the series' tasks open from now on, in the team's mode. Just this one:
+   * this task goes ahead, and the series' next event asks again. Never: this
+   * task is dismissed and the series opens no more. Unless it's never, the
+   * task takes the team's mode and its account's agents are asked to start
+   * (in auto and draft). The events held while it asked then go through the
+   * rules again. An answer that
+   * isn't one of the choices goes to the agents as input, and the series
+   * asks again.
+   */
+  private async answerSeries(task: Task, user: string, text: string): Promise<Task> {
+    const choice = seriesAnswer(text);
+    const series = task.series!;
+    const kept = await this.store.seriesFor(series);
+    await this.store.activity(task.id, user, "input", text);
+    await this.store.setQuestion(task.id, user);
+    await this.store.answerSeries(series, choice ?? null, user);
+    let resumed: Task;
+    if (choice === "never") {
+      resumed = (await this.store.setStatus(task.id, "dismissed", user, "never for this series"))!;
+      if (this.notifier && task.buzz_root) await this.notifier.updated(resumed, `${user} answered: **Never**. No tasks open for this series from now on.`).catch(() => {});
+    } else {
+      const mode = kept?.mode ?? "draft";
+      await this.store.setMode(task.id, mode);
+      resumed = (await this.store.setStatus(task.id, "open", user, choice === "always" ? "always for this series" : choice === "once" ? "just this one" : "input given"))!;
+      const account = resumed.account ? await this.store.account({ name: resumed.account }) : undefined;
+      const agents = account && account.channel === resumed.channel && (mode === "auto" || mode === "draft") ? account.agents : [];
+      const said = choice === "always" ? "**Always**. Tasks open for this series from now on." : choice === "once" ? "**Just this one**. The series' next event asks again." : `${text} (the series' next event asks again)`;
+      if (this.notifier && resumed.buzz_root) {
+        const labels = labelsOf(await this.config());
+        const event = await this.store.latestEvent(task.id);
+        const ask = agents.length ? `\n\n${askMessage(resumed, agents, user, choice ? undefined : text, account && briefing(account, labels), event && eventDetails(event, account?.domains ?? [], labels))}` : "";
+        await this.notifier.updated(resumed, `${user} answered: ${said}${ask}`, agents).catch((error) => this.log(`couldn't post the series answer on task ${task.id}: ${(error as Error).message}`));
+      }
+      if (agents.length) {
+        await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
+        await this.store.askAgain(task.id, agents);
+      }
+    }
+    for (const opened of await this.store.releaseHeld(series, await this.config())) await this.post(opened);
     return resumed;
   }
 
@@ -805,6 +858,7 @@ export function taskMessage(task: Task, detail?: { agents?: readonly string[]; b
     `📌 **Task ${task.id}: ${task.title}**`,
     [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
     MODE_TEXT[task.mode] ?? "",
+    task.question ? `⏸️ **Needs input:** ${task.question}${task.options?.length ? `\nOptions: ${task.options.join(" / ")}` : ""}\nAnswer from the Tasks board (Provide input on its card).` : "",
     detail?.source ? `\n${detail.source}\n` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
     ask,
