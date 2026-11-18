@@ -411,6 +411,17 @@ describe("account channels", () => {
     expect(text.match(/\(customer\)/g)).toHaveLength(1);
   });
 
+  it("opens prep only for meetings with a real customer, not a colleague's customer-domain address", () => {
+    const config: SignalsConfig = { version: 1, rules: [{ id: "prep", sources: ["google_calendar"], customer_attendees: "@globex\\.io$", action: "task" }] };
+    const meeting = (emails: string[]): EventInput => ({ source: "google_calendar", external_id: "c", payload: { attendees: emails.map((email) => ({ email })) } });
+    expect(ruleFor(config, meeting(["dane.isburgh@x.com", "disburgh@globex.io", "ann@globex.io"]))?.id).toBe("prep");
+    expect(ruleFor(config, meeting(["dane.isburgh@x.com", "disburgh@globex.io", "bob@x.com"]))).toBeUndefined();
+    expect(ruleFor(config, meeting(["bob@x.com"]))).toBeUndefined();
+    expect(ruleFor(config, { source: "google_calendar", external_id: "c" })).toBeUndefined();
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", customer_attendees: "(" }] })).toEqual(["rules[0].customer_attendees isn't a valid regular expression"]);
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", customer_attendees: 3 }] })).toHaveLength(1);
+  });
+
   it("matches a rule on a calendar event's attendees, so only meetings with the customer open prep", () => {
     const config: SignalsConfig = { version: 1, rules: [{ id: "prep", sources: ["google_calendar"], when: { "payload.attendees": "@globex\\.io" }, action: "task" }] };
     const meeting = (emails: string[]): EventInput => ({ source: "google_calendar", external_id: "c", payload: { attendees: emails.map((email) => ({ email, responseStatus: "accepted" })) } });

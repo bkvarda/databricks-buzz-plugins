@@ -15,6 +15,7 @@
 //   GET  /api/account?channel=|name=      one, with its preferences read
 //   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, delete?}
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
+import { type Attendee, attendeesOf, twinOf } from "./attendees";
 import { type AccountRecord, configProblems, type EventInput, DEFAULT_SOURCES, EMPTY_CONFIG, MAX_EVENTS_PER_POST, parsePreferences, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
@@ -419,21 +420,6 @@ export function briefing(account: AccountRecord): string {
     .join("\n");
 }
 
-type Attendee = Readonly<{ email?: string; name?: string; status?: string; organizer?: boolean }>;
-
-function attendeesOf(value: unknown): Attendee[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item): Attendee[] => {
-    if (typeof item === "string") return item.trim() ? [{ email: item.trim() }] : [];
-    if (!item || typeof item !== "object") return [];
-    const a = item as Record<string, unknown>;
-    const email = typeof a.email === "string" ? a.email : undefined;
-    const name = typeof a.displayName === "string" && a.displayName ? a.displayName : typeof a.name === "string" && a.name ? a.name : undefined;
-    if (!email && !name) return [];
-    return [{ ...(email && { email }), ...(name && { name }), ...(typeof a.responseStatus === "string" && { status: a.responseStatus }), ...(a.organizer === true && { organizer: true }) }];
-  });
-}
-
 /**
  * A time in the event's own zone, labeled with it: calendars give the time in
  * the reader's offset (`07:00-08:00`) and the zone it was set in
@@ -465,37 +451,9 @@ function timeText(value: unknown): string | undefined {
   return undefined;
 }
 
+
 const SHOWN = new Set(["start", "end", "attendees", "description", "location", "hangoutLink", "organizer"]);
 const MAX_ATTENDEES = 30;
-
-const letters = (text: string) => text.toLowerCase().normalize("NFKD").replace(/[^a-z]/g, "");
-
-/** Ways a person's address is commonly spelled, from their name (`dane.isburgh` → daneisburgh, disburgh, danei, isburghd, …). */
-function spellings(person: Attendee): Set<string> {
-  const names = [person.name ?? "", (person.email ?? "").split("@")[0]!.replace(/\+.*$/, "")]
-    .map((text) => text.split(/[\s._-]+/).map(letters).filter(Boolean))
-    .filter((parts) => parts.length >= 2);
-  const out = new Set<string>();
-  for (const parts of names) {
-    const first = parts[0]!;
-    const last = parts[parts.length - 1]!;
-    for (const spelled of [first + last, last + first, first[0] + last, first + last[0], last + first[0]]) if (spelled.length >= 5) out.add(spelled);
-  }
-  return out;
-}
-
-/** The other attendee (outside the customer's domains) the same person is, by name or how their address is spelled. */
-function twinOf(person: Attendee, others: readonly Attendee[]): string | undefined {
-  const local = letters((person.email ?? "").split("@")[0]!.replace(/\+.*$/, ""));
-  const name = person.name ? letters(person.name) : "";
-  const mine = spellings(person);
-  const found = others.find((other) => {
-    if (name && other.name && letters(other.name) === name) return true;
-    const theirs = spellings(other);
-    return (local.length >= 5 && theirs.has(local)) || [...mine].some((spelled) => theirs.has(spelled));
-  });
-  return found?.email;
-}
 
 /**
  * The source event as a task's post shows it: its link, when, who (people

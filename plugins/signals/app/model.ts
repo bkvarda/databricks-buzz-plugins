@@ -6,6 +6,8 @@
 // when an event's content changed, and runs the rules to decide whether it
 // opens a task, updates one, or is only recorded.
 
+import { realCustomers } from "./attendees";
+
 /** What a source sends. `external_id` is the source's own key for the thing (a message id, a ticket key, a table row's key). */
 export type EventInput = Readonly<{
   source: string;
@@ -93,6 +95,14 @@ export type Rule = Readonly<{
   when?: Readonly<Record<string, Condition>>;
   /** Field → condition that must not hold. */
   unless?: Readonly<Record<string, Condition>>;
+  /**
+   * A pattern for the customer's email addresses (`@(globex\\.io|globex\\.com)$`).
+   * The rule applies only when `payload.attendees` has someone it matches who
+   * isn't the same person as an attendee it doesn't match (see attendees.ts),
+   * so a meeting of your own team that invites their customer-domain
+   * addresses doesn't count.
+   */
+  customer_attendees?: string;
   /** task: open (or update) a task. update: only update a task that exists for the group. ignore: record the event, no task. */
   action: "task" | "update" | "ignore";
   /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
@@ -193,6 +203,15 @@ export function configProblems(raw: unknown): string[] {
           } else if (!Array.isArray(condition)) problems.push(`${where}.${key}.${field} is a pattern or a list of values`);
         }
     }
+    if (rule.customer_attendees !== undefined) {
+      if (typeof rule.customer_attendees !== "string" || !rule.customer_attendees) problems.push(`${where}.customer_attendees is a pattern for the customer's email addresses`);
+      else
+        try {
+          new RegExp(rule.customer_attendees, "i");
+        } catch {
+          problems.push(`${where}.customer_attendees isn't a valid regular expression`);
+        }
+    }
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
   }
@@ -233,7 +252,19 @@ const sourceMatches = (patterns: readonly string[] | undefined, source: string) 
 
 /** The first rule that applies to an event, in config order. */
 export function ruleFor(config: SignalsConfig, event: EventInput): Rule | undefined {
-  return config.rules.find((rule) => sourceMatches(rule.sources, event.source) && matches(rule.when, event) && !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)));
+  return config.rules.find(
+    (rule) =>
+      sourceMatches(rule.sources, event.source) &&
+      matches(rule.when, event) &&
+      !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)) &&
+      (!rule.customer_attendees || hasCustomer(rule.customer_attendees, event)),
+  );
+}
+
+function hasCustomer(pattern: string, event: EventInput): boolean {
+  let regex = regexes.get(pattern);
+  if (!regex) regexes.set(pattern, (regex = new RegExp(pattern, "i")));
+  return realCustomers(field(event, "payload.attendees"), (email) => regex.test(email)).length > 0;
 }
 
 /** True when any one of the conditions holds (so `unless` excludes on any match). */
