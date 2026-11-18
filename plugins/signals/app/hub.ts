@@ -223,6 +223,11 @@ export class Hub {
     if (!this.notifier) return;
     for (const task of result.created) await this.post(task);
     const seen = new Set<number>();
+    for (const { task, reason } of result.finished) {
+      if (!task.buzz_root || seen.has(task.id)) continue;
+      seen.add(task.id);
+      await this.notifier.updated(task, doneMessage(reason)).catch((error: Error) => this.log(`couldn't post that task ${task.id} is done: ${error.message}`));
+    }
     for (const update of result.updated) {
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
       seen.add(update.task.id);
@@ -547,7 +552,6 @@ export class Hub {
     return { handled, failed };
   }
 
-  /** Posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
   /**
    * Records the first reply each asked-for agent posts in a task's thread:
    * as activity, as the task's artifact, and by moving an open task to
@@ -613,9 +617,18 @@ export class Hub {
     return { recorded };
   }
 
-  async sweep(at?: number): Promise<{ posted: number; nudged: number }> {
+  /** Finishes tasks by their rules' done_when, posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
+  async sweep(at?: number): Promise<{ posted: number; nudged: number; finished: number }> {
     let posted = 0;
     let nudged = 0;
+    let finished = 0;
+    // Finished tasks first, so they aren't posted or nudged.
+    for (const { task, reason } of await this.store.finishable(await this.config(), at)) {
+      const done = await this.store.finish(task.id, reason);
+      if (!done) continue;
+      finished++;
+      if (this.notifier && done.buzz_root) await this.notifier.updated(done, doneMessage(reason)).catch(() => {});
+    }
     if (this.notifier) {
       for (const task of await this.store.unposted()) {
         await this.post(task);
@@ -627,9 +640,12 @@ export class Hub {
       await this.store.nudged(task.id, text, at);
       nudged++;
     }
-    return { posted, nudged };
+    return { posted, nudged, finished };
   }
 }
+
+/** What a task's thread is told when its rule finishes it. */
+export const doneMessage = (reason: string) => `✅ Done: ${reason}. (Set its status on the Tasks board if it isn't.)`;
 
 /** A task as its Buzz message shows it. */
 /** An account as the API gives it: with its preferences read, so the UI and agents see what took. */

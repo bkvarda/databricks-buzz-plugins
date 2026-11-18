@@ -107,7 +107,7 @@ setInterval(() => {
   void hub
     .sweep()
     .then(async (result) => {
-      state.lastSweep = `${new Date().toISOString()}: posted ${result.posted}, nudged ${result.nudged}`;
+      state.lastSweep = `${new Date().toISOString()}: posted ${result.posted}, nudged ${result.nudged}, finished ${result.finished}`;
       state.stats = await store.stats();
     })
     .catch((error: Error) => (state.lastSweep = `failed: ${error.message}`));

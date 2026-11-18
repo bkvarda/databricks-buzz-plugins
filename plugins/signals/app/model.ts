@@ -131,6 +131,31 @@ export type Rule = Readonly<{
   stale_after_hours?: number;
   /** What the nudge says; `{field}` takes an event field. */
   nudge?: string;
+  /** When its tasks are finished, so the hub marks them done itself (see DoneWhen). */
+  done_when?: DoneWhen;
+}>;
+
+/**
+ * When a rule's tasks are finished. Any one that holds marks an open task
+ * done, with a line in its thread:
+ *
+ * - `when`: the task's latest event matches these conditions (a ticket's
+ *   `payload.status_category: ["Done"]`). Checked as each event comes in, even
+ *   an event the rule no longer matches (a rule that skips resolved tickets).
+ * - `after`: an event field holding a time (ISO 8601, Unix seconds, or a
+ *   calendar `{dateTime}` / `{date}`), like a meeting's `payload.end`; done
+ *   once it has passed by `grace_hours` (default 0). Checked by the sweep.
+ * - `idle_days`: nothing new on the task (no event, no activity) for this many days. Checked by the sweep.
+ *
+ * Tasks still asking the team about a recurring series are left open.
+ */
+export type DoneWhen = Readonly<{
+  when?: Readonly<Record<string, Condition>>;
+  after?: string;
+  grace_hours?: number;
+  idle_days?: number;
+  /** What the thread is told; `{field}` takes an event field. A default says why. */
+  note?: string;
 }>;
 
 export type AccountRule = Readonly<{
@@ -177,6 +202,8 @@ export type SignalsConfig = Readonly<{
   default_channel?: string;
   /** What this deployment calls things (see Labels); generic words when omitted. */
   labels?: Labels;
+  /** Any rule's open tasks are done after this many days with nothing new, unless its done_when says idle_days. Off when omitted. */
+  done_idle_days?: number;
 }>;
 
 /**
@@ -253,6 +280,7 @@ export function configProblems(raw: unknown): string[] {
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
+    if (rule.done_when !== undefined) problems.push(...doneWhenProblems(rule.done_when, `${where}.done_when`));
   }
   if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
     problems.push("sources is a list of {name, label}");
@@ -275,10 +303,89 @@ export function configProblems(raw: unknown): string[] {
   for (const [n, rule] of (config.rules as Record<string, unknown>[]).entries())
     if (rule && typeof rule === "object" && rule.party !== undefined && (typeof rule.party !== "string" || !(rule.party in parties)))
       problems.push(`rules[${n}].party must be one of ${Object.keys(parties).join(", ")} (or a key you add in labels.parties)`);
+  if (config.done_idle_days !== undefined && !(typeof config.done_idle_days === "number" && config.done_idle_days > 0)) problems.push("done_idle_days must be a positive number");
   if (config.accounts !== undefined && !Array.isArray(config.accounts)) problems.push("accounts must be a list");
   for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries())
     if (!account || typeof account.name !== "string" || !account.name) problems.push(`accounts[${n}].name is required`);
   return problems;
+}
+
+function doneWhenProblems(raw: unknown, where: string): string[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [`${where} is an object with when, after or idle_days`];
+  const done = raw as Record<string, unknown>;
+  const problems: string[] = [];
+  if (done.when === undefined && done.after === undefined && done.idle_days === undefined) problems.push(`${where} needs when, after or idle_days`);
+  if (done.when !== undefined) {
+    if (!done.when || typeof done.when !== "object" || Array.isArray(done.when)) problems.push(`${where}.when is an object`);
+    else
+      for (const [path, condition] of Object.entries(done.when)) {
+        if (typeof condition === "string") {
+          try {
+            new RegExp(condition, "i");
+          } catch {
+            problems.push(`${where}.when.${path} isn't a valid regular expression`);
+          }
+        } else if (!Array.isArray(condition)) problems.push(`${where}.when.${path} is a pattern or a list of values`);
+      }
+  }
+  if (done.after !== undefined && (typeof done.after !== "string" || !done.after)) problems.push(`${where}.after is an event field holding a time, like payload.end`);
+  for (const key of ["grace_hours", "idle_days"] as const)
+    if (done[key] !== undefined && !(typeof done[key] === "number" && (done[key] as number) >= 0 && (key === "grace_hours" || (done[key] as number) > 0))) problems.push(`${where}.${key} must be a ${key === "idle_days" ? "positive" : "non-negative"} number`);
+  if (done.note !== undefined && (typeof done.note !== "string" || !done.note.trim())) problems.push(`${where}.note is text`);
+  return problems;
+}
+
+/**
+ * A time in an event field, in Unix seconds: ISO 8601, Unix seconds or
+ * milliseconds, or a calendar time object (`{dateTime}`, or `{date}` for an
+ * all-day event). Undefined when there's none.
+ */
+export function timeOf(value: unknown): number | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const object = value as { dateTime?: unknown; date?: unknown };
+    return timeOf(object.dateTime ?? object.date);
+  }
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  if (typeof value === "string" && !value.trim()) return undefined;
+  const seconds = toSeconds(value);
+  return Number.isNaN(seconds) ? undefined : seconds;
+}
+
+/**
+ * Why a task is finished, by its rule's `done_when` and its latest event, or
+ * undefined. `sweep` also checks the times (`after`, `idle_days`); without it
+ * only `when` is checked, as an event comes in. `lastActive` is when anything
+ * last happened on the task (Unix seconds).
+ */
+export function doneReason(done: DoneWhen | undefined, event: EventInput | undefined, options: Readonly<{ at: number; sweep: boolean; lastActive?: number }>): string | undefined {
+  if (!done) return undefined;
+  const say = (fallback: string) => (done.note && event ? fill(done.note, event) : fallback);
+  if (done.when && Object.keys(done.when).length && event && matches(done.when, event)) return say("its latest update says it's finished");
+  if (!options.sweep) return undefined;
+  if (done.after && event) {
+    const time = timeOf(field(event, done.after));
+    if (time !== undefined && time + (done.grace_hours ?? 0) * 3600 <= options.at) return say(`it ended ${new Date(time * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC`);
+  }
+  if (done.idle_days && options.lastActive !== undefined && options.lastActive + done.idle_days * 86400 <= options.at) return say(`nothing new in ${done.idle_days} days`);
+  return undefined;
+}
+
+/**
+ * The tasks an event finishes: for each rule with `done_when.when` that the
+ * event matches (and whose sources it's from), that rule's group for it. The
+ * rule itself needn't match the event, so a rule that skips resolved tickets
+ * still hears that its ticket was resolved.
+ */
+export function finishes(config: SignalsConfig, event: EventInput): { rule: Rule; group: string }[] {
+  return config.rules.flatMap((rule) =>
+    rule.action === "task" && rule.done_when?.when && Object.keys(rule.done_when.when).length && sourceMatches(rule.sources, event.source) && matches(rule.done_when.when, event) ? [{ rule, group: groupKey(rule, event) }] : [],
+  );
+}
+
+/** A rule's done_when with the config's done_idle_days filled in. */
+export function doneWhenOf(config: SignalsConfig, rule: Rule): DoneWhen | undefined {
+  if (!config.done_idle_days || rule.done_when?.idle_days) return rule.done_when;
+  return { ...rule.done_when, idle_days: config.done_idle_days };
 }
 
 /** An event field: `title`, `payload.status`, `payload.case.owner`. */
