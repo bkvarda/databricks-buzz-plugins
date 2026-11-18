@@ -407,4 +407,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Only exit on failure: a Databricks job counts any SystemExit, even 0, as a failed task.
+    code = main()
+    if code:
+        sys.exit(code)
