@@ -175,7 +175,7 @@ export type SignalsConfig = Readonly<{
 /**
  * What a deployment calls things, so each organization uses its own words:
  * `customer` for the people at an account (say "client"), and `parties` for
- * who a task from outside sits with on the tasks board, by key (a rule's
+ * who a task from outside sits with on the tasks board, by id (a rule's
  * `party`), like `{ "support": "Support" }`.
  */
 export type Labels = Readonly<{ customer?: string; parties?: Readonly<Record<string, string>> }>;
@@ -194,16 +194,9 @@ export function labelsOf(config: SignalsConfig | undefined): ResolvedLabels {
 /** "customer" → "Customer". */
 export const capitalized = (word: string) => word.charAt(0).toUpperCase() + word.slice(1);
 
-/**
- * The party a task from this event sits with: the rule's `party`, else the
- * source says (a Jira or ticket source is engineering's, a support or case
- * source is support's), else none.
- */
-export function partyFor(rule: Pick<Rule, "party"> | undefined, source: string): string | undefined {
-  if (rule?.party) return rule.party;
-  if (/(^|[._])(jira|tickets?|issues?)([._]|$)/i.test(source)) return "engineering";
-  if (/(^|[._])(support|cases?)([._]|$)/i.test(source)) return "support";
-  return undefined;
+/** The party a task from this rule sits with: the rule's `party`, or none. Parties are never guessed from the source. */
+export function partyFor(rule: Pick<Rule, "party"> | undefined): string | undefined {
+  return rule?.party || undefined;
 }
 
 export const EMPTY_CONFIG: SignalsConfig = { version: 1, first_run_seen: true, rules: [] };

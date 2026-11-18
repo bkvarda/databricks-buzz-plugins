@@ -649,8 +649,7 @@ function mailbox(value: string): { email?: string; name?: string } {
 /**
  * Who's on a task: agents asked to work on it (and whether they replied),
  * people who changed it, and who its source says: the party it sits with
- * (the rule's `party`, or engineering for a ticket and support for a case,
- * named as `labels.parties` says) and its owner or assignee, and the
+ * (the rule's `party`, named as `labels.parties` says) and its owner or assignee, and the
  * customer's people who wrote or are in the meeting (at the account's domains).
  */
 export function whoIsOn(people: readonly TaskPerson[], actors: readonly string[], event: EventInput | undefined, domains: readonly string[], labels: ResolvedLabels = labelsOf(undefined), rule?: Pick<Rule, "party">): BoardPerson[] {
@@ -674,7 +673,7 @@ export function whoIsOn(people: readonly TaskPerson[], actors: readonly string[]
   const customer = (email?: string) => Boolean(email && lower.some((domain) => email.endsWith(`@${domain}`) || email.endsWith(`.${domain}`)));
   const payload = event.payload ?? {};
   const source = event.source.toLowerCase();
-  const party = partyFor(rule, event.source);
+  const party = partyFor(rule);
   if (party) {
     add({ kind: "team", key: party, label: labels.parties[party] ?? capitalized(party), role: event.source });
     const owner = text(payload.owner) ?? text(payload.assignee);
