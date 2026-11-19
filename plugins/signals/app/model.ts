@@ -847,13 +847,18 @@ export function playbookFor(playbooks: Readonly<Record<string, string>> | undefi
  * account's agents.
  */
 export function agentsFor(account: Pick<AccountRecord, "agents" | "workstream_agents">, task: Readonly<{ rule_id?: string; workstream?: string | null }>): readonly string[] {
+  return agentListFor(account, task).agents;
+}
+
+/** Which of an account's agent lists a task goes to: a workstream's (or rule id's) by its key, or the account's (no key). */
+export function agentListFor(account: Pick<AccountRecord, "agents" | "workstream_agents">, task: Readonly<{ rule_id?: string; workstream?: string | null }>): { key?: string; agents: readonly string[] } {
   const entries = Object.entries(account.workstream_agents ?? {}).filter(([, keys]) => keys.length);
   for (const wanted of [task.rule_id, task.workstream ?? undefined]) {
     const lower = wanted?.trim().toLowerCase();
     const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
-    if (found) return found[1];
+    if (found) return { key: found[0], agents: found[1] };
   }
-  return account.agents;
+  return { agents: account.agents };
 }
 
 /** The workstreams a config's rules file tasks under, in rule order. */

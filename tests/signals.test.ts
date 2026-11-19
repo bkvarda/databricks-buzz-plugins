@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_PATHS, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -516,6 +516,29 @@ describe("account channels", () => {
     updates.length = 0;
     await call("/api/account", { name: "Globex", workstream_agents: { "Meeting Prep": [prep], questions: [tickets] } });
     expect(updates).toEqual([{ task: opened[1]!.task, mentions: [tickets] }]);
+
+    // Clearing a workstream's agents before they reply doesn't ask the account's too: the agents already asked keep it.
+    const texts: string[] = [];
+    const listen = new Hub(store, { opened: async (task) => "e".repeat(63) + task.id, updated: async (task, text, mentions = []) => void (texts.push(text), updates.push({ task: task.id, mentions })) }, { defaultConfig: { version: 1, rules } });
+    const save = (body: unknown) => listen.handle({ method: "POST", path: "/api/account", query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    updates.length = 0;
+    await save({ name: "Globex", workstream_agents: { "Meeting Prep": [prep] } });
+    expect(updates).toEqual([]);
+    // A task opened while the workstream had its own agents, once nobody's on it (Tickets taken off): clearing them hands it to the account's agents, saying why.
+    // Naming Tickets again asks nobody: Tickets is already on the older task.
+    await save({ name: "Globex", workstream_agents: { "Meeting Prep": [prep], questions: [tickets] } });
+    expect(updates).toEqual([]);
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "ann@globex.io", title: "Renewal?" }] });
+    const fresh = opened.at(-1)!;
+    expect(fresh.agents).toEqual([tickets]);
+    await call("/api/task", { id: fresh.task, unassign: [tickets] });
+    updates.length = 0;
+    await save({ name: "Globex", workstream_agents: { "Meeting Prep": [prep] } });
+    // The older task still has the account's agent it was opened with, so it isn't asked again.
+    expect(updates).toEqual([{ task: fresh.task, mentions: [general] }]);
+    expect(texts.at(-1)).toContain("no longer has its own agents");
+    expect(handOffReason("questions")).toBe("you've been named this account's agents for questions");
+    await call("/api/account", { name: "Globex", workstream_agents: { "Meeting Prep": [prep], questions: [tickets] } });
 
     expect((await call("/api/account", { name: "Globex", workstream_agents: { questions: ["nope"] } })).status).toBe(400);
     expect((await call("/api/account", { name: "Globex", workstream_agents: ["x"] })).status).toBe(400);
