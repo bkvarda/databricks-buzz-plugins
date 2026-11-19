@@ -23,7 +23,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -443,6 +443,9 @@ export class Hub {
       const was = new Set(agentsFor(before, task));
       return agentsFor(account, task).filter((key) => !was.has(key));
     };
+    // A workstream whose own agents were cleared falls back to the account's. That hands over only tasks no agent is on yet:
+    // the agents already asked, and not taken off, keep them.
+    const fellBack = (task: Task) => agentListFor(before, task).key !== undefined && agentListFor(account, task).key === undefined;
     const lower = account.name.toLowerCase();
     const tasks = (await this.store.untouched(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
     const woken: number[] = [];
@@ -451,11 +454,15 @@ export class Hub {
     const [gone, people] = await Promise.all([this.store.removed(ids), this.store.people(ids)]);
     for (const task of tasks) {
       // Not agents someone took off it, and not tasks someone gave owners: a person chose who has those.
-      const asked = addedFor(task).filter((key) => !gone.get(task.id)?.has(key));
-      if (!asked.length || (people.get(task.id) ?? []).some((person) => person.assigned_at)) continue;
+      const on = people.get(task.id) ?? [];
+      // Not agents already on it, either: they were asked before.
+      const asked = addedFor(task).filter((key) => !gone.get(task.id)?.has(key) && !on.some((person) => person.kind === "agent" && person.key === key));
+      if (!asked.length || on.some((person) => person.assigned_at)) continue;
+      if (fellBack(task) && on.some((person) => person.kind === "agent")) continue;
       try {
         const event = await this.store.latestEvent(task.id);
-        await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels)), asked);
+        const why = handOffReason(agentListFor(account, task).key, fellBack(task));
+        await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels), why), asked);
         await this.store.addPeople(task.id, asked.map((key) => ({ kind: "agent", key })));
         await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
@@ -826,10 +833,17 @@ const AGENT_RECORD = "Your first reply in this thread is recorded on the task. I
 const HAND_OFF_DAYS = 14;
 const HAND_OFF_MAX = 20;
 
+/** Why agents are handed a task: the list it goes to (a workstream's key, or the account's), and whether its workstream's own agents were just cleared. */
+export function handOffReason(workstream?: string, fellBack = false): string {
+  if (workstream) return `you've been named this account's agents for ${workstream}`;
+  if (fellBack) return "this task's workstream no longer has its own agents, so it goes to this account's agents";
+  return "you've been added to this account's agents";
+}
+
 /** The reply that asks agents just added to an account to work on a task that's already posted. */
-export function handOffMessage(task: Task, agents: readonly string[], account?: string, source?: string): string {
+export function handOffMessage(task: Task, agents: readonly string[], account?: string, source?: string, why = handOffReason()): string {
   return [
-    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you've been added to this account's agents, and no agent has worked on this task yet: ${AGENT_ASK[task.mode as "auto" | "draft"]} The task is in this thread's first message${source ? " and its source is below" : ""}. ${AGENT_RECORD}`,
+    `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} ${why}, and no agent has worked on this task yet: ${AGENT_ASK[task.mode as "auto" | "draft"]} The task is in this thread's first message${source ? " and its source is below" : ""}. ${AGENT_RECORD}`,
     // Tasks posted before posts carried their source don't have it in the first message.
     source ? `\n${source}` : "",
     account ? `\n${account}` : "",
