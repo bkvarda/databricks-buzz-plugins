@@ -46,22 +46,56 @@ function useProfiles(ctx: Context, keys: readonly string[]) {
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => (profiles ? profiles.subscribe(bump) : undefined), [profiles]);
   const wanted = keys.join(",");
-  React.useEffect(() => void profiles?.ensure(keys).catch(() => {}), [profiles, wanted]);
+  React.useEffect(() => {
+    if (!profiles || !keys.length) return;
+    // One ensure may ask for at most limit() profiles; a channel's roster can be more.
+    const limit = Math.max(1, (profiles as { limit?(): number }).limit?.() ?? 200);
+    for (let start = 0; start < keys.length; start += limit) {
+      try {
+        void profiles.ensure(keys.slice(start, start + limit)).catch(() => {});
+      } catch {
+        // Names are optional: the board shows short keys without them.
+      }
+    }
+  }, [profiles, wanted]);
   return (key: string): Profile | undefined => {
-    const found = profiles?.snapshot().get(key);
+    let found: { name?: string; picture?: string; isAgent?: true } | undefined;
+    try {
+      found = profiles?.snapshot().get(key);
+    } catch {
+      return undefined;
+    }
     if (!found) return undefined;
-    const picture = found.picture && session?.media ? (session.media(found.picture, "small") ?? found.picture) : found.picture;
+    let picture = found.picture;
+    try {
+      if (picture && session?.media) picture = session.media(picture, "small") ?? picture;
+    } catch {
+      // The original URL then.
+    }
     return { ...(found.name && { name: found.name }), ...(picture && { picture }), ...(found.isAgent && { agent: true }) };
   };
 }
+
+const NO_MEMBERS: readonly string[] = [];
 
 /** A channel's members, from its relay-signed roster (empty until the host has read it). */
 function useMembers(ctx: Context, channel: string | undefined): readonly string[] {
   const channels = optionalService<RelayView>(ctx, "relay")?.snapshot().session?.channels;
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => (channels?.subscribeList ? channels.subscribeList(bump) : undefined), [channels]);
-  React.useEffect(() => void (channel && channels?.resolve?.([channel]).then(bump, () => {})), [channels, channel]);
-  return (channel && channels?.get?.(channel)?.members) || [];
+  React.useEffect(() => {
+    if (!channel || !channels?.resolve) return;
+    try {
+      void channels.resolve([channel]).then(bump, () => {});
+    } catch {
+      // No roster then: the picker offers the board's agents.
+    }
+  }, [channels, channel]);
+  try {
+    return (channel && channels?.get?.(channel)?.members) || NO_MEMBERS;
+  } catch {
+    return NO_MEMBERS;
+  }
 }
 
 /** An npub's hex key, or undefined when it isn't one. */
@@ -71,6 +105,15 @@ const npubKey = (npub: string): string | undefined => {
     return found.type === "npub" ? found.data : undefined;
   } catch {
     return undefined;
+  }
+};
+
+/** A hex key's npub, or the key itself when it isn't one. */
+const npubOf = (key: string): string => {
+  try {
+    return npubEncode(key);
+  } catch {
+    return key;
   }
 };
 
@@ -161,7 +204,7 @@ function AddAgent(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
  * change in the thread: an agent assigned is asked to work on it, an agent
  * taken off is told to stop.
  */
-function Owners(props: { hub: HubClient; item: BoardTask; members: readonly string[]; boardAgents: readonly string[]; viewer?: string; profile(key: string): Profile | undefined; onChange(): void }) {
+function Owners(props: { hub: HubClient; item: BoardTask; members: readonly string[]; boardAgents: readonly string[]; viewer?: string; profile(key: string): Profile | undefined; onChange(): void; compact?: boolean }) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -201,7 +244,7 @@ function Owners(props: { hub: HubClient; item: BoardTask; members: readonly stri
   return (
     <Stack gap={6}>
       <Text size="xs" tone="tertiary" weight={600}>OWNERS</Text>
-      {item.task.question && !closed && <Stack direction="row" gap={8} align="center"><AssigneeMark assignee={{ kind: "you" }} profile={props.profile} /><Text size="sm">Waiting on your input</Text></Stack>}
+      {item.task.question && !closed && !props.compact && <Stack direction="row" gap={8} align="center"><AssigneeMark assignee={{ kind: "you" }} profile={props.profile} /><Text size="sm">Waiting on your input</Text></Stack>}
       {owners.length ? owners.map((person) => row(person, true)) : <Text size="xs" tone="subtle">No one{helpers.length ? "; agents asked are below" : ""}.</Text>}
       {helpers.length > 0 && helpers.map((person) => row(person, false))}
       {!closed && !picked && (
@@ -277,7 +320,10 @@ export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone():
 }
 
 /** What an opened task shows: what it asks, its latest activity, its assets, and what you can do with it. */
-function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void; open?(item: BoardTask): void; full?: boolean }) {
+/** What the owner pickers need: the channel's members, the board's agents, who's viewing, and their names. */
+type Assigning = Readonly<{ members: readonly string[]; boardAgents: readonly string[]; viewer?: string; profile(key: string): Profile | undefined }>;
+
+function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void; open?(item: BoardTask): void; full?: boolean; assigning?: Assigning }) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -299,6 +345,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
   return (
     <Stack gap={8} style={{ paddingTop: 8 }}>
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
+      {!props.full && props.assigning && <Owners hub={props.hub} item={item} {...props.assigning} onChange={props.onChange} compact />}
       {!props.full && item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
       {!props.full && item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}…` : item.activity.text} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
       {!props.full && assets.length > 0 && (
@@ -324,7 +371,28 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
   );
 }
 
-type TaskProps = { hub: HubClient; item: BoardTask; open: boolean; toggle(): void; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; view(item: BoardTask): void };
+type TaskProps = { hub: HubClient; item: BoardTask; open: boolean; toggle(): void; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; view(item: BoardTask): void; assigning: Assigning };
+
+/**
+ * The assignee's mark as a button: it opens the task in place, where its
+ * owners are at the top with the picker, so assigning or reassigning takes
+ * two clicks from the board.
+ */
+function AssignButton(props: { assignee: Assignee; profile(key: string): Profile | undefined; size?: number; open: boolean; toggle(): void }) {
+  const name = assigneeName(props.assignee, props.profile);
+  return (
+    <button
+      type="button"
+      title={props.open ? `${name}: owners are below` : `${name}: click to assign or reassign`}
+      aria-label={`Assign (now ${name})`}
+      onClick={(event) => (event.stopPropagation(), props.open || props.toggle())}
+      onKeyDown={(event) => event.stopPropagation()}
+      style={{ border: 0, padding: 0, background: "transparent", cursor: "pointer", display: "inline-flex", flex: "none", borderRadius: 999 }}
+    >
+      <AssigneeMark assignee={props.assignee} profile={props.profile} {...(props.size && { size: props.size })} />
+    </button>
+  );
+}
 
 /** The labels a task shows beside its title: workstream, initiative, mode, source and the links made for it. */
 function Meta(props: { item: BoardTask }) {
@@ -358,9 +426,9 @@ function TaskRow(props: TaskProps) {
         <Text size="sm" weight={500} style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.task.title}</Text>
         <span style={{ display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" }}><Meta item={item} /></span>
         <Text size="xs" tone="tertiary" style={{ flex: "none", width: 52, textAlign: "right" }}>{ago(item.task.last_event_at * 1000)}</Text>
-        <AssigneeMark assignee={assignee} profile={props.profile} />
+        <AssignButton assignee={assignee} profile={props.profile} open={props.open} toggle={props.toggle} />
       </div>
-      {props.open && <div style={{ padding: "0 12px 10px 54px" }}><TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} /></div>}
+      {props.open && <div style={{ padding: "0 12px 10px 54px" }}><TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} assigning={props.assigning} /></div>}
     </div>
   );
 }
@@ -377,7 +445,7 @@ function TaskCard(props: TaskProps) {
             <Text size="xs" tone="tertiary" mono>#{item.task.id}</Text>
             <Stack direction="row" gap={6} align="center">
               <Text size="xs" tone="tertiary">{ago(item.task.last_event_at * 1000)}</Text>
-              <AssigneeMark assignee={assignee} profile={props.profile} size={18} />
+              <AssignButton assignee={assignee} profile={props.profile} size={18} open={props.open} toggle={props.toggle} />
             </Stack>
           </Stack>
           <Stack direction="row" gap={6} align="flex-start">
@@ -387,7 +455,7 @@ function TaskCard(props: TaskProps) {
           <Stack direction="row" gap={6} wrap align="center"><Meta item={item} /></Stack>
         </Stack>
       </div>
-      {props.open && <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} />}
+      {props.open && <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} assigning={props.assigning} />}
     </div>
   );
 }
@@ -410,7 +478,13 @@ function useThread(ctx: Context, channel: string | undefined, root: string | nul
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     if (!channel || !root || !session?.thread) return setReader(undefined);
-    const opened = session.thread(channel, root, { priority: "foreground" });
+    let opened: ThreadReader;
+    try {
+      opened = session.thread(channel, root, { priority: "foreground" });
+    } catch {
+      // The host can't read it now; the view offers to open it in Buzz.
+      return setReader(undefined);
+    }
     let refreshed = false;
     const settle = () => {
       const now = opened.snapshot();
@@ -446,7 +520,7 @@ function useThread(ctx: Context, channel: string | undefined, root: string | nul
 function CommentItem(props: { comment: Comment; profile(key: string): Profile | undefined }) {
   const { comment } = props;
   const who = props.profile(comment.author);
-  const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}…`;
+  const name = who?.name ?? `${npubOf(comment.author).slice(0, 12)}…`;
   const mark = who?.picture ? <img src={who.picture} alt={name} style={{ width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" }} /> : <span style={{ width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" }}>{initials(name)}</span>;
   const raw = comment.text.length > 6000 ? `${comment.text.slice(0, 5999)}…` : comment.text;
   const text = withMentionNames(raw, npubKey, (key) => props.profile(key)?.name);
@@ -741,6 +815,37 @@ function Columns(props: { children: React.ReactNode }) {
 
 const COLUMN_WIDTH = 260;
 
+type BoundaryProps = { children: React.ReactNode; reset: unknown; retry(): void };
+let BoardBoundary: React.ComponentType<BoundaryProps> | undefined;
+/**
+ * Keeps a failure in the board from taking down the tab: it shows what went
+ * wrong, with a button to try again, instead of the host's crash card. Made
+ * on first use, since React is the host's and is bound when the plugin starts.
+ */
+function boundary(): React.ComponentType<BoundaryProps> {
+  BoardBoundary ??= class extends React.Component<BoundaryProps, { error?: Error; reset?: unknown }> {
+    override state: { error?: Error; reset?: unknown } = {};
+    static getDerivedStateFromError(error: unknown) {
+      return { error: error instanceof Error ? error : new Error(String(error)) };
+    }
+    static getDerivedStateFromProps(props: BoundaryProps, state: { error?: Error; reset?: unknown }) {
+      return props.reset === state.reset ? null : { error: undefined, reset: props.reset };
+    }
+    override componentDidCatch(error: unknown, info: { componentStack?: string | null }) {
+      console.error("Signals board failed", error, info.componentStack);
+    }
+    override render() {
+      if (!this.state.error) return this.props.children;
+      return (
+        <Notice tone="danger" title="The board hit an error" action={<Button size="sm" onClick={() => (this.setState({ error: undefined }), this.props.retry())}>Try again</Button>}>
+          <Text size="xs" mono as="div" style={{ overflowWrap: "anywhere" }}>{this.state.error.message || String(this.state.error)}</Text>
+        </Notice>
+      );
+    }
+  };
+  return BoardBoundary;
+}
+
 /** A channel's board: shared by the channel tab and the full-window page. */
 function Board(props: {
   ctx: Context;
@@ -763,7 +868,11 @@ function Board(props: {
   // The classifier's held-back events, for the Filtered view (an older hub without /api/filtered gives none).
   const filtered = useAsync(async (signal) => (hub && channel ? hub.filtered(channel.id, signal).catch((error: Error) => (/No route/.test(error.message) ? [] : Promise.reject(error))) : undefined), [hub, channel?.id, version]);
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
-  const profile = useProfiles(ctx, agents);
+  // The channel's members, for the owner pickers on the board (the task view reads its own).
+  const members = useMembers(ctx, channel?.id);
+  const profile = useProfiles(ctx, [...new Set([...agents, ...members])]);
+  const viewer = optionalService<RelayView>(ctx, "relay")?.snapshot().viewer;
+  const assigning: Assigning = { members, boardAgents: agents, ...(viewer && { viewer }), profile };
   const [view, setView] = React.useState<BoardView>(savedView);
   const chooseView = (next: BoardView) => {
     setView(next);
@@ -786,6 +895,7 @@ function Board(props: {
     void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channel.id, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
   };
 
+  const Boundary = boundary();
   let body: React.ReactNode;
   if (connection.status !== "connected") body = <Notice title="Connect Databricks" action={<Button variant="brand" onClick={() => service.openSettings()}>Connect</Button>}>Tasks live in your team's signals hub, a Databricks App.</Notice>;
   else if (!channel) body = props.noChannel ?? <Notice>Open this from a channel's menu.</Notice>;
@@ -800,7 +910,7 @@ function Board(props: {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
-    const task = (item: BoardTask, Item: typeof TaskRow) => <Item key={item.task.id} hub={hub} item={item} open={opened === item.task.id} toggle={() => setOpened(opened === item.task.id ? undefined : item.task.id)} profile={profile} steer={steer} onChange={refresh} view={(found) => setViewing(found.task.id)} />;
+    const task = (item: BoardTask, Item: typeof TaskRow) => <Item key={item.task.id} hub={hub} item={item} open={opened === item.task.id} toggle={() => setOpened(opened === item.task.id ? undefined : item.task.id)} profile={profile} steer={steer} onChange={refresh} view={(found) => setViewing(found.task.id)} assigning={assigning} />;
     const header = (group: (typeof STATUS_GROUPS)[number]) => (
       <Stack direction="row" gap={8} align="center">
         <StatusIcon status={group.status} />
@@ -857,7 +967,7 @@ function Board(props: {
               {hub && channel && <Button size="sm" disabled={board.loading} onClick={refresh}>{board.loading ? <Spinner size={10} /> : null}Refresh</Button>}
             </Stack>
           </div>
-          {body}
+          <Boundary reset={`${channel?.id}:${viewing}:${view}`} retry={refresh}>{body}</Boundary>
         </Stack>
       </div>
     </DbxRoot>

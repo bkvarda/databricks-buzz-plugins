@@ -1709,22 +1709,51 @@ function useProfiles(ctx, keys) {
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => profiles ? profiles.subscribe(bump) : void 0, [profiles]);
   const wanted = keys.join(",");
-  React.useEffect(() => void profiles?.ensure(keys).catch(() => {
-  }), [profiles, wanted]);
+  React.useEffect(() => {
+    if (!profiles || !keys.length) return;
+    const limit = Math.max(1, profiles.limit?.() ?? 200);
+    for (let start = 0; start < keys.length; start += limit) {
+      try {
+        void profiles.ensure(keys.slice(start, start + limit)).catch(() => {
+        });
+      } catch {
+      }
+    }
+  }, [profiles, wanted]);
   return (key) => {
-    const found = profiles?.snapshot().get(key);
+    let found;
+    try {
+      found = profiles?.snapshot().get(key);
+    } catch {
+      return void 0;
+    }
     if (!found) return void 0;
-    const picture = found.picture && session?.media ? session.media(found.picture, "small") ?? found.picture : found.picture;
+    let picture = found.picture;
+    try {
+      if (picture && session?.media) picture = session.media(picture, "small") ?? picture;
+    } catch {
+    }
     return { ...found.name && { name: found.name }, ...picture && { picture }, ...found.isAgent && { agent: true } };
   };
 }
+var NO_MEMBERS = [];
 function useMembers(ctx, channel) {
   const channels = optionalService(ctx, "relay")?.snapshot().session?.channels;
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => channels?.subscribeList ? channels.subscribeList(bump) : void 0, [channels]);
-  React.useEffect(() => void (channel && channels?.resolve?.([channel]).then(bump, () => {
-  })), [channels, channel]);
-  return channel && channels?.get?.(channel)?.members || [];
+  React.useEffect(() => {
+    if (!channel || !channels?.resolve) return;
+    try {
+      void channels.resolve([channel]).then(bump, () => {
+      });
+    } catch {
+    }
+  }, [channels, channel]);
+  try {
+    return channel && channels?.get?.(channel)?.members || NO_MEMBERS;
+  } catch {
+    return NO_MEMBERS;
+  }
 }
 var npubKey = (npub) => {
   try {
@@ -1732,6 +1761,13 @@ var npubKey = (npub) => {
     return found.type === "npub" ? found.data : void 0;
   } catch {
     return void 0;
+  }
+};
+var npubOf = (key) => {
+  try {
+    return npubEncode(key);
+  } catch {
+    return key;
   }
 };
 var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
@@ -1816,7 +1852,7 @@ function Owners(props) {
     else setPicked(member);
   };
   const row = (person, owner) => /* @__PURE__ */ React.createElement(Stack, { key: `${person.kind}:${person.key}`, direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: person.kind, key: person.key, label: person.label }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, nameOf(person, props.profile), !owner && /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, " \xB7 ", person.role)), !closed && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-input", disabled: busy, title: person.kind === "agent" ? "Take it off this task: it's told in the thread to stop" : "Take them off this task", "aria-label": `Take ${nameOf(person, props.profile)} off`, onClick: () => void run({ unassign: [off(person)] }), style: { width: "auto", padding: "0 6px", lineHeight: 1.4, cursor: "pointer" } }, "\xD7"));
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "OWNERS"), item.task.question && !closed && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: "you" }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Waiting on your input")), owners2.length ? owners2.map((person) => row(person, true)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No one", helpers.length ? "; agents asked are below" : "", "."), helpers.length > 0 && helpers.map((person) => row(person, false)), !closed && !picked && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assign", disabled: busy || !choices.length, value: "", onChange: (event) => pick(event.target.value), style: { fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("option", { value: "" }, choices.length ? "Assign to\u2026" : "No channel members to assign"), choices.map((member) => /* @__PURE__ */ React.createElement("option", { key: member.key, value: member.key }, member.agent ? "\u{1F916} " : "", member.name))), picked && /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs" }, "Assign ", picked.name, ":"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, title: "Take the current owners off and assign them", onClick: () => void run({ assign: [asOwner(picked)], unassign: owners2.map(off) }) }, "Reassign"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, title: "Keep the current owners", onClick: () => void run({ assign: [asOwner(picked)] }) }, "Add"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => setPicked(void 0) }, "Cancel"))), busy && /* @__PURE__ */ React.createElement(Spinner, { size: 10 }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "OWNERS"), item.task.question && !closed && !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: "you" }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Waiting on your input")), owners2.length ? owners2.map((person) => row(person, true)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No one", helpers.length ? "; agents asked are below" : "", "."), helpers.length > 0 && helpers.map((person) => row(person, false)), !closed && !picked && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assign", disabled: busy || !choices.length, value: "", onChange: (event) => pick(event.target.value), style: { fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("option", { value: "" }, choices.length ? "Assign to\u2026" : "No channel members to assign"), choices.map((member) => /* @__PURE__ */ React.createElement("option", { key: member.key, value: member.key }, member.agent ? "\u{1F916} " : "", member.name))), picked && /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs" }, "Assign ", picked.name, ":"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, title: "Take the current owners off and assign them", onClick: () => void run({ assign: [asOwner(picked)], unassign: owners2.map(off) }) }, "Reassign"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, title: "Keep the current owners", onClick: () => void run({ assign: [asOwner(picked)] }) }, "Add"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => setPicked(void 0) }, "Cancel"))), busy && /* @__PURE__ */ React.createElement(Spinner, { size: 10 }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error));
 }
 function ProvideInput(props) {
   const { task } = props.task;
@@ -1860,7 +1896,22 @@ function TaskBody(props) {
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
   const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && artifact.kind !== "workspace");
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && props.assigning && /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, ...props.assigning, onChange: props.onChange, compact: true }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+}
+function AssignButton(props) {
+  const name = assigneeName(props.assignee, props.profile);
+  return /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      type: "button",
+      title: props.open ? `${name}: owners are below` : `${name}: click to assign or reassign`,
+      "aria-label": `Assign (now ${name})`,
+      onClick: (event) => (event.stopPropagation(), props.open || props.toggle()),
+      onKeyDown: (event) => event.stopPropagation(),
+      style: { border: 0, padding: 0, background: "transparent", cursor: "pointer", display: "inline-flex", flex: "none", borderRadius: 999 }
+    },
+    /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: props.assignee, profile: props.profile, ...props.size && { size: props.size } })
+  );
 }
 function Meta(props) {
   const { item } = props;
@@ -1871,12 +1922,12 @@ var rowKeys = (toggle) => ({ role: "button", tabIndex: 0, onClick: toggle, onKey
 function TaskRow(props) {
   const { item } = props;
   const assignee = assigneeOf(item);
-  return /* @__PURE__ */ React.createElement("div", { style: { borderBottom: "1px solid var(--dbx-border)", background: props.open ? "var(--dbx-inset)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, className: "signals-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true, style: { flex: "none", width: 34 } }, "#", item.task.id), /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.task.title), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" } }, /* @__PURE__ */ React.createElement(Meta, { item })), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { flex: "none", width: 52, textAlign: "right" } }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile })), props.open && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px 54px" } }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view })));
+  return /* @__PURE__ */ React.createElement("div", { style: { borderBottom: "1px solid var(--dbx-border)", background: props.open ? "var(--dbx-inset)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, className: "signals-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true, style: { flex: "none", width: 34 } }, "#", item.task.id), /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.task.title), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" } }, /* @__PURE__ */ React.createElement(Meta, { item })), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { flex: "none", width: 52, textAlign: "right" } }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssignButton, { assignee, profile: props.profile, open: props.open, toggle: props.toggle })), props.open && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px 54px" } }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view, assigning: props.assigning })));
 }
 function TaskCard(props) {
   const { item } = props;
   const assignee = assigneeOf(item);
-  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view }));
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssignButton, { assignee, profile: props.profile, size: 18, open: props.open, toggle: props.toggle }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view, assigning: props.assigning }));
 }
 function useThread(ctx, channel, root) {
   const relay = optionalService(ctx, "relay");
@@ -1887,7 +1938,12 @@ function useThread(ctx, channel, root) {
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => {
     if (!channel || !root || !session?.thread) return setReader(void 0);
-    const opened = session.thread(channel, root, { priority: "foreground" });
+    let opened;
+    try {
+      opened = session.thread(channel, root, { priority: "foreground" });
+    } catch {
+      return setReader(void 0);
+    }
     let refreshed = false;
     const settle = () => {
       const now = opened.snapshot();
@@ -1922,7 +1978,7 @@ function useThread(ctx, channel, root) {
 function CommentItem(props) {
   const { comment } = props;
   const who = props.profile(comment.author);
-  const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}\u2026`;
+  const name = who?.name ?? `${npubOf(comment.author).slice(0, 12)}\u2026`;
   const mark = who?.picture ? /* @__PURE__ */ React.createElement("img", { src: who.picture, alt: name, style: { width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" } }) : /* @__PURE__ */ React.createElement("span", { style: { width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" } }, initials(name));
   const raw = comment.text.length > 6e3 ? `${comment.text.slice(0, 5999)}\u2026` : comment.text;
   const text = withMentionNames(raw, npubKey, (key) => props.profile(key)?.name);
@@ -2035,6 +2091,26 @@ function Columns(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { position: "relative", minWidth: 0, maxWidth: "100%" } }, /* @__PURE__ */ React.createElement("div", { style: { position: "sticky", top: 0, height: 0, zIndex: 1, pointerEvents: "none" } }, edges.left && /* @__PURE__ */ React.createElement("div", { style: arrow(-1) }, /* @__PURE__ */ React.createElement(Button, { size: "sm", title: "Scroll left", "aria-label": "Scroll left", onClick: () => scroll(-1) }, "\u2039")), edges.right && /* @__PURE__ */ React.createElement("div", { style: arrow(1) }, /* @__PURE__ */ React.createElement(Button, { size: "sm", title: "Scroll right", "aria-label": "Scroll right", onClick: () => scroll(1) }, "\u203A"))), /* @__PURE__ */ React.createElement("div", { ref: row, onScroll: measure, style: { display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start", minWidth: 0, maxWidth: "100%", paddingBottom: 8 } }, props.children));
 }
 var COLUMN_WIDTH = 260;
+var BoardBoundary;
+function boundary() {
+  BoardBoundary ??= class extends React.Component {
+    state = {};
+    static getDerivedStateFromError(error) {
+      return { error: error instanceof Error ? error : new Error(String(error)) };
+    }
+    static getDerivedStateFromProps(props, state) {
+      return props.reset === state.reset ? null : { error: void 0, reset: props.reset };
+    }
+    componentDidCatch(error, info) {
+      console.error("Signals board failed", error, info.componentStack);
+    }
+    render() {
+      if (!this.state.error) return this.props.children;
+      return /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "The board hit an error", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => (this.setState({ error: void 0 }), this.props.retry()) }, "Try again") }, /* @__PURE__ */ React.createElement(Text, { size: "xs", mono: true, as: "div", style: { overflowWrap: "anywhere" } }, this.state.error.message || String(this.state.error)));
+    }
+  };
+  return BoardBoundary;
+}
 function Board(props) {
   const { ctx, service, channel } = props;
   const connection = useConnection(service);
@@ -2045,7 +2121,10 @@ function Board(props) {
   const board = useAsync(async (signal) => hub2 && channel ? hub2.board(channel.id, signal) : void 0, [hub2, channel?.id, version]);
   const filtered = useAsync(async (signal) => hub2 && channel ? hub2.filtered(channel.id, signal).catch((error) => /No route/.test(error.message) ? [] : Promise.reject(error)) : void 0, [hub2, channel?.id, version]);
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
-  const profile = useProfiles(ctx, agents);
+  const members = useMembers(ctx, channel?.id);
+  const profile = useProfiles(ctx, [.../* @__PURE__ */ new Set([...agents, ...members])]);
+  const viewer = optionalService(ctx, "relay")?.snapshot().viewer;
+  const assigning = { members, boardAgents: agents, ...viewer && { viewer }, profile };
   const [view, setView] = React.useState(savedView);
   const chooseView = (next) => {
     setView(next);
@@ -2066,6 +2145,7 @@ function Board(props) {
     if (!relay?.viewer || !relay.origin || !navigation) return;
     void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId: channel.id, messageId: item.task.buzz_root, threadRootId: item.task.buzz_root, context: "channel" });
   };
+  const Boundary = boundary();
   let body;
   if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => service.openSettings() }, "Connect") }, "Tasks live in your team's signals hub, a Databricks App.");
   else if (!channel) body = props.noChannel ?? /* @__PURE__ */ React.createElement(Notice, null, "Open this from a channel's menu.");
@@ -2080,13 +2160,13 @@ function Board(props) {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
-    const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh, view: (found) => setViewing(found.task.id) });
+    const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh, view: (found) => setViewing(found.task.id), assigning });
     const header = (group) => /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusIcon, { status: group.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, group.title), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, grouped.get(group.status).length));
     body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length, ...filtered.data && { filtered: filtered.data.length } }), view === "filtered" ? /* @__PURE__ */ React.createElement(FilteredList, { events: filtered.data, loading: filtered.loading, ...filtered.error && { error: filtered.error }, ...filters.search && { search: filters.search } }) : !board.data.tasks.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel.") : !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
   }
   return (
     // The host gives the tab or page a fixed height and doesn't scroll it, so the board scrolls itself (as the SQL and Genie pages do).
-    /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", height: "100%", overflow: "auto", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", alignItems: "flex-end", justifyContent: "space-between", gap: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { flex: "1 1 240px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500, style: { overflowWrap: "anywhere" } }, channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it.")), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))), body)))
+    /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", height: "100%", overflow: "auto", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", alignItems: "flex-end", justifyContent: "space-between", gap: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { flex: "1 1 240px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500, style: { overflowWrap: "anywhere" } }, channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it.")), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))), /* @__PURE__ */ React.createElement(Boundary, { reset: `${channel?.id}:${viewing}:${view}`, retry: refresh }, body))))
   );
 }
 function boardPanel(ctx, service) {
