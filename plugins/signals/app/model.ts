@@ -814,6 +814,21 @@ export function playbookFor(playbooks: Readonly<Record<string, string>> | undefi
   return undefined;
 }
 
+/**
+ * The agents that work on a task: the ones the team named for its rule id,
+ * then for its workstream (any case), as playbooks are found; otherwise the
+ * account's agents.
+ */
+export function agentsFor(account: Pick<AccountRecord, "agents" | "workstream_agents">, task: Readonly<{ rule_id?: string; workstream?: string | null }>): readonly string[] {
+  const entries = Object.entries(account.workstream_agents ?? {}).filter(([, keys]) => keys.length);
+  for (const wanted of [task.rule_id, task.workstream ?? undefined]) {
+    const lower = wanted?.trim().toLowerCase();
+    const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
+    if (found) return found[1];
+  }
+  return account.agents;
+}
+
 /** The workstreams a config's rules file tasks under, in rule order. */
 export function workstreamsOf(config: SignalsConfig | undefined): string[] {
   return [...new Set((config?.rules ?? []).map((rule) => rule.workstream?.trim()).filter((name): name is string => Boolean(name)))];
@@ -877,6 +892,8 @@ export type AccountRecord = Readonly<{
   agents: readonly string[];
   /** How the team likes each kind of work done: workstream (or rule id) → playbook text. */
   playbooks: Readonly<Record<string, string>>;
+  /** Agents for one kind of work: workstream (or rule id) → hex pubkeys, in place of `agents` for its tasks. */
+  workstream_agents: Readonly<Record<string, readonly string[]>>;
   updated_by: string | null;
   updated_at: number | null;
 }>;

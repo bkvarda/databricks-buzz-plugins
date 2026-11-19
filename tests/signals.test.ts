@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
@@ -321,7 +321,7 @@ describe("account channels", () => {
   });
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
-    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], ids: {}, preferences: "questions: auto", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null };
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], ids: {}, preferences: "questions: auto", profile: "", agents: [], playbooks: {}, workstream_agents: {}, updated_by: null, updated_at: null };
     expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk"], preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
@@ -482,6 +482,46 @@ describe("account channels", () => {
     // An empty map clears them.
     await call("POST", "/api/account", { name: "Globex", playbooks: {} });
     expect((await store.account({ name: "Globex" }))!.playbooks).toEqual({});
+  });
+
+  it("mentions a workstream's own agents on its tasks, and the account's on the rest", async () => {
+    const account = { agents: ["a"], workstream_agents: { "Meeting Prep": ["b"], mail: ["c"] } };
+    expect(agentsFor(account, { rule_id: "meetings", workstream: "meeting prep" })).toEqual(["b"]);
+    expect(agentsFor(account, { rule_id: "mail", workstream: "meeting prep" })).toEqual(["c"]);
+    expect(agentsFor(account, { rule_id: "x", workstream: "questions" })).toEqual(["a"]);
+
+    const store = new SignalsStore(pglite(), "signals_ws_agents");
+    await store.setup();
+    const opened: { task: number; agents: readonly string[] }[] = [];
+    const updates: { task: number; mentions: readonly string[] }[] = [];
+    const rules = [
+      { id: "meetings", sources: ["google_calendar"], action: "task" as const, workstream: "meeting prep", group_by: "external_id" },
+      { id: "mail", sources: ["gmail"], action: "task" as const, workstream: "questions", group_by: "external_id" },
+    ];
+    const hub = new Hub(store, { opened: async (task, agents = []) => (opened.push({ task: task.id, agents }), "e".repeat(63) + task.id), updated: async (task, _text, mentions = []) => void updates.push({ task: task.id, mentions }) }, { defaultConfig: { version: 1, rules } });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const general = "ab".repeat(32);
+    const prep = "cd".repeat(32);
+    const saved = await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [general], preferences: "everything: draft", workstream_agents: { "Meeting Prep": [npubEncode(prep)], questions: [] } });
+    expect((saved.json as { account: { workstream_agents: object } }).account.workstream_agents).toEqual({ "Meeting Prep": [prep] });
+    await call("/api/sources", { source: "google_calendar", enabled: true });
+    await call("/api/sources", { source: "gmail", enabled: true });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }, { source: "gmail", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?" }] });
+    expect(opened.map((item) => item.agents)).toEqual([[prep], [general]]);
+
+    // Naming agents for a workstream later hands its untouched tasks to them, and only them.
+    const tickets = "ef".repeat(32);
+    updates.length = 0;
+    await call("/api/account", { name: "Globex", workstream_agents: { "Meeting Prep": [prep], questions: [tickets] } });
+    expect(updates).toEqual([{ task: opened[1]!.task, mentions: [tickets] }]);
+
+    expect((await call("/api/account", { name: "Globex", workstream_agents: { questions: ["nope"] } })).status).toBe(400);
+    expect((await call("/api/account", { name: "Globex", workstream_agents: ["x"] })).status).toBe(400);
+    // Saving without it keeps it.
+    await call("/api/account", { name: "Globex", preferences: "everything: auto" });
+    expect((await store.account({ name: "Globex" }))!.workstream_agents).toEqual({ "Meeting Prep": [prep], questions: [tickets] });
   });
 
   it("briefs agents without the Signals tools in the wake, and records their first reply on the task", async () => {
@@ -1101,7 +1141,7 @@ describe("account ids", () => {
 
 describe("rules for every account", () => {
   const example = JSON.parse(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")) as SignalsConfig;
-  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, ids: {}, preferences: "", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null });
+  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, ids: {}, preferences: "", profile: "", agents: [], playbooks: {}, workstream_agents: {}, updated_by: null, updated_at: null });
   const accounts = [record("Globex", "globex", ["globex.io"], ["Globex Corp"]), record("Initech", "initech", ["initech.com"])];
   const config = withAccounts(example, accounts);
 

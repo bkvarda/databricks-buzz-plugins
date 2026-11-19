@@ -107,7 +107,7 @@ export class HubClient {
 /** An account as the hub shows it, with what the deployment calls the account's people (labels.customer). */
 /** `warning`: why the hub can't post tasks in the account's channel (it isn't a member, say). */
 export type AccountView = AccountRecord & Readonly<{ read: Preferences; labels?: ResolvedLabels; workstreams?: readonly string[]; warning?: string }>;
-export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: Readonly<Record<string, readonly string[]>>; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>> }>;
+export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: Readonly<Record<string, readonly string[]>>; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>>; workstream_agents?: Readonly<Record<string, readonly string[]>> }>;
 
 export type TaskDetail = Readonly<{
   task: Task;
