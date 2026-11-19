@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -67,12 +67,20 @@ export type Series = Readonly<{
 export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number }>;
 
 export type Outcome = "new" | "changed" | "same" | "skipped";
+/** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
+export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
+
+/** An event a classifier filtered out, as the hub lists them. */
+export type FilteredEvent = Readonly<{ id: number; owner: string; source: string; external_id: string; title?: string; url?: string; actor?: string; account?: string; occurred_at: number; rule: string; score: number; filtered_at: number }>;
+
 export type IngestResult = Readonly<{
   received: number;
   new: number;
   changed: number;
   same: number;
   skipped: number;
+  /** Events a rule's classifier judged not worth a task. */
+  filtered: number;
   errors: { index: number; error: string }[];
   /** Tasks opened by this post. */
   created: Task[];
@@ -146,6 +154,11 @@ export class SignalsStore {
     // An event of a series whose question is still open: held until the team answers.
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS held_series text`);
     await this.q(`CREATE INDEX IF NOT EXISTS events_held ON $S.events (held_series) WHERE held_series IS NOT NULL`);
+    // An event a rule's classifier judged not worth a task: the rule, its score, and when (see Rule.classify).
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_rule text`);
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_score real`);
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_at bigint`);
+    await this.q(`CREATE INDEX IF NOT EXISTS events_filtered ON $S.events (filtered_at) WHERE filtered_at IS NOT NULL`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
@@ -290,8 +303,8 @@ export class SignalsStore {
    * on the new and changed ones. Events for a source they haven't turned on
    * are skipped (that's the opt-in). Returns what changed, for Buzz.
    */
-  async ingest(owner: string, events: readonly EventInput[], config: SignalsConfig): Promise<IngestResult> {
-    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, errors: [], created: [], updated: [], finished: [], firstRun: false };
+  async ingest(owner: string, events: readonly EventInput[], config: SignalsConfig, classifier?: Classifier): Promise<IngestResult> {
+    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], firstRun: false };
     const counts = result as { -readonly [K in keyof IngestResult]: IngestResult[K] };
     const consent = new Map<string, { enabled: boolean; firstRun: boolean }>();
     const touched = new Map<number, Task>();
@@ -308,7 +321,7 @@ export class SignalsStore {
         const recorded = await this.record(owner, event);
         counts[recorded.outcome]++;
         if (recorded.outcome === "same") continue;
-        const placed = await this.place(owner, event, recorded, config, state.firstRun);
+        const placed = await this.place(owner, event, recorded, config, state.firstRun, classifier, () => counts.filtered++);
         // An event can finish a task even when its rule no longer matches it (a resolved ticket).
         let finishedHere = false;
         for (const { rule, group } of finishes(config, event)) {
@@ -352,13 +365,24 @@ export class SignalsStore {
    * task asks the team, and the series' other events are held until they
    * answer; a series they said never to work on opens no tasks.
    */
-  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
+  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const decision = decide(config, event, { firstRun, owner });
     if (decision.kind === "none") return undefined;
     const task = await this.taskByGroup(decision.group);
     const rule = decision.rule;
     if (task) return { task, opened: false, create: decision.create, rule };
     if (!decision.create) return undefined;
+    if (rule.classify && classifier) {
+      // Fails open: no score (the model is down, say) opens the task.
+      const score = await classifier(event, rule.classify).catch(() => undefined);
+      const min = rule.classify.min ?? DEFAULT_CLASSIFY_MIN;
+      if (typeof score === "number" && Number.isFinite(score) && score < min) {
+        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4 WHERE id = $1`, [recorded.id, rule.id, score, now()]);
+        filtered?.();
+        return undefined;
+      }
+      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL WHERE id = $1`, [recorded.id, score]);
+    }
     const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) };
     if (!decision.series) return { task: await this.openTask(input), opened: true, create: true, rule };
     const series = await this.seriesFor(decision.series);
@@ -543,6 +567,22 @@ export class SignalsStore {
   }
 
   /** A channel's tasks for the board: every open one, and those done or dismissed within `days`. */
+  /** Recent events a rule's classifier filtered out, newest first, with their score (see Rule.classify). */
+  async filtered(options: { days?: number; limit?: number; source?: string; rule?: string } = {}, at = now()): Promise<FilteredEvent[]> {
+    const limit = Math.min(Math.max(1, Math.floor(options.limit ?? 100)), 500);
+    const found = await this.q(
+      `SELECT id, owner, source, external_id, title, url, actor, account, occurred_at, filtered_rule, filtered_score, filtered_at FROM $S.events
+       WHERE filtered_at IS NOT NULL AND task_id IS NULL AND filtered_at >= $1 AND ($2::text IS NULL OR source = $2) AND ($3::text IS NULL OR filtered_rule = $3)
+       ORDER BY filtered_at DESC, id DESC LIMIT ${limit}`,
+      [at - (options.days ?? 14) * 86400, options.source ?? null, options.rule ?? null],
+    );
+    return found.rows.map((row) => ({
+      id: Number(row.id), owner: String(row.owner), source: String(row.source), external_id: String(row.external_id),
+      ...(row.title != null && { title: String(row.title) }), ...(row.url != null && { url: String(row.url) }), ...(row.actor != null && { actor: String(row.actor) }), ...(row.account != null && { account: String(row.account) }),
+      occurred_at: Number(row.occurred_at), rule: String(row.filtered_rule), score: Number(row.filtered_score), filtered_at: Number(row.filtered_at),
+    }));
+  }
+
   async boardTasks(channel: string, days = 14, at = now(), limit = 200): Promise<Task[]> {
     const found = await this.q(
       `SELECT * FROM $S.tasks WHERE channel = $1 AND (status NOT IN ('done', 'dismissed') OR updated_at >= $2) ORDER BY last_event_at DESC, id DESC LIMIT ${limit}`,

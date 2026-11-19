@@ -22,7 +22,7 @@
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, configProblems, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
-import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
+import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -64,13 +64,15 @@ export type HubOptions = Readonly<{
   admins?: readonly string[];
   /** The config to use until one is saved (from SIGNALS_CONFIG). */
   defaultConfig?: SignalsConfig;
+  /** Asks rules' `classify` questions (see jevClassifier); without it, rules with `classify` open their tasks unasked. */
+  classifier?: Classifier;
   log?(line: string): void;
 }>;
 
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered"] as const;
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
@@ -163,6 +165,13 @@ export class Hub {
           if (!channel) return bad("Send ?channel= (a Buzz channel id).");
           return { json: await this.board(channel) };
         }
+        case "GET /api/filtered": {
+          const q = request.query;
+          const number = (name: string) => (q.get(name) ? Number(q.get(name)) || undefined : undefined);
+          const days = number("days");
+          const limit = number("limit");
+          return { json: { events: await this.store.filtered({ ...(days && { days }), ...(limit && { limit }), ...(q.get("source") && { source: q.get("source")! }), ...(q.get("rule") && { rule: q.get("rule")! }) }) } };
+        }
         case "GET /api/ids":
           return { json: { ids: idsByKind((await this.config()).accounts ?? []) } };
         case "GET /api/accounts":
@@ -218,7 +227,7 @@ export class Hub {
       }
       return [checked];
     });
-    const result = await this.store.ingest(user, events, await this.config());
+    const result = await this.store.ingest(user, events, await this.config(), this.options.classifier);
     await this.announce(result);
     return {
       json: {
@@ -227,6 +236,7 @@ export class Hub {
         changed: result.changed,
         same: result.same,
         skipped: result.skipped,
+        filtered: result.filtered,
         firstRun: result.firstRun,
         created: result.created.map((task) => task.id),
         updated: [...new Set(result.updated.map((update) => update.task.id))],
