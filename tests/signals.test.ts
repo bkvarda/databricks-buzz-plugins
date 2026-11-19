@@ -7,7 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
-import { assigneeOf, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, readView, replyMentions, replyText, taskFacts, threadComments } from "../plugins/signals/src/board-view";
+import { assigneeOf, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
 import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
@@ -1223,13 +1223,22 @@ describe("rules for every account", () => {
         { id: "a", authorId: "hub", createdAt: 1, content: "📋 Task #1" },
         { id: "c", authorId: scout, createdAt: 4, content: "note", audience: "agents" },
         { id: "d", authorId: "me", createdAt: 5, content: "  " },
-        { id: "e", authorId: "me", createdAt: 6, content: "Thanks", delivery: "pending" },
+        { id: "e", authorId: "me", createdAt: 6, content: "Thanks", delivery: "sending" },
+        { id: "f", authorId: "me", createdAt: 7, content: "Sent", delivery: "accepted" },
+        { id: "g", authorId: "me", createdAt: 8, content: "Seen", delivery: "seen" },
+        { id: "h", authorId: "me", createdAt: 9, content: "Lost", delivery: "failed" },
       ]);
-      expect(comments.map((comment) => [comment.id, comment.agents, comment.pending])).toEqual([["a", false, false], ["b", false, false], ["c", true, false], ["e", false, true]]);
+      // Only "sending" is pending: the relay never says "delivered", so a sent reply mustn't stay "sending".
+      expect(comments.map((comment) => [comment.id, comment.agents, comment.pending, comment.failed])).toEqual([["a", false, false, false], ["b", false, false, false], ["c", true, false, false], ["e", false, true, false], ["f", false, false, false], ["g", false, false, false], ["h", false, false, true]]);
       expect(replyMentions(assigneeOf(tasks[1]!))).toEqual([agent]);
       expect(replyMentions(assigneeOf(tasks[0]!))).toEqual([]);
       expect(replyMentions(assigneeOf(tasks[2]!))).toEqual([]);
       expect(replyText("  go on ", [{ npub: "npub1x" }])).toBe("nostr:npub1x go on");
+      const npub = npubEncode(agent);
+      const keyOf = (value: string) => (value === npub ? agent : undefined);
+      expect(mentionedKeys(`nostr:${npub} and nostr:${npub} again`, keyOf)).toEqual([agent]);
+      expect(withMentionNames(`nostr:${npub} draft is ready`, keyOf, () => "Genie")).toBe("**@Genie** draft is ready");
+      expect(withMentionNames(`nostr:${npub} hi`, keyOf, () => undefined)).toBe(`**@${npub.slice(0, 12)}…** hi`);
       expect(replyText("go on", [])).toBe("go on");
     });
 

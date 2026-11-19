@@ -13,11 +13,11 @@ import type { PanelProps } from "@dbx/core/host-types";
 import { optionalService } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { ago, Button, Disclosure, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { ago, Button, Disclosure, DbxRoot, Notice, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { Markdown } from "@dbx/core/ui/markdown";
-import { npubEncode } from "nostr-tools/nip19";
+import { decode, npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments } from "./board-view";
+import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
 import { type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 
 type Profile = { name?: string; picture?: string };
@@ -52,6 +52,16 @@ function useProfiles(ctx: Context, keys: readonly string[]) {
     return { ...(found.name && { name: found.name }), ...(picture && { picture }) };
   };
 }
+
+/** An npub's hex key, or undefined when it isn't one. */
+const npubKey = (npub: string): string | undefined => {
+  try {
+    const found = decode(npub);
+    return found.type === "npub" ? found.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 const initials = (label: string) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0]!.toUpperCase()).join("") || "?";
 
@@ -197,7 +207,8 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
     }
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
-  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
+  // The workspace link (Explore in Databricks) is in the task's full view; the expanded row keeps to what was made for it.
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && artifact.kind !== "workspace");
   return (
     <Stack gap={8} style={{ paddingTop: 8 }}>
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
@@ -206,7 +217,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
       {!props.full && assets.length > 0 && (
         <Stack direction="row" gap={6} wrap>
           {assets.map((artifact) => (
-            <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 }}>
+            <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem" }}>
               {ASSET_ICON[artifact.kind] ?? "🔗"} {artifact.title ?? artifact.kind}
             </a>
           ))}
@@ -324,7 +335,8 @@ function CommentItem(props: { comment: Comment; profile(key: string): Profile | 
   const who = props.profile(comment.author);
   const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}…`;
   const mark = who?.picture ? <img src={who.picture} alt={name} style={{ width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" }} /> : <span style={{ width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" }}>{initials(name)}</span>;
-  const text = comment.text.length > 6000 ? `${comment.text.slice(0, 5999)}…` : comment.text;
+  const raw = comment.text.length > 6000 ? `${comment.text.slice(0, 5999)}…` : comment.text;
+  const text = withMentionNames(raw, npubKey, (key) => props.profile(key)?.name);
   return (
     <div style={{ display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 }}>
       {mark}
@@ -332,6 +344,7 @@ function CommentItem(props: { comment: Comment; profile(key: string): Profile | 
         <Stack direction="row" gap={6} align="baseline">
           <Text size="sm" weight={600}>{name}</Text>
           <Text size="xs" tone="tertiary">{ago(comment.at * 1000)}{comment.pending ? " · sending" : ""}</Text>
+          {comment.failed && <Text size="xs" tone="danger">Not sent</Text>}
         </Stack>
         <div style={{ overflowWrap: "anywhere" }}>
           {comment.agents ? <Disclosure summary="Note between agents">{<Markdown source={text} size="sm" />}</Disclosure> : <Markdown source={text} size="sm" />}
@@ -385,12 +398,20 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
   const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? undefined, item.task.buzz_root);
   const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
   const facts = taskFacts(item);
-  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.map((comment) => comment.author))]);
+  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.flatMap((comment) => [comment.author, ...mentionedKeys(comment.text, npubKey)]))]);
   const who = (key: string) => props.profile(key) ?? authorProfile(key);
   const people = item.people.filter((person) => person.kind !== "agent");
   const end = React.useRef<HTMLDivElement>(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
+  // A new comment can come with a status change or an asset (agents post them in the thread), so reload the task then.
+  const seen = React.useRef<number | undefined>(undefined);
+  const { onChange } = props;
+  React.useEffect(() => {
+    if (thread.status !== "ready") return;
+    if (seen.current !== undefined && count > seen.current) onChange();
+    seen.current = count;
+  }, [count, thread.status]);
   return (
     <Stack gap={14}>
       <Stack direction="row" gap={8} align="center">
@@ -705,16 +726,17 @@ function Board(props: {
     <DbxRoot style={{ minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" }}>
       <div style={{ padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}>
         <Stack gap={16}>
-          <SectionHeader
-            title={channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"}
-            description={board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it."}
-            action={
-              <Stack direction="row" gap={6} align="center">
-                {props.action}
-                {hub && channel && <Button size="sm" disabled={board.loading} onClick={refresh}>{board.loading ? <Spinner size={10} /> : null}Refresh</Button>}
-              </Stack>
-            }
-          />
+          {/* Not SectionHeader: in a narrow tab its buttons wrap under the title rather than push the panel sideways. */}
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", justifyContent: "space-between", gap: 8, minWidth: 0 }}>
+            <Stack gap={2} style={{ flex: "1 1 240px", minWidth: 0 }}>
+              <Text as="h3" size="md" weight={500} style={{ overflowWrap: "anywhere" }}>{channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"}</Text>
+              <Text tone="subtle" size="sm" as="div">{board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it."}</Text>
+            </Stack>
+            <Stack direction="row" gap={6} align="center" wrap>
+              {props.action}
+              {hub && channel && <Button size="sm" disabled={board.loading} onClick={refresh}>{board.loading ? <Spinner size={10} /> : null}Refresh</Button>}
+            </Stack>
+          </div>
           {body}
         </Stack>
       </div>
