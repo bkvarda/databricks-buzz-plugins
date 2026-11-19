@@ -1048,6 +1048,424 @@ function accountPanel(service) {
 }
 var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and the task's workstream, and follow its mode for that workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first), the team's guidance and the workstream's playbook. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
 
+// packages/core/src/ui/markdown.tsx
+var SAFE_URL = /^https?:\/\//i;
+function renderInline(text, keyPrefix = "i") {
+  const nodes = [];
+  const pattern = /(\\[\\`*_{}[\]()#+\-.!~|<>$])|(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)<>]+)/g;
+  let last = 0;
+  let match;
+  let index = 0;
+  while (match = pattern.exec(text)) {
+    if (match.index > last) nodes.push(text.slice(last, match.index));
+    const token = match[0];
+    const key = `${keyPrefix}-${index++}`;
+    if (token.length === 2 && token.startsWith("\\")) nodes.push(token.slice(1));
+    else if (token.startsWith("`")) nodes.push(/* @__PURE__ */ React.createElement("code", { key }, token.slice(1, -1)));
+    else if (token.startsWith("**") || token.startsWith("__"))
+      nodes.push(/* @__PURE__ */ React.createElement("strong", { key }, renderInline(token.slice(2, -2), key)));
+    else if (token.startsWith("*")) nodes.push(/* @__PURE__ */ React.createElement("em", { key }, renderInline(token.slice(1, -1), key)));
+    else if (token.startsWith("[")) {
+      const label = token.slice(1, token.indexOf("]("));
+      const href = token.slice(token.indexOf("](") + 2, -1);
+      nodes.push(
+        SAFE_URL.test(href) ? /* @__PURE__ */ React.createElement("a", { key, href, target: "_blank", rel: "noreferrer", className: "dbx-link" }, label) : label
+      );
+    } else
+      nodes.push(
+        /* @__PURE__ */ React.createElement("a", { key, href: token, target: "_blank", rel: "noreferrer", className: "dbx-link" }, token)
+      );
+    last = match.index + token.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+var cells = (line2) => line2.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+function parseBlocks(source) {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line2 = lines[i] ?? "";
+    if (!line2.trim()) {
+      i++;
+      continue;
+    }
+    const fence = /^```(\S*)/.exec(line2);
+    if (fence) {
+      const body = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i] ?? "")) body.push(lines[i++] ?? "");
+      i++;
+      blocks.push({ type: "code", lang: fence[1] ?? "", code: body.join("\n") });
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line2);
+    if (heading) {
+      blocks.push({ type: "h", level: heading[1]?.length ?? 1, text: heading[2] ?? "" });
+      i++;
+      continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(line2) && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] ?? "")) {
+      const header = cells(line2);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i] ?? "")) rows.push(cells(lines[i++] ?? ""));
+      blocks.push({ type: "table", header, rows });
+      continue;
+    }
+    const bullet = /^\s*[-*+]\s+/;
+    const ordered = /^\s*\d+[.)]\s+/;
+    if (bullet.test(line2) || ordered.test(line2)) {
+      const type = bullet.test(line2) ? "ul" : "ol";
+      const marker = type === "ul" ? bullet : ordered;
+      const items = [];
+      while (i < lines.length && marker.test(lines[i] ?? "")) items.push((lines[i++] ?? "").replace(marker, ""));
+      blocks.push({ type, items });
+      continue;
+    }
+    const paragraph = [];
+    while (i < lines.length && (lines[i] ?? "").trim() && !/^```|^#{1,4}\s|^\s*[-*+]\s+|^\s*\d+[.)]\s+/.test(lines[i] ?? ""))
+      paragraph.push(lines[i++] ?? "");
+    blocks.push({ type: "p", text: paragraph.join("\n") });
+  }
+  return blocks;
+}
+function Markdown(props) {
+  const blocks = React.useMemo(() => parseBlocks(props.source), [props.source]);
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-md", style: { fontSize: props.size === "sm" ? "0.75rem" : "0.8125rem", lineHeight: 1.55 } }, blocks.map((block, index) => {
+    const key = `b${index}`;
+    switch (block.type) {
+      case "p":
+        return /* @__PURE__ */ React.createElement("p", { key, style: { whiteSpace: "pre-wrap" } }, renderInline(block.text, key));
+      case "h":
+        return /* @__PURE__ */ React.createElement("p", { key, style: { fontWeight: 600, fontSize: block.level <= 2 ? "0.9375rem" : void 0 } }, renderInline(block.text, key));
+      case "ul":
+      case "ol":
+        return React.createElement(
+          block.type,
+          { key },
+          block.items.map((item, n) => /* @__PURE__ */ React.createElement("li", { key: `${key}-${n}` }, renderInline(item, `${key}-${n}`)))
+        );
+      case "code":
+        return /* @__PURE__ */ React.createElement("pre", { key }, /* @__PURE__ */ React.createElement("code", null, block.code));
+      case "table":
+        return /* @__PURE__ */ React.createElement("div", { key, style: { overflow: "auto", margin: "0 0 8px" } }, /* @__PURE__ */ React.createElement("table", { className: "dbx-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, block.header.map((cell, n) => /* @__PURE__ */ React.createElement("th", { key: `${key}-h${n}` }, renderInline(cell))))), /* @__PURE__ */ React.createElement("tbody", null, block.rows.map((row, r) => /* @__PURE__ */ React.createElement("tr", { key: `${key}-r${r}` }, row.map((cell, n) => /* @__PURE__ */ React.createElement("td", { key: `${key}-r${r}-${n}` }, renderInline(cell))))))));
+    }
+    return null;
+  }));
+}
+
+// node_modules/@noble/hashes/utils.js
+var hasHexBuiltin = /* @__PURE__ */ (() => (
+  // @ts-ignore
+  typeof Uint8Array.from([]).toHex === "function" && typeof Uint8Array.fromHex === "function"
+))();
+var asciis = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 };
+function asciiToBase16(ch) {
+  if (ch >= asciis._0 && ch <= asciis._9)
+    return ch - asciis._0;
+  if (ch >= asciis.A && ch <= asciis.F)
+    return ch - (asciis.A - 10);
+  if (ch >= asciis.a && ch <= asciis.f)
+    return ch - (asciis.a - 10);
+  return;
+}
+function hexToBytes(hex) {
+  if (typeof hex !== "string")
+    throw new Error("hex string expected, got " + typeof hex);
+  if (hasHexBuiltin)
+    return Uint8Array.fromHex(hex);
+  const hl = hex.length;
+  const al = hl / 2;
+  if (hl % 2)
+    throw new Error("hex string expected, got unpadded hex of length " + hl);
+  const array = new Uint8Array(al);
+  for (let ai = 0, hi = 0; ai < al; ai++, hi += 2) {
+    const n1 = asciiToBase16(hex.charCodeAt(hi));
+    const n2 = asciiToBase16(hex.charCodeAt(hi + 1));
+    if (n1 === void 0 || n2 === void 0) {
+      const char = hex[hi] + hex[hi + 1];
+      throw new Error('hex string expected, got non-hex character "' + char + '" at index ' + hi);
+    }
+    array[ai] = n1 * 16 + n2;
+  }
+  return array;
+}
+
+// node_modules/@scure/base/index.js
+function isBytes(a) {
+  return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
+}
+function isArrayOf(isString, arr) {
+  if (!Array.isArray(arr))
+    return false;
+  if (arr.length === 0)
+    return true;
+  if (isString) {
+    return arr.every((item) => typeof item === "string");
+  } else {
+    return arr.every((item) => Number.isSafeInteger(item));
+  }
+}
+function afn(input) {
+  if (typeof input !== "function")
+    throw new Error("function expected");
+  return true;
+}
+function astr(label, input) {
+  if (typeof input !== "string")
+    throw new Error(`${label}: string expected`);
+  return true;
+}
+function anumber(n) {
+  if (!Number.isSafeInteger(n))
+    throw new Error(`invalid integer: ${n}`);
+}
+function aArr(input) {
+  if (!Array.isArray(input))
+    throw new Error("array expected");
+}
+function astrArr(label, input) {
+  if (!isArrayOf(true, input))
+    throw new Error(`${label}: array of strings expected`);
+}
+function anumArr(label, input) {
+  if (!isArrayOf(false, input))
+    throw new Error(`${label}: array of numbers expected`);
+}
+// @__NO_SIDE_EFFECTS__
+function chain(...args) {
+  const id = (a) => a;
+  const wrap = (a, b) => (c) => a(b(c));
+  const encode = args.map((x) => x.encode).reduceRight(wrap, id);
+  const decode = args.map((x) => x.decode).reduce(wrap, id);
+  return { encode, decode };
+}
+// @__NO_SIDE_EFFECTS__
+function alphabet(letters) {
+  const lettersA = typeof letters === "string" ? letters.split("") : letters;
+  const len = lettersA.length;
+  astrArr("alphabet", lettersA);
+  const indexes = new Map(lettersA.map((l, i) => [l, i]));
+  return {
+    encode: (digits) => {
+      aArr(digits);
+      return digits.map((i) => {
+        if (!Number.isSafeInteger(i) || i < 0 || i >= len)
+          throw new Error(`alphabet.encode: digit index outside alphabet "${i}". Allowed: ${letters}`);
+        return lettersA[i];
+      });
+    },
+    decode: (input) => {
+      aArr(input);
+      return input.map((letter) => {
+        astr("alphabet.decode", letter);
+        const i = indexes.get(letter);
+        if (i === void 0)
+          throw new Error(`Unknown letter: "${letter}". Allowed: ${letters}`);
+        return i;
+      });
+    }
+  };
+}
+// @__NO_SIDE_EFFECTS__
+function join(separator = "") {
+  astr("join", separator);
+  return {
+    encode: (from) => {
+      astrArr("join.decode", from);
+      return from.join(separator);
+    },
+    decode: (to) => {
+      astr("join.decode", to);
+      return to.split(separator);
+    }
+  };
+}
+var gcd = (a, b) => b === 0 ? a : gcd(b, a % b);
+var radix2carry = /* @__NO_SIDE_EFFECTS__ */ (from, to) => from + (to - gcd(from, to));
+var powers = /* @__PURE__ */ (() => {
+  let res = [];
+  for (let i = 0; i < 40; i++)
+    res.push(2 ** i);
+  return res;
+})();
+function convertRadix2(data, from, to, padding) {
+  aArr(data);
+  if (from <= 0 || from > 32)
+    throw new Error(`convertRadix2: wrong from=${from}`);
+  if (to <= 0 || to > 32)
+    throw new Error(`convertRadix2: wrong to=${to}`);
+  if (/* @__PURE__ */ radix2carry(from, to) > 32) {
+    throw new Error(`convertRadix2: carry overflow from=${from} to=${to} carryBits=${/* @__PURE__ */ radix2carry(from, to)}`);
+  }
+  let carry = 0;
+  let pos = 0;
+  const max = powers[from];
+  const mask = powers[to] - 1;
+  const res = [];
+  for (const n of data) {
+    anumber(n);
+    if (n >= max)
+      throw new Error(`convertRadix2: invalid data word=${n} from=${from}`);
+    carry = carry << from | n;
+    if (pos + from > 32)
+      throw new Error(`convertRadix2: carry overflow pos=${pos} from=${from}`);
+    pos += from;
+    for (; pos >= to; pos -= to)
+      res.push((carry >> pos - to & mask) >>> 0);
+    const pow = powers[pos];
+    if (pow === void 0)
+      throw new Error("invalid carry");
+    carry &= pow - 1;
+  }
+  carry = carry << to - pos & mask;
+  if (!padding && pos >= from)
+    throw new Error("Excess padding");
+  if (!padding && carry > 0)
+    throw new Error(`Non-zero padding: ${carry}`);
+  if (padding && pos > 0)
+    res.push(carry >>> 0);
+  return res;
+}
+// @__NO_SIDE_EFFECTS__
+function radix2(bits, revPadding = false) {
+  anumber(bits);
+  if (bits <= 0 || bits > 32)
+    throw new Error("radix2: bits should be in (0..32]");
+  if (/* @__PURE__ */ radix2carry(8, bits) > 32 || /* @__PURE__ */ radix2carry(bits, 8) > 32)
+    throw new Error("radix2: carry overflow");
+  return {
+    encode: (bytes) => {
+      if (!isBytes(bytes))
+        throw new Error("radix2.encode input should be Uint8Array");
+      return convertRadix2(Array.from(bytes), 8, bits, !revPadding);
+    },
+    decode: (digits) => {
+      anumArr("radix2.decode", digits);
+      return Uint8Array.from(convertRadix2(digits, bits, 8, revPadding));
+    }
+  };
+}
+function unsafeWrapper(fn) {
+  afn(fn);
+  return function(...args) {
+    try {
+      return fn.apply(null, args);
+    } catch (e) {
+    }
+  };
+}
+var BECH_ALPHABET = /* @__PURE__ */ chain(/* @__PURE__ */ alphabet("qpzry9x8gf2tvdw0s3jn54khce6mua7l"), /* @__PURE__ */ join(""));
+var POLYMOD_GENERATORS = [996825010, 642813549, 513874426, 1027748829, 705979059];
+function bech32Polymod(pre) {
+  const b = pre >> 25;
+  let chk = (pre & 33554431) << 5;
+  for (let i = 0; i < POLYMOD_GENERATORS.length; i++) {
+    if ((b >> i & 1) === 1)
+      chk ^= POLYMOD_GENERATORS[i];
+  }
+  return chk;
+}
+function bechChecksum(prefix, words, encodingConst = 1) {
+  const len = prefix.length;
+  let chk = 1;
+  for (let i = 0; i < len; i++) {
+    const c = prefix.charCodeAt(i);
+    if (c < 33 || c > 126)
+      throw new Error(`Invalid prefix (${prefix})`);
+    chk = bech32Polymod(chk) ^ c >> 5;
+  }
+  chk = bech32Polymod(chk);
+  for (let i = 0; i < len; i++)
+    chk = bech32Polymod(chk) ^ prefix.charCodeAt(i) & 31;
+  for (let v of words)
+    chk = bech32Polymod(chk) ^ v;
+  for (let i = 0; i < 6; i++)
+    chk = bech32Polymod(chk);
+  chk ^= encodingConst;
+  return BECH_ALPHABET.encode(convertRadix2([chk % powers[30]], 30, 5, false));
+}
+// @__NO_SIDE_EFFECTS__
+function genBech32(encoding) {
+  const ENCODING_CONST = encoding === "bech32" ? 1 : 734539939;
+  const _words = /* @__PURE__ */ radix2(5);
+  const fromWords = _words.decode;
+  const toWords = _words.encode;
+  const fromWordsUnsafe = unsafeWrapper(fromWords);
+  function encode(prefix, words, limit = 90) {
+    astr("bech32.encode prefix", prefix);
+    if (isBytes(words))
+      words = Array.from(words);
+    anumArr("bech32.encode", words);
+    const plen = prefix.length;
+    if (plen === 0)
+      throw new TypeError(`Invalid prefix length ${plen}`);
+    const actualLength = plen + 7 + words.length;
+    if (limit !== false && actualLength > limit)
+      throw new TypeError(`Length ${actualLength} exceeds limit ${limit}`);
+    const lowered = prefix.toLowerCase();
+    const sum = bechChecksum(lowered, words, ENCODING_CONST);
+    return `${lowered}1${BECH_ALPHABET.encode(words)}${sum}`;
+  }
+  function decode(str, limit = 90) {
+    astr("bech32.decode input", str);
+    const slen = str.length;
+    if (slen < 8 || limit !== false && slen > limit)
+      throw new TypeError(`invalid string length: ${slen} (${str}). Expected (8..${limit})`);
+    const lowered = str.toLowerCase();
+    if (str !== lowered && str !== str.toUpperCase())
+      throw new Error(`String must be lowercase or uppercase`);
+    const sepIndex = lowered.lastIndexOf("1");
+    if (sepIndex === 0 || sepIndex === -1)
+      throw new Error(`Letter "1" must be present between prefix and data only`);
+    const prefix = lowered.slice(0, sepIndex);
+    const data = lowered.slice(sepIndex + 1);
+    if (data.length < 6)
+      throw new Error("Data must be at least 6 characters long");
+    const words = BECH_ALPHABET.decode(data).slice(0, -6);
+    const sum = bechChecksum(prefix, words, ENCODING_CONST);
+    if (!data.endsWith(sum))
+      throw new Error(`Invalid checksum in ${str}: expected "${sum}"`);
+    return { prefix, words };
+  }
+  const decodeUnsafe = unsafeWrapper(decode);
+  function decodeToBytes(str) {
+    const { prefix, words } = decode(str, false);
+    return { prefix, words, bytes: fromWords(words) };
+  }
+  function encodeFromBytes(prefix, bytes) {
+    return encode(prefix, toWords(bytes));
+  }
+  return {
+    encode,
+    decode,
+    encodeFromBytes,
+    decodeToBytes,
+    decodeUnsafe,
+    fromWords,
+    fromWordsUnsafe,
+    toWords
+  };
+}
+var bech32 = /* @__PURE__ */ genBech32("bech32");
+
+// node_modules/nostr-tools/lib/esm/nip19.js
+var utf8Decoder = new TextDecoder("utf-8");
+var utf8Encoder = new TextEncoder();
+var Bech32MaxSize = 5e3;
+function npubEncode(hex) {
+  return encodeBytes("npub", hexToBytes(hex));
+}
+function encodeBech32(prefix, data) {
+  let words = bech32.toWords(data);
+  return bech32.encode(prefix, words, Bech32MaxSize);
+}
+function encodeBytes(prefix, bytes) {
+  return encodeBech32(prefix, bytes);
+}
+
 // plugins/signals/src/board-view.ts
 var VIEWS = ["list", "swimlanes"];
 var STATUS_GROUPS = [
@@ -1108,6 +1526,28 @@ function byStatus(tasks) {
 }
 var cardAssets = (item) => item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && !["reply", "draft", "workspace"].includes(artifact.kind));
 var readView = (value) => VIEWS.includes(value) ? value : "list";
+function threadComments(messages) {
+  return messages.filter((message) => message.content.trim()).map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery !== void 0 && message.delivery !== "delivered" })).sort((a, b) => a.at - b.at);
+}
+var replyMentions = (assignee) => assignee.kind === "agent" ? [assignee.key] : [];
+function replyText(text, mentions) {
+  const body = text.trim();
+  return mentions.length ? `${mentions.map((mention) => `nostr:${mention.npub}`).join(" ")} ${body}` : body;
+}
+function taskFacts(item) {
+  const { task } = item;
+  const date = (seconds) => new Date(seconds * 1e3).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  return [
+    { label: "Status", value: STATUS_GROUPS.find((group) => group.status === task.status)?.title ?? task.status },
+    { label: "Mode", value: task.mode },
+    ...task.workstream ? [{ label: "Workstream", value: task.workstream }] : [],
+    ...task.initiative ? [{ label: "Initiative", value: task.initiative }] : [],
+    ...task.account ? [{ label: "Account", value: task.account }] : [],
+    ...item.source ? [{ label: "Source", value: item.source.title ? `${item.source.source}: ${item.source.title}` : item.source.source }] : [],
+    { label: "Opened", value: date(task.created_at) },
+    { label: "Last event", value: `${date(task.last_event_at)}${task.event_count > 1 ? ` (${task.event_count} events)` : ""}` }
+  ];
+}
 
 // plugins/signals/src/board-panel.tsx
 function useProfiles(ctx, keys) {
@@ -1217,7 +1657,7 @@ function TaskBody(props) {
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
   const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
 }
 function Meta(props) {
   const { item } = props;
@@ -1228,12 +1668,85 @@ var rowKeys = (toggle) => ({ role: "button", tabIndex: 0, onClick: toggle, onKey
 function TaskRow(props) {
   const { item } = props;
   const assignee = assigneeOf(item);
-  return /* @__PURE__ */ React.createElement("div", { style: { borderBottom: "1px solid var(--dbx-border)", background: props.open ? "var(--dbx-inset)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, className: "signals-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true, style: { flex: "none", width: 34 } }, "#", item.task.id), /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.task.title), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" } }, /* @__PURE__ */ React.createElement(Meta, { item })), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { flex: "none", width: 52, textAlign: "right" } }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile })), props.open && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px 54px" } }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange })));
+  return /* @__PURE__ */ React.createElement("div", { style: { borderBottom: "1px solid var(--dbx-border)", background: props.open ? "var(--dbx-inset)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, className: "signals-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true, style: { flex: "none", width: 34 } }, "#", item.task.id), /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.task.title), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" } }, /* @__PURE__ */ React.createElement(Meta, { item })), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { flex: "none", width: 52, textAlign: "right" } }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile })), props.open && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px 54px" } }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view })));
 }
 function TaskCard(props) {
   const { item } = props;
   const assignee = assigneeOf(item);
-  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange }));
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view }));
+}
+function useThread(ctx, channel, root) {
+  const session = optionalService(ctx, "relay")?.snapshot().session;
+  const [reader, setReader] = React.useState();
+  const [, bump] = React.useReducer((n) => n + 1, 0);
+  React.useEffect(() => {
+    if (!channel || !root || !session?.thread) return setReader(void 0);
+    const opened = session.thread(channel, root);
+    setReader(opened);
+    const stop = opened.subscribe(bump);
+    return () => (stop(), opened.dispose());
+  }, [session, channel, root]);
+  const snapshot = reader?.snapshot();
+  const messages = snapshot ? [...snapshot.root ? [snapshot.root] : [], ...snapshot.replies] : [];
+  return {
+    available: Boolean(session?.thread),
+    status: snapshot?.status ?? "idle",
+    error: snapshot?.error,
+    comments: threadComments(messages),
+    more: snapshot?.canLoadMore ? () => void reader?.loadMore() : void 0,
+    reply: session?.messages?.reply && channel && root ? (content, mentions) => session.messages.reply(channel, root, content, mentions) : void 0
+  };
+}
+function CommentItem(props) {
+  const { comment } = props;
+  const who = props.profile(comment.author);
+  const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}\u2026`;
+  const mark = who?.picture ? /* @__PURE__ */ React.createElement("img", { src: who.picture, alt: name, style: { width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" } }) : /* @__PURE__ */ React.createElement("span", { style: { width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" } }, initials(name));
+  const text = comment.text.length > 6e3 ? `${comment.text.slice(0, 5999)}\u2026` : comment.text;
+  return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 } }, mark, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 auto", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "baseline" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, name), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(comment.at * 1e3), comment.pending ? " \xB7 sending" : "")), /* @__PURE__ */ React.createElement("div", { style: { overflowWrap: "anywhere" } }, comment.agents ? /* @__PURE__ */ React.createElement(Disclosure, { summary: "Note between agents" }, /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" })) : /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" }))));
+}
+function ReplyBox(props) {
+  const [text, setText] = React.useState("");
+  const [error, setError] = React.useState();
+  const mentions = replyMentions(props.assignee);
+  const to = props.assignee.kind === "agent" ? props.profile(props.assignee.key)?.name ?? props.assignee.label : void 0;
+  if (!props.send) return /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Replying needs Buzz's thread view here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer()) }, "Open the thread"), " to reply.");
+  const send = () => {
+    if (!text.trim()) return;
+    setError(void 0);
+    try {
+      props.send(replyText(text, mentions.map((key) => ({ npub: npubEncode(key) }))), mentions);
+      setText("");
+    } catch (problem) {
+      setError(describeError(problem));
+    }
+  };
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      className: "dbx-input",
+      rows: 3,
+      "aria-label": "Reply",
+      placeholder: to ? `Reply to ${to}\u2026` : "Reply in the task's thread\u2026",
+      value: text,
+      onChange: (event) => setText(event.target.value),
+      onKeyDown: (event) => event.key === "Enter" && (event.metaKey || event.ctrlKey) && (event.preventDefault(), send())
+    }
+  ), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, to ? `Mentions ${to}, the agent it's with.` : "Mentions no one: no agent is on it.", " \u2318\u21B5 sends."), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: !text.trim(), onClick: send }, "Reply")));
+}
+function TaskView(props) {
+  const { item } = props;
+  const assignee = assigneeOf(item);
+  const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? void 0, item.task.buzz_root);
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
+  const facts = taskFacts(item);
+  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.map((comment) => comment.author))]);
+  const who = (key) => props.profile(key) ?? authorProfile(key);
+  const people = item.people.filter((person) => person.kind !== "agent");
+  const end = React.useRef(null);
+  const count = thread.comments.length;
+  React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSIGNEE"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, assigneeName(assignee, props.profile)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
 }
 var VIEW_KEY = "signals.board.view";
 var savedView = () => {
@@ -1301,7 +1814,8 @@ function Board(props) {
   };
   const [filters, setFilters] = React.useState({});
   const [opened, setOpened] = React.useState();
-  React.useEffect(() => (setFilters({}), setOpened(void 0)), [channel?.id]);
+  const [viewing, setViewing] = React.useState();
+  React.useEffect(() => (setFilters({}), setOpened(void 0), setViewing(void 0)), [channel?.id]);
   const steer = (item) => {
     if (!item.thread || !channel || !item.task.buzz_root) return;
     if (props.openThread?.(item.thread)) return;
@@ -1317,11 +1831,14 @@ function Board(props) {
   else if (hubs.error || board.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? board.error));
   else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
   else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
-  else {
+  else if (viewing !== void 0 && board.data.tasks.some((item) => item.task.id === viewing)) {
+    const item = board.data.tasks.find((found) => found.task.id === viewing);
+    body = /* @__PURE__ */ React.createElement(TaskView, { ctx, hub: hub2, item, channel: channel.id, profile, steer, onChange: refresh, back: () => setViewing(void 0) });
+  } else {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
-    const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh });
+    const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh, view: (found) => setViewing(found.task.id) });
     const header = (group) => /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusIcon, { status: group.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, group.title), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, grouped.get(group.status).length));
     body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length }), !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
   }
