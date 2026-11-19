@@ -17,11 +17,11 @@ import { ago, Button, Disclosure, DbxRoot, Notice, Spinner, Stack, Text, openExt
 import { Markdown } from "@dbx/core/ui/markdown";
 import { decode, npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
-import { type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
+import { type Assignee, assigneeOf, type Member, memberChoices, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
+import { type BoardPerson, type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 
-type Profile = { name?: string; picture?: string };
-type ProfileQueries = { snapshot(): ReadonlyMap<string, Profile>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
+type Profile = { name?: string; picture?: string; agent?: boolean };
+type ProfileQueries = { snapshot(): ReadonlyMap<string, { name?: string; picture?: string; isAgent?: true }>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
 type ThreadMessage = { id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown };
 type ThreadReader = {
   snapshot(): { status: "idle" | "loading" | "ready" | "error"; root?: ThreadMessage; replies: readonly ThreadMessage[]; error?: string; canLoadMore: boolean; limited?: boolean; readKind?: "older" | "refresh" };
@@ -35,6 +35,7 @@ type RelaySession = {
   media?: (url: string, size?: "small") => string | undefined;
   thread?: (channelId: string, messageId: string, options?: { exact?: boolean; priority?: "foreground" | "background" }) => ThreadReader;
   messages?: { reply?: (channelId: string, rootId: string, content: string, mentions?: readonly string[]) => string };
+  channels?: { get?(channelId: string): { members?: readonly string[] } | undefined; resolve?(channelIds: readonly string[]): Promise<void>; subscribeList?(listener: () => void): () => void };
 };
 type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession; generation?: number; cached?: true; status?: string }; subscribe?(listener: () => void): () => void };
 
@@ -50,8 +51,17 @@ function useProfiles(ctx: Context, keys: readonly string[]) {
     const found = profiles?.snapshot().get(key);
     if (!found) return undefined;
     const picture = found.picture && session?.media ? (session.media(found.picture, "small") ?? found.picture) : found.picture;
-    return { ...(found.name && { name: found.name }), ...(picture && { picture }) };
+    return { ...(found.name && { name: found.name }), ...(picture && { picture }), ...(found.isAgent && { agent: true }) };
   };
+}
+
+/** A channel's members, from its relay-signed roster (empty until the host has read it). */
+function useMembers(ctx: Context, channel: string | undefined): readonly string[] {
+  const channels = optionalService<RelayView>(ctx, "relay")?.snapshot().session?.channels;
+  const [, bump] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => (channels?.subscribeList ? channels.subscribeList(bump) : undefined), [channels]);
+  React.useEffect(() => void (channel && channels?.resolve?.([channel]).then(bump, () => {})), [channels, channel]);
+  return (channel && channels?.get?.(channel)?.members) || [];
 }
 
 /** An npub's hex key, or undefined when it isn't one. */
@@ -70,16 +80,20 @@ const initials = (label: string) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(
 const assigneeName = (assignee: Assignee, profile: (key: string) => Profile | undefined) =>
   assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : (profile(assignee.key)?.name ?? assignee.label);
 
+/** A pubkey's name, or a person's email, for the owner list. */
+const nameOf = (person: { key: string; label: string }, profile: (key: string) => Profile | undefined) => profile(person.key)?.name ?? person.label;
+
 /** The assignee's picture (or initials), like Linear's: round for you, square for agents, dashed for no one. */
 function AssigneeMark(props: { assignee: Assignee; profile(key: string): Profile | undefined; size?: number }) {
   const size = props.size ?? 20;
   const name = assigneeName(props.assignee, props.profile);
-  const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : "Unassigned";
+  const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : props.assignee.kind === "person" ? name : "Unassigned";
   const base: React.CSSProperties = { width: size, height: size, flex: "none", boxSizing: "border-box", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: Math.round(size * 0.42), fontWeight: 600 };
   if (props.assignee.kind === "unassigned") return <span title={title} aria-label={title} style={{ ...base, borderRadius: 999, border: "1.5px dashed var(--dbx-border-strong)" }} />;
   if (props.assignee.kind === "you") return <span title={title} aria-label={title} style={{ ...base, borderRadius: 999, background: "var(--dbx-warning)", color: "var(--dbx-surface)" }}>!</span>;
   const picture = props.profile(props.assignee.key)?.picture;
-  const style: React.CSSProperties = { ...base, borderRadius: 5, border: "1px solid var(--dbx-border)" };
+  // People are round, agents square.
+  const style: React.CSSProperties = { ...base, borderRadius: props.assignee.kind === "person" ? 999 : 5, border: "1px solid var(--dbx-border)" };
   return picture ? <img src={picture} alt={name} title={title} style={{ ...style, objectFit: "cover" }} /> : <span title={title} aria-label={title} style={{ ...style, background: "var(--dbx-brand-tint)", color: "var(--dbx-subtle)" }}>{initials(name)}</span>;
 }
 
@@ -136,6 +150,78 @@ function AddAgent(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
         <Button size="sm" variant="brand" disabled={busy || !agent.trim()} onClick={() => void add()}>{busy ? <Spinner size={10} /> : null}Ask</Button>
         <Button size="sm" onClick={() => setOpen(false)}>Cancel</Button>
       </Stack>
+    </Stack>
+  );
+}
+
+/**
+ * A task's owners, each with an × to take them off, and a picker of the
+ * channel's members to assign. Picking someone while it has owners asks
+ * whether to add them or reassign (take the others off). The hub posts the
+ * change in the thread: an agent assigned is asked to work on it, an agent
+ * taken off is told to stop.
+ */
+function Owners(props: { hub: HubClient; item: BoardTask; members: readonly string[]; boardAgents: readonly string[]; viewer?: string; profile(key: string): Profile | undefined; onChange(): void }) {
+  const { item } = props;
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string>();
+  const [picked, setPicked] = React.useState<Member>();
+  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  const owners = ownersOf(item);
+  const helpers = removable(item).filter((person) => person.role !== "owner");
+  const choices = memberChoices(props.members, props.boardAgents, owners.map((owner) => owner.key), props.profile, props.viewer);
+  const run = async (input: { assign?: { key: string; kind: "agent" | "person" }[]; unassign?: { key: string; kind: "agent" | "person" }[] }) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await props.hub.updateTask({ id: item.task.id, ...input });
+      setPicked(undefined);
+      props.onChange();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const asOwner = (member: Member) => ({ key: member.key, kind: member.agent ? ("agent" as const) : ("person" as const) });
+  const off = (person: BoardPerson) => ({ key: person.key, kind: person.kind as "agent" | "person" });
+  const pick = (key: string) => {
+    const member = choices.find((choice) => choice.key === key);
+    if (!member) return;
+    if (!owners.length) void run({ assign: [asOwner(member)] });
+    else setPicked(member);
+  };
+  const row = (person: BoardPerson, owner: boolean) => (
+    <Stack key={`${person.kind}:${person.key}`} direction="row" gap={8} align="center">
+      <AssigneeMark assignee={{ kind: person.kind as "agent" | "person", key: person.key, label: person.label }} profile={props.profile} />
+      <Text size="sm" style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{nameOf(person, props.profile)}{!owner && <span style={{ color: "var(--dbx-tertiary)" }}> · {person.role}</span>}</Text>
+      {!closed && <button type="button" className="dbx-input" disabled={busy} title={person.kind === "agent" ? "Take it off this task: it's told in the thread to stop" : "Take them off this task"} aria-label={`Take ${nameOf(person, props.profile)} off`} onClick={() => void run({ unassign: [off(person)] })} style={{ width: "auto", padding: "0 6px", lineHeight: 1.4, cursor: "pointer" }}>×</button>}
+    </Stack>
+  );
+  return (
+    <Stack gap={6}>
+      <Text size="xs" tone="tertiary" weight={600}>OWNERS</Text>
+      {item.task.question && !closed && <Stack direction="row" gap={8} align="center"><AssigneeMark assignee={{ kind: "you" }} profile={props.profile} /><Text size="sm">Waiting on your input</Text></Stack>}
+      {owners.length ? owners.map((person) => row(person, true)) : <Text size="xs" tone="subtle">No one{helpers.length ? "; agents asked are below" : ""}.</Text>}
+      {helpers.length > 0 && helpers.map((person) => row(person, false))}
+      {!closed && !picked && (
+        <select className="dbx-input" aria-label="Assign" disabled={busy || !choices.length} value="" onChange={(event) => pick(event.target.value)} style={{ fontSize: "0.75rem" }}>
+          <option value="">{choices.length ? "Assign to…" : "No channel members to assign"}</option>
+          {choices.map((member) => <option key={member.key} value={member.key}>{member.agent ? "🤖 " : ""}{member.name}</option>)}
+        </select>
+      )}
+      {picked && (
+        <Stack gap={6}>
+          <Text size="xs">Assign {picked.name}:</Text>
+          <Stack direction="row" gap={6} wrap>
+            <Button size="sm" variant="brand" disabled={busy} title="Take the current owners off and assign them" onClick={() => void run({ assign: [asOwner(picked)], unassign: owners.map(off) })}>Reassign</Button>
+            <Button size="sm" disabled={busy} title="Keep the current owners" onClick={() => void run({ assign: [asOwner(picked)] })}>Add</Button>
+            <Button size="sm" disabled={busy} onClick={() => setPicked(undefined)}>Cancel</Button>
+          </Stack>
+        </Stack>
+      )}
+      {busy && <Spinner size={10} />}
+      {error && <Text size="xs" tone="danger">{error}</Text>}
     </Stack>
   );
 }
@@ -419,7 +505,7 @@ function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | u
 }
 
 /** A task's full view, like a Linear issue: title, details and assets beside its thread as comments, with a reply box. */
-function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back(): void }) {
+function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; boardAgents: readonly string[]; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back(): void }) {
   const { item } = props;
   const assignee = assigneeOf(item);
   const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? undefined, item.task.buzz_root);
@@ -427,7 +513,11 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
   const facts = taskFacts(item);
   const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.flatMap((comment) => [comment.author, ...mentionedKeys(comment.text, npubKey)]))]);
   const who = (key: string) => props.profile(key) ?? authorProfile(key);
-  const people = item.people.filter((person) => person.kind !== "agent");
+  // Owners and agents asked are under Owners.
+  const people = item.people.filter((person) => person.kind !== "agent" && !person.on);
+  const members = useMembers(props.ctx, props.channel ?? item.task.channel ?? undefined);
+  useProfiles(props.ctx, members);
+  const viewer = optionalService<RelayView>(props.ctx, "relay")?.snapshot().viewer;
   const end = React.useRef<HTMLDivElement>(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
@@ -476,10 +566,7 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
         </div>
         <aside style={{ flex: "1 1 220px", minWidth: 0, maxWidth: 340 }}>
           <Stack gap={12}>
-            <Stack gap={6}>
-              <Text size="xs" tone="tertiary" weight={600}>ASSIGNEE</Text>
-              <Stack direction="row" gap={8} align="center"><AssigneeMark assignee={assignee} profile={props.profile} /><Text size="sm">{assigneeName(assignee, props.profile)}</Text></Stack>
-            </Stack>
+            <Owners hub={props.hub} item={item} members={members} boardAgents={props.boardAgents} {...(viewer && { viewer })} profile={who} onChange={props.onChange} />
             <Stack gap={4}>
               <Text size="xs" tone="tertiary" weight={600}>DETAILS</Text>
               {facts.map((fact) => (
@@ -708,7 +795,7 @@ function Board(props: {
   else if (!board.data?.tasks.length && !filtered.data?.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
   else if (viewing !== undefined && board.data?.tasks.some((item) => item.task.id === viewing)) {
     const item = board.data.tasks.find((found) => found.task.id === viewing)!;
-    body = <TaskView ctx={ctx} hub={hub} item={item} channel={channel.id} profile={profile} steer={steer} onChange={refresh} back={() => setViewing(undefined)} />;
+    body = <TaskView ctx={ctx} hub={hub} item={item} channel={channel.id} boardAgents={agents} profile={profile} steer={steer} onChange={refresh} back={() => setViewing(undefined)} />;
   } else if (board.data) {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);

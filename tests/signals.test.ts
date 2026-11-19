@@ -7,7 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
-import { assigneeOf, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
+import { assigneeOf, memberChoices, ownersOf, removable, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
 import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
@@ -587,6 +587,86 @@ describe("account channels", () => {
     const root = "d".repeat(63) + "1";
     expect(await hub.collect(async () => [{ id: "r1", pubkey: scout, content: "Draft", created_at: 2, tags: [["e", root, "", "reply"]] }])).toEqual({ recorded: 1 });
     expect((await store.task(1))?.status).toBe("in_progress");
+  });
+
+  it("assigns and unassigns owners: agents are asked or told to stop, and an agent taken off stays off", async () => {
+    const store = new SignalsStore(pglite(), "signals_owners");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "d".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id", watch: ["payload.status"] }] } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const board = async () => ((await hub.handle({ method: "GET", path: "/api/board", query: new URLSearchParams("channel=globex"), user: "alice@x.com", body: async () => "" })).json as { tasks: { task: { id: number }; people: { kind: string; key: string; role: string; on?: true }[] }[] }).tasks.find((item) => item.task.id === 1)!.people;
+    const [genie, scout, bo] = ["ab".repeat(32), "ef".repeat(32), "34".repeat(32)];
+    const root = "d".repeat(63) + "1";
+    const reply = (id: string, pubkey: string) => [{ id, pubkey, content: "On it", created_at: 9e9, tags: [["e", root, "", "reply"]] }];
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [genie], preferences: "meeting prep: draft" });
+    await call("/api/sources", { source: "google_calendar", enabled: true });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "m1", actor: "ann@globex.io", title: "QBR", payload: { status: "a" } }] });
+    await hub.sweep();
+    replies.length = 0;
+
+    // The API's shape: lists of pubkeys, emails or {key, kind}.
+    expect(await call("/api/task", { id: 1, assign: ["nobody"] })).toMatchObject({ status: 400 });
+    expect(await call("/api/task", { id: 1, assign: [{ key: scout, kind: "robot" }] })).toMatchObject({ status: 400 });
+    expect(await call("/api/task", { id: 1, assign: [], unassign: [] })).toMatchObject({ status: 400 });
+
+    // Assign an agent: mentioned and asked to work on it, with the briefing, and logged.
+    const assigned = await call("/api/task", { id: 1, assign: [npubEncode(scout)], note: "Scout has the deck" });
+    expect(assigned.json).toMatchObject({ activities: expect.arrayContaining([expect.objectContaining({ kind: "assigned", text: expect.stringContaining("Scout has the deck") })]) });
+    expect(replies.at(-1)!.agents).toEqual([scout]);
+    expect(replies.at(-1)!.text).toContain(`assigned this to nostr:${npubEncode(scout)}`);
+    expect(replies.at(-1)!.text).toContain("post a draft in this thread");
+    expect(replies.at(-1)!.text).toContain("**For agents: Globex**");
+    expect(await board()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "agent", key: scout, role: "owner", on: true })]));
+    // Assigning the same owner again posts nothing.
+    const before = replies.length;
+    await call("/api/task", { id: 1, assign: [scout] });
+    expect(replies).toHaveLength(before);
+
+    // Assign a person (a channel member, by pubkey): mentioned, no agent asked.
+    await call("/api/task", { id: 1, assign: [{ key: bo, kind: "person" }] });
+    expect(replies.at(-1)!.agents).toEqual([bo]);
+    expect(replies.at(-1)!.text).toBe(`👤 alice@x.com assigned this to nostr:${npubEncode(bo)}.`);
+    // And by email.
+    await call("/api/task", { id: 1, assign: ["Cy <CY@x.com>"] });
+    expect(replies.at(-1)!.text).toContain("**cy@x.com**");
+    expect(replies.at(-1)!.agents).toEqual([]);
+
+    // Unassign the account's agent: told to stop, and not woken again by changes, answers, askAgain, handOff or collect.
+    await call("/api/task", { id: 1, unassign: [genie] });
+    expect(replies.at(-1)!.agents).toEqual([genie]);
+    expect(replies.at(-1)!.text).toContain(`nostr:${npubEncode(genie)} you're off this task`);
+    expect((await store.detail(1))?.activities.map((a) => a.kind)).toContain("unassigned");
+    expect((await board()).some((person) => person.key === genie)).toBe(false);
+    expect(await hub.collect(async () => reply("g1", genie))).toEqual({ recorded: 0 });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "m1", actor: "ann@globex.io", title: "QBR", payload: { status: "b" } }] });
+    const change = replies.at(-1)!;
+    expect(change.text).toContain("status");
+    expect(change.agents).toEqual([scout]);
+    await call("/api/task", { id: 1, question: "Which deck?", options: ["A", "B"] });
+    await call("/api/task", { id: 1, input: "A" });
+    expect(replies.at(-1)!.agents).toEqual([scout]);
+    await store.askAgain(1, [genie]);
+    expect((await store.people([1])).get(1)?.some((person) => person.key === genie)).toBe(false);
+    expect((await call("/api/account", { name: "Globex", agents: [genie, "56".repeat(32)] })).json).not.toHaveProperty("woken");
+    expect(await hub.collect(async () => reply("g2", genie))).toEqual({ recorded: 0 });
+    expect(await hub.collect(async () => reply("s1", scout))).toEqual({ recorded: 1 });
+
+    // Reassign in one call: Scout off (told to stop), Genie on (asked again, so it's back).
+    await call("/api/task", { id: 1, assign: [genie], unassign: [scout, { key: bo, kind: "person" }] });
+    const swap = replies.at(-1)!;
+    expect(swap.agents).toEqual(expect.arrayContaining([genie, scout]));
+    expect(swap.text).toContain(`assigned this to nostr:${npubEncode(genie)}`);
+    expect(swap.text).toContain(`nostr:${npubEncode(scout)} you're off this task`);
+    const owners = (await board()).filter((person) => person.role === "owner").map((person) => person.key);
+    expect(owners.sort()).toEqual(["cy@x.com", genie].sort());
+    expect(await hub.collect(async () => reply("s2", scout))).toEqual({ recorded: 0 });
+    expect(await hub.collect(async () => reply("g3", genie))).toEqual({ recorded: 1 });
   });
 
   it("sends an account's open tasks without a channel to the channel it gets", async () => {
@@ -1191,6 +1271,28 @@ describe("rules for every account", () => {
 
     it("shows one assignee: you when it needs input, else the agent that replied, else the one asked, else no one", () => {
       expect(tasks.map(assigneeOf)).toEqual([{ kind: "you" }, { kind: "agent", key: agent, label: "Genie" }, { kind: "unassigned" }, { kind: "agent", key: scout, label: "Scout" }]);
+    });
+
+    it("shows its first owner over the agents asked, lists who can be taken off, and offers the channel's other members", () => {
+      const people = [
+        { kind: "agent", key: agent, label: "Genie", role: "replied", on: true },
+        { kind: "person", key: "bo@x.com", label: "bo@x.com", role: "owner", on: true },
+        { kind: "agent", key: scout, label: "Scout", role: "owner", on: true },
+        { kind: "customer", key: "ann@globex.io", label: "Ann", role: "wrote" },
+      ];
+      const owned = item(5, { status: "in_progress" }, people);
+      expect(assigneeOf(owned)).toEqual({ kind: "person", key: "bo@x.com", label: "bo@x.com" });
+      expect(ownersOf(owned).map((person) => person.key)).toEqual(["bo@x.com", scout]);
+      expect(removable(owned).map((person) => person.key)).toEqual([agent, "bo@x.com", scout]);
+      // A question still puts it with you.
+      expect(assigneeOf(item(6, { status: "waiting", question: "?" }, people))).toEqual({ kind: "you" });
+      const me = "77".repeat(32);
+      const names: Record<string, { name?: string; agent?: boolean }> = { [agent]: { name: "Genie", agent: true }, [me]: { name: "Alice" }, ["88".repeat(32)]: { name: "Zed" } };
+      expect(memberChoices([me, "88".repeat(32), scout, agent], [agent], [scout], (key) => names[key], me)).toEqual([
+        { key: agent, name: "Genie", agent: true },
+        { key: me, name: "Alice (you)", agent: false },
+        { key: "88".repeat(32), name: "Zed", agent: false },
+      ]);
     });
 
     it("filters by status, workstream, assignee, mode and words, and counts each choice", () => {

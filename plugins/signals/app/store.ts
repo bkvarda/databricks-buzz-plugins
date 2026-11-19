@@ -64,7 +64,8 @@ export type Series = Readonly<{
 }>;
 
 /** Someone on a task: an agent (hex pubkey) asked to work on it, or a person (email) who changed it. */
-export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number }>;
+/** Someone on a task. `assigned_at`: when a person (or an agent) made them its owner, as against an agent asked to help. */
+export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number; assigned_at?: number }>;
 
 export type Outcome = "new" | "changed" | "same" | "skipped";
 /** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
@@ -174,6 +175,9 @@ export class SignalsStore {
       task_id bigint NOT NULL, kind text NOT NULL, key text NOT NULL, label text, at bigint NOT NULL, replied_at bigint, PRIMARY KEY (task_id, kind, key))`);
     // When an agent was asked again (given the input it asked for): only its replies after this count.
     await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS asked_at bigint`);
+    // Owners someone chose (assigned_at), and who was taken off (removed_at): kept, so nothing puts them back but assigning them again.
+    await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS assigned_at bigint`);
+    await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS removed_at bigint`);
     await this.setupInbox();
   }
 
@@ -540,17 +544,52 @@ export class SignalsStore {
     const found = await this.q(
       `SELECT * FROM $S.tasks t WHERE buzz_root IS NOT NULL AND status NOT IN ('done', 'dismissed')
          AND ((created_at >= $1 AND agent_reply IS NULL AND account IS NOT NULL AND mode IN ('auto', 'draft'))
-           OR EXISTS (SELECT 1 FROM $S.task_people p WHERE p.task_id = t.id AND p.kind = 'agent' AND p.replied_at IS NULL AND COALESCE(p.asked_at, t.created_at) >= $1))
+           OR EXISTS (SELECT 1 FROM $S.task_people p WHERE p.task_id = t.id AND p.kind = 'agent' AND p.replied_at IS NULL AND p.removed_at IS NULL AND COALESCE(p.asked_at, t.created_at) >= $1))
          ORDER BY id LIMIT ${limit}`,
       [at - days * 86400],
     );
     return found.rows.map(toTask);
   }
 
-  /** Adds people to a task (agents by hex pubkey, people by email); ones already on it stay as they were. */
+  /** Adds people to a task (agents by hex pubkey, people by email); ones already on it, or taken off it, stay as they were. */
   async addPeople(task: number, people: readonly Readonly<{ kind: "agent" | "person"; key: string; label?: string }>[]): Promise<void> {
     for (const person of people)
       await this.q(`INSERT INTO $S.task_people (task_id, kind, key, label, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, [task, person.kind, person.key, person.label ?? null, now()]);
+  }
+
+  /**
+   * Puts someone on a task by a person's choice: back on it if they were taken
+   * off. An agent is asked from now (only its replies since count). `owner`:
+   * made its owner, as against asked to help.
+   */
+  async assign(task: number, kind: "agent" | "person", key: string, owner: boolean, at = now()): Promise<void> {
+    await this.q(
+      `INSERT INTO $S.task_people (task_id, kind, key, at, asked_at, assigned_at) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (task_id, kind, key) DO UPDATE SET removed_at = NULL, replied_at = CASE WHEN EXCLUDED.kind = 'agent' THEN NULL ELSE $S.task_people.replied_at END,
+         asked_at = COALESCE(EXCLUDED.asked_at, $S.task_people.asked_at), assigned_at = COALESCE(EXCLUDED.assigned_at, $S.task_people.assigned_at)`,
+      [task, kind, key, at, kind === "agent" ? at : null, owner ? at : null],
+    );
+  }
+
+  /** Takes someone off a task. The row stays, marked removed, so nothing but assigning them again puts them back. */
+  async unassign(task: number, key: string, kind: TaskPerson["kind"], at = now()): Promise<TaskPerson["kind"] | undefined> {
+    const found = await this.q(`UPDATE $S.task_people SET removed_at = $3, assigned_at = NULL WHERE task_id = $1 AND key = $2 AND removed_at IS NULL RETURNING kind`, [task, key, at]);
+    if (found.rows[0]) return found.rows[0].kind as TaskPerson["kind"];
+    // Not on it yet (an account agent the hub would still wait on, say): recorded as taken off, so it isn't.
+    await this.q(`INSERT INTO $S.task_people (task_id, kind, key, at, removed_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT DO NOTHING`, [task, kind, key, at]);
+    return undefined;
+  }
+
+  /** The agents taken off each of the tasks: the hub doesn't wake or wait on them. */
+  async removed(tasks: readonly number[]): Promise<Map<number, Set<string>>> {
+    const out = new Map<number, Set<string>>();
+    if (!tasks.length) return out;
+    const found = await this.q(`SELECT task_id, key FROM $S.task_people WHERE task_id = ANY($1::bigint[]) AND removed_at IS NOT NULL`, [tasks]);
+    for (const row of found.rows) {
+      const id = Number(row.task_id);
+      out.set(id, (out.get(id) ?? new Set()).add(String(row.key)));
+    }
+    return out;
   }
 
   /** Records that an agent replied in the task's thread (adding it to the task if it wasn't on it). */
@@ -566,10 +605,11 @@ export class SignalsStore {
   async people(tasks: readonly number[]): Promise<Map<number, TaskPerson[]>> {
     const out = new Map<number, TaskPerson[]>();
     if (!tasks.length) return out;
-    const found = await this.q(`SELECT task_id, kind, key, label, at, replied_at, asked_at FROM $S.task_people WHERE task_id = ANY($1::bigint[]) ORDER BY at, key`, [tasks]);
+    // Who's on them now: not those taken off.
+    const found = await this.q(`SELECT task_id, kind, key, label, at, replied_at, asked_at, assigned_at FROM $S.task_people WHERE task_id = ANY($1::bigint[]) AND removed_at IS NULL ORDER BY at, key`, [tasks]);
     for (const row of found.rows) {
       const id = Number(row.task_id);
-      out.set(id, [...(out.get(id) ?? []), { kind: row.kind as TaskPerson["kind"], key: String(row.key), ...(row.label ? { label: String(row.label) } : {}), at: Number(row.at), ...(row.replied_at !== null && row.replied_at !== undefined && { replied_at: Number(row.replied_at) }), ...(row.asked_at !== null && row.asked_at !== undefined && { asked_at: Number(row.asked_at) }) }]);
+      out.set(id, [...(out.get(id) ?? []), { kind: row.kind as TaskPerson["kind"], key: String(row.key), ...(row.label ? { label: String(row.label) } : {}), at: Number(row.at), ...(row.replied_at !== null && row.replied_at !== undefined && { replied_at: Number(row.replied_at) }), ...(row.asked_at !== null && row.asked_at !== undefined && { asked_at: Number(row.asked_at) }), ...(row.assigned_at !== null && row.assigned_at !== undefined && { assigned_at: Number(row.assigned_at) }) }]);
     }
     return out;
   }
@@ -647,7 +687,7 @@ export class SignalsStore {
     for (const key of agents)
       await this.q(
         `INSERT INTO $S.task_people (task_id, kind, key, at, asked_at) VALUES ($1, 'agent', $2, $3, $3)
-         ON CONFLICT (task_id, kind, key) DO UPDATE SET replied_at = NULL, asked_at = EXCLUDED.asked_at`,
+         ON CONFLICT (task_id, kind, key) DO UPDATE SET replied_at = NULL, asked_at = EXCLUDED.asked_at WHERE $S.task_people.removed_at IS NULL`,
         [task, key, at],
       );
   }

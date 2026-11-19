@@ -17,6 +17,8 @@
 //   POST /api/account {name, rename?, channel?, aliases?, domains?, ids?, agents?, preferences?, profile?, playbooks?, delete?}
 //   GET  /api/board?channel=              a channel's tasks for the board: who's on each, its source, artifacts, last activity
 //   POST /api/task {id, agents: [...]}    asks agents to work on a task (in its thread)
+//   POST /api/task {id, assign?: [...], unassign?: [...], note?}  sets its owners (see setOwners): agents or people, by
+//                                         pubkey (hex or npub) or email, or {key, kind: "agent"|"person", label?}
 //   POST /api/task {id, question, options?}  needs input: waiting, with the question (agents ask this way)
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
@@ -421,12 +423,17 @@ export class Hub {
     const tasks = (await this.store.untouched(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
     const woken: number[] = [];
     const labels = labelsOf(await this.config());
+    const ids = tasks.map((task) => task.id);
+    const [gone, people] = await Promise.all([this.store.removed(ids), this.store.people(ids)]);
     for (const task of tasks) {
+      // Not agents someone took off it, and not tasks someone gave owners: a person chose who has those.
+      const asked = agents.filter((key) => !gone.get(task.id)?.has(key));
+      if (!asked.length || (people.get(task.id) ?? []).some((person) => person.assigned_at)) continue;
       try {
         const event = await this.store.latestEvent(task.id);
-        await this.notifier.updated(task, handOffMessage(task, agents, briefing(account, labels, task), event && eventDetails(event, account.domains, labels)), agents);
-        await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
-        await this.store.activity(task.id, "hub", "agents_asked", `Asked ${agents.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
+        await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels)), asked);
+        await this.store.addPeople(task.id, asked.map((key) => ({ kind: "agent", key })));
+        await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
       } catch (error) {
         this.log(`couldn't ask agents to work on task ${task.id}: ${(error as Error).message}`);
@@ -458,7 +465,7 @@ export class Hub {
           for (const opened of await this.store.releaseHeld(asking, await this.config())) await this.post(opened);
         }
       }
-    } else if (note && input.agents === undefined) await this.store.activity(id, user, "note", note);
+    } else if (note && input.agents === undefined && input.assign === undefined && input.unassign === undefined) await this.store.activity(id, user, "note", note);
     if (input.agents !== undefined) {
       const keys = Array.isArray(input.agents) ? [...new Set(input.agents.map((item) => agentKey(String(item))))] : [];
       if (!keys.length || keys.some((key) => !key) || keys.length > 10) return bad("agents is a list of up to 10 Buzz pubkeys (hex or npub).");
@@ -467,8 +474,17 @@ export class Hub {
       const event = await this.store.latestEvent(id);
       const labels = labelsOf(await this.config());
       await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels, task), event && eventDetails(event, account?.domains ?? [], labels)), keys);
-      await this.store.addPeople(id, keys.map((key) => ({ kind: "agent", key })));
+      // Asking an agent taken off it puts it back.
+      for (const key of keys) await this.store.assign(id, "agent", key, false);
       await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `agent:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
+    }
+    if (input.assign !== undefined || input.unassign !== undefined) {
+      const assign = input.assign === undefined ? [] : readOwners(input.assign);
+      const unassign = input.unassign === undefined ? [] : readOwners(input.unassign);
+      if (typeof assign === "string" || typeof unassign === "string") return bad(`assign and unassign are lists of up to 10 owners: ${(typeof assign === "string" ? assign : unassign) as string}`);
+      if (!assign.length && !unassign.length) return bad("Send who to assign or unassign.");
+      if (assign.some((owner) => owner.kind === "agent") && (!this.notifier || !task.buzz_root)) return bad("The task isn't posted in Buzz yet, so there's no thread to ask an agent in.", 409);
+      task = await this.setOwners(task, user, assign, unassign, note);
     }
     if (input.question !== undefined) {
       const ask = readQuestion(input.question, input.options);
@@ -494,6 +510,44 @@ export class Hub {
   }
 
   /**
+   * Sets a task's owners: takes `unassign` off it, then puts `assign` on it as
+   * its owners, so a reassignment is one call. One message in its thread says
+   * what changed. An agent assigned is mentioned and asked to work on it, with
+   * the account's briefing, and the hub records its next reply. A person
+   * assigned is mentioned (by pubkey) and no agent wakes. An agent taken off
+   * is told to stop, and from then on it isn't mentioned by changes or
+   * answers, isn't waited on, and saving the account's agents doesn't put it
+   * back: only assigning it again does.
+   */
+  private async setOwners(task: Task, user: string, assign: readonly Owner[], unassign: readonly Owner[], note?: string): Promise<Task> {
+    const adding = new Set(assign.map((owner) => owner.key));
+    const off: Owner[] = [];
+    for (const owner of unassign) {
+      if (adding.has(owner.key)) continue;
+      const kind = await this.store.unassign(task.id, owner.key, owner.kind);
+      if (kind) off.push({ kind, key: owner.key });
+    }
+    const people = (await this.store.people([task.id])).get(task.id) ?? [];
+    const on = assign.filter((owner) => !people.some((person) => person.key === owner.key && person.assigned_at));
+    for (const owner of on) await this.store.assign(task.id, owner.kind, owner.key, true);
+    if (!off.length && !on.length) return task;
+    const said = (owner: Owner) => (owner.kind === "agent" ? `agent:${npub(owner.key)}` : HEX64.test(owner.key) ? `person:${npub(owner.key)}` : owner.key);
+    if (off.length) await this.store.activity(task.id, user, "unassigned", `Took ${off.map(said).join(", ")} off it`);
+    if (on.length) await this.store.activity(task.id, user, "assigned", `Assigned ${on.map(said).join(", ")}${note ? `: ${note}` : ""}`);
+    const updated = (await this.store.task(task.id))!;
+    if (this.notifier && task.buzz_root) {
+      const agents = on.some((owner) => owner.kind === "agent");
+      const account = agents && task.account ? await this.store.account({ name: task.account }) : undefined;
+      const labels = labelsOf(await this.config());
+      const event = agents ? await this.store.latestEvent(task.id) : undefined;
+      const text = ownersMessage(updated, user, on, off, note, account && briefing(account, labels, updated), event && eventDetails(event, account?.domains ?? [], labels));
+      const mentions = [...new Set([...on, ...off.filter((owner) => owner.kind === "agent")].map((owner) => owner.key).filter((key) => HEX64.test(key)))];
+      await this.notifier.updated(updated, text, mentions).catch((error) => this.log(`couldn't post the owners of task ${task.id}: ${(error as Error).message}`));
+    }
+    return updated;
+  }
+
+  /**
    * Answers a task's question: posts the answer in its thread, mentioning its
    * agents (the one that asked first), takes the question off, moves it back to
    * in_progress, and asks the agents again, so each one's next reply is
@@ -502,7 +556,9 @@ export class Hub {
   private async answer(task: Task, user: string, text: string): Promise<Task> {
     if (task.series && task.asked_by === SERIES_ASKER) return this.answerSeries(task, user, text);
     const people = (await this.store.people([task.id])).get(task.id) ?? [];
-    const asker = task.asked_by && HEX64.test(task.asked_by) ? [task.asked_by] : [];
+    // An agent that asked and was taken off since isn't asked to go on.
+    const gone = (await this.store.removed([task.id])).get(task.id);
+    const asker = task.asked_by && HEX64.test(task.asked_by) && !gone?.has(task.asked_by) ? [task.asked_by] : [];
     const agents = [...new Set([...asker, ...people.filter((person) => person.kind === "agent").map((person) => person.key)])];
     await this.store.activity(task.id, user, "input", text);
     await this.store.setQuestion(task.id, user);
@@ -557,7 +613,8 @@ export class Hub {
       await this.store.setMode(task.id, mode);
       resumed = (await this.store.setStatus(task.id, "open", user, choice === "always" ? "always for this series" : choice === "once" ? "just this one" : "input given"))!;
       const account = resumed.account ? await this.store.account({ name: resumed.account }) : undefined;
-      const agents = account && account.channel === resumed.channel && (mode === "auto" || mode === "draft") ? account.agents : [];
+      const gone = (await this.store.removed([task.id])).get(task.id);
+      const agents = account && account.channel === resumed.channel && (mode === "auto" || mode === "draft") ? account.agents.filter((key) => !gone?.has(key)) : [];
       const said = choice === "always" ? "**Always**. Tasks open for this series from now on." : choice === "once" ? "**Just this one**. The series' next event asks again." : `${text} (the series' next event asks again)`;
       if (this.notifier && resumed.buzz_root) {
         const labels = labelsOf(await this.config());
@@ -641,12 +698,13 @@ export class Hub {
     if (!tasks.length) return { recorded: 0 };
     const accounts = new Map((await this.store.accounts()).map((account) => [account.name, account]));
     const people = await this.store.people(tasks.map((task) => task.id));
+    const gone = await this.store.removed(tasks.map((task) => task.id));
     // The agents each task waits on: the account's, until one replies, and every agent asked to work on it that hasn't.
     const waiting = tasks.flatMap((task) => {
       const on = (people.get(task.id) ?? []).filter((person) => person.kind === "agent");
       const account = task.account ? accounts.get(task.account) : undefined;
       const fromAccount = !task.agent_reply && (task.mode === "auto" || task.mode === "draft") && account?.channel === task.channel ? (account?.agents ?? []) : [];
-      const done = new Set(on.filter((person) => person.replied_at).map((person) => person.key));
+      const done = new Set([...on.filter((person) => person.replied_at).map((person) => person.key), ...(gone.get(task.id) ?? [])]);
       const agents = [...new Set([...fromAccount, ...on.filter((person) => !person.replied_at).map((person) => person.key)])].filter((key) => !done.has(key));
       // An agent asked again (given input) counts only its replies since.
       const since = new Map(on.filter((person) => person.asked_at).map((person) => [person.key, person.asked_at!]));
@@ -864,8 +922,10 @@ export type BoardPerson = Readonly<{
   kind: "agent" | "person" | "customer" | "team";
   key: string;
   label: string;
-  /** Why they're on it, e.g. "asked", "replied", "assignee", "changed it". */
+  /** Why they're on it, e.g. "owner" (someone assigned them), "asked", "replied", "assignee", "changed it". */
   role: string;
+  /** On the task in the hub (an owner, or an agent asked), so it can be taken off; others are only seen in its source or activity. */
+  on?: true;
 }>;
 
 export type BoardTask = Readonly<{
@@ -900,8 +960,8 @@ export function whoIsOn(people: readonly TaskPerson[], actors: readonly string[]
     if (!out.has(id)) out.set(id, person);
   };
   for (const person of people) {
-    if (person.kind === "agent") add({ kind: "agent", key: person.key, label: person.label ?? npub(person.key).slice(0, 12) + "…", role: person.replied_at ? "replied" : "asked" });
-    else add({ kind: "person", key: person.key, label: person.label ?? person.key, role: "on it" });
+    if (person.kind === "agent") add({ kind: "agent", key: person.key, label: person.label ?? npub(person.key).slice(0, 12) + "…", role: person.assigned_at ? "owner" : person.replied_at ? "replied" : "asked", on: true });
+    else add({ kind: "person", key: person.key, label: person.label ?? (HEX64.test(person.key) ? npub(person.key).slice(0, 12) + "…" : person.key), role: person.assigned_at ? "owner" : "on it", on: true });
   }
   for (const actor of actors) {
     if (actor.startsWith("agent:")) {
@@ -1040,6 +1100,45 @@ export function changedMessage(task: Task, update: string, changes: readonly Fie
 }
 
 /** The reply that asks agents someone added to a task to work on it. */
+/** An owner as the API takes one: an agent or a person, by hex pubkey or (people only) email. */
+export type Owner = Readonly<{ kind: "agent" | "person"; key: string }>;
+
+/** Owners from the API: pubkeys (hex or npub, agents unless said) or emails (people), or {key, kind}; else what's wrong. */
+export function readOwners(value: unknown): Owner[] | string {
+  const list = Array.isArray(value) ? value : [value];
+  if (list.length > 10) return "at most 10.";
+  const out = new Map<string, Owner>();
+  for (const item of list) {
+    const raw = typeof item === "string" ? item : item && typeof item === "object" && typeof (item as { key?: unknown }).key === "string" ? (item as { key: string }).key : undefined;
+    const kind = item && typeof item === "object" ? (item as { kind?: unknown }).kind : undefined;
+    if (raw === undefined || (kind !== undefined && kind !== "agent" && kind !== "person")) return "each is a pubkey (hex or npub), an email, or {key, kind: \"agent\" | \"person\"}.";
+    const key = agentKey(raw);
+    const email = key ? undefined : mailbox(raw).email;
+    if (!key && !email) return `${JSON.stringify(raw)} isn't a pubkey or an email.`;
+    out.set(key || email!, { kind: email ? "person" : ((kind as Owner["kind"] | undefined) ?? "agent"), key: key || email! });
+  }
+  return [...out.values()];
+}
+
+/** The thread's line when a task's owners change: who's off it (agents told to stop) and who has it now (agents asked to start). */
+export function ownersMessage(task: Task, user: string, on: readonly Owner[], off: readonly Owner[], note?: string, account?: string, source?: string): string {
+  const who = (owner: Owner) => (HEX64.test(owner.key) ? `nostr:${npub(owner.key)}` : `**${owner.key}**`);
+  const agents = on.filter((owner) => owner.kind === "agent");
+  const offAgents = off.filter((owner) => owner.kind === "agent");
+  const offPeople = off.filter((owner) => owner.kind === "person");
+  const mode = task.mode === "auto" ? "auto" : "draft";
+  return [
+    on.length ? `👤 ${user} assigned this to ${on.map(who).join(", ")}.${note ? ` ${note}` : ""}` : `👤 ${user} took ${off.map(who).join(", ")} off this task.${note ? ` ${note}` : ""}`,
+    on.length && offPeople.length ? `${offPeople.map(who).join(", ")} ${offPeople.length > 1 ? "are" : "is"} off it.` : "",
+    offAgents.length ? `\n${offAgents.map(who).join(" ")} you're off this task: stop working on it, and don't post more here unless someone asks you.` : "",
+    agents.length ? `\n${agents.map(who).join(" ")} ${AGENT_ASK[mode]} The task is in this thread's first message${source ? " and its source is below" : ""}. ${AGENT_RECORD}` : "",
+    agents.length && source ? `\n${source}` : "",
+    agents.length && account ? `\n${account}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function askMessage(task: Task, agents: readonly string[], user: string, note?: string, account?: string, source?: string): string {
   const mode = task.mode === "auto" || task.mode === "draft" ? task.mode : "draft";
   return [
