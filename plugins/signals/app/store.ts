@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -87,7 +87,8 @@ export type IngestResult = Readonly<{
   /** Tasks opened by this post. */
   created: Task[];
   /** Tasks an event of this post was added to. */
-  updated: { task: Task; title?: string; url?: string; changes?: FieldChange[] }[];
+  /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
+  updated: { task: Task; title?: string; url?: string; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   firstRun: boolean;
@@ -350,17 +351,22 @@ export class SignalsStore {
         }
         // What the watched fields were: this event's last version, or else the task's latest event (another event of its group).
         let changes: FieldChange[] = [];
+        let outgrown: { rule: string; values: { field: string; value: string }[] } | undefined;
         if (!placed.opened) {
           const watched = [...(placed.rule.watch ?? []), ...(config.rules.find((rule) => rule.id === task.rule_id)?.watch ?? [])];
           if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
           // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
           if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule);
+          // Still on its old rule, and that rule doesn't apply now (a case back to Open, say): its playbook would be the wrong one.
+          const own = config.rules.find((rule) => rule.id === task.rule_id);
+          if (changes.length && own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
+            outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
         await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
       } catch (error) {
         result.errors.push({ index, error: (error as Error).message });
       }

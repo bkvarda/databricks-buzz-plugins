@@ -271,7 +271,7 @@ export class Hub {
       const title = update.title && plainSlack(update.title);
       const text = `Update: ${update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event")}`;
       if (update.changes?.length) {
-        await this.changed(update.task, text, update.changes).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
+        await this.changed(update.task, text, update.changes, update.outgrown).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
         continue;
       }
       await this.notifier.updated(update.task, text).catch((error: Error) => this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`));
@@ -283,14 +283,17 @@ export class Hub {
    * go on with the playbook of the rule it's under now. Tasks in ask or off
    * mode, or no agent on, only get the line.
    */
-  private async changed(task: Task, update: string, changes: readonly FieldChange[]) {
+  private async changed(task: Task, update: string, changes: readonly FieldChange[], outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>) {
     const people = (await this.store.people([task.id])).get(task.id) ?? [];
     const agents = task.mode === "auto" || task.mode === "draft" ? [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
     const account = agents.length && task.account ? await this.store.account({ name: task.account }) : undefined;
     const labels = labelsOf(await this.config());
     if (agents.length) await this.store.askAgain(task.id, agents);
     await this.store.activity(task.id, "hub", "changed", changes.map(changeLine).join("; "));
-    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, task)), agents);
+    // A rule that no longer applies gives no playbook of its own: the workstream's, if any.
+    const playbookTask = outgrown ? { rule_id: "", workstream: task.workstream } : task;
+    const event = agents.length ? await this.store.latestEvent(task.id) : undefined;
+    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels)), agents);
   }
 
   private async post(task: Task) {
@@ -1023,11 +1026,13 @@ export function answerMessage(task: Task, user: string, text: string, agents: re
 const changeLine = (change: FieldChange) => `${change.field}: ${change.from} → ${change.to}`;
 
 /** The thread's line when a watched field changes, asking the agents on it (if any) to go on. */
-export function changedMessage(task: Task, update: string, changes: readonly FieldChange[], agents: readonly string[], account?: string): string {
+export function changedMessage(task: Task, update: string, changes: readonly FieldChange[], agents: readonly string[], account?: string, outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, source?: string): string {
   const mode = task.mode === "auto" ? "auto" : "draft";
   return [
     `${update}\n${changes.map((change) => `- **${change.field}:** ${change.from} → ${change.to}`).join("\n")}`,
+    outgrown ? `\nThe rule this task is under (${outgrown.rule}) no longer applies, and no other rule for this kind of work does, so its playbook isn't given. Now: ${outgrown.values.map((item) => `${item.field} ${item.value}`).join(", ")}. Go by the source as it is now${source && agents.length ? " (below)" : ""}.` : "",
     agents.length ? `\n${agents.map((key) => `nostr:${npub(key)}`).join(" ")} this changed since you last looked: ${AGENT_ASK[mode]} Your next reply in this thread is recorded on the task.` : "",
+    agents.length && source ? `\n${source}` : "",
     agents.length && account ? `\n${account}` : "",
   ]
     .filter(Boolean)

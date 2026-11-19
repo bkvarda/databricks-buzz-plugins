@@ -172,6 +172,9 @@ export type Rule = Readonly<{
 /** A watched field's change between a task's previous event and its new one. */
 export type FieldChange = Readonly<{ field: string; from: string; to: string }>;
 
+/** A watched field's value on an event, as the thread shows it. */
+export const watchedValue = (event: EventInput, path: string) => shown(field(event, path)) || "(none)";
+
 const shown = (value: unknown) => (value === undefined || value === null || value === "" ? "" : typeof value === "object" ? JSON.stringify(value) : String(value));
 
 /** The watched fields that differ between two events, in the order given; a field only one of them has counts. */
@@ -539,14 +542,18 @@ const sourceMatches = (patterns: readonly string[] | undefined, source: string) 
  * source sent it (their email), for `skip_own`.
  */
 export function ruleFor(config: SignalsConfig, event: EventInput, owner?: string): Rule | undefined {
-  return config.rules.find(
-    (rule) =>
+  return config.rules.find((rule) => ruleApplies(config, rule, event, owner));
+}
+
+/** Whether one rule applies to an event (as ruleFor checks each, in order). */
+export function ruleApplies(config: SignalsConfig, rule: Rule, event: EventInput, owner?: string): boolean {
+  return (
       sourceMatches(rule.sources, event.source) &&
       matches(rule.when, event) &&
       !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)) &&
       !(rule.skip_own && owner && emailOf(event.actor) === owner.toLowerCase()) &&
       aboutCustomer(config, rule, event) &&
-      (!rule.known_account || knownAccount(config, event, rule)),
+      (!rule.known_account || knownAccount(config, event, rule))
   );
 }
 

@@ -1383,3 +1383,48 @@ describe("watched fields", () => {
     expect(await store.task(1)).toMatchObject({ rule_id: "case-confirm" });
   });
 });
+
+describe("watched fields, rule outgrown", () => {
+  it("leaves out the old rule's playbook when it no longer applies and no other rule of the group does", async () => {
+    const store = new SignalsStore(pglite(), "signals_outgrown");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const watch = ["payload.es_status"];
+    const awaiting = { "payload.status": ["Awaiting Confirmation"] };
+    const rules = [
+      { id: "case-es-open", sources: ["table.cases"], when: { ...awaiting, "payload.es_status": "." }, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
+      { id: "case-confirm", sources: ["table.cases"], when: awaiting, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
+      { id: "case-updates", sources: ["table.cases"], action: "update" as const, group: "case", group_by: "external_id" },
+    ];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-confirm": "Ask, quoting the solution.", cases: "Work the case." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (status: string, es_status?: string) => ({ source: "table.cases", external_id: "C-1", account: "Globex", title: "Case C-1", payload: { status, ...(es_status && { es_status }) } });
+    await call("/api/events", { events: [kase("Awaiting Confirmation")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-confirm" });
+
+    // Back to Open with a ticket: only the update rule matches, so the task stays on case-confirm, whose playbook is wrong now.
+    await call("/api/events", { events: [kase("Open", "Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-confirm" });
+    const text = replies.at(-1)!.text;
+    expect(replies.at(-1)!.agents).toEqual([genie]);
+    expect(text).toContain("- **es_status:** (none) → Mitigated");
+    expect(text).toContain("The rule this task is under (case-confirm) no longer applies");
+    expect(text).toContain("Now: es_status Mitigated");
+    expect(text).not.toContain("Ask, quoting the solution.");
+    expect(text).toContain("Playbook for cases");
+    expect(text).toContain("status: Open");
+
+    // Awaiting again with the ticket: case-es-open takes it over, with no outgrown line.
+    await call("/api/events", { events: [kase("Awaiting Confirmation", "Resolved")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-es-open" });
+    expect(replies.at(-1)!.text).not.toContain("no longer applies");
+  });
+});
