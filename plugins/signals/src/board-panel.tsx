@@ -39,9 +39,51 @@ type RelaySession = {
 };
 type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession; generation?: number; cached?: true; status?: string }; subscribe?(listener: () => void): () => void };
 
+type RelaySnapshot = ReturnType<RelayView["snapshot"]>;
+const NO_RELAY: RelaySnapshot = {};
+const readRelay = (relay: RelayView | undefined): RelaySnapshot => {
+  try {
+    return relay?.snapshot() ?? NO_RELAY;
+  } catch {
+    return NO_RELAY;
+  }
+};
+
+/**
+ * The host's relay snapshot, held steady between the relay's notices. The
+ * hooks below key their effects on the session; if they read it fresh on
+ * every render and the host hands out a new object each time, an effect that
+ * sets state (opening a thread reader, reading the roster) re-runs on every
+ * render, which loops until React gives up and the tab crashes. So the
+ * session changes only when the relay says it did, and then only when its
+ * generation or the session itself is new.
+ */
+function useRelay(ctx: Context): RelaySnapshot {
+  const relay = optionalService<RelayView>(ctx, "relay");
+  const [held, setHeld] = React.useState<RelaySnapshot>(() => readRelay(relay));
+  React.useEffect(() => {
+    const update = () =>
+      setHeld((previous) => {
+        const next = readRelay(relay);
+        const same = next.session === previous.session && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin;
+        if (same) return previous;
+        // A new object for the same generation is the same session.
+        if (next.generation !== undefined && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin) return previous;
+        return next;
+      });
+    update();
+    try {
+      return relay?.subscribe?.(update);
+    } catch {
+      return undefined;
+    }
+  }, [relay]);
+  return held;
+}
+
 /** Buzz profiles (names and pictures) of the agents on the board, from the host's relay when it has one. */
 function useProfiles(ctx: Context, keys: readonly string[]) {
-  const session = optionalService<RelayView>(ctx, "relay")?.snapshot().session;
+  const session = useRelay(ctx).session;
   const profiles = session?.profiles;
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => (profiles ? profiles.subscribe(bump) : undefined), [profiles]);
@@ -80,7 +122,7 @@ const NO_MEMBERS: readonly string[] = [];
 
 /** A channel's members, from its relay-signed roster (empty until the host has read it). */
 function useMembers(ctx: Context, channel: string | undefined): readonly string[] {
-  const channels = optionalService<RelayView>(ctx, "relay")?.snapshot().session?.channels;
+  const channels = useRelay(ctx).session?.channels;
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => (channels?.subscribeList ? channels.subscribeList(bump) : undefined), [channels]);
   React.useEffect(() => {
@@ -470,10 +512,7 @@ function TaskCard(props: TaskProps) {
  * reader that settles with the root alone is asked once to refresh.
  */
 function useThread(ctx: Context, channel: string | undefined, root: string | null | undefined) {
-  const relay = optionalService<RelayView>(ctx, "relay");
-  const [, relayChanged] = React.useReducer((n: number) => n + 1, 0);
-  React.useEffect(() => relay?.subscribe?.(relayChanged), [relay]);
-  const session = relay?.snapshot().session;
+  const session = useRelay(ctx).session;
   const [reader, setReader] = React.useState<ThreadReader>();
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
@@ -591,7 +630,7 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
   const people = item.people.filter((person) => person.kind !== "agent" && !person.on);
   const members = useMembers(props.ctx, props.channel ?? item.task.channel ?? undefined);
   useProfiles(props.ctx, members);
-  const viewer = optionalService<RelayView>(props.ctx, "relay")?.snapshot().viewer;
+  const viewer = useRelay(props.ctx).viewer;
   const end = React.useRef<HTMLDivElement>(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
@@ -871,7 +910,7 @@ function Board(props: {
   // The channel's members, for the owner pickers on the board (the task view reads its own).
   const members = useMembers(ctx, channel?.id);
   const profile = useProfiles(ctx, [...new Set([...agents, ...members])]);
-  const viewer = optionalService<RelayView>(ctx, "relay")?.snapshot().viewer;
+  const viewer = useRelay(ctx).viewer;
   const assigning: Assigning = { members, boardAgents: agents, ...(viewer && { viewer }), profile };
   const [view, setView] = React.useState<BoardView>(savedView);
   const chooseView = (next: BoardView) => {

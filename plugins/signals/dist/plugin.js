@@ -1703,8 +1703,36 @@ function filterFiltered(events, search) {
 }
 
 // plugins/signals/src/board-panel.tsx
+var NO_RELAY = {};
+var readRelay = (relay) => {
+  try {
+    return relay?.snapshot() ?? NO_RELAY;
+  } catch {
+    return NO_RELAY;
+  }
+};
+function useRelay(ctx) {
+  const relay = optionalService(ctx, "relay");
+  const [held, setHeld] = React.useState(() => readRelay(relay));
+  React.useEffect(() => {
+    const update = () => setHeld((previous) => {
+      const next = readRelay(relay);
+      const same = next.session === previous.session && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin;
+      if (same) return previous;
+      if (next.generation !== void 0 && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin) return previous;
+      return next;
+    });
+    update();
+    try {
+      return relay?.subscribe?.(update);
+    } catch {
+      return void 0;
+    }
+  }, [relay]);
+  return held;
+}
 function useProfiles(ctx, keys) {
-  const session = optionalService(ctx, "relay")?.snapshot().session;
+  const session = useRelay(ctx).session;
   const profiles = session?.profiles;
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => profiles ? profiles.subscribe(bump) : void 0, [profiles]);
@@ -1738,7 +1766,7 @@ function useProfiles(ctx, keys) {
 }
 var NO_MEMBERS = [];
 function useMembers(ctx, channel) {
-  const channels = optionalService(ctx, "relay")?.snapshot().session?.channels;
+  const channels = useRelay(ctx).session?.channels;
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => channels?.subscribeList ? channels.subscribeList(bump) : void 0, [channels]);
   React.useEffect(() => {
@@ -1930,10 +1958,7 @@ function TaskCard(props) {
   return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssignButton, { assignee, profile: props.profile, size: 18, open: props.open, toggle: props.toggle }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, open: props.view, assigning: props.assigning }));
 }
 function useThread(ctx, channel, root) {
-  const relay = optionalService(ctx, "relay");
-  const [, relayChanged] = React.useReducer((n) => n + 1, 0);
-  React.useEffect(() => relay?.subscribe?.(relayChanged), [relay]);
-  const session = relay?.snapshot().session;
+  const session = useRelay(ctx).session;
   const [reader, setReader] = React.useState();
   const [, bump] = React.useReducer((n) => n + 1, 0);
   React.useEffect(() => {
@@ -2024,7 +2049,7 @@ function TaskView(props) {
   const people = item.people.filter((person) => person.kind !== "agent" && !person.on);
   const members = useMembers(props.ctx, props.channel ?? item.task.channel ?? void 0);
   useProfiles(props.ctx, members);
-  const viewer = optionalService(props.ctx, "relay")?.snapshot().viewer;
+  const viewer = useRelay(props.ctx).viewer;
   const end = React.useRef(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
@@ -2123,7 +2148,7 @@ function Board(props) {
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
   const members = useMembers(ctx, channel?.id);
   const profile = useProfiles(ctx, [.../* @__PURE__ */ new Set([...agents, ...members])]);
-  const viewer = optionalService(ctx, "relay")?.snapshot().viewer;
+  const viewer = useRelay(ctx).viewer;
   const assigning = { members, boardAgents: agents, ...viewer && { viewer }, profile };
   const [view, setView] = React.useState(savedView);
   const chooseView = (next) => {
