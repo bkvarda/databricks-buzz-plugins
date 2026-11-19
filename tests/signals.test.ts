@@ -1336,3 +1336,50 @@ describe("classify", () => {
     expect(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")).toBe(readFileSync(new URL("../plugins/signals/hub/signals.config.json", import.meta.url), "utf8"));
   });
 });
+
+describe("watched fields", () => {
+  it("lists what a watched field changed to, moves the task to the rule that now applies, and asks its agents to go on", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const watch = ["payload.es_status"];
+    const rules = [
+      { id: "case-es-resolved", sources: ["table.cases"], when: { "payload.es_status": ["Resolved"] }, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
+      { id: "case-es-open", sources: ["table.cases"], when: { "payload.es_status": "." }, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
+      { id: "case-confirm", sources: ["table.cases"], action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
+    ];
+    expect(configProblems({ version: 1, rules })).toEqual([]);
+    expect(configProblems({ version: 1, rules: [{ ...rules[0]!, watch: [] }] })).toEqual([expect.stringMatching(/watch is a list/)]);
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-es-resolved": "Draft confirm-or-close." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (es_status: string | undefined, title = "Case C-1") => ({ source: "table.cases", external_id: "C-1", account: "Globex", title, payload: { case: "C-1", ...(es_status && { es_status }) } });
+    await call("/api/events", { events: [kase("Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-es-open", channel: "globex" });
+
+    // The ticket is resolved: the thread says so, and the agent is asked again with the Resolved rule's playbook.
+    await call("/api/events", { events: [kase("Resolved")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-es-resolved", event_count: 2 });
+    expect(replies.at(-1)).toMatchObject({ task: 1, agents: [genie] });
+    expect(replies.at(-1)!.text).toContain("- **es_status:** Mitigated → Resolved");
+    expect(replies.at(-1)!.text).toContain(`nostr:${npubEncode(genie)} this changed since you last looked`);
+    expect(replies.at(-1)!.text).toContain("Playbook for case-es-resolved");
+    expect((await store.detail(1))!.activities.map((a) => a.kind)).toContain("changed");
+
+    // A change to a field nobody watches is the usual update line, mentioning no one.
+    await call("/api/events", { events: [kase("Resolved", "Case C-1 (renamed)")] });
+    expect(replies.at(-1)).toEqual({ task: 1, text: "Update: Case C-1 (renamed)", agents: [] });
+
+    // The ticket unlinked: (none), back under the no-ticket rule.
+    await call("/api/events", { events: [kase(undefined)] });
+    expect(replies.at(-1)!.text).toContain("- **es_status:** Resolved → (none)");
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-confirm" });
+  });
+});

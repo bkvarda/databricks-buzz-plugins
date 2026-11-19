@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -87,7 +87,7 @@ export type IngestResult = Readonly<{
   /** Tasks opened by this post. */
   created: Task[];
   /** Tasks an event of this post was added to. */
-  updated: { task: Task; title?: string; url?: string }[];
+  updated: { task: Task; title?: string; url?: string; changes?: FieldChange[] }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   firstRun: boolean;
@@ -275,14 +275,14 @@ export class SignalsStore {
   // --- events -------------------------------------------------------------
 
   /** Records one event: new, changed (a new content hash) or the same. */
-  async record(owner: string, event: EventInput): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null }> {
+  async record(owner: string, event: EventInput): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput }> {
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
     const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null];
     // xmax = 0 only for a row this statement inserted.
-    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; inserted: boolean; changed: boolean }>(
-      `WITH previous AS (SELECT content_hash FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3)
+    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean }>(
+      `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3)
        INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload)
        VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (owner, source, external_id) DO UPDATE SET
@@ -293,12 +293,16 @@ export class SignalsStore {
          occurred_at = excluded.occurred_at, title = excluded.title, url = excluded.url, actor = excluded.actor,
          account = excluded.account, group_key = excluded.group_key, payload = excluded.payload
        RETURNING id, versions, task_id,
+         (SELECT row_to_json(previous) FROM previous) AS before,
          NOT EXISTS (SELECT 1 FROM previous) AS inserted,
          COALESCE((SELECT content_hash FROM previous) <> $4, false) AS changed`,
       values,
     );
     const row = found.rows[0]!;
-    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id) };
+    // The event as it was before this version (pg gives row_to_json as an object, PGlite may give text).
+    const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
+    const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
+    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }) };
   }
 
   /**
@@ -344,10 +348,19 @@ export class SignalsStore {
           // (A finished task stays done when a late event for it is itself past done, like a meeting's notes after it ended.)
           await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
         }
+        // What the watched fields were: this event's last version, or else the task's latest event (another event of its group).
+        let changes: FieldChange[] = [];
+        if (!placed.opened) {
+          const watched = [...(placed.rule.watch ?? []), ...(config.rules.find((rule) => rule.id === task.rule_id)?.watch ?? [])];
+          if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
+          // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
+          // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
+          if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule);
+        }
         await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }) });
       } catch (error) {
         result.errors.push({ index, error: (error as Error).message });
       }
@@ -416,6 +429,13 @@ export class SignalsStore {
     const task = toTask(found.rows[0]!);
     await this.activity(task.id, "signals", "opened", `Opened by rule ${input.rule}.`);
     return task;
+  }
+
+  /** Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule. */
+  private async refile(task: Task, rule: Rule): Promise<Task> {
+    const found = await this.q(`UPDATE $S.tasks SET rule_id = $2, workstream = COALESCE($3, workstream), updated_at = $4 WHERE id = $1 RETURNING *`, [task.id, rule.id, rule.workstream ?? null, now()]);
+    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.`);
+    return found.rows[0] ? toTask(found.rows[0]) : task;
   }
 
   private async attach(task: number, event: number, version: number, at: number): Promise<void> {
