@@ -5,20 +5,37 @@
 // agent on it, otherwise no one. Opening a task shows its latest activity,
 // the links made for it, and what you can do: answer what an agent asked
 // (Provide input), add an agent, open its thread to steer the agents there,
-// change its status or dismiss it.
+// change its status or dismiss it. Its full view (Open) shows its details,
+// every asset, and its thread as comments, with a box to reply that mentions
+// the agent it's with.
 import type { Context } from "@buzz/author";
 import type { PanelProps } from "@dbx/core/host-types";
 import { optionalService } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { ago, Button, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { ago, Button, Disclosure, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { Markdown } from "@dbx/core/ui/markdown";
+import { npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, filterOptions, filterTasks, NONE, readView, STATUS_GROUPS } from "./board-view";
+import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterOptions, filterTasks, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments } from "./board-view";
 import { type BoardTask, chosenHub, HubClient } from "./client";
 
 type Profile = { name?: string; picture?: string };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, Profile>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
-type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: { profiles?: ProfileQueries; media?: (url: string, size?: "small") => string | undefined } } };
+type ThreadMessage = { id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown };
+type ThreadReader = {
+  snapshot(): { status: "idle" | "loading" | "ready" | "error"; root?: ThreadMessage; replies: readonly ThreadMessage[]; error?: string; canLoadMore: boolean };
+  subscribe(listener: () => void): () => void;
+  loadMore(): Promise<void>;
+  dispose(): void;
+};
+type RelaySession = {
+  profiles?: ProfileQueries;
+  media?: (url: string, size?: "small") => string | undefined;
+  thread?: (channelId: string, messageId: string) => ThreadReader;
+  messages?: { reply?: (channelId: string, rootId: string, content: string, mentions?: readonly string[]) => string };
+};
+type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession } };
 
 /** Buzz profiles (names and pictures) of the agents on the board, from the host's relay when it has one. */
 function useProfiles(ctx: Context, keys: readonly string[]) {
@@ -163,7 +180,7 @@ export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone():
 }
 
 /** What an opened task shows: what it asks, its latest activity, its assets, and what you can do with it. */
-function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void }) {
+function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void; open?(item: BoardTask): void; full?: boolean }) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -184,9 +201,9 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
   return (
     <Stack gap={8} style={{ paddingTop: 8 }}>
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
-      {item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
-      {item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}…` : item.activity.text} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
-      {assets.length > 0 && (
+      {!props.full && item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
+      {!props.full && item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}…` : item.activity.text} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
+      {!props.full && assets.length > 0 && (
         <Stack direction="row" gap={6} wrap>
           {assets.map((artifact) => (
             <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 }}>
@@ -197,6 +214,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
       )}
       {error && <Text size="xs" tone="danger">{error}</Text>}
       <Stack direction="row" gap={6} wrap align="center">
+        {props.open && <Button size="sm" variant="primary" title="Its details, assets and thread" onClick={() => props.open!(item)}>Open</Button>}
         <Button size="sm" disabled={!item.thread} title="Open its thread to steer the agents there" onClick={() => props.steer(item)}>Steer</Button>
         {!closed && <AddAgent hub={props.hub} task={item} onDone={props.onChange} />}
         <select className="dbx-input" aria-label="Status" disabled={busy} value={item.task.status} onChange={(event) => void setStatus(event.target.value)} style={{ width: "auto", fontSize: "0.75rem" }}>
@@ -208,7 +226,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
   );
 }
 
-type TaskProps = { hub: HubClient; item: BoardTask; open: boolean; toggle(): void; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void };
+type TaskProps = { hub: HubClient; item: BoardTask; open: boolean; toggle(): void; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; view(item: BoardTask): void };
 
 /** The labels a task shows beside its title: workstream, initiative, mode, source and the links made for it. */
 function Meta(props: { item: BoardTask }) {
@@ -244,7 +262,7 @@ function TaskRow(props: TaskProps) {
         <Text size="xs" tone="tertiary" style={{ flex: "none", width: 52, textAlign: "right" }}>{ago(item.task.last_event_at * 1000)}</Text>
         <AssigneeMark assignee={assignee} profile={props.profile} />
       </div>
-      {props.open && <div style={{ padding: "0 12px 10px 54px" }}><TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} /></div>}
+      {props.open && <div style={{ padding: "0 12px 10px 54px" }}><TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} /></div>}
     </div>
   );
 }
@@ -271,8 +289,174 @@ function TaskCard(props: TaskProps) {
           <Stack direction="row" gap={6} wrap align="center"><Meta item={item} /></Stack>
         </Stack>
       </div>
-      {props.open && <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} />}
+      {props.open && <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} open={props.view} />}
     </div>
+  );
+}
+
+/** A task's thread from the host's relay, as comments, kept up to date while it's shown. */
+function useThread(ctx: Context, channel: string | undefined, root: string | null | undefined) {
+  const session = optionalService<RelayView>(ctx, "relay")?.snapshot().session;
+  const [reader, setReader] = React.useState<ThreadReader>();
+  const [, bump] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    if (!channel || !root || !session?.thread) return setReader(undefined);
+    const opened = session.thread(channel, root);
+    setReader(opened);
+    const stop = opened.subscribe(bump);
+    return () => (stop(), opened.dispose());
+  }, [session, channel, root]);
+  const snapshot = reader?.snapshot();
+  const messages = snapshot ? [...(snapshot.root ? [snapshot.root] : []), ...snapshot.replies] : [];
+  return {
+    available: Boolean(session?.thread),
+    status: snapshot?.status ?? "idle",
+    error: snapshot?.error,
+    comments: threadComments(messages),
+    more: snapshot?.canLoadMore ? () => void reader?.loadMore() : undefined,
+    reply: session?.messages?.reply && channel && root ? (content: string, mentions: readonly string[]) => session.messages!.reply!(channel, root, content, mentions) : undefined,
+  };
+}
+
+/** A comment in the task's thread: who wrote it, when, and what it says. Agents' notes to each other are folded away. */
+function CommentItem(props: { comment: Comment; profile(key: string): Profile | undefined }) {
+  const { comment } = props;
+  const who = props.profile(comment.author);
+  const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}…`;
+  const mark = who?.picture ? <img src={who.picture} alt={name} style={{ width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" }} /> : <span style={{ width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" }}>{initials(name)}</span>;
+  const text = comment.text.length > 6000 ? `${comment.text.slice(0, 5999)}…` : comment.text;
+  return (
+    <div style={{ display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 }}>
+      {mark}
+      <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+        <Stack direction="row" gap={6} align="baseline">
+          <Text size="sm" weight={600}>{name}</Text>
+          <Text size="xs" tone="tertiary">{ago(comment.at * 1000)}{comment.pending ? " · sending" : ""}</Text>
+        </Stack>
+        <div style={{ overflowWrap: "anywhere" }}>
+          {comment.agents ? <Disclosure summary="Note between agents">{<Markdown source={text} size="sm" />}</Disclosure> : <Markdown source={text} size="sm" />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The box under the comments: a reply in the task's thread, mentioning the agent it's with. */
+function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | undefined; send?: (content: string, mentions: readonly string[]) => string; steer(): void }) {
+  const [text, setText] = React.useState("");
+  const [error, setError] = React.useState<string>();
+  const mentions = replyMentions(props.assignee);
+  const to = props.assignee.kind === "agent" ? (props.profile(props.assignee.key)?.name ?? props.assignee.label) : undefined;
+  if (!props.send) return <Text size="xs" tone="subtle">Replying needs Buzz's thread view here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer())}>Open the thread</a> to reply.</Text>;
+  const send = () => {
+    if (!text.trim()) return;
+    setError(undefined);
+    try {
+      props.send!(replyText(text, mentions.map((key) => ({ npub: npubEncode(key) }))), mentions);
+      setText("");
+    } catch (problem) {
+      setError(describeError(problem));
+    }
+  };
+  return (
+    <Stack gap={6}>
+      <textarea
+        className="dbx-input"
+        rows={3}
+        aria-label="Reply"
+        placeholder={to ? `Reply to ${to}…` : "Reply in the task's thread…"}
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => (event.key === "Enter" && (event.metaKey || event.ctrlKey)) && (event.preventDefault(), send())}
+      />
+      {error && <Text size="xs" tone="danger">{error}</Text>}
+      <Stack direction="row" gap={8} align="center" justify="space-between">
+        <Text size="xs" tone="tertiary">{to ? `Mentions ${to}, the agent it's with.` : "Mentions no one: no agent is on it."} ⌘↵ sends.</Text>
+        <Button size="sm" variant="brand" disabled={!text.trim()} onClick={send}>Reply</Button>
+      </Stack>
+    </Stack>
+  );
+}
+
+/** A task's full view, like a Linear issue: title, details and assets beside its thread as comments, with a reply box. */
+function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back(): void }) {
+  const { item } = props;
+  const assignee = assigneeOf(item);
+  const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? undefined, item.task.buzz_root);
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
+  const facts = taskFacts(item);
+  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.map((comment) => comment.author))]);
+  const who = (key: string) => props.profile(key) ?? authorProfile(key);
+  const people = item.people.filter((person) => person.kind !== "agent");
+  const end = React.useRef<HTMLDivElement>(null);
+  const count = thread.comments.length;
+  React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
+  return (
+    <Stack gap={14}>
+      <Stack direction="row" gap={8} align="center">
+        <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>
+        <Text size="xs" tone="tertiary" mono>#{item.task.id}</Text>
+      </Stack>
+      <Stack direction="row" gap={8} align="flex-start">
+        <span style={{ paddingTop: 4 }}><StatusIcon status={item.task.status} size={15} /></span>
+        <Text as="h2" size="xl" weight={600} style={{ overflowWrap: "anywhere" }}>{item.task.title}</Text>
+      </Stack>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 }}>
+        <div style={{ flex: "2 1 360px", minWidth: 0 }}>
+          <Stack gap={14}>
+            <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} full />
+            <div style={{ borderTop: "1px solid var(--dbx-border)", paddingTop: 12 }}>
+              <Stack gap={12}>
+                <Text size="sm" weight={600}>Activity</Text>
+                {!item.thread ? <Text size="xs" tone="subtle">Not posted in Buzz yet.</Text>
+                  : !thread.available ? <Text size="xs" tone="subtle">The thread can't be read here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a>.</Text>
+                  : thread.status === "error" ? <Text size="xs" tone="danger">{thread.error ?? "Couldn't read the thread."}</Text>
+                  : thread.status !== "ready" && !count ? <Spinner label="Loading the thread" />
+                  : (
+                    <Stack gap={14}>
+                      {thread.more && <Button size="sm" variant="ghost" onClick={thread.more}>Earlier comments</Button>}
+                      {thread.comments.map((comment) => <CommentItem key={comment.id} comment={comment} profile={who} />)}
+                      <div ref={end} />
+                    </Stack>
+                  )}
+                {item.thread && <ReplyBox assignee={assignee} profile={props.profile} {...(thread.reply && { send: thread.reply })} steer={() => props.steer(item)} />}
+              </Stack>
+            </div>
+          </Stack>
+        </div>
+        <aside style={{ flex: "1 1 220px", minWidth: 0, maxWidth: 340 }}>
+          <Stack gap={12}>
+            <Stack gap={6}>
+              <Text size="xs" tone="tertiary" weight={600}>ASSIGNEE</Text>
+              <Stack direction="row" gap={8} align="center"><AssigneeMark assignee={assignee} profile={props.profile} /><Text size="sm">{assigneeName(assignee, props.profile)}</Text></Stack>
+            </Stack>
+            <Stack gap={4}>
+              <Text size="xs" tone="tertiary" weight={600}>DETAILS</Text>
+              {facts.map((fact) => (
+                <div key={fact.label} style={{ display: "flex", gap: 8, fontSize: "0.75rem" }}>
+                  <span style={{ flex: "0 0 84px", color: "var(--dbx-tertiary)" }}>{fact.label}</span>
+                  <span style={{ minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" }}>{fact.label === "Source" && item.source?.url ? <a href={item.source.url} onClick={link(item.source.url)}>{fact.value}</a> : fact.value}</span>
+                </div>
+              ))}
+            </Stack>
+            {people.length > 0 && (
+              <Stack gap={4}>
+                <Text size="xs" tone="tertiary" weight={600}>PEOPLE</Text>
+                {people.map((person) => <Text key={`${person.kind}:${person.key}`} size="xs">{person.label} <span style={{ color: "var(--dbx-tertiary)" }}>· {person.role}</span></Text>)}
+              </Stack>
+            )}
+            <Stack gap={4}>
+              <Text size="xs" tone="tertiary" weight={600}>ASSETS</Text>
+              {!assets.length ? <Text size="xs" tone="subtle">Nothing made for it yet.</Text> : assets.map((artifact) => (
+                <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 }}>
+                  {ASSET_ICON[artifact.kind] ?? "🔗"} {artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60)} <span style={{ color: "var(--dbx-tertiary)" }}>· {artifact.kind}</span>
+                </a>
+              ))}
+            </Stack>
+          </Stack>
+        </aside>
+      </div>
+    </Stack>
   );
 }
 
@@ -413,7 +597,8 @@ function Board(props: {
   };
   const [filters, setFilters] = React.useState<BoardFilters>({});
   const [opened, setOpened] = React.useState<number>();
-  React.useEffect(() => (setFilters({}), setOpened(undefined)), [channel?.id]);
+  const [viewing, setViewing] = React.useState<number>();
+  React.useEffect(() => (setFilters({}), setOpened(undefined), setViewing(undefined)), [channel?.id]);
   const steer = (item: BoardTask) => {
     if (!item.thread || !channel || !item.task.buzz_root) return;
     if (props.openThread?.(item.thread)) return;
@@ -430,11 +615,14 @@ function Board(props: {
   else if (hubs.error || board.error) body = <Notice tone="danger">{describeError((hubs.error ?? board.error)!)}</Notice>;
   else if (!hub) body = <Notice title="No signals hub in this workspace">Deploy one first (see the Signals plugin's README).</Notice>;
   else if (!board.data?.tasks.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
-  else {
+  else if (viewing !== undefined && board.data.tasks.some((item) => item.task.id === viewing)) {
+    const item = board.data.tasks.find((found) => found.task.id === viewing)!;
+    body = <TaskView ctx={ctx} hub={hub} item={item} channel={channel.id} profile={profile} steer={steer} onChange={refresh} back={() => setViewing(undefined)} />;
+  } else {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
-    const task = (item: BoardTask, Item: typeof TaskRow) => <Item key={item.task.id} hub={hub} item={item} open={opened === item.task.id} toggle={() => setOpened(opened === item.task.id ? undefined : item.task.id)} profile={profile} steer={steer} onChange={refresh} />;
+    const task = (item: BoardTask, Item: typeof TaskRow) => <Item key={item.task.id} hub={hub} item={item} open={opened === item.task.id} toggle={() => setOpened(opened === item.task.id ? undefined : item.task.id)} profile={profile} steer={steer} onChange={refresh} view={(found) => setViewing(found.task.id)} />;
     const header = (group: (typeof STATUS_GROUPS)[number]) => (
       <Stack direction="row" gap={8} align="center">
         <StatusIcon status={group.status} />

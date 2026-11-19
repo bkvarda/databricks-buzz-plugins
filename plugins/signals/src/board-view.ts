@@ -98,3 +98,43 @@ export const cardAssets = (item: BoardTask) => item.artifacts.filter((artifact) 
 
 /** A view from storage or a link, or the list. */
 export const readView = (value: unknown): BoardView => (VIEWS as readonly unknown[]).includes(value) ? (value as BoardView) : "list";
+
+/** A message in a task's thread, as the task view shows it: a comment. */
+export type Comment = Readonly<{ id: string; author: string; at: number; text: string; agents: boolean; pending: boolean }>;
+
+/** The thread's messages as comments, oldest first, without empty ones. `agents` marks coordination between agents, shown quietly. */
+export function threadComments(messages: readonly Readonly<{ id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown }>[]): Comment[] {
+  return messages
+    .filter((message) => message.content.trim())
+    .map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery !== undefined && message.delivery !== "delivered" }))
+    .sort((a, b) => a.at - b.at);
+}
+
+/**
+ * Who a reply from the task view mentions: its assignee when that's an
+ * agent, so the agent on it wakes up; no one when the task is with you or no
+ * one (it goes in the thread for the record).
+ */
+export const replyMentions = (assignee: Assignee): string[] => (assignee.kind === "agent" ? [assignee.key] : []);
+
+/** A reply's text: the mention first (as nostr:npub…, which Buzz shows as the name), then what you wrote. */
+export function replyText(text: string, mentions: readonly { npub: string }[]): string {
+  const body = text.trim();
+  return mentions.length ? `${mentions.map((mention) => `nostr:${mention.npub}`).join(" ")} ${body}` : body;
+}
+
+/** The task's details, as label and value pairs, for its view. */
+export function taskFacts(item: BoardTask): { label: string; value: string }[] {
+  const { task } = item;
+  const date = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  return [
+    { label: "Status", value: STATUS_GROUPS.find((group) => group.status === task.status)?.title ?? task.status },
+    { label: "Mode", value: task.mode },
+    ...(task.workstream ? [{ label: "Workstream", value: task.workstream }] : []),
+    ...(task.initiative ? [{ label: "Initiative", value: task.initiative }] : []),
+    ...(task.account ? [{ label: "Account", value: task.account }] : []),
+    ...(item.source ? [{ label: "Source", value: item.source.title ? `${item.source.source}: ${item.source.title}` : item.source.source }] : []),
+    { label: "Opened", value: date(task.created_at) },
+    { label: "Last event", value: `${date(task.last_event_at)}${task.event_count > 1 ? ` (${task.event_count} events)` : ""}` },
+  ];
+}

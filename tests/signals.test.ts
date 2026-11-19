@@ -7,7 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
-import { assigneeOf, byStatus, cardAssets, filterOptions, filterTasks, readView } from "../plugins/signals/src/board-view";
+import { assigneeOf, byStatus, cardAssets, filterOptions, filterTasks, readView, replyMentions, replyText, taskFacts, threadComments } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 
 const config: SignalsConfig = {
@@ -1213,6 +1213,36 @@ describe("rules for every account", () => {
       expect(readView("swimlanes")).toBe("swimlanes");
       expect(readView("grid")).toBe("list");
       expect(readView(null)).toBe("list");
+    });
+
+    it("shows the thread as comments, and a reply mentions the agent the task is with", () => {
+      const comments = threadComments([
+        { id: "b", authorId: agent, createdAt: 3, content: "Draft ready", delivery: "delivered" },
+        { id: "a", authorId: "hub", createdAt: 1, content: "📋 Task #1" },
+        { id: "c", authorId: scout, createdAt: 4, content: "note", audience: "agents" },
+        { id: "d", authorId: "me", createdAt: 5, content: "  " },
+        { id: "e", authorId: "me", createdAt: 6, content: "Thanks", delivery: "pending" },
+      ]);
+      expect(comments.map((comment) => [comment.id, comment.agents, comment.pending])).toEqual([["a", false, false], ["b", false, false], ["c", true, false], ["e", false, true]]);
+      expect(replyMentions(assigneeOf(tasks[1]!))).toEqual([agent]);
+      expect(replyMentions(assigneeOf(tasks[0]!))).toEqual([]);
+      expect(replyMentions(assigneeOf(tasks[2]!))).toEqual([]);
+      expect(replyText("  go on ", [{ npub: "npub1x" }])).toBe("nostr:npub1x go on");
+      expect(replyText("go on", [])).toBe("go on");
+    });
+
+    it("lists a task's details", () => {
+      const facts = taskFacts(item(9, { account: "Globex", created_at: 1_700_000_000, last_event_at: 1_700_003_600, event_count: 3, initiative: "Q4" }));
+      expect(facts).toEqual([
+        { label: "Status", value: "Open" },
+        { label: "Mode", value: "draft" },
+        { label: "Workstream", value: "meeting prep" },
+        { label: "Initiative", value: "Q4" },
+        { label: "Account", value: "Globex" },
+        { label: "Source", value: "gmail: Pricing question" },
+        { label: "Opened", value: "2023-11-14 22:13 UTC" },
+        { label: "Last event", value: "2023-11-14 23:13 UTC (3 events)" },
+      ]);
     });
   });
 });
