@@ -23,7 +23,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -303,7 +303,7 @@ export class Hub {
     try {
       // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
-      const agents = account && account.channel === task.channel ? account.agents : [];
+      const agents = account && account.channel === task.channel ? agentsFor(account, task) : [];
       const event = await this.store.latestEvent(task.id);
       const labels = labelsOf(await this.config());
       const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
@@ -365,10 +365,29 @@ export class Hub {
     const ids = input.ids === undefined ? undefined : readIds(input.ids);
     if (typeof ids === "string") return bad(ids);
     const agents = list("agents", 10)?.map(agentKey);
-    // Agents the save adds (none when it doesn't change the agents).
-    const before = agents && ((await this.store.account({ name }))?.agents ?? []);
     const notAgent = agents?.find((key) => !key);
     if (notAgent !== undefined) return bad("agents are Buzz pubkeys (64 hex characters or an npub).");
+    let workstreamAgents: Record<string, string[]> | undefined;
+    if (input.workstream_agents !== undefined) {
+      const given = input.workstream_agents;
+      if (!given || typeof given !== "object" || Array.isArray(given)) return bad("workstream_agents maps a workstream (or rule id) to the agents that work on its tasks.");
+      workstreamAgents = {};
+      for (const [key, value] of Object.entries(given as Record<string, unknown>)) {
+        const name = key.trim();
+        if (!name || name.length > 80) return bad("A workstream is 1-80 characters.");
+        const items = Array.isArray(value) ? value.map(String) : typeof value === "string" ? value.split(/[,\s]+/) : undefined;
+        if (!items) return bad(`The ${name} agents are a list of Buzz pubkeys.`);
+        const keys = [...new Set(items.map((item) => item.trim()).filter(Boolean).map(agentKey))];
+        if (keys.some((item) => !item)) return bad(`The ${name} agents are Buzz pubkeys (64 hex characters or an npub).`);
+        if (keys.length > 10) return bad(`A workstream has at most 10 agents.`);
+        if (Object.keys(workstreamAgents).some((other) => other.toLowerCase() === name.toLowerCase())) return bad(`${name} is named twice.`);
+        // No agents is the same as none: its tasks go to the account's agents.
+        if (keys.length) workstreamAgents[name] = keys;
+      }
+      if (Object.keys(workstreamAgents).length > MAX_PLAYBOOKS) return bad(`An account names agents for at most ${MAX_PLAYBOOKS} workstreams.`);
+    }
+    // The account as it was, to find the agents the save adds (none when it doesn't change who works on what).
+    const before = agents || workstreamAgents ? await this.store.account({ name }) : undefined;
     const preferences = text("preferences", 8000);
     const profile = text("profile", 16000);
     let playbooks: Record<string, string> | undefined;
@@ -399,13 +418,13 @@ export class Hub {
         ...(preferences !== undefined && { preferences }),
         ...(profile !== undefined && { profile }),
         ...(playbooks && { playbooks }),
+        ...(workstreamAgents && { workstream_agents: workstreamAgents }),
       },
       user,
     );
     this.cached = undefined;
     this.log(`${user} saved the account ${account.name}`);
-    const added = before ? account.agents.filter((key) => !before.includes(key)) : [];
-    const woken = added.length ? await this.handOff(account, added) : [];
+    const woken = agents || workstreamAgents ? await this.handOff(account, before ?? { agents: [], workstream_agents: {} }) : [];
     const config = await this.config();
     const warning = await this.postProblem(account.channel);
     return { json: { account: withRead(account), labels: labelsOf(config), workstreams: workstreamsOf(config), ...(woken.length && { woken }), ...(warning && { warning }) } };
@@ -417,8 +436,13 @@ export class Hub {
    * each task's thread, mentioning them, with the account's briefing. Their
    * first reply is recorded as for a new task (see collect).
    */
-  private async handOff(account: AccountRecord, agents: readonly string[]): Promise<number[]> {
+  private async handOff(account: AccountRecord, before: Pick<AccountRecord, "agents" | "workstream_agents">): Promise<number[]> {
     if (!this.notifier || !account.channel) return [];
+    // Each task's new agents: the ones for its workstream now that weren't before.
+    const addedFor = (task: Task) => {
+      const was = new Set(agentsFor(before, task));
+      return agentsFor(account, task).filter((key) => !was.has(key));
+    };
     const lower = account.name.toLowerCase();
     const tasks = (await this.store.untouched(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
     const woken: number[] = [];
@@ -427,7 +451,7 @@ export class Hub {
     const [gone, people] = await Promise.all([this.store.removed(ids), this.store.people(ids)]);
     for (const task of tasks) {
       // Not agents someone took off it, and not tasks someone gave owners: a person chose who has those.
-      const asked = agents.filter((key) => !gone.get(task.id)?.has(key));
+      const asked = addedFor(task).filter((key) => !gone.get(task.id)?.has(key));
       if (!asked.length || (people.get(task.id) ?? []).some((person) => person.assigned_at)) continue;
       try {
         const event = await this.store.latestEvent(task.id);
@@ -439,7 +463,7 @@ export class Hub {
         this.log(`couldn't ask agents to work on task ${task.id}: ${(error as Error).message}`);
       }
     }
-    if (woken.length) this.log(`asked ${agents.length} new agent(s) of ${account.name} to work on tasks ${woken.join(", ")}`);
+    if (woken.length) this.log(`asked new agents of ${account.name} to work on tasks ${woken.join(", ")}`);
     return woken;
   }
 
@@ -614,7 +638,7 @@ export class Hub {
       resumed = (await this.store.setStatus(task.id, "open", user, choice === "always" ? "always for this series" : choice === "once" ? "just this one" : "input given"))!;
       const account = resumed.account ? await this.store.account({ name: resumed.account }) : undefined;
       const gone = (await this.store.removed([task.id])).get(task.id);
-      const agents = account && account.channel === resumed.channel && (mode === "auto" || mode === "draft") ? account.agents.filter((key) => !gone?.has(key)) : [];
+      const agents = account && account.channel === resumed.channel && (mode === "auto" || mode === "draft") ? agentsFor(account, resumed).filter((key) => !gone?.has(key)) : [];
       const said = choice === "always" ? "**Always**. Tasks open for this series from now on." : choice === "once" ? "**Just this one**. The series' next event asks again." : `${text} (the series' next event asks again)`;
       if (this.notifier && resumed.buzz_root) {
         const labels = labelsOf(await this.config());
@@ -703,7 +727,7 @@ export class Hub {
     const waiting = tasks.flatMap((task) => {
       const on = (people.get(task.id) ?? []).filter((person) => person.kind === "agent");
       const account = task.account ? accounts.get(task.account) : undefined;
-      const fromAccount = !task.agent_reply && (task.mode === "auto" || task.mode === "draft") && account?.channel === task.channel ? (account?.agents ?? []) : [];
+      const fromAccount = !task.agent_reply && (task.mode === "auto" || task.mode === "draft") && account?.channel === task.channel ? agentsFor(account, task) : [];
       const done = new Set([...on.filter((person) => person.replied_at).map((person) => person.key), ...(gone.get(task.id) ?? [])]);
       const agents = [...new Set([...fromAccount, ...on.filter((person) => !person.replied_at).map((person) => person.key)])].filter((key) => !done.has(key));
       // An agent asked again (given input) counts only its replies since.
