@@ -9,6 +9,8 @@ import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
 import { assigneeOf, byStatus, cardAssets, filterOptions, filterTasks, readView, replyMentions, replyText, taskFacts, threadComments } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
+import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
+import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
 
 const config: SignalsConfig = {
   version: 1,
@@ -1244,5 +1246,70 @@ describe("rules for every account", () => {
         { label: "Last event", value: "2023-11-14 23:13 UTC (3 events)" },
       ]);
     });
+  });
+});
+
+describe("classify", () => {
+  const rules: SignalsConfig = {
+    ...config,
+    rules: [{ id: "customer-mail", sources: ["gmail"], when: { actor: "@acme\\.com$" }, classify: { question: "Does it ask for something?", true: "asks", false: "FYI", min: 0.7 }, action: "task", group_by: "group_key" }],
+  };
+
+  it("checks classify in the config", () => {
+    expect(configProblems(rules)).toEqual([]);
+    const bad = (classify: unknown, action = "task") => configProblems({ version: 1, rules: [{ id: "r", action, classify } as never] });
+    expect(bad({})).toEqual(["rules[0].classify is {question, true?, false?, min?}"]);
+    expect(bad({ question: "Q?", true: "yes" })).toEqual(["rules[0].classify.true and .false go together, as text"]);
+    expect(bad({ question: "Q?", min: 1.5 })).toEqual(["rules[0].classify.min is a number between 0 and 1"]);
+    expect(bad({ question: "Q?" }, "ignore")).toEqual(["rules[0].classify needs action task"]);
+  });
+
+  it("sends the model only what it needs, and reads its score", () => {
+    expect(classifyState({ source: "gmail", external_id: "1", title: "Pricing?", actor: "Sam <sam@acme.com>", payload: { to: ["me@x.com"], snippet: "Could you   send\nthe quote?", labelIds: ["INBOX"] } })).toEqual({ source: "gmail", title: "Pricing?", from: "Sam <sam@acme.com>", to: '["me@x.com"]', snippet: "Could you send the quote?" });
+    expect(classifyQuestions({ question: "Q?", true: "a", false: "b" })).toEqual({ classify: { type: "noul", instructions: "Q?", criteria: { true: "a", false: "b" } } });
+    expect(classifyQuestions({ question: "Q?" })).toEqual({ classify: { type: "noul", instructions: "Q?" } });
+    expect(answerScore({ answers: { classify: { noul: 0.42 } } })).toBe(0.42);
+    expect(answerScore({ answers: { classify: { noul: 3 } } })).toBeUndefined();
+    expect(answerScore({ error: "x" })).toBeUndefined();
+  });
+
+  it("calls the serving endpoint, and fails open", async () => {
+    const calls: { path: string; body: unknown }[] = [];
+    const ok = jevClassifier(async (path, init) => (calls.push({ path, body: init.body }), { answers: { classify: { noul: 0.9 } } }));
+    expect(await ok({ source: "gmail", external_id: "1", title: "Hi" }, { question: "Q?" })).toBe(0.9);
+    expect(calls[0]).toMatchObject({ path: "/serving-endpoints/databricks-openjev-qwen35-4b/invocations", body: { state: { source: "gmail", title: "Hi" }, questions: { classify: { instructions: "Q?" } } } });
+    const lines: string[] = [];
+    const down = jevClassifier(async () => Promise.reject(new Error("HTTP 503")), "my-ep", (line) => lines.push(line));
+    expect(await down({ source: "gmail", external_id: "2" }, { question: "Q?" })).toBeUndefined();
+    expect(lines).toEqual(["classifier my-ep failed for gmail 2: HTTP 503"]);
+  });
+
+  it("opens tasks the model passes, records the ones it doesn't, and opens when it can't tell", async () => {
+    const scores: Record<string, number | undefined> = { m1: 0.95, m2: 0.1, m4: 0.05 };
+    const asked: string[] = [];
+    const store = new SignalsStore(pglite(), "signals_classify");
+    await store.setup();
+    const hub = new Hub(store, undefined, { defaultConfig: rules, classifier: async (event) => (asked.push(event.external_id), event.external_id === "m3" ? Promise.reject(new Error("down")) : scores[event.external_id]) });
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    const mail = (id: string, thread: string, title: string) => ({ source: "gmail", external_id: id, actor: "sam@acme.com", title, group_key: thread });
+    const reply = await call("POST", "/api/events", { events: [mail("m1", "t1", "Can you help?"), mail("m2", "t2", "Accepted: sync"), mail("m3", "t3", "Question")] });
+    expect(reply.json).toMatchObject({ new: 3, filtered: 1, created: [1, 2] });
+    // A later mail in a thread with a task isn't asked: it updates the task.
+    const later = await call("POST", "/api/events", { events: [mail("m4", "t1", "Re: Can you help?")] });
+    expect(later.json).toMatchObject({ filtered: 0, updated: [1] });
+    expect(asked).toEqual(["m1", "m2", "m3"]);
+    const filtered = (await call("GET", "/api/filtered")).json as { events: { external_id: string; rule: string; score: number; title?: string }[] };
+    expect(filtered.events).toEqual([expect.objectContaining({ external_id: "m2", rule: "customer-mail", title: "Accepted: sync" })]);
+    expect(filtered.events[0]!.score).toBeCloseTo(0.1);
+    expect(((await call("GET", "/api/filtered", undefined, "rule=other")).json as { events: unknown[] }).events).toEqual([]);
+    expect(HUB_PATHS).toContain("/api/filtered");
+  });
+
+  it("the example config classifies customer mail", () => {
+    const example = JSON.parse(readFileSync(new URL("../plugins/signals/hub/signals.config.json", import.meta.url), "utf8")) as SignalsConfig;
+    expect(example.rules.find((rule) => rule.id === "customer-mail")?.classify?.question).toMatch(/asking/);
+    expect(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")).toBe(readFileSync(new URL("../plugins/signals/hub/signals.config.json", import.meta.url), "utf8"));
   });
 });

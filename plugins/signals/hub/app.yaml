@@ -11,3 +11,8 @@ env:
   # Who may change the rules (comma-separated emails). Everyone may when unset.
   # - name: SIGNALS_ADMINS
   #   value: you@example.com
+  # The serving endpoint that answers rules' `classify` questions (this is the
+  # default; "off" turns classifying off, so those rules open every task).
+  # The app's service principal needs Can query on it.
+  # - name: SIGNALS_CLASSIFIER
+  #   value: databricks-openjev-qwen35-4b

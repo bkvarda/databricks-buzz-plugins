@@ -122,6 +122,14 @@ export type Rule = Readonly<{
    * opens nothing (no task in default_channel); a later rule may still apply.
    */
   known_account?: boolean;
+  /**
+   * Asks a small model whether the event really needs the team (see
+   * Classify), before it opens a new task. Below `min` the event is recorded
+   * as filtered, with its score, and opens nothing; it's on the hub's
+   * filtered list. Updates to tasks that exist aren't asked. When the model
+   * can't answer, the task opens (it fails open).
+   */
+  classify?: Classify;
   /** task: open (or update) a task. update: only update a task that exists for the group. ignore: record the event, no task. */
   action: "task" | "update" | "ignore";
   /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
@@ -153,6 +161,32 @@ export type Rule = Readonly<{
   /** When its tasks are finished, so the hub marks them done itself (see DoneWhen). */
   done_when?: DoneWhen;
 }>;
+
+/**
+ * A yes/no question for a rule's events, put to the classifier model with the
+ * event's source, subject, sender, recipients and snippet. `true` and
+ * `false` say what each answer means; `min` is the lowest probability of yes
+ * that opens a task (default 0.7).
+ */
+export type Classify = Readonly<{ question: string; true?: string; false?: string; min?: number }>;
+export const DEFAULT_CLASSIFY_MIN = 0.7;
+
+/** What the classifier sees of an event: only what it needs to judge it. */
+export function classifyState(event: EventInput): Record<string, string> {
+  const payload = event.payload ?? {};
+  const text = (value: unknown, max: number) => (typeof value === "string" ? value : value === undefined || value === null ? "" : JSON.stringify(value)).replace(/\s+/g, " ").trim().slice(0, max);
+  const state: Record<string, string> = { source: event.source, title: text(event.title, 300), from: text(event.actor, 200) };
+  for (const [key, max] of [["to", 300], ["snippet", 1000], ["description", 1000], ["text", 1000], ["status", 100]] as const) {
+    const value = text(payload[key], max);
+    if (value) state[key] = value;
+  }
+  return state;
+}
+
+/** The questions to send the classifier for a rule's `classify`, under `classify`. */
+export function classifyQuestions(classify: Classify): Record<string, { type: "noul"; instructions: string; criteria?: { true: string; false: string } }> {
+  return { classify: { type: "noul", instructions: classify.question, ...(classify.true && classify.false && { criteria: { true: classify.true, false: classify.false } }) } };
+}
 
 /**
  * When a rule's tasks are finished. Any one that holds marks an open task
@@ -309,6 +343,15 @@ export function configProblems(raw: unknown): string[] {
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
     if (rule.done_when !== undefined) problems.push(...doneWhenProblems(rule.done_when, `${where}.done_when`));
+    if (rule.classify !== undefined) {
+      const c = rule.classify as Record<string, unknown>;
+      if (!c || typeof c !== "object" || Array.isArray(c) || typeof c.question !== "string" || !c.question.trim()) problems.push(`${where}.classify is {question, true?, false?, min?}`);
+      else {
+        if ((c.true === undefined) !== (c.false === undefined) || (c.true !== undefined && (typeof c.true !== "string" || typeof c.false !== "string"))) problems.push(`${where}.classify.true and .false go together, as text`);
+        if (c.min !== undefined && !(typeof c.min === "number" && c.min > 0 && c.min < 1)) problems.push(`${where}.classify.min is a number between 0 and 1`);
+        if (rule.action !== "task") problems.push(`${where}.classify needs action task`);
+      }
+    }
   }
   if (config.sources !== undefined && (!Array.isArray(config.sources) || (config.sources as Record<string, unknown>[]).some((source) => !source || typeof source.name !== "string" || typeof source.label !== "string")))
     problems.push("sources is a list of {name, label}");

@@ -10,11 +10,13 @@
 //
 // app.yaml: a `postgres` resource, LAKEBASE_ENDPOINT (valueFrom: postgres) and,
 // for posting to Buzz, BUZZ_IDENTITY_SECRET. Optional: SIGNALS_ADMINS (emails
-// that may change the rules), SIGNALS_CONFIG (the starting rules, as JSON).
+// that may change the rules), SIGNALS_CONFIG (the starting rules, as JSON),
+// SIGNALS_CLASSIFIER (the serving endpoint for rules' `classify`; "off" turns it off).
 import { readFile } from "node:fs/promises";
 import { BuzzApp } from "../../agents/app/sdk";
 import { Lakebase } from "../../agents/app/index-store";
 import { splitMessage } from "../../agents/runner/buzz";
+import { jevClassifier, DEFAULT_CLASSIFIER_ENDPOINT } from "./classify";
 import { Hub, HUB_PATHS, type Notifier, taskMessage } from "./hub";
 import { configProblems, type SignalsConfig } from "./model";
 import { schemaName, SignalsStore } from "./store";
@@ -77,7 +79,10 @@ async function prepare() {
     await store.setup();
     const admins = (process.env.SIGNALS_ADMINS ?? "").split(",").map((admin) => admin.trim()).filter(Boolean);
     const defaultConfig = await startingConfig();
-    hub = new Hub(store, notifier, { ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), log: (line) => console.log(`[signals] ${line}`) });
+    const log = (line: string) => console.log(`[signals] ${line}`);
+    const endpoint = process.env.SIGNALS_CLASSIFIER?.trim() || DEFAULT_CLASSIFIER_ENDPOINT;
+    const classifier = endpoint === "off" ? undefined : jevClassifier((path, init) => app.databricks.api(path, init), endpoint, log);
+    hub = new Hub(store, notifier, { ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), ...(classifier && { classifier }), log });
     state.ready = true;
     state.setupError = undefined;
     state.stats = await store.stats();
