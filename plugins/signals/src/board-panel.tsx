@@ -608,11 +608,14 @@ function Columns(props: { children: React.ReactNode }) {
     return () => observer.disconnect();
   }, [measure]);
   const scroll = (direction: 1 | -1) => row.current?.scrollBy({ left: direction * (COLUMN_WIDTH + 12), behavior: "smooth" });
-  const arrow = (direction: 1 | -1): React.CSSProperties => ({ position: "absolute", top: 0, [direction < 0 ? "left" : "right"]: 0, zIndex: 1, boxShadow: "0 1px 4px rgba(0,0,0,0.15)" });
+  const arrow = (direction: 1 | -1): React.CSSProperties => ({ position: "absolute", top: 0, [direction < 0 ? "left" : "right"]: 0, boxShadow: "0 1px 4px rgba(0,0,0,0.15)", pointerEvents: "auto" });
   return (
     <div style={{ position: "relative", minWidth: 0, maxWidth: "100%" }}>
-      {edges.left && <div style={arrow(-1)}><Button size="sm" title="Scroll left" aria-label="Scroll left" onClick={() => scroll(-1)}>‹</Button></div>}
-      {edges.right && <div style={arrow(1)}><Button size="sm" title="Scroll right" aria-label="Scroll right" onClick={() => scroll(1)}>›</Button></div>}
+      {/* A zero-height bar that sticks to the top of the board as it scrolls down, so the arrows stay in view. */}
+      <div style={{ position: "sticky", top: 0, height: 0, zIndex: 1, pointerEvents: "none" }}>
+        {edges.left && <div style={arrow(-1)}><Button size="sm" title="Scroll left" aria-label="Scroll left" onClick={() => scroll(-1)}>‹</Button></div>}
+        {edges.right && <div style={arrow(1)}><Button size="sm" title="Scroll right" aria-label="Scroll right" onClick={() => scroll(1)}>›</Button></div>}
+      </div>
       <div ref={row} onScroll={measure} style={{ display: "flex", gap: 12, overflowX: "auto", alignItems: "flex-start", minWidth: 0, maxWidth: "100%", paddingBottom: 8 }}>
         {props.children}
       </div>
@@ -723,7 +726,8 @@ function Board(props: {
     );
   }
   return (
-    <DbxRoot style={{ minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" }}>
+    // The host gives the tab or page a fixed height and doesn't scroll it, so the board scrolls itself (as the SQL and Genie pages do).
+    <DbxRoot style={{ minWidth: 0, maxWidth: "100%", width: "100%", height: "100%", overflow: "auto", boxSizing: "border-box" }}>
       <div style={{ padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}>
         <Stack gap={16}>
           {/* Not SectionHeader: in a narrow tab its buttons wrap under the title rather than push the panel sideways. */}
