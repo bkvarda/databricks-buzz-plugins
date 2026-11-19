@@ -872,6 +872,10 @@ var HubClient = class {
   deleteAccount(name) {
     return this.call("POST", "/api/account", { body: { name, delete: true } });
   }
+  /** Events a rule's classifier kept from opening a task in this channel, newest first, with why. */
+  filtered(channel, signal) {
+    return this.call("GET", "/api/filtered", { query: { channel, days: 14, limit: 100 }, ...signal && { signal } }).then((reply) => reply.events);
+  }
   events(events) {
     return this.call("POST", "/api/events", { body: { events } });
   }
@@ -1467,7 +1471,7 @@ function encodeBytes(prefix, bytes) {
 }
 
 // plugins/signals/src/board-view.ts
-var VIEWS = ["list", "swimlanes"];
+var VIEWS = ["list", "swimlanes", "filtered"];
 var STATUS_GROUPS = [
   { status: "waiting", title: "Needs input" },
   { status: "open", title: "Open" },
@@ -1547,6 +1551,19 @@ function taskFacts(item) {
     { label: "Opened", value: date(task.created_at) },
     { label: "Last event", value: `${date(task.last_event_at)}${task.event_count > 1 ? ` (${task.event_count} events)` : ""}` }
   ];
+}
+function filteredWhy(event) {
+  const percent = (n) => `${Math.round(n * 100)}%`;
+  const score = `scored ${percent(event.score)}${event.min !== void 0 ? `, needed ${percent(event.min)}` : ""}`;
+  return `${event.rule}: ${score}${event.question ? ` on \u201C${event.question}\u201D` : ""}`;
+}
+function filterFiltered(events, search) {
+  const words = (search ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [...events];
+  return events.filter((event) => {
+    const text = [event.title, event.actor, event.source, event.rule, event.account].filter(Boolean).join(" ").toLowerCase();
+    return words.every((word) => text.includes(word));
+  });
 }
 
 // plugins/signals/src/board-panel.tsx
@@ -1756,6 +1773,14 @@ var savedView = () => {
     return "list";
   }
 };
+function FilteredList(props) {
+  if (props.error) return /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(props.error));
+  if (!props.events) return props.loading ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading filtered events" }) : null;
+  const shown = filterFiltered(props.events, props.search);
+  if (!props.events.length) return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Nothing filtered in the last two weeks. Rules with ", /* @__PURE__ */ React.createElement("code", null, "classify"), " list here the events their question held back.");
+  if (!shown.length) return /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No filtered events match the search.");
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Events from the last two weeks that a rule's classifier kept from opening a task here. If one should have been a task, loosen the rule's question or lower its ", /* @__PURE__ */ React.createElement("code", null, "min"), "."), /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, shown.map((event, n) => /* @__PURE__ */ React.createElement("div", { key: event.id, style: { padding: "8px 12px", borderTop: n ? "1px solid var(--dbx-border)" : void 0, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", wrap: true }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: "0.8125rem", fontWeight: 500, minWidth: 0, flex: "1 1 200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: event.title }, event.url ? /* @__PURE__ */ React.createElement("a", { href: event.url, onClick: (click) => (click.preventDefault(), openExternal(event.url)) }, event.title || event.external_id) : event.title || event.external_id), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, event.source, " \xB7 ", ago(event.filtered_at * 1e3))), event.actor && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, event.actor), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, filteredWhy(event)))))));
+}
 function Toolbar(props) {
   const { filters, setFilters } = props;
   const options = filterOptions(props.tasks);
@@ -1763,7 +1788,7 @@ function Toolbar(props) {
   const set = (key) => (event) => setFilters({ ...filters, [key]: event.target.value || void 0 });
   const select = { width: "auto", fontSize: "0.75rem", padding: "2px 6px" };
   const any = Object.values(filters).some(Boolean);
-  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "View", style: { display: "inline-flex", border: "1px solid var(--dbx-border)", borderRadius: 6, overflow: "hidden" } }, ["list", "swimlanes"].map((view) => /* @__PURE__ */ React.createElement("button", { key: view, type: "button", role: "tab", "aria-selected": props.view === view, onClick: () => props.setView(view), style: { border: 0, padding: "3px 10px", fontSize: "0.75rem", cursor: "pointer", color: props.view === view ? "var(--dbx-ink)" : "var(--dbx-subtle)", background: props.view === view ? "var(--dbx-inset)" : "transparent", fontWeight: props.view === view ? 600 : 400 } }, view === "list" ? "\u2630 List" : "\u25A5 Swimlanes"))), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", type: "search", "aria-label": "Search tasks", placeholder: "Search\u2026", value: filters.search ?? "", onChange: set("search"), style: { ...select, width: 160 } }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", value: filters.status ?? "", onChange: set("status"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any status"), STATUS_GROUPS.map((group) => /* @__PURE__ */ React.createElement("option", { key: group.status, value: group.status }, group.title, " (", statusCounts.get(group.status).length, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Workstream", value: filters.workstream ?? "", onChange: set("workstream"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any workstream"), options.workstreams.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value === NONE ? "No workstream" : option.value, " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assignee", value: filters.assignee ?? "", onChange: set("assignee"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Anyone"), options.assignees.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, assigneeName(option.assignee, props.profile), " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Mode", value: filters.mode ?? "", onChange: set("mode"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any mode"), options.modes.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value, " (", option.count, ")"))), any && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setFilters({}) }, "Clear"), any && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, props.shown, " of ", props.tasks.length));
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "View", style: { display: "inline-flex", border: "1px solid var(--dbx-border)", borderRadius: 6, overflow: "hidden" } }, ["list", "swimlanes", "filtered"].map((view) => /* @__PURE__ */ React.createElement("button", { key: view, type: "button", role: "tab", "aria-selected": props.view === view, onClick: () => props.setView(view), title: view === "filtered" ? "Events the classifier kept from opening a task, and why" : void 0, style: { border: 0, padding: "3px 10px", fontSize: "0.75rem", cursor: "pointer", color: props.view === view ? "var(--dbx-ink)" : "var(--dbx-subtle)", background: props.view === view ? "var(--dbx-inset)" : "transparent", fontWeight: props.view === view ? 600 : 400 } }, view === "list" ? "\u2630 List" : view === "swimlanes" ? "\u25A5 Swimlanes" : `\u2298 Filtered${props.filtered !== void 0 ? ` (${props.filtered})` : ""}`))), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", type: "search", "aria-label": props.view === "filtered" ? "Search filtered events" : "Search tasks", placeholder: "Search\u2026", value: filters.search ?? "", onChange: set("search"), style: { ...select, width: 160 } }), props.view !== "filtered" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", value: filters.status ?? "", onChange: set("status"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any status"), STATUS_GROUPS.map((group) => /* @__PURE__ */ React.createElement("option", { key: group.status, value: group.status }, group.title, " (", statusCounts.get(group.status).length, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Workstream", value: filters.workstream ?? "", onChange: set("workstream"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any workstream"), options.workstreams.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value === NONE ? "No workstream" : option.value, " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assignee", value: filters.assignee ?? "", onChange: set("assignee"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Anyone"), options.assignees.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, assigneeName(option.assignee, props.profile), " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Mode", value: filters.mode ?? "", onChange: set("mode"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any mode"), options.modes.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value, " (", option.count, ")")))), any && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setFilters({}) }, "Clear"), any && props.view !== "filtered" && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, props.shown, " of ", props.tasks.length));
 }
 var BOARD_PAGE = "board";
 var PLUGIN_ID = "bkvarda.databricks-signals";
@@ -1802,6 +1827,7 @@ function Board(props) {
   const hub2 = React.useMemo(() => app ? new HubClient(service.client(), app) : void 0, [app?.name, app?.url]);
   const [version, refresh] = React.useReducer((n) => n + 1, 0);
   const board = useAsync(async (signal) => hub2 && channel ? hub2.board(channel.id, signal) : void 0, [hub2, channel?.id, version]);
+  const filtered = useAsync(async (signal) => hub2 && channel ? hub2.filtered(channel.id, signal).catch((error) => /No route/.test(error.message) ? [] : Promise.reject(error)) : void 0, [hub2, channel?.id, version]);
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
   const profile = useProfiles(ctx, agents);
   const [view, setView] = React.useState(savedView);
@@ -1830,17 +1856,17 @@ function Board(props) {
   else if (hubs.loading || board.loading && !board.data) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Loading tasks" });
   else if (hubs.error || board.error) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, describeError(hubs.error ?? board.error));
   else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
-  else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
-  else if (viewing !== void 0 && board.data.tasks.some((item) => item.task.id === viewing)) {
+  else if (!board.data?.tasks.length && !filtered.data?.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
+  else if (viewing !== void 0 && board.data?.tasks.some((item) => item.task.id === viewing)) {
     const item = board.data.tasks.find((found) => found.task.id === viewing);
     body = /* @__PURE__ */ React.createElement(TaskView, { ctx, hub: hub2, item, channel: channel.id, profile, steer, onChange: refresh, back: () => setViewing(void 0) });
-  } else {
+  } else if (board.data) {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
     const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh, view: (found) => setViewing(found.task.id) });
     const header = (group) => /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusIcon, { status: group.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, group.title), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, grouped.get(group.status).length));
-    body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length }), !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
+    body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length, ...filtered.data && { filtered: filtered.data.length } }), view === "filtered" ? /* @__PURE__ */ React.createElement(FilteredList, { events: filtered.data, loading: filtered.loading, ...filtered.error && { error: filtered.error }, ...filters.search && { search: filters.search } }) : !board.data.tasks.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel.") : !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
   }
   return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
     SectionHeader,

@@ -21,7 +21,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -170,7 +170,17 @@ export class Hub {
           const number = (name: string) => (q.get(name) ? Number(q.get(name)) || undefined : undefined);
           const days = number("days");
           const limit = number("limit");
-          return { json: { events: await this.store.filtered({ ...(days && { days }), ...(limit && { limit }), ...(q.get("source") && { source: q.get("source")! }), ...(q.get("rule") && { rule: q.get("rule")! }) }) } };
+          const events = await this.store.filtered({ ...(days && { days }), ...(limit && { limit }), ...(q.get("source") && { source: q.get("source")! }), ...(q.get("rule") && { rule: q.get("rule")! }), ...(q.get("channel") && { channel: q.get("channel")! }) });
+          // Why each was held back: its rule's question and the score it needed.
+          const rules = new Map((await this.config()).rules.map((rule) => [rule.id, rule]));
+          return {
+            json: {
+              events: events.map((event) => {
+                const classify = rules.get(event.rule)?.classify;
+                return classify ? { ...event, question: classify.question, min: classify.min ?? DEFAULT_CLASSIFY_MIN } : event;
+              }),
+            },
+          };
         }
         case "GET /api/ids":
           return { json: { ids: idsByKind((await this.config()).accounts ?? []) } };

@@ -7,7 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
-import { assigneeOf, byStatus, cardAssets, filterOptions, filterTasks, readView, replyMentions, replyText, taskFacts, threadComments } from "../plugins/signals/src/board-view";
+import { assigneeOf, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, readView, replyMentions, replyText, taskFacts, threadComments } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
 import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
@@ -1304,7 +1304,21 @@ describe("classify", () => {
     expect(filtered.events).toEqual([expect.objectContaining({ external_id: "m2", rule: "customer-mail", title: "Accepted: sync" })]);
     expect(filtered.events[0]!.score).toBeCloseTo(0.1);
     expect(((await call("GET", "/api/filtered", undefined, "rule=other")).json as { events: unknown[] }).events).toEqual([]);
+    // Each says why: the channel its task would have gone to, its rule's question and the score it needed.
+    expect(filtered.events[0]).toMatchObject({ channel: "acme", question: "Does it ask for something?", min: 0.7 });
+    expect(((await call("GET", "/api/filtered", undefined, "channel=acme")).json as { events: unknown[] }).events).toHaveLength(1);
+    expect(((await call("GET", "/api/filtered", undefined, "channel=triage")).json as { events: unknown[] }).events).toEqual([]);
     expect(HUB_PATHS).toContain("/api/filtered");
+  });
+
+  it("the board's Filtered view says why each event was held back, and searches them", () => {
+    const event = { id: 1, owner: "a@x.com", source: "gmail", external_id: "m2", title: "Your lunch receipt", actor: "Cafe <receipts@cafe.com>", occurred_at: 1, rule: "customer-mail", score: 0.378, filtered_at: 2, question: "Is the sender asking?", min: 0.7 };
+    expect(filteredWhy(event)).toBe("customer-mail: scored 38%, needed 70% on “Is the sender asking?”");
+    expect(filteredWhy({ ...event, question: undefined, min: undefined } as never)).toBe("customer-mail: scored 38%");
+    expect(filterFiltered([event], "LUNCH cafe")).toHaveLength(1);
+    expect(filterFiltered([event], "quota")).toEqual([]);
+    expect(filterFiltered([event], undefined)).toHaveLength(1);
+    expect(readView("filtered")).toBe("filtered");
   });
 
   it("the example config classifies customer mail", () => {

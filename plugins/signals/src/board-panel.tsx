@@ -17,8 +17,8 @@ import { ago, Button, Disclosure, DbxRoot, Notice, SectionHeader, Spinner, Stack
 import { Markdown } from "@dbx/core/ui/markdown";
 import { npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterOptions, filterTasks, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments } from "./board-view";
-import { type BoardTask, chosenHub, HubClient } from "./client";
+import { type Assignee, assigneeOf, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments } from "./board-view";
+import { type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 
 type Profile = { name?: string; picture?: string };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, Profile>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
@@ -469,8 +469,42 @@ const savedView = (): BoardView => {
   }
 };
 
+/**
+ * The events a rule's classifier kept from opening a task in this channel,
+ * with why: the rule, its score against the one it needed, and the question,
+ * so the team can see what it held back and tune the question or `min`.
+ */
+function FilteredList(props: { events: readonly FilteredEvent[] | undefined; loading: boolean; error?: Error; search?: string }) {
+  if (props.error) return <Notice tone="danger">{describeError(props.error)}</Notice>;
+  if (!props.events) return props.loading ? <Spinner label="Loading filtered events" /> : null;
+  const shown = filterFiltered(props.events, props.search);
+  if (!props.events.length) return <Text tone="subtle" size="sm">Nothing filtered in the last two weeks. Rules with <code>classify</code> list here the events their question held back.</Text>;
+  if (!shown.length) return <Text tone="subtle" size="sm">No filtered events match the search.</Text>;
+  return (
+    <Stack gap={6}>
+      <Text size="xs" tone="tertiary">Events from the last two weeks that a rule's classifier kept from opening a task here. If one should have been a task, loosen the rule's question or lower its <code>min</code>.</Text>
+      <div style={{ border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 }}>
+        {shown.map((event, n) => (
+          <div key={event.id} style={{ padding: "8px 12px", borderTop: n ? "1px solid var(--dbx-border)" : undefined, minWidth: 0 }}>
+            <Stack gap={2}>
+              <Stack direction="row" gap={8} align="center" wrap>
+                <span style={{ fontSize: "0.8125rem", fontWeight: 500, minWidth: 0, flex: "1 1 200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={event.title}>
+                  {event.url ? <a href={event.url} onClick={(click) => (click.preventDefault(), openExternal(event.url!))}>{event.title || event.external_id}</a> : event.title || event.external_id}
+                </span>
+                <Text size="xs" tone="tertiary">{event.source} · {ago(event.filtered_at * 1000)}</Text>
+              </Stack>
+              {event.actor && <Text size="xs" tone="subtle">{event.actor}</Text>}
+              <Text size="xs" tone="tertiary">{filteredWhy(event)}</Text>
+            </Stack>
+          </div>
+        ))}
+      </div>
+    </Stack>
+  );
+}
+
 /** The filters and the view switch, in one bar above the tasks. */
-function Toolbar(props: { tasks: readonly BoardTask[]; filters: BoardFilters; setFilters(filters: BoardFilters): void; view: BoardView; setView(view: BoardView): void; profile(key: string): Profile | undefined; shown: number }) {
+function Toolbar(props: { tasks: readonly BoardTask[]; filters: BoardFilters; setFilters(filters: BoardFilters): void; view: BoardView; setView(view: BoardView): void; profile(key: string): Profile | undefined; shown: number; filtered?: number }) {
   const { filters, setFilters } = props;
   const options = filterOptions(props.tasks);
   const statusCounts = byStatus(props.tasks);
@@ -480,13 +514,14 @@ function Toolbar(props: { tasks: readonly BoardTask[]; filters: BoardFilters; se
   return (
     <Stack direction="row" gap={6} wrap align="center">
       <div role="tablist" aria-label="View" style={{ display: "inline-flex", border: "1px solid var(--dbx-border)", borderRadius: 6, overflow: "hidden" }}>
-        {(["list", "swimlanes"] as const).map((view) => (
-          <button key={view} type="button" role="tab" aria-selected={props.view === view} onClick={() => props.setView(view)} style={{ border: 0, padding: "3px 10px", fontSize: "0.75rem", cursor: "pointer", color: props.view === view ? "var(--dbx-ink)" : "var(--dbx-subtle)", background: props.view === view ? "var(--dbx-inset)" : "transparent", fontWeight: props.view === view ? 600 : 400 }}>
-            {view === "list" ? "☰ List" : "▥ Swimlanes"}
+        {(["list", "swimlanes", "filtered"] as const).map((view) => (
+          <button key={view} type="button" role="tab" aria-selected={props.view === view} onClick={() => props.setView(view)} title={view === "filtered" ? "Events the classifier kept from opening a task, and why" : undefined} style={{ border: 0, padding: "3px 10px", fontSize: "0.75rem", cursor: "pointer", color: props.view === view ? "var(--dbx-ink)" : "var(--dbx-subtle)", background: props.view === view ? "var(--dbx-inset)" : "transparent", fontWeight: props.view === view ? 600 : 400 }}>
+            {view === "list" ? "☰ List" : view === "swimlanes" ? "▥ Swimlanes" : `⊘ Filtered${props.filtered !== undefined ? ` (${props.filtered})` : ""}`}
           </button>
         ))}
       </div>
-      <input className="dbx-input" type="search" aria-label="Search tasks" placeholder="Search…" value={filters.search ?? ""} onChange={set("search")} style={{ ...select, width: 160 }} />
+      <input className="dbx-input" type="search" aria-label={props.view === "filtered" ? "Search filtered events" : "Search tasks"} placeholder="Search…" value={filters.search ?? ""} onChange={set("search")} style={{ ...select, width: 160 }} />
+      {props.view !== "filtered" && <>
       <select className="dbx-input" aria-label="Status" value={filters.status ?? ""} onChange={set("status")} style={select}>
         <option value="">Any status</option>
         {STATUS_GROUPS.map((group) => <option key={group.status} value={group.status}>{group.title} ({statusCounts.get(group.status)!.length})</option>)}
@@ -503,8 +538,9 @@ function Toolbar(props: { tasks: readonly BoardTask[]; filters: BoardFilters; se
         <option value="">Any mode</option>
         {options.modes.map((option) => <option key={option.value} value={option.value}>{option.value} ({option.count})</option>)}
       </select>
+      </>}
       {any && <Button size="sm" onClick={() => setFilters({})}>Clear</Button>}
-      {any && <Text size="xs" tone="tertiary">{props.shown} of {props.tasks.length}</Text>}
+      {any && props.view !== "filtered" && <Text size="xs" tone="tertiary">{props.shown} of {props.tasks.length}</Text>}
     </Stack>
   );
 }
@@ -584,6 +620,8 @@ function Board(props: {
   const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url]);
   const [version, refresh] = React.useReducer((n: number) => n + 1, 0);
   const board = useAsync(async (signal) => (hub && channel ? hub.board(channel.id, signal) : undefined), [hub, channel?.id, version]);
+  // The classifier's held-back events, for the Filtered view (an older hub without /api/filtered gives none).
+  const filtered = useAsync(async (signal) => (hub && channel ? hub.filtered(channel.id, signal).catch((error: Error) => (/No route/.test(error.message) ? [] : Promise.reject(error))) : undefined), [hub, channel?.id, version]);
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
   const profile = useProfiles(ctx, agents);
   const [view, setView] = React.useState<BoardView>(savedView);
@@ -614,11 +652,11 @@ function Board(props: {
   else if (hubs.loading || (board.loading && !board.data)) body = <Spinner label="Loading tasks" />;
   else if (hubs.error || board.error) body = <Notice tone="danger">{describeError((hubs.error ?? board.error)!)}</Notice>;
   else if (!hub) body = <Notice title="No signals hub in this workspace">Deploy one first (see the Signals plugin's README).</Notice>;
-  else if (!board.data?.tasks.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
-  else if (viewing !== undefined && board.data.tasks.some((item) => item.task.id === viewing)) {
+  else if (!board.data?.tasks.length && !filtered.data?.length) body = <Text tone="subtle" size="sm">No tasks in this channel{board.data?.account ? "" : " (set it up as an account from the channel menu)"}.</Text>;
+  else if (viewing !== undefined && board.data?.tasks.some((item) => item.task.id === viewing)) {
     const item = board.data.tasks.find((found) => found.task.id === viewing)!;
     body = <TaskView ctx={ctx} hub={hub} item={item} channel={channel.id} profile={profile} steer={steer} onChange={refresh} back={() => setViewing(undefined)} />;
-  } else {
+  } else if (board.data) {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
     const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
@@ -632,8 +670,12 @@ function Board(props: {
     );
     body = (
       <Stack gap={12}>
-        <Toolbar tasks={board.data.tasks} filters={filters} setFilters={setFilters} view={view} setView={chooseView} profile={profile} shown={shown.length} />
-        {!shown.length ? (
+        <Toolbar tasks={board.data.tasks} filters={filters} setFilters={setFilters} view={view} setView={chooseView} profile={profile} shown={shown.length} {...(filtered.data && { filtered: filtered.data.length })} />
+        {view === "filtered" ? (
+          <FilteredList events={filtered.data} loading={filtered.loading} {...(filtered.error && { error: filtered.error })} {...(filters.search && { search: filters.search })} />
+        ) : !board.data.tasks.length ? (
+          <Text tone="subtle" size="sm">No tasks in this channel.</Text>
+        ) : !shown.length ? (
           <Text tone="subtle" size="sm">No tasks match these filters.</Text>
         ) : view === "list" ? (
           <div style={{ border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 }}>
