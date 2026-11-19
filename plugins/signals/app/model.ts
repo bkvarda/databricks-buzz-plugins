@@ -141,6 +141,15 @@ export type Rule = Readonly<{
    * group_key; when it's empty, the event's own source and external_id.
    */
   group_by?: string;
+  /**
+   * What makes one person's thing the same as another person's, when their
+   * group keys differ (each mailbox has its own Gmail thread ids): a template
+   * of fields, like `{actor}|{title}|{occurred_at}`, that has the same value
+   * in every copy. Every field it names must be there. When a new group's
+   * event matches it, that group joins the task the match is on, so its later
+   * events go there too.
+   */
+  same_as?: string;
   /** Rules with the same group share tasks (default: the rule's id). An `update` rule needs the group of the rule that opens the tasks. */
   group?: string;
   /** Overrides the account the event says (a fixed name or `{payload.account_name}`). */
@@ -365,6 +374,7 @@ export function configProblems(raw: unknown): string[] {
     if (rule.known_account !== undefined && typeof rule.known_account !== "boolean") problems.push(`${where}.known_account is true or false`);
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
+    if (rule.same_as !== undefined && (typeof rule.same_as !== "string" || !/\{[a-z_][a-z0-9_.]*\}/i.test(rule.same_as))) problems.push(`${where}.same_as is a {field} template, like {actor}|{title}|{occurred_at}`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
     if (rule.done_when !== undefined) problems.push(...doneWhenProblems(rule.done_when, `${where}.done_when`));
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
@@ -669,6 +679,22 @@ function fillGroup(template: string, event: EventInput): string | undefined {
   return any ? filled : undefined;
 }
 
+/**
+ * An event's copy key for a rule with `same_as`: the rule's group and the
+ * template filled in. Undefined without `same_as`, or when a field it names
+ * is empty (a half-filled key would join unrelated things).
+ */
+export function sameKey(rule: Rule, event: EventInput): string | undefined {
+  if (!rule.same_as) return undefined;
+  let missing = false;
+  const filled = rule.same_as.replace(/\{([a-z_][a-z0-9_.]*)\}/gi, (_, path: string) => {
+    const value = field(event, path);
+    if (value === undefined || value === null || value === "") missing = true;
+    return typeof value === "object" ? JSON.stringify(value) : String(value ?? "").trim().toLowerCase();
+  });
+  return missing ? undefined : `${rule.group ?? rule.id}|${filled}`;
+}
+
 /** Which task an event belongs to, for a rule. */
 export function groupKey(rule: Rule, event: EventInput): string {
   const by = !rule.group_by ? event.group_key : rule.group_by.includes("{") ? fillGroup(rule.group_by, event) : field(event, rule.group_by);
@@ -708,7 +734,7 @@ export const seriesQuestion = (title: string) => `"${title}" is part of a recurr
 
 export type Decision =
   | Readonly<{ kind: "none"; reason: string }>
-  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string }>;
+  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string; same?: string }>;
 
 /**
  * What to do with an event that is new or changed. `firstRun` is a source's
@@ -728,7 +754,8 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   // A team that turned a kind of work off still gets updates on tasks already open.
   const create = rule.action === "task" && mode !== "off" && !(options.firstRun && config.first_run_seen !== false);
   const series = seriesKey(rule, event, account);
-  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }) };
+  const same = sameKey(rule, event);
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }) };
 }
 
 // ---------------------------------------------------------------------------
