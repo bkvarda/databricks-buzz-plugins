@@ -100,13 +100,31 @@ export const cardAssets = (item: BoardTask) => item.artifacts.filter((artifact) 
 export const readView = (value: unknown): BoardView => (VIEWS as readonly unknown[]).includes(value) ? (value as BoardView) : "list";
 
 /** A message in a task's thread, as the task view shows it: a comment. */
-export type Comment = Readonly<{ id: string; author: string; at: number; text: string; agents: boolean; pending: boolean }>;
+export type Comment = Readonly<{ id: string; author: string; at: number; text: string; agents: boolean; pending: boolean; failed: boolean }>;
+
+const MENTION = /nostr:(npub1[02-9ac-hj-np-z]{58})/g;
+
+/** The people a text mentions as nostr:npub…, as hex keys, once each. */
+export function mentionedKeys(text: string, decode: (npub: string) => string | undefined): string[] {
+  const keys = [...text.matchAll(MENTION)].map((match) => decode(match[1]!)).filter((key): key is string => Boolean(key));
+  return [...new Set(keys)];
+}
+
+/** A text with each nostr:npub… mention shown as @Name, as Buzz shows it; one with no name known shows a short npub. */
+export function withMentionNames(text: string, decode: (npub: string) => string | undefined, name: (key: string) => string | undefined): string {
+  return text.replace(MENTION, (whole, npub: string) => {
+    const key = decode(npub);
+    if (!key) return whole;
+    return `**@${name(key) ?? `${npub.slice(0, 12)}…`}**`;
+  });
+}
 
 /** The thread's messages as comments, oldest first, without empty ones. `agents` marks coordination between agents, shown quietly. */
 export function threadComments(messages: readonly Readonly<{ id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown }>[]): Comment[] {
   return messages
     .filter((message) => message.content.trim())
-    .map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery !== undefined && message.delivery !== "delivered" }))
+    // The relay's delivery states: "sending" until it answers, then "accepted", "seen" or "unknown" (sent), or "failed".
+    .map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery === "sending", failed: message.delivery === "failed" }))
     .sort((a, b) => a.at - b.at);
 }
 

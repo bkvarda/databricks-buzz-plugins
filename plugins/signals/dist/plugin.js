@@ -1161,10 +1161,36 @@ function Markdown(props) {
 }
 
 // node_modules/@noble/hashes/utils.js
+function isBytes(a) {
+  return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
+}
+function abytes(value, length, title = "") {
+  const bytes = isBytes(value);
+  const len = value?.length;
+  const needsLen = length !== void 0;
+  if (!bytes || needsLen && len !== length) {
+    const prefix = title && `"${title}" `;
+    const ofLen = needsLen ? ` of length ${length}` : "";
+    const got = bytes ? `length=${len}` : `type=${typeof value}`;
+    throw new Error(prefix + "expected Uint8Array" + ofLen + ", got " + got);
+  }
+  return value;
+}
 var hasHexBuiltin = /* @__PURE__ */ (() => (
   // @ts-ignore
   typeof Uint8Array.from([]).toHex === "function" && typeof Uint8Array.fromHex === "function"
 ))();
+var hexes = /* @__PURE__ */ Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+function bytesToHex(bytes) {
+  abytes(bytes);
+  if (hasHexBuiltin)
+    return bytes.toHex();
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += hexes[bytes[i]];
+  }
+  return hex;
+}
 var asciis = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 };
 function asciiToBase16(ch) {
   if (ch >= asciis._0 && ch <= asciis._9)
@@ -1198,7 +1224,7 @@ function hexToBytes(hex) {
 }
 
 // node_modules/@scure/base/index.js
-function isBytes(a) {
+function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
 }
 function isArrayOf(isString, arr) {
@@ -1243,8 +1269,8 @@ function chain(...args) {
   const id = (a) => a;
   const wrap = (a, b) => (c) => a(b(c));
   const encode = args.map((x) => x.encode).reduceRight(wrap, id);
-  const decode = args.map((x) => x.decode).reduce(wrap, id);
-  return { encode, decode };
+  const decode2 = args.map((x) => x.decode).reduce(wrap, id);
+  return { encode, decode: decode2 };
 }
 // @__NO_SIDE_EFFECTS__
 function alphabet(letters) {
@@ -1342,7 +1368,7 @@ function radix2(bits, revPadding = false) {
     throw new Error("radix2: carry overflow");
   return {
     encode: (bytes) => {
-      if (!isBytes(bytes))
+      if (!isBytes2(bytes))
         throw new Error("radix2.encode input should be Uint8Array");
       return convertRadix2(Array.from(bytes), 8, bits, !revPadding);
     },
@@ -1400,7 +1426,7 @@ function genBech32(encoding) {
   const fromWordsUnsafe = unsafeWrapper(fromWords);
   function encode(prefix, words, limit = 90) {
     astr("bech32.encode prefix", prefix);
-    if (isBytes(words))
+    if (isBytes2(words))
       words = Array.from(words);
     anumArr("bech32.encode", words);
     const plen = prefix.length;
@@ -1413,7 +1439,7 @@ function genBech32(encoding) {
     const sum = bechChecksum(lowered, words, ENCODING_CONST);
     return `${lowered}1${BECH_ALPHABET.encode(words)}${sum}`;
   }
-  function decode(str, limit = 90) {
+  function decode2(str, limit = 90) {
     astr("bech32.decode input", str);
     const slen = str.length;
     if (slen < 8 || limit !== false && slen > limit)
@@ -1434,9 +1460,9 @@ function genBech32(encoding) {
       throw new Error(`Invalid checksum in ${str}: expected "${sum}"`);
     return { prefix, words };
   }
-  const decodeUnsafe = unsafeWrapper(decode);
+  const decodeUnsafe = unsafeWrapper(decode2);
   function decodeToBytes(str) {
-    const { prefix, words } = decode(str, false);
+    const { prefix, words } = decode2(str, false);
     return { prefix, words, bytes: fromWords(words) };
   }
   function encodeFromBytes(prefix, bytes) {
@@ -1444,7 +1470,7 @@ function genBech32(encoding) {
   }
   return {
     encode,
-    decode,
+    decode: decode2,
     encodeFromBytes,
     decodeToBytes,
     decodeUnsafe,
@@ -1459,6 +1485,92 @@ var bech32 = /* @__PURE__ */ genBech32("bech32");
 var utf8Decoder = new TextDecoder("utf-8");
 var utf8Encoder = new TextEncoder();
 var Bech32MaxSize = 5e3;
+function decode(code) {
+  let { prefix, words } = bech32.decode(code, Bech32MaxSize);
+  let data = new Uint8Array(bech32.fromWords(words));
+  switch (prefix) {
+    case "nprofile": {
+      let tlv = parseTLV(data);
+      if (!tlv[0]?.[0])
+        throw new Error("missing TLV 0 for nprofile");
+      if (tlv[0][0].length !== 32)
+        throw new Error("TLV 0 should be 32 bytes");
+      return {
+        type: "nprofile",
+        data: {
+          pubkey: bytesToHex(tlv[0][0]),
+          relays: tlv[1] ? tlv[1].map((d) => utf8Decoder.decode(d)) : []
+        }
+      };
+    }
+    case "nevent": {
+      let tlv = parseTLV(data);
+      if (!tlv[0]?.[0])
+        throw new Error("missing TLV 0 for nevent");
+      if (tlv[0][0].length !== 32)
+        throw new Error("TLV 0 should be 32 bytes");
+      if (tlv[2] && tlv[2][0].length !== 32)
+        throw new Error("TLV 2 should be 32 bytes");
+      if (tlv[3] && tlv[3][0].length !== 4)
+        throw new Error("TLV 3 should be 4 bytes");
+      return {
+        type: "nevent",
+        data: {
+          id: bytesToHex(tlv[0][0]),
+          relays: tlv[1] ? tlv[1].map((d) => utf8Decoder.decode(d)) : [],
+          author: tlv[2]?.[0] ? bytesToHex(tlv[2][0]) : void 0,
+          kind: tlv[3]?.[0] ? parseInt(bytesToHex(tlv[3][0]), 16) : void 0
+        }
+      };
+    }
+    case "naddr": {
+      let tlv = parseTLV(data);
+      if (!tlv[0]?.[0])
+        throw new Error("missing TLV 0 for naddr");
+      if (!tlv[2]?.[0])
+        throw new Error("missing TLV 2 for naddr");
+      if (tlv[2][0].length !== 32)
+        throw new Error("TLV 2 should be 32 bytes");
+      if (!tlv[3]?.[0])
+        throw new Error("missing TLV 3 for naddr");
+      if (tlv[3][0].length !== 4)
+        throw new Error("TLV 3 should be 4 bytes");
+      return {
+        type: "naddr",
+        data: {
+          identifier: utf8Decoder.decode(tlv[0][0]),
+          pubkey: bytesToHex(tlv[2][0]),
+          kind: parseInt(bytesToHex(tlv[3][0]), 16),
+          relays: tlv[1] ? tlv[1].map((d) => utf8Decoder.decode(d)) : []
+        }
+      };
+    }
+    case "nsec":
+      return { type: prefix, data };
+    case "npub":
+    case "note":
+      return { type: prefix, data: bytesToHex(data) };
+    default:
+      throw new Error(`unknown prefix ${prefix}`);
+  }
+}
+function parseTLV(data) {
+  let result = {};
+  let rest = data;
+  while (rest.length > 0) {
+    if (rest.length < 2)
+      throw new Error("not enough data to read TLV");
+    let t = rest[0];
+    let l = rest[1];
+    let v = rest.slice(2, 2 + l);
+    rest = rest.slice(2 + l);
+    if (v.length < l)
+      throw new Error(`not enough data to read on TLV ${t}`);
+    result[t] = result[t] || [];
+    result[t].push(v);
+  }
+  return result;
+}
 function npubEncode(hex) {
   return encodeBytes("npub", hexToBytes(hex));
 }
@@ -1530,8 +1642,20 @@ function byStatus(tasks) {
 }
 var cardAssets = (item) => item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && !["reply", "draft", "workspace"].includes(artifact.kind));
 var readView = (value) => VIEWS.includes(value) ? value : "list";
+var MENTION = /nostr:(npub1[02-9ac-hj-np-z]{58})/g;
+function mentionedKeys(text, decode2) {
+  const keys = [...text.matchAll(MENTION)].map((match) => decode2(match[1])).filter((key) => Boolean(key));
+  return [...new Set(keys)];
+}
+function withMentionNames(text, decode2, name) {
+  return text.replace(MENTION, (whole, npub) => {
+    const key = decode2(npub);
+    if (!key) return whole;
+    return `**@${name(key) ?? `${npub.slice(0, 12)}\u2026`}**`;
+  });
+}
 function threadComments(messages) {
-  return messages.filter((message) => message.content.trim()).map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery !== void 0 && message.delivery !== "delivered" })).sort((a, b) => a.at - b.at);
+  return messages.filter((message) => message.content.trim()).map((message) => ({ id: message.id, author: message.authorId, at: message.createdAt, text: message.content, agents: message.audience === "agents", pending: message.delivery === "sending", failed: message.delivery === "failed" })).sort((a, b) => a.at - b.at);
 }
 var replyMentions = (assignee) => assignee.kind === "agent" ? [assignee.key] : [];
 function replyText(text, mentions) {
@@ -1582,6 +1706,14 @@ function useProfiles(ctx, keys) {
     return { ...found.name && { name: found.name }, ...picture && { picture } };
   };
 }
+var npubKey = (npub) => {
+  try {
+    const found = decode(npub);
+    return found.type === "npub" ? found.data : void 0;
+  } catch {
+    return void 0;
+  }
+};
 var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
 var assigneeName = (assignee, profile) => assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : profile(assignee.key)?.name ?? assignee.label;
 function AssigneeMark(props) {
@@ -1673,8 +1805,8 @@ function TaskBody(props) {
     }
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
-  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && artifact.kind !== "workspace");
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
 }
 function Meta(props) {
   const { item } = props;
@@ -1719,8 +1851,9 @@ function CommentItem(props) {
   const who = props.profile(comment.author);
   const name = who?.name ?? `${npubEncode(comment.author).slice(0, 12)}\u2026`;
   const mark = who?.picture ? /* @__PURE__ */ React.createElement("img", { src: who.picture, alt: name, style: { width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" } }) : /* @__PURE__ */ React.createElement("span", { style: { width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" } }, initials(name));
-  const text = comment.text.length > 6e3 ? `${comment.text.slice(0, 5999)}\u2026` : comment.text;
-  return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 } }, mark, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 auto", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "baseline" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, name), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(comment.at * 1e3), comment.pending ? " \xB7 sending" : "")), /* @__PURE__ */ React.createElement("div", { style: { overflowWrap: "anywhere" } }, comment.agents ? /* @__PURE__ */ React.createElement(Disclosure, { summary: "Note between agents" }, /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" })) : /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" }))));
+  const raw = comment.text.length > 6e3 ? `${comment.text.slice(0, 5999)}\u2026` : comment.text;
+  const text = withMentionNames(raw, npubKey, (key) => props.profile(key)?.name);
+  return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 } }, mark, /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 auto", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "baseline" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, name), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(comment.at * 1e3), comment.pending ? " \xB7 sending" : ""), comment.failed && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, "Not sent")), /* @__PURE__ */ React.createElement("div", { style: { overflowWrap: "anywhere" } }, comment.agents ? /* @__PURE__ */ React.createElement(Disclosure, { summary: "Note between agents" }, /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" })) : /* @__PURE__ */ React.createElement(Markdown, { source: text, size: "sm" }))));
 }
 function ReplyBox(props) {
   const [text, setText] = React.useState("");
@@ -1757,12 +1890,19 @@ function TaskView(props) {
   const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? void 0, item.task.buzz_root);
   const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
   const facts = taskFacts(item);
-  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.map((comment) => comment.author))]);
+  const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.flatMap((comment) => [comment.author, ...mentionedKeys(comment.text, npubKey)]))]);
   const who = (key) => props.profile(key) ?? authorProfile(key);
   const people = item.people.filter((person) => person.kind !== "agent");
   const end = React.useRef(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
+  const seen = React.useRef(void 0);
+  const { onChange } = props;
+  React.useEffect(() => {
+    if (thread.status !== "ready") return;
+    if (seen.current !== void 0 && count > seen.current) onChange();
+    seen.current = count;
+  }, [count, thread.status]);
   return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSIGNEE"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, assigneeName(assignee, props.profile)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
 }
 var VIEW_KEY = "signals.board.view";
@@ -1868,14 +2008,7 @@ function Board(props) {
     const header = (group) => /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusIcon, { status: group.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, group.title), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, grouped.get(group.status).length));
     body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length, ...filtered.data && { filtered: filtered.data.length } }), view === "filtered" ? /* @__PURE__ */ React.createElement(FilteredList, { events: filtered.data, loading: filtered.loading, ...filtered.error && { error: filtered.error }, ...filters.search && { search: filters.search } }) : !board.data.tasks.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel.") : !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
   }
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
-    SectionHeader,
-    {
-      title: channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks",
-      description: board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it.",
-      action: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))
-    }
-  ), body)));
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", alignItems: "flex-end", justifyContent: "space-between", gap: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { flex: "1 1 240px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500, style: { overflowWrap: "anywhere" } }, channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks"), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it.")), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))), body)));
 }
 function boardPanel(ctx, service) {
   return function BoardPanel({ channelContext, context }) {
