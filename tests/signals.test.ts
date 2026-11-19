@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, markedQuestion, readQuestion, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -514,7 +514,7 @@ describe("account channels", () => {
     const replies = [
       { id: "r0", pubkey: "cd".repeat(32), content: "Not the agent", created_at: 1, tags: [["e", root, "", "reply"]] },
       { id: "r2", pubkey: agent, content: "Second", created_at: 3, tags: [["e", root, "", "reply"]] },
-      { id: "r1", pubkey: agent, content: "Draft:\n  agenda for the QBR", created_at: 2, tags: [["e", root, "", "reply"]] },
+      { id: "r1", pubkey: agent, content: "Draft:\n  agenda for the QBR in [QBR agenda](https://docs.google.com/document/d/abc/edit), see https://github.com/o/r/pull/7.", created_at: 2, tags: [["e", root, "", "reply"]] },
     ];
     let asked: unknown;
     expect(await hub.collect(async (filters) => ((asked = filters), replies))).toEqual({ recorded: 1 });
@@ -522,8 +522,12 @@ describe("account channels", () => {
     const detail = await store.detail(1);
     expect(detail?.task).toMatchObject({ status: "in_progress" });
     expect(detail?.activities.map((a) => a.kind)).toEqual(["opened", "agent_reply", "status"]);
-    expect(detail?.activities[1]).toMatchObject({ text: "Draft: agenda for the QBR" });
-    expect(detail?.artifacts).toMatchObject([{ kind: "draft", url: "buzz://message?channel=globex&id=r1" }]);
+    expect(detail?.activities[1]!.text).toMatch(/^Draft: agenda for the QBR/);
+    expect(detail?.artifacts).toMatchObject([
+      { kind: "draft", url: "buzz://message?channel=globex&id=r1" },
+      { kind: "doc", url: "https://docs.google.com/document/d/abc/edit", title: "QBR agenda" },
+      { kind: "pr", url: "https://github.com/o/r/pull/7" },
+    ]);
     // Recorded once.
     expect(await hub.collect(async () => replies)).toEqual({ recorded: 0 });
   });
@@ -1143,5 +1147,26 @@ describe("rules for every account", () => {
     await hub.sweep();
     expect((await call("GET", "/api/account", undefined, "channel=globex")).json).not.toHaveProperty("warning");
     expect((await new Hub(store, undefined, { defaultConfig: example }).handle({ method: "GET", path: "/api/account", query: new URLSearchParams("channel=globex"), user: "me@x.com", body: async () => "" })).json).toMatchObject({ warning: expect.stringContaining("no Buzz identity") });
+  });
+
+  it("types the links in agent replies as assets", () => {
+    expect(linkKind("https://docs.google.com/spreadsheets/d/x")).toBe("sheet");
+    expect(linkKind("https://docs.google.com/presentation/d/x")).toBe("slides");
+    expect(linkKind("https://docs.google.com/document/d/x")).toBe("doc");
+    expect(linkKind("https://drive.google.com/file/d/x")).toBe("drive");
+    expect(linkKind("https://github.com/o/r/issues/3")).toBe("issue");
+    expect(linkKind("https://github.com/o/r/blob/main/a.ts")).toBe("code");
+    expect(linkKind("https://signals-1.aws.databricksapps.com/")).toBe("app");
+    expect(linkKind("https://x.cloud.databricks.com/dashboardsv3/1")).toBe("dashboard");
+    expect(linkKind("https://x.cloud.databricks.com/editor/notebooks/1")).toBe("notebook");
+    expect(linkKind("https://x.cloud.databricks.com/")).toBe("workspace");
+    expect(linkKind("https://acme.slack.com/archives/C1/p1")).toBe("slack");
+    expect(linkKind("https://example.com/a")).toBe("link");
+    expect(linkKind("not a url")).toBe("link");
+    expect(replyLinks("See [the doc](https://docs.google.com/document/d/a), https://github.com/o/r/pull/1. Again https://docs.google.com/document/d/a and <https://example.com/x>")).toEqual([
+      { url: "https://docs.google.com/document/d/a", kind: "doc", title: "the doc" },
+      { url: "https://github.com/o/r/pull/1", kind: "pr" },
+      { url: "https://example.com/x", kind: "link" },
+    ]);
   });
 });
