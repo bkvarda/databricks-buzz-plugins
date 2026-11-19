@@ -1718,9 +1718,7 @@ function useRelay(ctx) {
     const update = () => setHeld((previous) => {
       const next = readRelay(relay);
       const same = next.session === previous.session && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin;
-      if (same) return previous;
-      if (next.generation !== void 0 && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin) return previous;
-      return next;
+      return same ? previous : next;
     });
     update();
     try {

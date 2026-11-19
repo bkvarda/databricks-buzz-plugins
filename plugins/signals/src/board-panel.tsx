@@ -55,8 +55,8 @@ const readRelay = (relay: RelayView | undefined): RelaySnapshot => {
  * every render and the host hands out a new object each time, an effect that
  * sets state (opening a thread reader, reading the roster) re-runs on every
  * render, which loops until React gives up and the tab crashes. So the
- * session changes only when the relay says it did, and then only when its
- * generation or the session itself is new.
+ * snapshot is read only when the relay says it changed, and kept when its
+ * session, generation, viewer and origin are all the same.
  */
 function useRelay(ctx: Context): RelaySnapshot {
   const relay = optionalService<RelayView>(ctx, "relay");
@@ -66,10 +66,10 @@ function useRelay(ctx: Context): RelaySnapshot {
       setHeld((previous) => {
         const next = readRelay(relay);
         const same = next.session === previous.session && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin;
-        if (same) return previous;
-        // A new object for the same generation is the same session.
-        if (next.generation !== undefined && next.generation === previous.generation && next.viewer === previous.viewer && next.origin === previous.origin) return previous;
-        return next;
+        // A new session is taken even under the same generation: the relay
+        // only notifies on a change, so this can't loop, and a reconnect the
+        // host makes without a new generation still reopens the thread.
+        return same ? previous : next;
       });
     update();
     try {
