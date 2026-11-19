@@ -1,6 +1,8 @@
 """Tests for the poller, with a fake workspace and hub. Run: python3 -m unittest test_poller.py"""
 
+import contextlib
 import datetime as dt
+import io
 import unittest
 
 import poller
@@ -252,6 +254,146 @@ class Run(unittest.TestCase):
         summary = poller.run(ws, {"sources": [MAIL]}, None, None, dry_run=True, log=lambda _: None, now=NOW)
         self.assertEqual(summary["gmail"]["events"], 1)
         self.assertFalse([c for c in ws.calls if c[0] == "hub"])
+
+# ---------------------------------------------------------------------------
+# hub_auth: a separate client for hub calls
+
+
+class FakeConfig:
+    def __init__(self, name, host="https://default.example.com", fail=None):
+        self.name, self.host, self.fail = name, host, fail
+
+    def authenticate(self):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        return {"Authorization": f"Bearer {self.name}"}
+
+
+class FakeClient:
+    def __init__(self, name, **kwargs):
+        self.config = FakeConfig(name)
+        self.kwargs = kwargs
+
+
+class FakeHttp:
+    def __init__(self, status=200, text='{"sources": []}'):
+        self.requests, self.status, self.text = [], status, text
+
+    def request(self, method, url, headers=None, json=None, timeout=None):
+        self.requests.append((method, url, headers, json))
+        reply = type("Reply", (), {})()
+        reply.status_code, reply.text, reply.headers = self.status, self.text, {}
+        reply.raise_for_status = lambda: None
+        reply.json = lambda: __import__("json").loads(self.text)
+        return reply
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        return self.request("POST", url, headers, json, timeout)
+
+
+PROFILE = {"profile": "buzz-lakebase-lab"}
+
+
+def workspace(hub_auth=None, make=None, http=None):
+    made = []
+
+    def make_client(**kwargs):
+        made.append(kwargs)
+        return FakeClient("hub", **kwargs)
+
+    ws = poller.Workspace(FakeClient("default"), hub_auth=hub_auth, make_client=make or make_client)
+    ws.http = http or FakeHttp()
+    return ws, made
+
+
+class HubAuth(unittest.TestCase):
+    def test_without_hub_auth_hub_calls_use_the_default_client_as_before(self):
+        ws, made = workspace()
+        ws.hub("https://hub", "GET", "/api/sources")
+        self.assertEqual(ws.http.requests, [("GET", "https://hub/api/sources", {"Authorization": "Bearer default", "Content-Type": "application/json"}, None)])
+        self.assertEqual(made, [])
+
+    def test_a_profile_signs_hub_calls_in_with_that_profile(self):
+        ws, made = workspace({"profile": "buzz-lakebase-lab"})
+        ws.hub("https://hub", "POST", "/api/cursor", {"source": "x"})
+        ws.hub("https://hub", "GET", "/api/ids")
+        self.assertEqual(made, [{"profile": "buzz-lakebase-lab"}])  # made once
+        self.assertEqual([r[2]["Authorization"] for r in ws.http.requests], ["Bearer hub", "Bearer hub"])
+
+    def test_hub_calls_use_the_hub_client_and_sql_and_mcp_the_default(self):
+        ws, _ = workspace(PROFILE)
+        ws.hub("https://hub", "GET", "/api/sources")
+        self.assertEqual(ws.headers()["Authorization"], "Bearer default")  # what mcp() sends
+        self.assertEqual(ws.client.config.name, "default")  # what sql() and table_exists() use
+        self.assertEqual(ws.hub_as.config.name, "hub")
+        ws.http = FakeHttp(text='{"result": {"content": [{"type": "text", "text": "{\\"items\\": []}"}]}}')
+        ws.mcp("gmail", "gmail_search", {})
+        self.assertTrue(all(r[2]["Authorization"] == "Bearer default" for r in ws.http.requests))
+        self.assertTrue(ws.http.requests[0][1].startswith("https://default.example.com/"))
+
+    def test_bad_hub_auth_says_what_it_takes(self):
+        for bad in ["x", {}, {"profile": "p", "host": "https://h"}, {"host": "https://h", "secret_scope": "s", "client_id_key": "a", "client_secret_key": "b"}]:
+            self.assertIn('hub_auth is {"profile"', poller.check_hub_auth(bad), bad)
+        self.assertIn("hub_auth.profile", poller.check_hub_auth({"profile": ""}))
+        self.assertIsNone(poller.check_hub_auth(PROFILE))
+
+    def test_a_profile_that_cant_sign_in_says_which(self):
+        def fail(**kwargs):
+            raise ValueError("profile not found")
+
+        ws, _ = workspace(PROFILE, make=fail)
+        with self.assertRaises(RuntimeError) as caught:
+            ws.hub("https://hub", "GET", "/api/ids")
+        self.assertIn("couldn't sign in with profile 'buzz-lakebase-lab'", str(caught.exception))
+        self.assertEqual(ws.http.requests, [])
+
+
+class Main(unittest.TestCase):
+    def run_main(self, config, *flags):
+        import json as j
+        import os
+        import tempfile
+
+        made = {}
+
+        class Recorder:
+            def __init__(self, client=None, hub_auth=None, make_client=None):
+                made["hub_auth"] = hub_auth
+
+        path = os.path.join(tempfile.mkdtemp(), "sources.json")
+        with open(path, "w") as file:
+            j.dump(config, file)
+        real_workspace, real_inbox, real_run = poller.Workspace, poller.LakebaseInbox, poller.run
+        poller.Workspace = Recorder
+        poller.LakebaseInbox = lambda ws, settings: ("inbox", settings)
+        poller.run = lambda ws, config, hub, warehouse, dry_run, inbox=None: made.update(inbox=inbox, hub=hub) or {}
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                poller.main(["--config", path, *flags])
+        finally:
+            poller.Workspace, poller.LakebaseInbox, poller.run = real_workspace, real_inbox, real_run
+        return made
+
+    def test_the_lakebase_job_config_runs_as_before(self):
+        lakebase = {"endpoint": "projects/p/branches/b/endpoints/e", "host": "h", "schema": "signals_x"}
+        made = self.run_main({"sources": [MAIL], "lakebase": lakebase}, "--lakebase")
+        self.assertEqual(made, {"hub_auth": None, "inbox": ("inbox", lakebase), "hub": None})
+
+    def test_hub_auth_goes_to_the_workspace(self):
+        made = self.run_main({"sources": [CASES], "hub_auth": PROFILE}, "--hub", "https://hub")
+        self.assertEqual(made["hub_auth"], PROFILE)
+        self.assertIsNone(made["inbox"])
+
+    def test_lakebase_with_hub_auth_says_to_use_hub(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_main({"sources": [CASES], "hub_auth": PROFILE, "lakebase": {}}, "--lakebase")
+        self.assertIn("Use --hub instead", str(caught.exception))
+
+    def test_bad_hub_auth_stops_before_anything_runs(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_main({"sources": [CASES], "hub_auth": {"profile": ""}}, "--hub", "https://hub")
+        self.assertIn("hub_auth.profile", str(caught.exception))
+
 
 
 if __name__ == "__main__":
