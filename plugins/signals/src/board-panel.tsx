@@ -24,18 +24,19 @@ type Profile = { name?: string; picture?: string };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, Profile>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
 type ThreadMessage = { id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown };
 type ThreadReader = {
-  snapshot(): { status: "idle" | "loading" | "ready" | "error"; root?: ThreadMessage; replies: readonly ThreadMessage[]; error?: string; canLoadMore: boolean };
+  snapshot(): { status: "idle" | "loading" | "ready" | "error"; root?: ThreadMessage; replies: readonly ThreadMessage[]; error?: string; canLoadMore: boolean; limited?: boolean; readKind?: "older" | "refresh" };
   subscribe(listener: () => void): () => void;
   loadMore(): Promise<void>;
+  refresh?(): Promise<void>;
   dispose(): void;
 };
 type RelaySession = {
   profiles?: ProfileQueries;
   media?: (url: string, size?: "small") => string | undefined;
-  thread?: (channelId: string, messageId: string) => ThreadReader;
+  thread?: (channelId: string, messageId: string, options?: { exact?: boolean; priority?: "foreground" | "background" }) => ThreadReader;
   messages?: { reply?: (channelId: string, rootId: string, content: string, mentions?: readonly string[]) => string };
 };
-type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession } };
+type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession; generation?: number; cached?: true; status?: string }; subscribe?(listener: () => void): () => void };
 
 /** Buzz profiles (names and pictures) of the agents on the board, from the host's relay when it has one. */
 function useProfiles(ctx: Context, keys: readonly string[]) {
@@ -305,27 +306,53 @@ function TaskCard(props: TaskProps) {
   );
 }
 
-/** A task's thread from the host's relay, as comments, kept up to date while it's shown. */
+/**
+ * A task's thread from the host's relay, as comments, kept up to date while it's shown.
+ *
+ * The host replaces its relay session when it connects or reconnects, and
+ * a reader opened on the old one (say, on the device's saved copy while
+ * connecting) shows what was saved, often just the root, and never reads on.
+ * So this follows the relay and opens a new reader on each new session. A
+ * reader that settles with the root alone is asked once to refresh.
+ */
 function useThread(ctx: Context, channel: string | undefined, root: string | null | undefined) {
-  const session = optionalService<RelayView>(ctx, "relay")?.snapshot().session;
+  const relay = optionalService<RelayView>(ctx, "relay");
+  const [, relayChanged] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => relay?.subscribe?.(relayChanged), [relay]);
+  const session = relay?.snapshot().session;
   const [reader, setReader] = React.useState<ThreadReader>();
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     if (!channel || !root || !session?.thread) return setReader(undefined);
-    const opened = session.thread(channel, root);
+    const opened = session.thread(channel, root, { priority: "foreground" });
+    let refreshed = false;
+    const settle = () => {
+      const now = opened.snapshot();
+      if (!refreshed && now.status === "ready" && !now.replies.length && opened.refresh) {
+        refreshed = true;
+        void opened.refresh().catch(() => {});
+      }
+      bump();
+    };
+    const stop = opened.subscribe(settle);
     setReader(opened);
-    const stop = opened.subscribe(bump);
+    settle();
     return () => (stop(), opened.dispose());
   }, [session, channel, root]);
   const snapshot = reader?.snapshot();
   const messages = snapshot ? [...(snapshot.root ? [snapshot.root] : []), ...snapshot.replies] : [];
+  const reply = session?.messages?.reply;
   return {
     available: Boolean(session?.thread),
     status: snapshot?.status ?? "idle",
+    /** Reading more of it (a refresh or an earlier page) while some is shown. */
+    reading: snapshot?.status === "loading" || Boolean(snapshot?.readKind),
+    /** The reader stopped at its bound with no way to read on here. */
+    limited: Boolean(snapshot?.limited && !snapshot.canLoadMore),
     error: snapshot?.error,
     comments: threadComments(messages),
     more: snapshot?.canLoadMore ? () => void reader?.loadMore() : undefined,
-    reply: session?.messages?.reply && channel && root ? (content: string, mentions: readonly string[]) => session.messages!.reply!(channel, root, content, mentions) : undefined,
+    reply: reply && channel && root ? (content: string, mentions: readonly string[]) => reply(channel, root, content, mentions) : undefined,
   };
 }
 
@@ -384,7 +411,7 @@ function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | u
       />
       {error && <Text size="xs" tone="danger">{error}</Text>}
       <Stack direction="row" gap={8} align="center" justify="space-between">
-        <Text size="xs" tone="tertiary">{to ? `Mentions ${to}, the agent it's with.` : "Mentions no one: no agent is on it."} ⌘↵ sends.</Text>
+        <Text size="xs" tone="tertiary">{to ? `Mentions ${to}, the agent it's with.` : props.assignee.kind === "you" ? "Mentions no one: it's waiting on your answer." : "Mentions no one: no agent is on it."} ⌘↵ sends.</Text>
         <Button size="sm" variant="brand" disabled={!text.trim()} onClick={send}>Reply</Button>
       </Stack>
     </Stack>
@@ -436,6 +463,8 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
                   : (
                     <Stack gap={14}>
                       {thread.more && <Button size="sm" variant="ghost" onClick={thread.more}>Earlier comments</Button>}
+                      {thread.reading && <Spinner size={10} label="Reading the thread" />}
+                      {thread.limited && <Text size="xs" tone="subtle">Only part of the thread can be read here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a> for the rest.</Text>}
                       {thread.comments.map((comment) => <CommentItem key={comment.id} comment={comment} profile={who} />)}
                       <div ref={end} />
                     </Stack>
