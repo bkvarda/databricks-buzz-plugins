@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -128,6 +128,9 @@ export class SignalsStore {
       title text, url text, actor text, account text, group_key text, payload jsonb, task_id bigint,
       UNIQUE (owner, source, external_id))`);
     await this.q(`CREATE INDEX IF NOT EXISTS events_task ON $S.events (task_id)`);
+    // Copies of one thing in several people's sources (see Rule.same_as): a copy key's task, and the other groups joined to a task.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.copies (key text PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL)`);
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.group_links (group_key text PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.tasks (
       id bigserial PRIMARY KEY, rule_id text NOT NULL, group_key text NOT NULL UNIQUE, title text NOT NULL,
       account text, channel text, workstream text, status text NOT NULL DEFAULT 'open', created_by text NOT NULL,
@@ -395,10 +398,37 @@ export class SignalsStore {
   private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const decision = decide(config, event, { firstRun, owner });
     if (decision.kind === "none") return undefined;
-    const task = await this.taskByGroup(decision.group);
     const rule = decision.rule;
-    if (task) return { task, opened: false, create: decision.create, rule };
+    const found = await this.taskByGroup(decision.group);
+    if (found) {
+      if (decision.same) await this.copyOf(decision.same, found.id);
+      return { task: found, opened: false, create: decision.create, rule };
+    }
+    // Another person's copy of it (the same mail in their mailbox) has a task: this group joins it.
+    const copy = decision.same ? await this.copyTask(decision.same) : undefined;
+    if (copy) {
+      await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [decision.group, copy.id, now()]);
+      await this.activity(copy.id, "signals", "joined", `${owner}'s copy joined it (${event.source}).`);
+      return { task: copy, opened: false, create: decision.create, rule };
+    }
     if (!decision.create) return undefined;
+    const placed = await this.placeNew(owner, event, recorded, decision, classifier, filtered);
+    if (placed && decision.same) await this.copyOf(decision.same, placed.task.id);
+    return placed;
+  }
+
+  /** Records that a copy key's thing is on a task (the first task it was on keeps it). */
+  private async copyOf(key: string, task: number): Promise<void> {
+    await this.q(`INSERT INTO $S.copies (key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING`, [key, task, now()]);
+  }
+
+  private async copyTask(key: string): Promise<Task | undefined> {
+    const found = await this.q(`SELECT t.* FROM $S.copies c JOIN $S.tasks t ON t.id = c.task_id WHERE c.key = $1`, [key]);
+    return found.rows[0] ? toTask(found.rows[0]) : undefined;
+  }
+
+  private async placeNew(owner: string, event: EventInput, recorded: { id: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
+    const rule = decision.rule;
     if (rule.classify && classifier) {
       // Fails open: no score (the model is down, say) opens the task.
       const score = await classifier(event, rule.classify).catch(() => undefined);
@@ -456,9 +486,12 @@ export class SignalsStore {
     await this.q(`UPDATE $S.tasks SET event_count = event_count + 1, latest_event = $2, last_event_at = GREATEST(last_event_at, $3), updated_at = $4 WHERE id = $1`, [task, event, Number.isNaN(at) ? now() : at, now()]);
   }
 
+  /** The task a group's events go to: the one it opened, or the one it joined as a copy of another person's. */
   async taskByGroup(group: string): Promise<Task | undefined> {
     const found = await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [group]);
-    return found.rows[0] ? toTask(found.rows[0]) : undefined;
+    if (found.rows[0]) return toTask(found.rows[0]);
+    const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
+    return linked.rows[0] ? toTask(linked.rows[0]) : undefined;
   }
 
   async task(id: number): Promise<Task | undefined> {

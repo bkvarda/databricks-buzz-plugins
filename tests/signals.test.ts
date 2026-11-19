@@ -524,6 +524,42 @@ describe("account channels", () => {
     expect((await store.account({ name: "Globex" }))!.workstream_agents).toEqual({ "Meeting Prep": [prep], questions: [tickets] });
   });
 
+  it("puts several people's copies of one mail on one task, and their later replies there too", async () => {
+    const rule = { id: "mail", sources: ["gmail"], action: "task" as const, group_by: "group_key", same_as: "{actor}|{title}|{occurred_at}" };
+    expect(configProblems({ version: 1, rules: [rule] })).toEqual([]);
+    expect(configProblems({ version: 1, rules: [{ ...rule, same_as: "actor" }] })).not.toEqual([]);
+    const store = new SignalsStore(pglite(), "signals_copies");
+    await store.setup();
+    const opened: number[] = [];
+    const hub = new Hub(store, { opened: async (task) => (opened.push(task.id), "f".repeat(63) + task.id), updated: async () => {} }, { defaultConfig: { version: 1, rules: [rule] } });
+    const as = (user: string) => (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user, body: async () => JSON.stringify(body) });
+    const alice = as("alice@x.com");
+    const sam = as("sam@x.com");
+    await alice("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"] });
+    const date = "Thu, 19 Nov 2026 23:31:51 +0000";
+    const mail = (id: string, thread: string, extra: object = {}) => ({ source: "gmail", external_id: id, group_key: thread, actor: "Ann <ann@globex.io>", title: "Pricing?", occurred_at: date, ...extra });
+    for (const call of [alice, sam]) {
+      await call("/api/sources", { source: "gmail", enabled: true });
+      await call("/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    }
+    await alice("/api/events", { events: [mail("a1", "ta")] });
+    // Sam's copy has its own message and thread ids.
+    await sam("/api/events", { events: [mail("s1", "ts")] });
+    expect(opened).toHaveLength(1);
+    const task = (await store.tasks())[0]!;
+    expect(task.event_count).toBe(2);
+    // Sam's later reply in his own thread goes to the same task.
+    await sam("/api/events", { events: [mail("s2", "ts", { actor: "sam@x.com", title: "Re: Pricing?", occurred_at: "Thu, 19 Nov 2026 23:40:00 +0000" })] });
+    expect(opened).toHaveLength(1);
+    expect((await store.task(task.id))!.event_count).toBe(3);
+    // A different mail (another time) is its own task.
+    await sam("/api/events", { events: [mail("s3", "ts2", { occurred_at: "Fri, 20 Nov 2026 09:00:00 +0000" })] });
+    expect(opened).toHaveLength(2);
+    // A copy missing a field it names doesn't join anything.
+    await alice("/api/events", { events: [mail("a4", "ta4", { occurred_at: undefined, title: "Pricing?" })] });
+    expect(opened).toHaveLength(3);
+  });
+
   it("briefs agents without the Signals tools in the wake, and records their first reply on the task", async () => {
     const store = new SignalsStore(pglite(), "signals_remote");
     await store.setup();
