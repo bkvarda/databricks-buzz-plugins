@@ -44,6 +44,21 @@ The config lists sources (see sources.example.json):
   the source "unavailable" and it is skipped. The cursor is the largest
   `watermark` column seen.
 
+Account ids: a source that covers every account names the kinds of account ids
+it uses, `"ids": ["crm"]`, and gets every account's ids of each kind (set in
+the account panel, or `ids` in the hub's config accounts; the hub serves them
+at GET /api/ids, and in Lakebase as the account_ids table):
+
+- a table source's query has `:crm`, which becomes bound parameters
+  (`:crm_0, :crm_1, ...`), as in `WHERE account_id IN (:crm)`; the ids are
+  never pasted into the SQL.
+- an mcp source's args have `{crm: <clause with {}>}`, which becomes the clause
+  once per id joined by OR, with `\\` and `"` in the id escaped:
+  `({jira_customer: cf[10001] ~ "{}"})` -> `(cf[10001] ~ "Acme" OR cf[10001] ~ "Acme Co")`.
+
+When no account has ids of a kind the source uses, it is skipped (reported as
+unavailable, with why).
+
 `map` turns an item into an event: external_id, title, url, actor, account,
 group_key, occurred_at, and payload (a list of fields, "*" for the whole item,
 or an object of specs). A spec is a path ("fields.summary"), a template
@@ -227,6 +242,55 @@ class Unavailable(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Account ids in queries
+
+
+def needed_ids(source: dict, ids: dict[str, list[str]]) -> dict[str, list[str]]:
+    """The ids of each kind the source uses; Unavailable when an account has none of a kind."""
+    kinds = source.get("ids") or []
+    if isinstance(kinds, str):
+        kinds = [kinds]
+    missing = [kind for kind in kinds if not ids.get(kind)]
+    if missing:
+        raise Unavailable(f"no account has {', '.join(missing)} ids yet (add them in the account panel, as `{missing[0]}: ...`)")
+    return {kind: list(ids[kind]) for kind in kinds}
+
+
+def bind_ids(query: str, ids: dict[str, list[str]]) -> tuple[str, dict[str, str]]:
+    """The query with each `:kind` as one bound parameter per id (`:kind_0, :kind_1`), and those parameters."""
+    parameters: dict[str, str] = {}
+    for kind, values in ids.items():
+        names = [f"{kind}_{n}" for n in range(len(values))]
+        parameters.update(zip(names, values))
+        # `:kind` as a whole name, not part of `::cast` or a longer name.
+        query = re.sub(rf"(?<![:\w]):{re.escape(kind)}(?!\w)", ", ".join(f":{name}" for name in names), query)
+    return query, parameters
+
+
+def quoted(value: str) -> str:
+    """A value for inside a double-quoted string (JQL's): backslashes and quotes escaped."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def clause_ids(template: Any, ids: dict[str, list[str]]) -> Any:
+    """`{kind: <clause with {}>}` in strings (recursively) as the clause once per id, joined by OR."""
+    if isinstance(template, dict):
+        return {key: clause_ids(value, ids) for key, value in template.items()}
+    if isinstance(template, list):
+        return [clause_ids(value, ids) for value in template]
+    if not isinstance(template, str) or not ids:
+        return template
+
+    def one(match: re.Match) -> str:
+        kind, clause = match.group(1), match.group(2)
+        if kind not in ids:
+            return match.group(0)
+        return " OR ".join(clause.replace("{}", quoted(value)) for value in ids[kind])
+
+    return re.sub(r"\{([a-z][a-z0-9_]*):\s?((?:[^{}]|\{\})*)\}", one, template)
+
+
 class Workspace:
     """Calls as the job's owner, through the Databricks SDK's auth."""
 
@@ -335,6 +399,12 @@ class LakebaseInbox:
 
     def call(self, method: str, path: str, body: Any = None) -> Any:
         with self.db.cursor() as cursor:
+            if (method, path) == ("GET", "/api/ids"):
+                cursor.execute(f"SELECT kind, id FROM {self.schema}.account_ids ORDER BY kind, id")
+                ids: dict[str, list[str]] = {}
+                for kind, value in cursor.fetchall():
+                    ids.setdefault(kind, []).append(value)
+                return {"ids": ids}
             if (method, path) == ("GET", "/api/sources"):
                 # Row-level security returns only this person's sources.
                 cursor.execute(f"SELECT source, enabled, cursor FROM {self.schema}.sources")
@@ -360,16 +430,17 @@ def with_detail(ws: Workspace, service: str, detail: dict, item: dict, clock: di
     return {**item, **found} if isinstance(found, dict) else item
 
 
-def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str | None, now: dt.datetime) -> tuple[list[dict], str]:
-    """One source's events since its cursor, and its next cursor."""
+def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str | None, now: dt.datetime, ids: dict[str, list[str]] | None = None) -> tuple[list[dict], str]:
+    """One source's events since its cursor, and its next cursor. `ids`: every account's ids, by kind."""
     lookback = dt.timedelta(hours=float(source.get("lookback_hours", 24)))
     name = source["name"]
+    used = needed_ids(source, ids or {})
     if source["kind"] == "mcp":
         since = parse_time(cursor) or now - lookback
         # Look back a little past the cursor: the hub dedupes, and sources index late.
         since = min(since, now) - dt.timedelta(minutes=float(source.get("overlap_minutes", 10)))
         clock = {"now": now, "since": since}
-        data = ws.mcp(source.get("service", name), source["tool"], fill(source.get("args", {}), None, clock))
+        data = ws.mcp(source.get("service", name), source["tool"], clause_ids(fill(source.get("args", {}), None, clock), used))
         items = get_path(data, source.get("items", "items")) if source.get("items", "items") else data
         if source.get("sections"):
             items = sections(items, source["sections"].get("split", r"^#+ .*$"), source["sections"].get("keys"))
@@ -385,7 +456,8 @@ def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str 
         if source.get("table") and not ws.table_exists(source["table"]):
             raise Unavailable(f"{source['table']} isn't there or you can't read it")
         since = cursor or source.get("start", "1970-01-01T00:00:00Z")
-        rows = ws.sql(warehouse, source["query"], {"since": since})
+        query, bound = bind_ids(source["query"], used)
+        rows = ws.sql(warehouse, query, {"since": since, **bound})
         clock = {"now": now, "since": parse_time(since) or now - lookback}
         events = [e for e in (to_event(name, row, source.get("map", {}), clock) for row in rows) if e]
         watermark = source.get("watermark")
@@ -406,6 +478,15 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
 
     state = {} if dry_run else {s["source"]: s for s in call("GET", "/api/sources")["sources"]}
     summary: dict[str, Any] = {}
+    ids: dict[str, list[str]] = {}
+    ids_error = ""
+    wanted = [s for s in config.get("sources", []) if s.get("ids") and (dry_run or (state.get(s["name"]) or {}).get("enabled"))]
+    if wanted and (hub or inbox):
+        try:
+            ids = call("GET", "/api/ids").get("ids") or {}
+        except Exception as error:  # the sources that need ids are skipped, saying why
+            ids_error = f"couldn't read account ids: {error}"[:600]
+            log(ids_error)
     for source in config.get("sources", []):
         name = source["name"]
         known = state.get(name)
@@ -413,7 +494,9 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
             summary[name] = "off"
             continue
         try:
-            events, cursor = poll_source(ws, source, known.get("cursor") if known else None, warehouse or config.get("warehouse"), now)
+            if ids_error and source.get("ids"):
+                raise Unavailable(ids_error)
+            events, cursor = poll_source(ws, source, known.get("cursor") if known else None, warehouse or config.get("warehouse"), now, ids)
         except (NotSignedIn, Unavailable) as error:
             summary[name] = f"unavailable: {error}"
             log(f"{name}: {summary[name]}")

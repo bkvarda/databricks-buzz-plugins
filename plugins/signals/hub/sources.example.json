@@ -92,6 +92,24 @@
       }
     },
     {
+      "name": "jira_customers",
+      "kind": "mcp",
+      "service": "atlassian",
+      "tool": "searchJiraIssuesUsingJql",
+      "ids": ["jira_customer"],
+      "args": { "jql": "({jira_customer: \"Customer\" ~ \"{}\"}) AND updated >= \"{since_date}\" ORDER BY updated DESC", "maxResults": 50, "fields": ["summary", "status", "updated", "priority", "customfield_10001"] },
+      "items": "issues",
+      "lookback_hours": 48,
+      "map": {
+        "external_id": "key",
+        "group_key": "key",
+        "title": "{key} {fields.summary}",
+        "account": "fields.customfield_10001",
+        "occurred_at": "fields.updated",
+        "payload": { "status": "{fields.status.name}", "status_category": "{fields.status.statusCategory.name}", "priority": "{fields.priority.name}" }
+      }
+    },
+    {
       "name": "table.support_cases",
       "kind": "table",
       "table": "main.support.cases",
@@ -104,6 +122,22 @@
         "account": "account_name",
         "occurred_at": "updated_at",
         "payload": ["status", "subject"]
+      }
+    },
+    {
+      "name": "table.usage",
+      "kind": "table",
+      "table": "main.sales.account_usage",
+      "ids": ["crm"],
+      "query": "SELECT account_id, workspace_id, metric, value, updated_at FROM main.sales.account_usage WHERE account_id IN (:crm) AND updated_at > :since ORDER BY updated_at LIMIT 1000",
+      "watermark": "updated_at",
+      "map": {
+        "external_id": "{account_id}:{workspace_id}:{metric}:{updated_at}",
+        "group_key": "{account_id}:{metric}",
+        "title": "{metric} for workspace {workspace_id}",
+        "account": "account_id",
+        "occurred_at": "updated_at",
+        "payload": ["workspace_id", "metric", "value"]
       }
     }
   ]

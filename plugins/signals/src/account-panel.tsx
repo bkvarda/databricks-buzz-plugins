@@ -59,11 +59,26 @@ function Playbooks(props: { workstreams: readonly string[]; value: Record<string
 
 const splitList = (text: string) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 
+/** Ids as the form shows them: a line per kind, `crm: 0016100000AbCdE, 0016100000FgHiJ`. */
+const idsText = (ids: Readonly<Record<string, readonly string[]>> | undefined) => Object.entries(ids ?? {}).map(([kind, values]) => `${kind}: ${values.join(", ")}`).join("\n");
+/** The form's ids lines back as kind → ids (the hub checks the kinds). */
+const parseIds = (text: string): Record<string, string[]> => {
+  const out: Record<string, string[]> = {};
+  for (const line of text.split("\n")) {
+    const at = line.indexOf(":");
+    if (!line.trim()) continue;
+    const kind = (at < 0 ? line : line.slice(0, at)).trim();
+    out[kind] = [...(out[kind] ?? []), ...(at < 0 ? [] : line.slice(at + 1).split(",").map((id) => id.trim()).filter(Boolean))];
+  }
+  return out;
+};
+
 function Form(props: { hub: HubClient; channel: { id: string; name: string }; account?: AccountView; workstreams?: readonly string[]; onSaved(account: AccountView): void }) {
   const { hub, channel, account } = props;
   const [name, setName] = React.useState(account?.name ?? channel.name.replace(/[-_]+/g, " "));
   const [aliases, setAliases] = React.useState(account?.aliases.join(", ") ?? "");
   const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
+  const [ids, setIds] = React.useState(idsText(account?.ids));
   const [agents, setAgents] = React.useState(account?.agents.join(", ") ?? "");
   const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
   const [playbooks, setPlaybooks] = React.useState<Record<string, string>>({ ...(account?.playbooks ?? {}) });
@@ -80,6 +95,7 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         channel: channel.id,
         aliases: splitList(aliases),
         domains: splitList(domains),
+        ids: parseIds(ids),
         agents: splitList(agents),
         preferences,
         playbooks: Object.fromEntries(Object.entries(playbooks).filter(([, text]) => text.trim())),
@@ -102,6 +118,9 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         </Field>
         <Field label={`${capitalized(account?.labels?.customer ?? "customer")} email domains`} hint="Mail, meetings and mentions from people at these domains open tasks in this channel (with the hub's shared rules). Colleagues' addresses at these domains don't count.">
           <input className="dbx-input" placeholder="example.com" value={domains} onChange={(event) => setDomains(event.target.value)} />
+        </Field>
+        <Field label="Ids in other systems" hint={<>A line per kind of id, like <code>crm: 0016100000AbCdE</code> or <code>jira_customer: Example, Example Co</code>. Sources that ask for a kind get every account's ids of it, and events that carry one of these ids find this account.</>}>
+          <textarea className="dbx-textarea" rows={3} placeholder="crm: 0016100000AbCdE" value={ids} onChange={(event) => setIds(event.target.value)} />
         </Field>
         <Field label="Agents that work on tasks" hint="Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread. They must be members of this channel.">
           <input className="dbx-input" placeholder="npub1…" value={agents} onChange={(event) => setAgents(event.target.value)} />
@@ -188,6 +207,7 @@ export function accountPanel(service: DatabricksService) {
                   <Button size="sm" onClick={() => setEditing(true)}>Edit</Button>
                 </Stack>
                 {account.domains.length > 0 && <Text size="sm" tone="subtle">{capitalized(account.labels?.customer ?? "customer")} domains: {account.domains.join(", ")}</Text>}
+                {Object.keys(account.ids ?? {}).length > 0 && <Text size="sm" tone="subtle">Ids: {Object.entries(account.ids).map(([kind, values]) => `${kind} ${values.join(", ")}`).join(" · ")}</Text>}
                 <Text size="sm" tone="subtle">{account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"}</Text>
                 <Stack direction="row" gap={6} wrap>
                   {Object.entries(account.read.modes).map(([key, mode]) => <Badge key={key}>{`${key}: ${mode}`}</Badge>)}
