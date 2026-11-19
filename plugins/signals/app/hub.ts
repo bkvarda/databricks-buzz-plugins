@@ -21,7 +21,7 @@
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -270,8 +270,27 @@ export class Hub {
       seen.add(update.task.id);
       const title = update.title && plainSlack(update.title);
       const text = `Update: ${update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event")}`;
+      if (update.changes?.length) {
+        await this.changed(update.task, text, update.changes).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
+        continue;
+      }
       await this.notifier.updated(update.task, text).catch((error: Error) => this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`));
     }
+  }
+
+  /**
+   * A watched field changed: says what changed, and asks the task's agents to
+   * go on with the playbook of the rule it's under now. Tasks in ask or off
+   * mode, or no agent on, only get the line.
+   */
+  private async changed(task: Task, update: string, changes: readonly FieldChange[]) {
+    const people = (await this.store.people([task.id])).get(task.id) ?? [];
+    const agents = task.mode === "auto" || task.mode === "draft" ? [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
+    const account = agents.length && task.account ? await this.store.account({ name: task.account }) : undefined;
+    const labels = labelsOf(await this.config());
+    if (agents.length) await this.store.askAgain(task.id, agents);
+    await this.store.activity(task.id, "hub", "changed", changes.map(changeLine).join("; "));
+    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, task)), agents);
   }
 
   private async post(task: Task) {
@@ -996,6 +1015,20 @@ export function answerMessage(task: Task, user: string, text: string, agents: re
     `${agents.map((key) => `nostr:${npub(key)}`).join(" ")}${agents.length ? " " : ""}${user} answered: ${text}`.trim(),
     `\n> ${task.question}`,
     agents.length ? "\nPlease go on with the task. Your next reply in this thread is recorded on it." : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+const changeLine = (change: FieldChange) => `${change.field}: ${change.from} → ${change.to}`;
+
+/** The thread's line when a watched field changes, asking the agents on it (if any) to go on. */
+export function changedMessage(task: Task, update: string, changes: readonly FieldChange[], agents: readonly string[], account?: string): string {
+  const mode = task.mode === "auto" ? "auto" : "draft";
+  return [
+    `${update}\n${changes.map((change) => `- **${change.field}:** ${change.from} → ${change.to}`).join("\n")}`,
+    agents.length ? `\n${agents.map((key) => `nostr:${npub(key)}`).join(" ")} this changed since you last looked: ${AGENT_ASK[mode]} Your next reply in this thread is recorded on the task.` : "",
+    agents.length && account ? `\n${account}` : "",
   ]
     .filter(Boolean)
     .join("\n");

@@ -160,7 +160,28 @@ export type Rule = Readonly<{
   nudge?: string;
   /** When its tasks are finished, so the hub marks them done itself (see DoneWhen). */
   done_when?: DoneWhen;
+  /**
+   * Event fields (`payload.es_status`) whose changes matter: when a later
+   * event changes one, the task's thread is told what changed
+   * (`es_status: Mitigated → Resolved`) and the agents on it are asked to go
+   * on, with the playbook of the rule that now applies.
+   */
+  watch?: readonly string[];
 }>;
+
+/** A watched field's change between a task's previous event and its new one. */
+export type FieldChange = Readonly<{ field: string; from: string; to: string }>;
+
+const shown = (value: unknown) => (value === undefined || value === null || value === "" ? "" : typeof value === "object" ? JSON.stringify(value) : String(value));
+
+/** The watched fields that differ between two events, in the order given; a field only one of them has counts. */
+export function fieldChanges(fields: readonly string[] | undefined, before: EventInput | undefined, after: EventInput): FieldChange[] {
+  if (!before || !fields?.length) return [];
+  return [...new Set(fields)].flatMap((path) => {
+    const [from, to] = [shown(field(before, path)), shown(field(after, path))];
+    return from === to ? [] : [{ field: path.replace(/^payload\./, ""), from: from || "(none)", to: to || "(none)" }];
+  });
+}
 
 /**
  * A yes/no question for a rule's events, put to the classifier model with the
@@ -343,6 +364,7 @@ export function configProblems(raw: unknown): string[] {
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
     if (rule.done_when !== undefined) problems.push(...doneWhenProblems(rule.done_when, `${where}.done_when`));
+    if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
     if (rule.classify !== undefined) {
       const c = rule.classify as Record<string, unknown>;
       if (!c || typeof c !== "object" || Array.isArray(c) || typeof c.question !== "string" || !c.question.trim()) problems.push(`${where}.classify is {question, true?, false?, min?}`);
