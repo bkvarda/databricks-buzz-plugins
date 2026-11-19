@@ -22,6 +22,12 @@ How it reaches the hub:
   "database": "databricks_postgres", "schema": "signals_<app name>"}`. It
   needs `psycopg[binary]` and a Postgres role for the person in the database.
 
+- `hub_auth` in the config (with `--hub`) signs hub calls in with another
+  profile than the default client's, for sources in another workspace than
+  the hub's: `{"profile": "<name>"}`, a profile in ~/.databrickscfg for the
+  hub's workspace. SQL and MCP calls stay on the default client
+  (DATABRICKS_CONFIG_PROFILE picks its profile).
+
 The config lists sources (see sources.example.json):
 
 - kind "mcp": a tool of a system.ai MCP service. `args` and `map` are templates:
@@ -291,22 +297,55 @@ def clause_ids(template: Any, ids: dict[str, list[str]]) -> Any:
     return re.sub(r"\{([a-z][a-z0-9_]*):\s?((?:[^{}]|\{\})*)\}", one, template)
 
 
-class Workspace:
-    """Calls as the job's owner, through the Databricks SDK's auth."""
+def check_hub_auth(settings: Any) -> str | None:
+    """What's wrong with a config's `hub_auth`, or None. It's {"profile": "<name>"}."""
+    if not isinstance(settings, dict) or set(settings) != {"profile"}:
+        return 'hub_auth is {"profile": "<name>"}, a profile in ~/.databrickscfg for the hub\'s workspace'
+    if not isinstance(settings["profile"], str) or not settings["profile"]:
+        return "hub_auth.profile is a profile name from ~/.databrickscfg"
+    return None
 
-    def __init__(self, client=None):
+
+def hub_client(settings: dict, make: Callable[..., Any] | None = None) -> Any:
+    """The client for hub calls that `hub_auth` describes."""
+    problem = check_hub_auth(settings)
+    if problem:
+        raise SystemExit(problem)
+    if make is None:
+        from databricks.sdk import WorkspaceClient as make
+    try:
+        return make(profile=settings["profile"])
+    except Exception as error:
+        raise RuntimeError(f"hub_auth: couldn't sign in with profile {settings['profile']!r}: {error}") from None
+
+
+class Workspace:
+    """Calls as the job's owner, through the Databricks SDK's auth. `hub_auth` (optional) signs hub calls in as someone else."""
+
+    def __init__(self, client=None, hub_auth: dict | None = None, make_client: Callable[..., Any] | None = None):
         if client is None:
             from databricks.sdk import WorkspaceClient
 
             client = WorkspaceClient()
         self.client = client
         self.host = client.config.host.rstrip("/")
+        self.hub_auth = hub_auth
+        self.make_client = make_client
+        self.hub_as: Any = None
         import requests
 
         self.http = requests.Session()
 
     def headers(self) -> dict:
         return {**self.client.config.authenticate(), "Content-Type": "application/json"}
+
+    def hub_headers(self) -> dict:
+        """Headers for a hub call: the default client's, or `hub_auth`'s client's (made on the first call)."""
+        if self.hub_auth is None:
+            return self.headers()
+        if self.hub_as is None:
+            self.hub_as = hub_client(self.hub_auth, self.make_client)
+        return {**self.hub_as.config.authenticate(), "Content-Type": "application/json"}
 
     def mcp(self, service: str, tool: str, args: dict) -> Any:
         url = f"{self.host}/ai-gateway/mcp-services/system.ai.{service}"
@@ -372,7 +411,7 @@ class Workspace:
         return rows
 
     def hub(self, base: str, method: str, path: str, body: Any = None) -> Any:
-        response = self.http.request(method, f"{base.rstrip('/')}{path}", headers=self.headers(), json=body, timeout=120)
+        response = self.http.request(method, f"{base.rstrip('/')}{path}", headers=self.hub_headers(), json=body, timeout=120)
         if response.status_code >= 400:
             raise RuntimeError(f"hub {path}: HTTP {response.status_code} {response.text[:300]}")
         return response.json()
@@ -538,7 +577,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     with open(args.config) as file:
         config = json.load(file)
-    ws = Workspace()
+    hub_auth = config.get("hub_auth")
+    if hub_auth is not None:
+        problem = check_hub_auth(hub_auth)
+        if problem:
+            raise SystemExit(problem)
+        if args.lakebase:
+            raise SystemExit("hub_auth is for calling the hub app (--hub <app url>, or `hub` in the config); --lakebase writes to the hub's inbox as the job's owner and can't use it. Use --hub instead.")
+    ws = Workspace(hub_auth=hub_auth)
     inbox = LakebaseInbox(ws, config.get("lakebase") or {}) if args.lakebase and not args.dry_run else None
     summary = run(ws, config, args.hub, args.warehouse, args.dry_run, inbox=inbox)
     print(json.dumps(summary, indent=2, default=str))

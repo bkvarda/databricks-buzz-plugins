@@ -51,6 +51,19 @@ Databricks Apps only take OAuth tokens, and a job's token isn't one, so a job ca
 - Add to `sources.json`: `"lakebase": {"endpoint": "projects/<p>/branches/<b>/endpoints/<e>", "host": "<endpoint host>", "database": "databricks_postgres", "schema": "signals_<app name>"}`. The schema is on the hub's status page.
 - Roles with `BYPASSRLS` (Lakebase project owners) aren't limited by these policies. They can read the database anyway.
 
+### Sources in another workspace
+
+Some tables live only in another workspace than the hub's. Run the poller for those sources from a laptop, as yourself, with two profiles: the default one for the workspace with the tables (SQL and MCP calls), and `hub_auth` for the hub's workspace (every hub call: `/api/sources`, `/api/events`, `/api/cursor`, `/api/ids`).
+
+1. Sign in to both: `databricks auth login --profile <tables profile>` and `databricks auth login --profile <hub profile>`.
+2. Give that run its own `sources.json` with only those sources, `"hub": "<app url>"` and `"hub_auth": {"profile": "<hub profile>"}`.
+3. Run it, every 15 minutes say (cron or launchd): `DATABRICKS_CONFIG_PROFILE=<tables profile> python poller.py --config sources.json --hub <app url> --warehouse <id in the tables workspace>`.
+
+- Its events are yours, like the ones your job posts: the same sources turned on in **Settings → Signals**, cursors and accounts. A source you post from both places shares one cursor, so give each source to only one of them.
+- While the laptop is asleep or offline, those sources pause; the next run picks up from their cursors.
+- `hub_auth` works only with `--hub`. With `--lakebase` the poller stops and says so.
+- A job can't do this as a service principal. Databricks Apps doesn't send the hub an email for a service principal, so the hub turns its calls away (HTTP 401), and the hub keeps sources per person anyway.
+
 ## Rules for every account
 
 The example rules don't name an account. They say "from the customer", and the accounts teams set up in their channels say who the customer is:
