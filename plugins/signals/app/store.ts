@@ -71,7 +71,9 @@ export type Outcome = "new" | "changed" | "same" | "skipped";
 export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
 
 /** An event a classifier filtered out, as the hub lists them. */
-export type FilteredEvent = Readonly<{ id: number; owner: string; source: string; external_id: string; title?: string; url?: string; actor?: string; account?: string; occurred_at: number; rule: string; score: number; filtered_at: number }>;
+export type FilteredEvent = Readonly<{ id: number; owner: string; source: string; external_id: string; title?: string; url?: string; actor?: string; account?: string; occurred_at: number; rule: string; score: number; filtered_at: number; channel?: string;
+  /** The rule's classify question and the score it needed (the hub adds them from its config). */
+  question?: string; min?: number }>;
 
 export type IngestResult = Readonly<{
   received: number;
@@ -158,6 +160,7 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_rule text`);
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_score real`);
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_at bigint`);
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_channel text`);
     await this.q(`CREATE INDEX IF NOT EXISTS events_filtered ON $S.events (filtered_at) WHERE filtered_at IS NOT NULL`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
@@ -377,11 +380,12 @@ export class SignalsStore {
       const score = await classifier(event, rule.classify).catch(() => undefined);
       const min = rule.classify.min ?? DEFAULT_CLASSIFY_MIN;
       if (typeof score === "number" && Number.isFinite(score) && score < min) {
-        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4 WHERE id = $1`, [recorded.id, rule.id, score, now()]);
+        // The channel its task would have gone to, so that channel's board can list it.
+        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4, filtered_channel = $5 WHERE id = $1`, [recorded.id, rule.id, score, now(), decision.channel ?? null]);
         filtered?.();
         return undefined;
       }
-      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL WHERE id = $1`, [recorded.id, score]);
+      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL, filtered_channel = NULL WHERE id = $1`, [recorded.id, score]);
     }
     const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) };
     if (!decision.series) return { task: await this.openTask(input), opened: true, create: true, rule };
@@ -568,18 +572,19 @@ export class SignalsStore {
 
   /** A channel's tasks for the board: every open one, and those done or dismissed within `days`. */
   /** Recent events a rule's classifier filtered out, newest first, with their score (see Rule.classify). */
-  async filtered(options: { days?: number; limit?: number; source?: string; rule?: string } = {}, at = now()): Promise<FilteredEvent[]> {
+  async filtered(options: { days?: number; limit?: number; source?: string; rule?: string; channel?: string } = {}, at = now()): Promise<FilteredEvent[]> {
     const limit = Math.min(Math.max(1, Math.floor(options.limit ?? 100)), 500);
     const found = await this.q(
-      `SELECT id, owner, source, external_id, title, url, actor, account, occurred_at, filtered_rule, filtered_score, filtered_at FROM $S.events
-       WHERE filtered_at IS NOT NULL AND task_id IS NULL AND filtered_at >= $1 AND ($2::text IS NULL OR source = $2) AND ($3::text IS NULL OR filtered_rule = $3)
+      `SELECT id, owner, source, external_id, title, url, actor, account, occurred_at, filtered_rule, filtered_score, filtered_at, filtered_channel FROM $S.events
+       WHERE filtered_at IS NOT NULL AND task_id IS NULL AND filtered_at >= $1 AND ($2::text IS NULL OR source = $2) AND ($3::text IS NULL OR filtered_rule = $3) AND ($4::text IS NULL OR filtered_channel = $4)
        ORDER BY filtered_at DESC, id DESC LIMIT ${limit}`,
-      [at - (options.days ?? 14) * 86400, options.source ?? null, options.rule ?? null],
+      [at - (options.days ?? 14) * 86400, options.source ?? null, options.rule ?? null, options.channel ?? null],
     );
     return found.rows.map((row) => ({
       id: Number(row.id), owner: String(row.owner), source: String(row.source), external_id: String(row.external_id),
       ...(row.title != null && { title: String(row.title) }), ...(row.url != null && { url: String(row.url) }), ...(row.actor != null && { actor: String(row.actor) }), ...(row.account != null && { account: String(row.account) }),
       occurred_at: Number(row.occurred_at), rule: String(row.filtered_rule), score: Number(row.filtered_score), filtered_at: Number(row.filtered_at),
+      ...(row.filtered_channel != null && { channel: String(row.filtered_channel) }),
     }));
   }
 

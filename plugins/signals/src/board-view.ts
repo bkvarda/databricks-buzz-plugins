@@ -1,9 +1,9 @@
 // What the tasks board shows, apart from how it draws it: each task's
 // assignee, the filters, and the list and swimlane views' groups.
-import type { BoardPerson, BoardTask } from "./client";
+import type { BoardPerson, BoardTask, FilteredEvent } from "./client";
 
-/** The views of the board: rows grouped by status, or a column per status. */
-export const VIEWS = ["list", "swimlanes"] as const;
+/** The views of the board: rows grouped by status, a column per status, or the events the classifier held back. */
+export const VIEWS = ["list", "swimlanes", "filtered"] as const;
 export type BoardView = (typeof VIEWS)[number];
 
 /** The statuses, in the board's order; done and dismissed show the last two weeks. */
@@ -137,4 +137,21 @@ export function taskFacts(item: BoardTask): { label: string; value: string }[] {
     { label: "Opened", value: date(task.created_at) },
     { label: "Last event", value: `${date(task.last_event_at)}${task.event_count > 1 ? ` (${task.event_count} events)` : ""}` },
   ];
+}
+
+/** Why the classifier held an event back, in a line: its rule, its score against the one it needed, and the question. */
+export function filteredWhy(event: FilteredEvent): string {
+  const percent = (n: number) => `${Math.round(n * 100)}%`;
+  const score = `scored ${percent(event.score)}${event.min !== undefined ? `, needed ${percent(event.min)}` : ""}`;
+  return `${event.rule}: ${score}${event.question ? ` on “${event.question}”` : ""}`;
+}
+
+/** Filtered events matching the board's search (title, sender, source, rule), any case. */
+export function filterFiltered(events: readonly FilteredEvent[], search: string | undefined): FilteredEvent[] {
+  const words = (search ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [...events];
+  return events.filter((event) => {
+    const text = [event.title, event.actor, event.source, event.rule, event.account].filter(Boolean).join(" ").toLowerCase();
+    return words.every((word) => text.includes(word));
+  });
 }

@@ -7,7 +7,9 @@ import type { DatabricksClient } from "@dbx/core/client";
 import type { DatabricksService } from "@dbx/core/service";
 import type { AccountRecord, Preferences, ResolvedLabels, SourceInfo } from "../app/model";
 import type { BoardPerson, BoardTask } from "../app/hub";
-import type { Task } from "../app/store";
+import type { FilteredEvent, Task } from "../app/store";
+
+export type { FilteredEvent };
 
 export type { BoardPerson, BoardTask };
 
@@ -92,6 +94,10 @@ export class HubClient {
   }
   deleteAccount(name: string) {
     return this.call<{ deleted: boolean }>("POST", "/api/account", { body: { name, delete: true } });
+  }
+  /** Events a rule's classifier kept from opening a task in this channel, newest first, with why. */
+  filtered(channel: string, signal?: AbortSignal) {
+    return this.call<{ events: FilteredEvent[] }>("GET", "/api/filtered", { query: { channel, days: 14, limit: 100 }, ...(signal && { signal }) }).then((reply) => reply.events);
   }
   events(events: readonly unknown[]) {
     return this.call<{ new: number; changed: number; same: number; skipped: number; created: number[]; updated: number[]; errors: { index: number; error: string }[] }>("POST", "/api/events", { body: { events } });
