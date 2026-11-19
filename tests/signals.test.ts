@@ -318,7 +318,7 @@ describe("account channels", () => {
   });
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
-    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], preferences: "questions: auto", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null };
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], ids: {}, preferences: "questions: auto", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null };
     expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk"], preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
@@ -973,9 +973,48 @@ describe("Slack markup", () => {
   });
 });
 
+describe("account ids", () => {
+  it("are kept by kind, served to pollers and find the account of events that carry one", async () => {
+    const store = new SignalsStore(pglite(), "signals_ids");
+    await store.setup();
+    const config: SignalsConfig = { version: 1, first_run_seen: true, rules: [{ id: "cases", sources: ["table.*"], action: "task", group_by: "external_id" }], accounts: [{ name: "Initech", ids: { crm: ["001-INI"] } }] };
+    const hub = new Hub(store, undefined, { defaultConfig: config });
+    const call = (method: string, path: string, body?: unknown, query = "") => hub.handle({ method, path, query: new URLSearchParams(query), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+
+    expect(await call("POST", "/api/account", { name: "Globex", ids: { "CRM id": ["x"] } })).toMatchObject({ status: 400 });
+    expect(await call("POST", "/api/account", { name: "Globex", ids: { since: ["x"] } })).toMatchObject({ status: 400 });
+    expect(configProblems({ ...config, accounts: [{ name: "X", ids: ["nope"] as never }] })).toEqual([expect.stringContaining("accounts[0].ids")]);
+    const saved = await call("POST", "/api/account", { name: "Globex", channel: "globex", ids: { CRM: "001-GLX, 001-GLX2", jira_customer: ["Globex", "Globex Corp", "Globex"], empty: [] } });
+    expect(saved.json).toMatchObject({ account: { ids: { crm: ["001-GLX", "001-GLX2"], jira_customer: ["Globex", "Globex Corp"] } } });
+    // Every account's ids by kind, registered and config accounts.
+    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-GLX", "001-GLX2", "001-INI"], jira_customer: ["Globex", "Globex Corp"] } });
+    // The same, for pollers that reach the hub through Lakebase.
+    expect((await store["db"].query("SELECT kind, id FROM signals_ids.account_ids ORDER BY kind, id")).rows).toEqual([
+      { kind: "crm", id: "001-GLX" },
+      { kind: "crm", id: "001-GLX2" },
+      { kind: "crm", id: "001-INI" },
+      { kind: "jira_customer", id: "Globex" },
+      { kind: "jira_customer", id: "Globex Corp" },
+    ]);
+    // An event whose account is an id finds the account (any case).
+    await call("POST", "/api/sources", { source: "table.cases", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "table.cases", external_id: "C-1", account: "001-glx2", title: "Case" }, { source: "table.cases", external_id: "C-2", account: "001-INI", title: "Case" }] });
+    const tasks = await store.tasks({});
+    expect(tasks.find((task) => task.group_key.endsWith("C-1"))).toMatchObject({ account: "Globex", channel: "globex" });
+    expect(tasks.find((task) => task.group_key.endsWith("C-2"))).toMatchObject({ account: "Initech" });
+    expect((await call("GET", "/api/account", undefined, "name=001-GLX")).json).toMatchObject({ account: { name: "Globex" } });
+    // Saving without ids keeps them; {} clears them.
+    await call("POST", "/api/account", { name: "Globex", preferences: "questions: ask" });
+    expect((await store.account({ name: "Globex" }))!.ids).toEqual({ crm: ["001-GLX", "001-GLX2"], jira_customer: ["Globex", "Globex Corp"] });
+    await call("POST", "/api/account", { name: "Globex", ids: {} });
+    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-INI"] } });
+  });
+});
+
 describe("rules for every account", () => {
   const example = JSON.parse(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")) as SignalsConfig;
-  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, preferences: "", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null });
+  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, ids: {}, preferences: "", profile: "", agents: [], playbooks: {}, updated_by: null, updated_at: null });
   const accounts = [record("Globex", "globex", ["globex.io"], ["Globex Corp"]), record("Initech", "initech", ["initech.com"])];
   const config = withAccounts(example, accounts);
 

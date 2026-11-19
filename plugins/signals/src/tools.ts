@@ -118,6 +118,7 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` · channel ${account.channel}` : ""}`,
           account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
+          Object.keys(account.ids ?? {}).length ? `Ids: ${Object.entries(account.ids).map(([kind, values]) => `${kind} ${values.join(", ")}`).join("; ")}` : "",
           "",
           `Modes (default draft): ${modes.length ? modes.map(([key, mode]) => `${key}: ${mode}`).join("; ") : "none set"}`,
           "- auto: do the work and report it in the task's thread. draft: prepare it (a draft doc, a reply) for a person to send. ask: ask in the thread before doing anything. off: no tasks.",

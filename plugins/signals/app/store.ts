@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountRecord, contentKey, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, finishes, isOpen, matches, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -128,6 +128,8 @@ export class SignalsStore {
       name text PRIMARY KEY, channel text UNIQUE, aliases jsonb NOT NULL DEFAULT '[]', domains jsonb NOT NULL DEFAULT '[]',
       preferences text NOT NULL DEFAULT '', profile text NOT NULL DEFAULT '', updated_by text, updated_at bigint)`);
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS agents jsonb NOT NULL DEFAULT '[]'`);
+    // Ids in other systems, by kind: {"crm": ["0016100000AbCdE"]}.
+    await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS ids jsonb NOT NULL DEFAULT '{}'`);
     // Playbooks: how the team likes each workstream's work done (workstream → text).
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS playbooks jsonb NOT NULL DEFAULT '{}'`);
     // The first reply an account's agent posted in the task's thread, once the hub has recorded it.
@@ -181,6 +183,16 @@ export class SignalsStore {
     await this.q(`GRANT SELECT (id, kind, at, done_at, result), INSERT (kind, body) ON $S.inbox TO PUBLIC`);
     await this.q(`GRANT USAGE ON SEQUENCE $S.inbox_id_seq TO PUBLIC`);
     await this.q(`GRANT SELECT (source, enabled, cursor, last_post_at, last_error) ON $S.sources TO PUBLIC`);
+    // Every account's ids (registered and config accounts), which pollers fill into their queries; the hub keeps it current (publishIds).
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.account_ids (kind text NOT NULL, id text NOT NULL, PRIMARY KEY (kind, id))`);
+    await this.q(`GRANT SELECT ON $S.account_ids TO PUBLIC`);
+  }
+
+  /** Replaces the ids pollers read (kind → ids). */
+  async publishIds(ids: Readonly<Record<string, readonly string[]>>): Promise<void> {
+    const rows = Object.entries(ids).flatMap(([kind, values]) => values.map((id) => [kind, id]));
+    await this.q(`DELETE FROM $S.account_ids`);
+    if (rows.length) await this.q(`INSERT INTO $S.account_ids (kind, id) SELECT * FROM unnest($1::text[], $2::text[]) ON CONFLICT DO NOTHING`, [rows.map((row) => row[0]), rows.map((row) => row[1])]);
   }
 
   /** Inbox posts the hub hasn't handled yet, oldest first. */
@@ -704,7 +716,7 @@ export class SignalsStore {
     return (await this.q(`SELECT * FROM $S.accounts ORDER BY name`)).rows.map(toAccount);
   }
 
-  /** The account by name or alias (any case), or by its channel. */
+  /** The account by name, alias or id (any case), or by its channel. */
   async account(by: Readonly<{ name?: string; channel?: string }>): Promise<AccountRecord | undefined> {
     if (by.channel) {
       const found = await this.q(`SELECT * FROM $S.accounts WHERE channel = $1`, [by.channel]);
@@ -712,7 +724,7 @@ export class SignalsStore {
     }
     if (!by.name) return undefined;
     const lower = by.name.trim().toLowerCase();
-    return (await this.accounts()).find((account) => account.name.toLowerCase() === lower || account.aliases.some((alias) => alias.toLowerCase() === lower));
+    return (await this.accounts()).find((account) => namesAccount(account, lower));
   }
 
   /**
@@ -720,7 +732,7 @@ export class SignalsStore {
    * gives it a new name and moves its tasks along. A channel belongs to one
    * account at a time.
    */
-  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>> }>, by: string): Promise<AccountRecord> {
+  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: AccountIds; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>> }>, by: string): Promise<AccountRecord> {
     const at = now();
     const existing = await this.account({ name });
     const key = existing?.name ?? name.trim();
@@ -734,6 +746,7 @@ export class SignalsStore {
     }
     if (fields.aliases) set("aliases", JSON.stringify(fields.aliases));
     if (fields.domains) set("domains", JSON.stringify(fields.domains));
+    if (fields.ids) set("ids", JSON.stringify(fields.ids));
     if (fields.agents) set("agents", JSON.stringify(fields.agents));
     if (fields.preferences !== undefined) set("preferences", fields.preferences);
     if (fields.profile !== undefined) set("profile", fields.profile);
@@ -837,6 +850,9 @@ function toSeries(row: Row): Series {
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
 
+const idLists = (value: unknown): Record<string, string[]> =>
+  value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).map(([kind, ids]) => [kind, strings(ids)] as [string, string[]]).filter(([, ids]) => ids.length)) : {};
+
 const texts = (value: unknown): Record<string, string> =>
   value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {};
 
@@ -846,6 +862,7 @@ function toAccount(row: Row): AccountRecord {
     channel: (row.channel as string | null) ?? null,
     aliases: strings(typeof row.aliases === "string" ? JSON.parse(row.aliases) : row.aliases),
     domains: strings(typeof row.domains === "string" ? JSON.parse(row.domains) : row.domains),
+    ids: idLists(typeof row.ids === "string" ? JSON.parse(row.ids) : row.ids),
     preferences: String(row.preferences ?? ""),
     profile: String(row.profile ?? ""),
     agents: strings(typeof row.agents === "string" ? JSON.parse(row.agents) : row.agents),

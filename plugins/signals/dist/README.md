@@ -64,6 +64,14 @@ A rule with one or more of the first three applies when any of them holds. The t
 
 **Sources that know the account.** A table or ticket source that's about one account should say which in the event's `account` (its `map` has `"account": "account_name"`, say). The account's name or other names (an id from another system works as an other name) then match it, with no rule naming the account. A source's query can cover all your accounts instead of one: select the account column, map it to `account`, and give each account that value as one of its other names. A query that only fits one account (`WHERE account_id = '...'`) means every person edits it for each new account.
 
+**Account ids in queries.** A table or ticket source that reads only your accounts' rows needs their ids, and those differ per account. Give each account its ids in the panel's **Ids in other systems**, a line per kind (`crm: 0016100000AbCdE`, `jira_customer: Example, Example Co`), or as `ids` on a config account (`"ids": {"crm": ["0016100000AbCdE"]}`). A kind is a lowercase name of your choosing. The source then names the kinds it uses, `"ids": ["crm"]`, and the poller fills in every account's ids of each kind, read from the hub (`GET /api/ids`, or the `account_ids` table for jobs that reach it through Lakebase):
+
+- **SQL:** `:crm` in a table source's query becomes one bound parameter per id, so `WHERE account_id IN (:crm)` runs as `IN (:crm_0, :crm_1)`. The ids are never pasted into the statement.
+- **Tool args (JQL, say):** `{crm: <clause>}` becomes the clause once per id, joined by `OR`, with `{}` as the id. Backslashes and double quotes in the id are escaped, for use inside a quoted string: `({jira_customer: "Customer" ~ "{}"})` becomes `("Customer" ~ "Example" OR "Customer" ~ "Example Co")`.
+- **No ids yet:** when no account has ids of a kind a source uses, the poller skips the source and reports it as unavailable, saying which kind is missing.
+
+Map the source's account column to `account`. An account's ids count as its names, so the event then finds the account by an id, as well as by its name or other names. The example `table.usage` and `jira_customers` sources in `sources.example.json` work this way. With ids, a new account needs only the panel, and no one edits the sources.
+
 **Slack.** The example `slack` source fetches only the messages that mention whoever runs it, so its rule needn't name anyone. Don't put a person's Slack id in a shared rule: it would only match that person's mentions.
 
 ## Rules

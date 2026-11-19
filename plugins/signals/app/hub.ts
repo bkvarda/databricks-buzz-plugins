@@ -13,14 +13,15 @@
 //   POST /api/task {id, status?, note?, workstream?, initiative?, artifact?: {url, title?, kind?}}
 //   GET  /api/accounts                    the account channels teams set up
 //   GET  /api/account?channel=|name=      one, with its preferences read
-//   POST /api/account {name, rename?, channel?, aliases?, domains?, agents?, preferences?, profile?, playbooks?, delete?}
+//   GET  /api/ids                         every account's ids by kind, which pollers fill into queries
+//   POST /api/account {name, rename?, channel?, aliases?, domains?, ids?, agents?, preferences?, profile?, playbooks?, delete?}
 //   GET  /api/board?channel=              a channel's tasks for the board: who's on each, its source, artifacts, last activity
 //   POST /api/task {id, agents: [...]}    asks agents to work on a task (in its thread)
 //   POST /api/task {id, question, options?}  needs input: waiting, with the question (agents ask this way)
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, configProblems, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -69,10 +70,11 @@ export type HubOptions = Readonly<{
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids"] as const;
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
+  private publishedIds?: string;
   /** The last failure to post a task in each channel, until a post there works. */
   private readonly postFailures = new Map<string, string>();
 
@@ -87,6 +89,14 @@ export class Hub {
     if (this.cached && Date.now() - this.cached.at < 30_000) return this.cached.config;
     const config = withAccounts((await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, await this.store.accounts());
     this.cached = { at: Date.now(), config };
+    // Poller jobs that reach the hub through Lakebase read the ids from a table.
+    const ids = idsByKind(config.accounts ?? []);
+    const text = JSON.stringify(ids);
+    if (text !== this.publishedIds)
+      await this.store.publishIds(ids).then(
+        () => (this.publishedIds = text),
+        (error: Error) => this.log(`couldn't publish account ids for pollers: ${error.message}`),
+      );
     return config;
   }
 
@@ -153,6 +163,8 @@ export class Hub {
           if (!channel) return bad("Send ?channel= (a Buzz channel id).");
           return { json: await this.board(channel) };
         }
+        case "GET /api/ids":
+          return { json: { ids: idsByKind((await this.config()).accounts ?? []) } };
         case "GET /api/accounts":
           return { json: { accounts: await this.store.accounts() } };
         case "GET /api/account": {
@@ -306,6 +318,8 @@ export class Hub {
     if (input.channel !== undefined && input.channel !== null && (typeof input.channel !== "string" || !/^[\w-]{1,100}$/.test(input.channel))) return bad("channel is a Buzz channel id.");
     if (input.rename !== undefined && (typeof input.rename !== "string" || !input.rename.trim() || input.rename.length > 200)) return bad("rename is the account's new name (1-200 characters).");
     const aliases = list("aliases", 20);
+    const ids = input.ids === undefined ? undefined : readIds(input.ids);
+    if (typeof ids === "string") return bad(ids);
     const agents = list("agents", 10)?.map(agentKey);
     // Agents the save adds (none when it doesn't change the agents).
     const before = agents && ((await this.store.account({ name }))?.agents ?? []);
@@ -336,6 +350,7 @@ export class Hub {
         ...(input.channel !== undefined && { channel: (input.channel as string | null) || null }),
         ...(aliases && { aliases }),
         ...(domains && { domains }),
+        ...(ids && { ids }),
         ...(agents && { agents: agents as string[] }),
         ...(preferences !== undefined && { preferences }),
         ...(profile !== undefined && { profile }),

@@ -196,6 +196,57 @@ class Run(unittest.TestCase):
         cursor = [c[3] for c in ws.calls if c[0] == "hub" and c[2] == "/api/cursor"][0]
         self.assertEqual(cursor["cursor"], "2026-11-17T11:00:00")
 
+    def test_account_ids_bind_into_sql_and_join_into_jql(self):
+        class WithIds(FakeWorkspace):
+            def hub(self, base, method, path, body=None):
+                if path == "/api/ids":
+                    self.calls.append(("hub", method, path, body))
+                    return {"ids": {"crm": ["001A", "001B"], "jira_customer": ['Acme', 'Acme "Labs"\\x']}}
+                return super().hub(base, method, path, body)
+
+            def sql(self, warehouse, statement, parameters):
+                self.calls.append(("sql", statement, parameters))
+                return []
+
+        table = {**CASES, "ids": ["crm"], "query": "SELECT * FROM main.s.cases WHERE account_id IN (:crm) AND updated_at > :since AND note::string <> ':crmx'"}
+        jira = {"name": "jira", "kind": "mcp", "service": "atlassian", "tool": "search", "ids": ["jira_customer"], "args": {"jql": '({jira_customer: cf[1] ~ "{}"}) AND updated >= "{since_date}"'}, "items": "issues", "map": {"external_id": "key"}}
+        ws = WithIds([{"source": "table.cases", "enabled": True}, {"source": "jira", "enabled": True}], mcp={"atlassian": {"issues": []}}, tables=["main.s.cases"])
+        poller.run(ws, {"sources": [table, jira]}, "https://hub", "wh", log=lambda _: None, now=NOW)
+        sql = [c for c in ws.calls if c[0] == "sql"][0]
+        # The ids are bound parameters, never part of the statement.
+        self.assertEqual(sql[1], "SELECT * FROM main.s.cases WHERE account_id IN (:crm_0, :crm_1) AND updated_at > :since AND note::string <> ':crmx'")
+        self.assertEqual(sql[2], {"since": "1970-01-01T00:00:00Z", "crm_0": "001A", "crm_1": "001B"})
+        jql = [c for c in ws.calls if c[0] == "mcp"][0][3]["jql"]
+        self.assertEqual(jql, '(cf[1] ~ "Acme" OR cf[1] ~ "Acme \\"Labs\\"\\\\x") AND updated >= "2026-11-16"')
+        self.assertEqual(len([c for c in ws.calls if c[0] == "hub" and c[2] == "/api/ids"]), 1)
+
+    def test_sources_whose_ids_no_account_has_are_skipped_saying_why(self):
+        logged = []
+        ws = FakeWorkspace([{"source": "table.cases", "enabled": True}, {"source": "gmail", "enabled": True}], mcp={"gmail": {"items": []}}, tables=["main.s.cases"])
+        summary = poller.run(ws, {"sources": [{**CASES, "ids": ["crm"], "query": "SELECT 1 WHERE a IN (:crm)"}, MAIL]}, "https://hub", "wh", log=logged.append, now=NOW)
+        self.assertEqual(summary["table.cases"], "unavailable: no account has crm ids yet (add them in the account panel, as `crm: ...`)")
+        self.assertIn("table.cases: unavailable: no account has crm ids yet (add them in the account panel, as `crm: ...`)", logged)
+        self.assertFalse([c for c in ws.calls if c[0] == "sql"])
+        self.assertEqual(summary["gmail"]["events"], 0)  # the others still run
+
+    def test_sources_without_ids_run_as_before_and_ids_read_failures_are_reported(self):
+        class Broken(FakeWorkspace):
+            def hub(self, base, method, path, body=None):
+                if path == "/api/ids":
+                    raise RuntimeError("hub /api/ids: HTTP 404")
+                return super().hub(base, method, path, body)
+
+        # No source names ids: the hub isn't asked for them, and queries go out unchanged.
+        ws = Broken([{"source": "table.cases", "enabled": True}], tables=["main.s.cases"])
+        summary = poller.run(ws, {"sources": [CASES]}, "https://hub", "wh", log=lambda _: None, now=NOW)
+        self.assertEqual(summary["table.cases"]["events"], 0)
+        self.assertEqual([c[1:] for c in ws.calls if c[0] == "sql"], [(CASES["query"], {"since": "1970-01-01T00:00:00Z"})])
+        self.assertFalse([c for c in ws.calls if c[0] == "hub" and c[2] == "/api/ids"])
+        ws = Broken([{"source": "table.cases", "enabled": True}, {"source": "gmail", "enabled": True}], mcp={"gmail": {"items": []}}, tables=["main.s.cases"])
+        summary = poller.run(ws, {"sources": [{**CASES, "ids": ["crm"], "query": "SELECT 1 WHERE a IN (:crm)"}, MAIL]}, "https://hub", "wh", log=lambda _: None, now=NOW)
+        self.assertEqual(summary["table.cases"], "unavailable: couldn't read account ids: hub /api/ids: HTTP 404")
+        self.assertEqual(summary["gmail"]["events"], 0)
+
     def test_dry_run_needs_no_hub(self):
         ws = FakeWorkspace([], mcp={"gmail": {"items": [{"id": "m1"}]}})
         summary = poller.run(ws, {"sources": [MAIL]}, None, None, dry_run=True, log=lambda _: None, now=NOW)

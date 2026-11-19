@@ -181,6 +181,8 @@ export type AccountRule = Readonly<{
   domains?: readonly string[];
   /** Other names sources use for it. */
   aliases?: readonly string[];
+  /** Its ids in other systems, by kind (`{"crm": ["0016100000AbCdE"]}`): events whose `account` is one match it, and pollers fill them into queries (see AccountIds). */
+  ids?: AccountIds;
   /** The team's preferences, as they wrote them (see parsePreferences). */
   preferences?: string;
 }>;
@@ -326,6 +328,10 @@ export function configProblems(raw: unknown): string[] {
   for (const [n, account] of ((config.accounts as Record<string, unknown>[] | undefined) ?? []).entries()) {
     if (!account || typeof account.name !== "string" || !account.name) problems.push(`accounts[${n}].name is required`);
     else if (account.domains !== undefined && (!Array.isArray(account.domains) || account.domains.some((domain) => typeof domain !== "string" || !validDomain(domain.toLowerCase())))) problems.push(`accounts[${n}].domains is a list of email domains, like example.com`);
+    else if (account.ids !== undefined) {
+      const read = readIds(account.ids);
+      if (typeof read === "string") problems.push(`accounts[${n}].ids: ${read}`);
+    }
   }
   return problems;
 }
@@ -544,7 +550,7 @@ export function fill(template: string, event: EventInput): string {
 }
 
 /**
- * The account an event is about: the rule's, the event's (by name or alias),
+ * The account an event is about: the rule's, the event's (by name, alias or id),
  * then the account whose domains the actor is at, the first whose `when`
  * holds, the one with the meeting's real customers among its attendees, and
  * (with the rule's `account_named_in`) the one that field names.
@@ -554,7 +560,7 @@ export function accountFor(config: SignalsConfig, event: EventInput, rule?: Rule
   const accounts = config.accounts ?? [];
   if (named) {
     const lower = named.toLowerCase();
-    return accounts.find((account) => account.name.toLowerCase() === lower || account.aliases?.some((alias) => alias.toLowerCase() === lower)) ?? { name: named };
+    return accounts.find((account) => namesAccount(account, lower)) ?? { name: named };
   }
   return (
     byActor(accounts, event) ??
@@ -726,6 +732,48 @@ export function workstreamsOf(config: SignalsConfig | undefined): string[] {
   return [...new Set((config?.rules ?? []).map((rule) => rule.workstream?.trim()).filter((name): name is string => Boolean(name)))];
 }
 
+/**
+ * An account's ids in other systems, by kind: `{"crm": ["0016100000AbCdE"], "jira_customer": ["Example", "Example Co"]}`.
+ * A kind is a lowercase name (letters, digits, `_`), and pollers fill each
+ * kind's ids from every account into the queries that ask for it: `:crm` in
+ * SQL (as bound parameters) and `{crm: <clause with {}>}` in a tool's args.
+ */
+export type AccountIds = Readonly<Record<string, readonly string[]>>;
+
+const ID_KIND = /^[a-z][a-z0-9_]{0,39}$/;
+export const MAX_ID_KINDS = 20;
+export const MAX_IDS = 50;
+
+/** Ids as given (a kind's ids as a list, or one comma-separated text), cleaned; or what's wrong with them. */
+export function readIds(raw: unknown): AccountIds | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return 'ids maps a kind to its ids, like {"crm": ["0016100000AbCdE"]}';
+  const out: Record<string, string[]> = {};
+  for (const [given, value] of Object.entries(raw as Record<string, unknown>)) {
+    const kind = given.trim().toLowerCase();
+    if (!ID_KIND.test(kind) || kind === "since") return `${given} isn't a kind of id: use lowercase letters, digits and _ (not "since")`;
+    const items = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,\n]/) : undefined;
+    if (!items || items.some((item) => typeof item !== "string")) return `${kind} is a list of ids`;
+    const ids = [...new Set((items as string[]).map((item) => item.trim()).filter(Boolean))];
+    if (ids.some((id) => id.length > 200)) return `${kind} has an id longer than 200 characters`;
+    if (ids.length > MAX_IDS) return `${kind} has more than ${MAX_IDS} ids`;
+    if (ids.length) out[kind] = [...(out[kind] ?? []), ...ids.filter((id) => !out[kind]?.includes(id))];
+  }
+  if (Object.keys(out).length > MAX_ID_KINDS) return `at most ${MAX_ID_KINDS} kinds of ids`;
+  return out;
+}
+
+/** True when the account's name, one of its other names or one of its ids is this (lowercase) text. */
+export function namesAccount(account: Readonly<{ name: string; aliases?: readonly string[]; ids?: AccountIds }>, lower: string): boolean {
+  return account.name.toLowerCase() === lower || Boolean(account.aliases?.some((alias) => alias.toLowerCase() === lower)) || Object.values(account.ids ?? {}).some((ids) => ids.some((id) => id.toLowerCase() === lower));
+}
+
+/** Every account's ids, by kind (each kind's ids once, sorted): what pollers fill into queries. */
+export function idsByKind(accounts: readonly Readonly<{ ids?: AccountIds }>[]): Record<string, string[]> {
+  const out: Record<string, Set<string>> = {};
+  for (const account of accounts) for (const [kind, ids] of Object.entries(account.ids ?? {})) for (const id of ids) (out[kind] ??= new Set()).add(id);
+  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)).map(([kind, ids]) => [kind, [...ids].sort()]));
+}
+
 /** What a team registers for its account channel (the hub's accounts table). */
 export type AccountRecord = Readonly<{
   name: string;
@@ -733,6 +781,8 @@ export type AccountRecord = Readonly<{
   aliases: readonly string[];
   /** Email domains of the customer's people, so their mail and meetings find the account. */
   domains: readonly string[];
+  /** Its ids in other systems, by kind. */
+  ids: AccountIds;
   preferences: string;
   /** What agents have learned about the account, its team and its people. */
   profile: string;
@@ -755,6 +805,7 @@ export function accountRule(record: AccountRecord): AccountRule {
     ...(record.channel && { channel: record.channel }),
     ...(record.aliases.length && { aliases: record.aliases }),
     ...(domains.length && { domains }),
+    ...(Object.keys(record.ids ?? {}).length && { ids: record.ids }),
     ...(record.preferences && { preferences: record.preferences }),
   };
 }
