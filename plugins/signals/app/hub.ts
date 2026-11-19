@@ -442,7 +442,7 @@ export class Hub {
     const artifact = input.artifact as { url?: unknown; title?: unknown; kind?: unknown } | undefined;
     if (artifact) {
       if (typeof artifact.url !== "string" || !/^https?:\/\//.test(artifact.url)) return bad("artifact.url must be an http(s) link.");
-      await this.store.artifact(id, user, typeof artifact.kind === "string" ? artifact.kind : "link", artifact.url, typeof artifact.title === "string" ? artifact.title : undefined);
+      await this.store.artifact(id, user, typeof artifact.kind === "string" ? artifact.kind : linkKind(artifact.url), artifact.url, typeof artifact.title === "string" ? artifact.title : undefined);
     }
     if (this.notifier && task.buzz_root && (input.status !== undefined || artifact)) {
       const parts = [input.status !== undefined && `${user} set this to **${input.status}**${note ? `: ${note}` : ""}`, artifact && `${user} added [${(artifact.title as string) ?? artifact.url}](${artifact.url as string})`].filter(Boolean);
@@ -629,6 +629,9 @@ export class Hub {
         const text = reply.content.replace(/\s+/g, " ").trim();
         await this.store.activity(task.id, actor, "agent_reply", text.length > 500 ? `${text.slice(0, 497)}…` : text);
         await this.store.artifact(task.id, actor, task.mode === "draft" ? "draft" : "reply", `buzz://message?channel=${task.channel}&id=${reply.id}`, `Agent reply in the task's thread`);
+        // Links in the reply (a doc, a PR, a workspace, an app) become the task's assets, each once.
+        const have = new Set((await this.store.detail(task.id))?.artifacts.map((item) => item.url) ?? []);
+        for (const link of replyLinks(reply.content)) if (!have.has(link.url)) await this.store.artifact(task.id, actor, link.kind, link.url, link.title);
         await this.store.replied(task.id, agent, reply.created_at);
         // Agents without the Signals tools ask for input by marking a line in their reply.
         const ask = !question ? markedQuestion(reply.content) : undefined;
@@ -897,6 +900,48 @@ export function readQuestion(question: unknown, options: unknown): { question: s
   if (!list || list.some((item) => typeof item !== "string" || !item.trim() || item.length > 200) || list.length > MAX_OPTIONS)
     return `options is a list of up to ${MAX_OPTIONS} choices (text, at most 200 characters each).`;
   return { question: question.trim(), options: [...new Set((list as string[]).map((item) => item.trim()))] };
+}
+
+/**
+ * The kind of asset a link is, from its address: a Google doc, sheet, slides
+ * or Drive file; a GitHub pull request, issue or code; a Databricks app,
+ * notebook, dashboard or workspace; a Slack message; or any other link.
+ */
+export function linkKind(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "link";
+  }
+  const host = parsed.hostname.toLowerCase();
+  const path = parsed.pathname;
+  if (host === "docs.google.com") return /^\/spreadsheets\//.test(path) ? "sheet" : /^\/presentation\//.test(path) ? "slides" : /^\/forms\//.test(path) ? "form" : "doc";
+  if (host === "drive.google.com") return "drive";
+  if (host === "github.com") return /\/pull\/\d+/.test(path) ? "pr" : /\/issues\/\d+/.test(path) ? "issue" : "code";
+  if (host.endsWith(".databricksapps.com")) return "app";
+  if (host.endsWith(".cloud.databricks.com") || host.endsWith(".azuredatabricks.net") || host.endsWith(".gcp.databricks.com")) {
+    if (/\/apps\//.test(path)) return "app";
+    if (/\/(sql\/)?dashboards|\/dashboardsv3\//.test(path)) return "dashboard";
+    if (/\/editor\/notebooks\/|#notebook\//.test(path + parsed.hash)) return "notebook";
+    return "workspace";
+  }
+  if (host.endsWith(".slack.com")) return "slack";
+  return "link";
+}
+
+const LINK = /\[([^\]\n]{1,200})\]\((https?:\/\/[^\s)]+)\)|<?(https?:\/\/[^\s<>()\]"'`]+)/g;
+
+/** The http(s) links in an agent's reply, each once, with its kind and the markdown link text as its title. */
+export function replyLinks(text: string): { url: string; kind: string; title?: string }[] {
+  const out = new Map<string, { url: string; kind: string; title?: string }>();
+  for (const found of text.matchAll(LINK)) {
+    const url = (found[2] ?? found[3] ?? "").replace(/[.,;:!?>*_]+$/, "");
+    if (!url || out.has(url)) continue;
+    const title = found[1]?.trim();
+    out.set(url, { url, kind: linkKind(url), ...(title && title !== url ? { title } : {}) });
+  }
+  return [...out.values()].slice(0, 20);
 }
 
 const splitOptions = (text: string) => text.split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).map((item) => item.trim()).filter(Boolean);
