@@ -59,6 +59,7 @@ The example rules don't name an account. They say "from the customer", and the a
 - `customer_attendees: true`: the meeting has a real customer among its attendees, at one of an account's domains. A colleague's address at the customer's domain doesn't count (see below).
 - `account_named_in: "<field>"`: the field names an account, by its name or one of its other names, as whole words. `payload.channel` finds `ext-globex-team` for Globex, which helps in shared Slack channels where the customer's people show no email; `title` finds a meeting's notes, `Globex sync - Notes by Gemini`.
 - `skip_own: true`: skip events whose `actor` is the person whose source sent them, like your own Slack messages.
+- `known_account: true`: only events about an account the hub knows, one set up in a channel or a config account, found by its name, other names, ids or domains. An event that names some other company opens nothing, rather than a task in `default_channel`. This suits ticket sources that match loosely, where `Customer ~ "Acme"` can also return "Acme Party Inc".
 
 A rule with one or more of the first three applies when any of them holds. The task then goes to that account, and to its channel. With `true`, these rules apply to every account set up in the panel, and to config accounts with `domains`. They can still be patterns instead (`"customer_attendees": "@example\\.com$"`), which apply only to addresses that match. A rule's `account` still overrides the account it finds.
 

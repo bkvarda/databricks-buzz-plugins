@@ -115,6 +115,13 @@ export type Rule = Readonly<{
   account_named_in?: string;
   /** Skip events whose `actor` is the person whose source sent them (your own Slack messages, mail you sent). */
   skip_own?: boolean;
+  /**
+   * Only events about an account the hub knows (set up in a channel, or a
+   * config account), found by its name, other names, ids, domains or the
+   * other ways accountFor finds one. An event naming an account no one set up
+   * opens nothing (no task in default_channel); a later rule may still apply.
+   */
+  known_account?: boolean;
   /** task: open (or update) a task. update: only update a task that exists for the group. ignore: record the event, no task. */
   action: "task" | "update" | "ignore";
   /** The task's title; `{field}` takes an event field, e.g. "Prep: {title}". Defaults to the event's title. */
@@ -297,6 +304,7 @@ export function configProblems(raw: unknown): string[] {
     }
     if (rule.account_named_in !== undefined && (typeof rule.account_named_in !== "string" || !rule.account_named_in)) problems.push(`${where}.account_named_in is a field, like payload.channel`);
     if (rule.skip_own !== undefined && typeof rule.skip_own !== "boolean") problems.push(`${where}.skip_own is true or false`);
+    if (rule.known_account !== undefined && typeof rule.known_account !== "boolean") problems.push(`${where}.known_account is true or false`);
     if (rule.group_by !== undefined && (typeof rule.group_by !== "string" || !rule.group_by)) problems.push(`${where}.group_by is a field or a {field} template`);
     if (rule.series !== undefined && (typeof rule.series !== "string" || !rule.series)) problems.push(`${where}.series is a field or a {field} template`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
@@ -472,8 +480,15 @@ export function ruleFor(config: SignalsConfig, event: EventInput, owner?: string
       matches(rule.when, event) &&
       !(rule.unless && Object.keys(rule.unless).length && matchesAny(rule.unless, event)) &&
       !(rule.skip_own && owner && emailOf(event.actor) === owner.toLowerCase()) &&
-      aboutCustomer(config, rule, event),
+      aboutCustomer(config, rule, event) &&
+      (!rule.known_account || knownAccount(config, event, rule)),
   );
+}
+
+/** Whether the account an event is about (for the rule) is one the config has, not just a name the event gives. */
+function knownAccount(config: SignalsConfig, event: EventInput, rule: Rule): boolean {
+  const account = accountFor(config, event, rule);
+  return Boolean(account && (config.accounts ?? []).includes(account));
 }
 
 /** A rule's customer conditions: with any of them, at least one must hold (they're all ways to say the event is about a customer). */
