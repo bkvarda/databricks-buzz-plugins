@@ -395,14 +395,14 @@ function Card(props) {
   return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: props.padding ?? 16, ...props.style } }, props.children);
 }
 function openExternal(url, doc = document) {
-  const link = doc.createElement("a");
-  link.href = url;
-  link.target = "_blank";
-  link.rel = "noreferrer";
-  link.style.display = "none";
-  doc.body.appendChild(link);
-  link.click();
-  link.remove();
+  const link2 = doc.createElement("a");
+  link2.href = url;
+  link2.target = "_blank";
+  link2.rel = "noreferrer";
+  link2.style.display = "none";
+  doc.body.appendChild(link2);
+  link2.click();
+  link2.remove();
 }
 function Notice(props) {
   const tone = props.tone ?? "info";
@@ -1048,19 +1048,68 @@ function accountPanel(service) {
 }
 var ACCOUNT_INSTRUCTIONS = `Signals: when you work on a signals task, or in a channel set up as an account, first call signals_account with the channel id and the task's workstream, and follow its mode for that workstream (auto: do it and report in the task's thread; draft: prepare it for a person to send; ask: ask in the thread first), the team's guidance and the workstream's playbook. Record what you did with signals_task_update. When you learn something lasting about the customer or the team, update the profile with signals_account_learn.`;
 
-// plugins/signals/src/board-panel.tsx
-var COLUMNS = [
+// plugins/signals/src/board-view.ts
+var VIEWS = ["list", "swimlanes"];
+var STATUS_GROUPS = [
+  { status: "waiting", title: "Needs input" },
   { status: "open", title: "Open" },
   { status: "in_progress", title: "In progress" },
-  { status: "waiting", title: "Waiting" },
   { status: "done", title: "Done" },
   { status: "dismissed", title: "Dismissed" }
 ];
-function columns(tasks) {
-  const out = new Map(COLUMNS.map((column) => [column.status, []]));
+function assigneeOf(item) {
+  const open = item.task.status !== "done" && item.task.status !== "dismissed";
+  if (open && item.task.question) return { kind: "you" };
+  const agents = item.people.filter((person) => person.kind === "agent");
+  const agent = agents.find((person) => person.role === "replied") ?? agents[0];
+  return agent ? { kind: "agent", key: agent.key, label: agent.label } : { kind: "unassigned" };
+}
+var assigneeValue = (assignee) => assignee.kind === "agent" ? `agent:${assignee.key}` : assignee.kind;
+function filterTasks(tasks, filters) {
+  const words = (filters.search ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  return tasks.filter((item) => {
+    const { task } = item;
+    if (filters.status && task.status !== filters.status) return false;
+    if (filters.workstream && (task.workstream ?? "") !== (filters.workstream === NONE ? "" : filters.workstream)) return false;
+    if (filters.mode && task.mode !== filters.mode) return false;
+    if (filters.assignee && assigneeValue(assigneeOf(item)) !== filters.assignee) return false;
+    if (!words.length) return true;
+    const haystack = [`#${task.id}`, task.title, task.workstream, task.initiative, item.source?.source, item.source?.title].filter(Boolean).join(" ").toLowerCase();
+    return words.every((word) => haystack.includes(word));
+  });
+}
+var NONE = "(none)";
+function filterOptions(tasks) {
+  const count = (map, value, extra) => {
+    const found = map.get(value);
+    if (found) found.count++;
+    else map.set(value, { value, count: 1, ...extra });
+  };
+  const workstreams = /* @__PURE__ */ new Map();
+  const modes = /* @__PURE__ */ new Map();
+  const assignees = /* @__PURE__ */ new Map();
+  for (const item of tasks) {
+    count(workstreams, item.task.workstream ?? NONE, {});
+    count(modes, item.task.mode, {});
+    const assignee = assigneeOf(item);
+    count(assignees, assigneeValue(assignee), { assignee });
+  }
+  const order = { you: 0, agent: 1, unassigned: 2 };
+  return {
+    workstreams: [...workstreams.values()].sort((a, b) => a.value === NONE ? 1 : b.value === NONE ? -1 : a.value.localeCompare(b.value)),
+    modes: [...modes.values()].sort((a, b) => a.value.localeCompare(b.value)),
+    assignees: [...assignees.values()].sort((a, b) => order[a.assignee.kind] - order[b.assignee.kind] || a.value.localeCompare(b.value))
+  };
+}
+function byStatus(tasks) {
+  const out = new Map(STATUS_GROUPS.map((group) => [group.status, []]));
   for (const item of tasks) out.get(item.task.status)?.push(item);
   return out;
 }
+var cardAssets = (item) => item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && !["reply", "draft", "workspace"].includes(artifact.kind));
+var readView = (value) => VIEWS.includes(value) ? value : "list";
+
+// plugins/signals/src/board-panel.tsx
 function useProfiles(ctx, keys) {
   const session = optionalService(ctx, "relay")?.snapshot().session;
   const profiles = session?.profiles;
@@ -1077,16 +1126,31 @@ function useProfiles(ctx, keys) {
   };
 }
 var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
-var KIND_COLOR = { agent: "var(--dbx-brand-tint)", person: "var(--dbx-inset)", customer: "var(--dbx-warning-tint, var(--dbx-inset))", team: "var(--dbx-inset)" };
-var KIND_TEXT = { agent: "Agent", person: "Your team", customer: "Customer", team: "Team" };
-var kindText = (kind, labels) => kind === "customer" && labels ? capitalized(labels.customer) : KIND_TEXT[kind];
-function Avatar(props) {
-  const label = props.profile?.name ?? props.person.label;
-  const title = `${label}: ${kindText(props.person.kind, props.labels)}, ${props.person.role}`;
-  const size = 22;
-  const style = { width: size, height: size, borderRadius: props.person.kind === "agent" ? 6 : 999, flex: "none", border: "1px solid var(--dbx-border)" };
-  return props.profile?.picture ? /* @__PURE__ */ React.createElement("img", { src: props.profile.picture, alt: label, title, style: { ...style, objectFit: "cover" } }) : /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...style, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: KIND_COLOR[props.person.kind], color: "var(--dbx-subtle)" } }, initials(label));
+var assigneeName = (assignee, profile) => assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : profile(assignee.key)?.name ?? assignee.label;
+function AssigneeMark(props) {
+  const size = props.size ?? 20;
+  const name = assigneeName(props.assignee, props.profile);
+  const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : "Unassigned";
+  const base = { width: size, height: size, flex: "none", boxSizing: "border-box", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: Math.round(size * 0.42), fontWeight: 600 };
+  if (props.assignee.kind === "unassigned") return /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...base, borderRadius: 999, border: "1.5px dashed var(--dbx-border-strong)" } });
+  if (props.assignee.kind === "you") return /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...base, borderRadius: 999, background: "var(--dbx-warning)", color: "var(--dbx-surface)" } }, "!");
+  const picture = props.profile(props.assignee.key)?.picture;
+  const style = { ...base, borderRadius: 5, border: "1px solid var(--dbx-border)" };
+  return picture ? /* @__PURE__ */ React.createElement("img", { src: picture, alt: name, title, style: { ...style, objectFit: "cover" } }) : /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...style, background: "var(--dbx-brand-tint)", color: "var(--dbx-subtle)" } }, initials(name));
 }
+function StatusIcon(props) {
+  const size = props.size ?? 13;
+  const color = { open: "var(--dbx-tertiary)", in_progress: "var(--dbx-warning)", waiting: "var(--dbx-danger)", done: "var(--dbx-success)", dismissed: "var(--dbx-tertiary)" }[props.status] ?? "var(--dbx-tertiary)";
+  const fill = props.status === "in_progress" ? `conic-gradient(${color} 0 50%, transparent 50% 100%)` : props.status === "done" ? color : "transparent";
+  const label = STATUS_GROUPS.find((group) => group.status === props.status)?.title ?? props.status;
+  return /* @__PURE__ */ React.createElement("span", { title: label, "aria-label": label, style: { width: size, height: size, flex: "none", boxSizing: "border-box", borderRadius: 999, border: `1.5px ${props.status === "waiting" ? "dotted" : "solid"} ${color}`, background: fill, display: "inline-flex", alignItems: "center", justifyContent: "center", color: "var(--dbx-surface)", fontSize: size * 0.6, lineHeight: 1 } }, props.status === "done" ? "\u2713" : props.status === "dismissed" ? /* @__PURE__ */ React.createElement("span", { style: { color, fontSize: size * 0.7 } }, "\xD7") : null);
+}
+function Chip(props) {
+  const color = props.tone === "brand" ? "var(--dbx-lava-text)" : props.tone === "success" ? "var(--dbx-success)" : "var(--dbx-subtle)";
+  return /* @__PURE__ */ React.createElement("span", { title: props.title, style: { display: "inline-flex", alignItems: "center", padding: "0 6px", borderRadius: 4, border: "1px solid var(--dbx-border)", fontSize: "0.6875rem", lineHeight: "18px", color, whiteSpace: "nowrap", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" } }, props.children);
+}
+var ASSET_ICON = { doc: "\u{1F4C4}", sheet: "\u{1F4CA}", slides: "\u{1F4FD}", form: "\u{1F4DD}", drive: "\u{1F4C1}", pr: "\u21C4", issue: "\u25CE", code: "</>", app: "\u25A3", dashboard: "\u{1F4C8}", notebook: "\u{1F4D3}", slack: "#", link: "\u{1F517}" };
+var link = (url) => (event) => (event.preventDefault(), event.stopPropagation(), openExternal(url));
 function AddAgent(props) {
   const [open, setOpen] = React.useState(false);
   const [agent, setAgent] = React.useState("");
@@ -1135,7 +1199,7 @@ function ProvideInput(props) {
   };
   return /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "3px solid var(--dbx-warning, var(--dbx-brand))", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", weight: 600 }, "Needs input"), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, task.question), !open ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => setOpen(true) }, "Provide input") : /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, (task.options ?? []).length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, task.options.map((option) => /* @__PURE__ */ React.createElement(Button, { key: option, size: "sm", disabled: busy, onClick: () => void send(option) }, option))), /* @__PURE__ */ React.createElement("textarea", { className: "dbx-input", rows: 2, placeholder: (task.options ?? []).length ? "Or write your answer" : "Your answer", value: text, onChange: (event) => setText(event.target.value) }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || !text.trim(), onClick: () => void send(text) }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Send"), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setOpen(false) }, "Cancel")))));
 }
-function TaskCard(props) {
+function TaskBody(props) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState();
@@ -1152,7 +1216,41 @@ function TaskCard(props) {
     }
   };
   const closed = item.task.status === "done" || item.task.status === "dismissed";
-  return /* @__PURE__ */ React.createElement(Card, null, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, "#", item.task.id, " ", item.task.title), /* @__PURE__ */ React.createElement(Badge, { tone: item.task.mode === "auto" ? "success" : "neutral" }, item.task.mode)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, item.task.workstream && /* @__PURE__ */ React.createElement(Badge, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Badge, { tone: "brand" }, item.task.initiative), item.source && (item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: (event) => (event.preventDefault(), openExternal(item.source.url)), style: { fontSize: "0.75rem" } }, item.source.source) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source)), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3))), item.people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 4, wrap: true, align: "center" }, item.people.map((person) => /* @__PURE__ */ React.createElement(Avatar, { key: `${person.kind}:${person.key}`, person, ...props.labels && { labels: props.labels }, ...person.kind === "agent" && props.profile(person.key) && { profile: props.profile(person.key) } }))), item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 160 ? `${item.activity.text.slice(0, 159)}\u2026` : item.activity.text), item.artifacts.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, item.artifacts.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement(Text, { key: `${artifact.at}:${artifact.url}`, size: "xs" }, artifact.url.startsWith("http") ? /* @__PURE__ */ React.createElement("a", { href: artifact.url, onClick: (event) => (event.preventDefault(), openExternal(artifact.url)) }, artifact.title ?? artifact.kind) : artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss"))));
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+}
+function Meta(props) {
+  const { item } = props;
+  const assets = cardAssets(item);
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, item.task.workstream && /* @__PURE__ */ React.createElement(Chip, null, item.task.workstream), item.task.initiative && /* @__PURE__ */ React.createElement(Chip, { tone: "brand" }, item.task.initiative), item.task.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip, { tone: item.task.mode === "auto" ? "success" : void 0, title: "How agents handle it" }, item.task.mode), item.source && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, item.source.source), assets.slice(0, 3).map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.title ?? artifact.url, style: { fontSize: "0.75rem", textDecoration: "none" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}")), assets.length > 3 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "+", assets.length - 3));
+}
+var rowKeys = (toggle) => ({ role: "button", tabIndex: 0, onClick: toggle, onKeyDown: (event) => (event.key === "Enter" || event.key === " ") && event.target === event.currentTarget && (event.preventDefault(), toggle()) });
+function TaskRow(props) {
+  const { item } = props;
+  const assignee = assigneeOf(item);
+  return /* @__PURE__ */ React.createElement("div", { style: { borderBottom: "1px solid var(--dbx-border)", background: props.open ? "var(--dbx-inset)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, className: "signals-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true, style: { flex: "none", width: 34 } }, "#", item.task.id), /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500, style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, item.task.title), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" } }, /* @__PURE__ */ React.createElement(Meta, { item })), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { flex: "none", width: 52, textAlign: "right" } }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile })), props.open && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 12px 10px 54px" } }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange })));
+}
+function TaskCard(props) {
+  const { item } = props;
+  const assignee = assigneeOf(item);
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 10, borderRadius: 8, boxShadow: props.open ? "0 1px 6px rgba(0,0,0,0.12)" : void 0 } }, /* @__PURE__ */ React.createElement("div", { ...rowKeys(props.toggle), "aria-expanded": props.open, style: { cursor: "pointer" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, ago(item.task.last_event_at * 1e3)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 2 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status })), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 500 }, item.task.title)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement(Meta, { item })))), props.open && /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange }));
+}
+var VIEW_KEY = "signals.board.view";
+var savedView = () => {
+  try {
+    return readView(globalThis.localStorage?.getItem(VIEW_KEY));
+  } catch {
+    return "list";
+  }
+};
+function Toolbar(props) {
+  const { filters, setFilters } = props;
+  const options = filterOptions(props.tasks);
+  const statusCounts = byStatus(props.tasks);
+  const set = (key) => (event) => setFilters({ ...filters, [key]: event.target.value || void 0 });
+  const select = { width: "auto", fontSize: "0.75rem", padding: "2px 6px" };
+  const any = Object.values(filters).some(Boolean);
+  return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, /* @__PURE__ */ React.createElement("div", { role: "tablist", "aria-label": "View", style: { display: "inline-flex", border: "1px solid var(--dbx-border)", borderRadius: 6, overflow: "hidden" } }, ["list", "swimlanes"].map((view) => /* @__PURE__ */ React.createElement("button", { key: view, type: "button", role: "tab", "aria-selected": props.view === view, onClick: () => props.setView(view), style: { border: 0, padding: "3px 10px", fontSize: "0.75rem", cursor: "pointer", color: props.view === view ? "var(--dbx-ink)" : "var(--dbx-subtle)", background: props.view === view ? "var(--dbx-inset)" : "transparent", fontWeight: props.view === view ? 600 : 400 } }, view === "list" ? "\u2630 List" : "\u25A5 Swimlanes"))), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", type: "search", "aria-label": "Search tasks", placeholder: "Search\u2026", value: filters.search ?? "", onChange: set("search"), style: { ...select, width: 160 } }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", value: filters.status ?? "", onChange: set("status"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any status"), STATUS_GROUPS.map((group) => /* @__PURE__ */ React.createElement("option", { key: group.status, value: group.status }, group.title, " (", statusCounts.get(group.status).length, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Workstream", value: filters.workstream ?? "", onChange: set("workstream"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any workstream"), options.workstreams.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value === NONE ? "No workstream" : option.value, " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assignee", value: filters.assignee ?? "", onChange: set("assignee"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Anyone"), options.assignees.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, assigneeName(option.assignee, props.profile), " (", option.count, ")"))), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Mode", value: filters.mode ?? "", onChange: set("mode"), style: select }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Any mode"), options.modes.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.value, " (", option.count, ")"))), any && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setFilters({}) }, "Clear"), any && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, props.shown, " of ", props.tasks.length));
 }
 var BOARD_PAGE = "board";
 var PLUGIN_ID = "bkvarda.databricks-signals";
@@ -1193,6 +1291,17 @@ function Board(props) {
   const board = useAsync(async (signal) => hub2 && channel ? hub2.board(channel.id, signal) : void 0, [hub2, channel?.id, version]);
   const agents = [...new Set((board.data?.tasks ?? []).flatMap((item) => item.people.filter((person) => person.kind === "agent").map((person) => person.key)))];
   const profile = useProfiles(ctx, agents);
+  const [view, setView] = React.useState(savedView);
+  const chooseView = (next) => {
+    setView(next);
+    try {
+      globalThis.localStorage?.setItem(VIEW_KEY, next);
+    } catch {
+    }
+  };
+  const [filters, setFilters] = React.useState({});
+  const [opened, setOpened] = React.useState();
+  React.useEffect(() => (setFilters({}), setOpened(void 0)), [channel?.id]);
   const steer = (item) => {
     if (!item.thread || !channel || !item.task.buzz_root) return;
     if (props.openThread?.(item.thread)) return;
@@ -1209,14 +1318,18 @@ function Board(props) {
   else if (!hub2) body = /* @__PURE__ */ React.createElement(Notice, { title: "No signals hub in this workspace" }, "Deploy one first (see the Signals plugin's README).");
   else if (!board.data?.tasks.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
   else {
-    const grouped = columns(board.data.tasks);
-    body = /* @__PURE__ */ React.createElement(Columns, null, COLUMNS.map((column) => /* @__PURE__ */ React.createElement("div", { key: column.status, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, column.title), /* @__PURE__ */ React.createElement(Badge, null, grouped.get(column.status).length)), grouped.get(column.status).map((item) => /* @__PURE__ */ React.createElement(TaskCard, { key: item.task.id, hub: hub2, item, ...board.data?.labels && { labels: board.data.labels }, profile, steer, onChange: refresh }))))));
+    const shown = filterTasks(board.data.tasks, filters);
+    const grouped = byStatus(shown);
+    const groups = STATUS_GROUPS.filter((group) => !filters.status || group.status === filters.status);
+    const task = (item, Item) => /* @__PURE__ */ React.createElement(Item, { key: item.task.id, hub: hub2, item, open: opened === item.task.id, toggle: () => setOpened(opened === item.task.id ? void 0 : item.task.id), profile, steer, onChange: refresh });
+    const header = (group) => /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(StatusIcon, { status: group.status }), /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, group.title), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, grouped.get(group.status).length));
+    body = /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Toolbar, { tasks: board.data.tasks, filters, setFilters, view, setView: chooseView, profile, shown: shown.length }), !shown.length ? /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks match these filters.") : view === "list" ? /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, overflow: "hidden", minWidth: 0 } }, groups.filter((group) => grouped.get(group.status).length).map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title }, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 12px", background: "var(--dbx-inset)", borderBottom: "1px solid var(--dbx-border)" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskRow))))) : /* @__PURE__ */ React.createElement(Columns, null, groups.map((group) => /* @__PURE__ */ React.createElement("section", { key: group.status, "aria-label": group.title, style: { flex: `0 0 ${COLUMN_WIDTH}px`, minWidth: 0, background: "var(--dbx-inset)", borderRadius: 8, padding: 8, boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { style: { padding: "2px 4px" } }, header(group)), grouped.get(group.status).map((item) => task(item, TaskCard)))))));
   }
   return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
     SectionHeader,
     {
       title: channel ? `Tasks in #${channel.name ?? "channel"}` : "Tasks",
-      description: board.data?.account ? `${board.data.account}: who's on each task, what's been made for it, and its latest activity.` : "Who's on each task, what's been made for it, and its latest activity.",
+      description: board.data?.account ? `${board.data.account}: who each task is with and what's been made for it. Open a task to act on it.` : "Who each task is with and what's been made for it. Open a task to act on it.",
       action: /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, props.action, hub2 && channel && /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: board.loading, onClick: refresh }, board.loading ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Refresh"))
     }
   ), body)));

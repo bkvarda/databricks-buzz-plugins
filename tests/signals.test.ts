@@ -7,6 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, Hub, HUB_PATHS, linkKind
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
+import { assigneeOf, byStatus, cardAssets, filterOptions, filterTasks, readView } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 
 const config: SignalsConfig = {
@@ -1168,5 +1169,50 @@ describe("rules for every account", () => {
       { url: "https://github.com/o/r/pull/1", kind: "pr" },
       { url: "https://example.com/x", kind: "link" },
     ]);
+  });
+
+  describe("board view", () => {
+    const agent = "ab".repeat(32);
+    const scout = "ef".repeat(32);
+    const item = (id: number, over: Record<string, unknown> = {}, people: unknown[] = [], artifacts: unknown[] = []) =>
+      ({ task: { id, title: `Task ${id}`, status: "open", mode: "draft", workstream: "meeting prep", initiative: null, last_event_at: id, question: null, ...over }, people, artifacts, source: { source: "gmail", title: "Pricing question", occurred_at: 0 } }) as never;
+    const tasks = [
+      item(1, { status: "waiting", question: "Which SKU?" }, [{ kind: "agent", key: agent, label: "Genie", role: "replied" }]),
+      item(2, { status: "in_progress" }, [{ kind: "agent", key: scout, label: "Scout", role: "asked" }, { kind: "agent", key: agent, label: "Genie", role: "replied" }, { kind: "customer", key: "ann@globex.io", label: "Ann", role: "wrote" }]),
+      item(3, { mode: "auto", workstream: null }, [{ kind: "customer", key: "ann@globex.io", label: "Ann", role: "wrote" }]),
+      item(4, { status: "done", question: "Old?" }, [{ kind: "agent", key: scout, label: "Scout", role: "asked" }], [
+        { at: 1, actor: "a", kind: "reply", url: "buzz://message?channel=c&id=r" },
+        { at: 2, actor: "a", kind: "doc", url: "https://docs.google.com/document/d/x", title: "Plan" },
+        { at: 3, actor: "a", kind: "workspace", url: "https://x.cloud.databricks.com/genie" },
+      ]),
+    ];
+
+    it("shows one assignee: you when it needs input, else the agent that replied, else the one asked, else no one", () => {
+      expect(tasks.map(assigneeOf)).toEqual([{ kind: "you" }, { kind: "agent", key: agent, label: "Genie" }, { kind: "unassigned" }, { kind: "agent", key: scout, label: "Scout" }]);
+    });
+
+    it("filters by status, workstream, assignee, mode and words, and counts each choice", () => {
+      const ids = (filters: object) => filterTasks(tasks, filters).map((found) => found.task.id);
+      expect(ids({})).toEqual([1, 2, 3, 4]);
+      expect(ids({ status: "open" })).toEqual([3]);
+      expect(ids({ workstream: "(none)" })).toEqual([3]);
+      expect(ids({ workstream: "meeting prep", mode: "draft" })).toEqual([1, 2, 4]);
+      expect(ids({ assignee: "you" })).toEqual([1]);
+      expect(ids({ assignee: `agent:${scout}` })).toEqual([4]);
+      expect(ids({ search: "#2" })).toEqual([2]);
+      expect(ids({ search: "PRICING task 3" })).toEqual([3]);
+      const options = filterOptions(tasks);
+      expect(options.workstreams).toEqual([{ value: "meeting prep", count: 3 }, { value: "(none)", count: 1 }]);
+      expect(options.modes).toEqual([{ value: "auto", count: 1 }, { value: "draft", count: 3 }]);
+      expect(options.assignees.map((option) => [option.value, option.count])).toEqual([["you", 1], [`agent:${agent}`, 1], [`agent:${scout}`, 1], ["unassigned", 1]]);
+      expect([...byStatus(tasks).entries()].map(([status, list]) => [status, list.length])).toEqual([["waiting", 1], ["open", 1], ["in_progress", 1], ["done", 1], ["dismissed", 0]]);
+    });
+
+    it("leaves the reply record and workspace links off cards, and reads a saved view", () => {
+      expect(cardAssets(tasks[3]!).map((artifact) => artifact.kind)).toEqual(["doc"]);
+      expect(readView("swimlanes")).toBe("swimlanes");
+      expect(readView("grid")).toBe("list");
+      expect(readView(null)).toBe("list");
+    });
   });
 });
