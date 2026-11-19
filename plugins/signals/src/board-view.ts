@@ -17,21 +17,50 @@ export const STATUS_GROUPS = [
 
 /**
  * Who a task is with, the one name its card shows: you, when it waits on a
- * person's input; otherwise the agent that replied in its thread, or the
- * one asked; otherwise no one.
+ * person's input; otherwise its first owner (an agent or a person someone
+ * assigned); otherwise the agent that replied in its thread, or the one
+ * asked; otherwise no one.
  */
-export type Assignee = Readonly<{ kind: "you" } | { kind: "agent"; key: string; label: string } | { kind: "unassigned" }>;
+export type Assignee = Readonly<{ kind: "you" } | { kind: "agent"; key: string; label: string } | { kind: "person"; key: string; label: string } | { kind: "unassigned" }>;
+
+/** A task's owners: who someone assigned it to, agents and people, in the order they were. */
+export const ownersOf = (item: BoardTask) => item.people.filter((person) => person.on && person.role === "owner" && (person.kind === "agent" || person.kind === "person"));
+
+/** Who's on a task in the hub and can be taken off it: its owners and the agents asked to work on it. */
+export const removable = (item: BoardTask) => item.people.filter((person) => person.on && (person.kind === "agent" || person.kind === "person"));
 
 export function assigneeOf(item: BoardTask): Assignee {
   const open = item.task.status !== "done" && item.task.status !== "dismissed";
   if (open && item.task.question) return { kind: "you" };
+  const owner = ownersOf(item)[0];
+  if (owner) return { kind: owner.kind as "agent" | "person", key: owner.key, label: owner.label };
   const agents = item.people.filter((person): person is BoardPerson & { kind: "agent" } => person.kind === "agent");
   const agent = agents.find((person) => person.role === "replied") ?? agents[0];
   return agent ? { kind: "agent", key: agent.key, label: agent.label } : { kind: "unassigned" };
 }
 
 /** An assignee as a filter value: "you", "unassigned" or "agent:<hex>". */
-export const assigneeValue = (assignee: Assignee) => (assignee.kind === "agent" ? `agent:${assignee.key}` : assignee.kind);
+export const assigneeValue = (assignee: Assignee) => (assignee.kind === "agent" ? `agent:${assignee.key}` : assignee.kind === "person" ? `person:${assignee.key}` : assignee.kind);
+
+/** A channel member someone can assign a task to. */
+export type Member = Readonly<{ key: string; name: string; agent: boolean }>;
+
+/**
+ * The owner picker's choices: the channel's members (from its signed roster)
+ * and the agents on the board, without the task's owners, agents first,
+ * then by name. `profile` names them and says which are agents.
+ */
+export function memberChoices(members: readonly string[], boardAgents: readonly string[], owners: readonly string[], profile: (key: string) => { name?: string; agent?: boolean } | undefined, viewer?: string): Member[] {
+  const taken = new Set(owners);
+  const agents = new Set(boardAgents);
+  return [...new Set([...members, ...boardAgents])]
+    .filter((key) => !taken.has(key))
+    .map((key) => {
+      const found = profile(key);
+      return { key, name: key === viewer ? `${found?.name ?? "You"} (you)` : (found?.name ?? `${key.slice(0, 8)}…`), agent: Boolean(found?.agent) || agents.has(key) };
+    })
+    .sort((a, b) => Number(b.agent) - Number(a.agent) || a.name.localeCompare(b.name));
+}
 
 /** The board's filters; an empty one keeps every task. */
 export type BoardFilters = Readonly<{ status?: string; workstream?: string; assignee?: string; mode?: string; search?: string }>;
@@ -74,7 +103,7 @@ export function filterOptions(tasks: readonly BoardTask[]): {
     const assignee = assigneeOf(item);
     count(assignees, assigneeValue(assignee), { assignee });
   }
-  const order = { you: 0, agent: 1, unassigned: 2 } as const;
+  const order = { you: 0, person: 1, agent: 2, unassigned: 3 } as const;
   return {
     workstreams: [...workstreams.values()].sort((a, b) => (a.value === NONE ? 1 : b.value === NONE ? -1 : a.value.localeCompare(b.value))),
     modes: [...modes.values()].sort((a, b) => a.value.localeCompare(b.value)),

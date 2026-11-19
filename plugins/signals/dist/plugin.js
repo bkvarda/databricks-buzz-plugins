@@ -1591,14 +1591,26 @@ var STATUS_GROUPS = [
   { status: "done", title: "Done" },
   { status: "dismissed", title: "Dismissed" }
 ];
+var ownersOf = (item) => item.people.filter((person) => person.on && person.role === "owner" && (person.kind === "agent" || person.kind === "person"));
+var removable = (item) => item.people.filter((person) => person.on && (person.kind === "agent" || person.kind === "person"));
 function assigneeOf(item) {
   const open = item.task.status !== "done" && item.task.status !== "dismissed";
   if (open && item.task.question) return { kind: "you" };
+  const owner = ownersOf(item)[0];
+  if (owner) return { kind: owner.kind, key: owner.key, label: owner.label };
   const agents = item.people.filter((person) => person.kind === "agent");
   const agent = agents.find((person) => person.role === "replied") ?? agents[0];
   return agent ? { kind: "agent", key: agent.key, label: agent.label } : { kind: "unassigned" };
 }
-var assigneeValue = (assignee) => assignee.kind === "agent" ? `agent:${assignee.key}` : assignee.kind;
+var assigneeValue = (assignee) => assignee.kind === "agent" ? `agent:${assignee.key}` : assignee.kind === "person" ? `person:${assignee.key}` : assignee.kind;
+function memberChoices(members, boardAgents, owners2, profile, viewer) {
+  const taken = new Set(owners2);
+  const agents = new Set(boardAgents);
+  return [.../* @__PURE__ */ new Set([...members, ...boardAgents])].filter((key) => !taken.has(key)).map((key) => {
+    const found = profile(key);
+    return { key, name: key === viewer ? `${found?.name ?? "You"} (you)` : found?.name ?? `${key.slice(0, 8)}\u2026`, agent: Boolean(found?.agent) || agents.has(key) };
+  }).sort((a, b) => Number(b.agent) - Number(a.agent) || a.name.localeCompare(b.name));
+}
 function filterTasks(tasks, filters) {
   const words = (filters.search ?? "").toLowerCase().split(/\s+/).filter(Boolean);
   return tasks.filter((item) => {
@@ -1628,7 +1640,7 @@ function filterOptions(tasks) {
     const assignee = assigneeOf(item);
     count(assignees, assigneeValue(assignee), { assignee });
   }
-  const order = { you: 0, agent: 1, unassigned: 2 };
+  const order = { you: 0, person: 1, agent: 2, unassigned: 3 };
   return {
     workstreams: [...workstreams.values()].sort((a, b) => a.value === NONE ? 1 : b.value === NONE ? -1 : a.value.localeCompare(b.value)),
     modes: [...modes.values()].sort((a, b) => a.value.localeCompare(b.value)),
@@ -1703,8 +1715,16 @@ function useProfiles(ctx, keys) {
     const found = profiles?.snapshot().get(key);
     if (!found) return void 0;
     const picture = found.picture && session?.media ? session.media(found.picture, "small") ?? found.picture : found.picture;
-    return { ...found.name && { name: found.name }, ...picture && { picture } };
+    return { ...found.name && { name: found.name }, ...picture && { picture }, ...found.isAgent && { agent: true } };
   };
+}
+function useMembers(ctx, channel) {
+  const channels = optionalService(ctx, "relay")?.snapshot().session?.channels;
+  const [, bump] = React.useReducer((n) => n + 1, 0);
+  React.useEffect(() => channels?.subscribeList ? channels.subscribeList(bump) : void 0, [channels]);
+  React.useEffect(() => void (channel && channels?.resolve?.([channel]).then(bump, () => {
+  })), [channels, channel]);
+  return channel && channels?.get?.(channel)?.members || [];
 }
 var npubKey = (npub) => {
   try {
@@ -1716,15 +1736,16 @@ var npubKey = (npub) => {
 };
 var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
 var assigneeName = (assignee, profile) => assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : profile(assignee.key)?.name ?? assignee.label;
+var nameOf = (person, profile) => profile(person.key)?.name ?? person.label;
 function AssigneeMark(props) {
   const size = props.size ?? 20;
   const name = assigneeName(props.assignee, props.profile);
-  const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : "Unassigned";
+  const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : props.assignee.kind === "person" ? name : "Unassigned";
   const base = { width: size, height: size, flex: "none", boxSizing: "border-box", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: Math.round(size * 0.42), fontWeight: 600 };
   if (props.assignee.kind === "unassigned") return /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...base, borderRadius: 999, border: "1.5px dashed var(--dbx-border-strong)" } });
   if (props.assignee.kind === "you") return /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...base, borderRadius: 999, background: "var(--dbx-warning)", color: "var(--dbx-surface)" } }, "!");
   const picture = props.profile(props.assignee.key)?.picture;
-  const style = { ...base, borderRadius: 5, border: "1px solid var(--dbx-border)" };
+  const style = { ...base, borderRadius: props.assignee.kind === "person" ? 999 : 5, border: "1px solid var(--dbx-border)" };
   return picture ? /* @__PURE__ */ React.createElement("img", { src: picture, alt: name, title, style: { ...style, objectFit: "cover" } }) : /* @__PURE__ */ React.createElement("span", { title, "aria-label": title, style: { ...style, background: "var(--dbx-brand-tint)", color: "var(--dbx-subtle)" } }, initials(name));
 }
 function StatusIcon(props) {
@@ -1763,6 +1784,39 @@ function AddAgent(props) {
     }
   };
   return /* @__PURE__ */ React.createElement(Stack, { gap: 6, style: { width: "100%" } }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "Agent npub1\u2026 (a member of this channel)", value: agent, onChange: (event) => setAgent(event.target.value) }), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", placeholder: "What to do (optional)", value: note, onChange: (event) => setNote(event.target.value) }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6 }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || !agent.trim(), onClick: () => void add() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Ask"), /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => setOpen(false) }, "Cancel")));
+}
+function Owners(props) {
+  const { item } = props;
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  const [picked, setPicked] = React.useState();
+  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  const owners2 = ownersOf(item);
+  const helpers = removable(item).filter((person) => person.role !== "owner");
+  const choices = memberChoices(props.members, props.boardAgents, owners2.map((owner) => owner.key), props.profile, props.viewer);
+  const run = async (input) => {
+    setBusy(true);
+    setError(void 0);
+    try {
+      await props.hub.updateTask({ id: item.task.id, ...input });
+      setPicked(void 0);
+      props.onChange();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const asOwner = (member) => ({ key: member.key, kind: member.agent ? "agent" : "person" });
+  const off = (person) => ({ key: person.key, kind: person.kind });
+  const pick = (key) => {
+    const member = choices.find((choice) => choice.key === key);
+    if (!member) return;
+    if (!owners2.length) void run({ assign: [asOwner(member)] });
+    else setPicked(member);
+  };
+  const row = (person, owner) => /* @__PURE__ */ React.createElement(Stack, { key: `${person.kind}:${person.key}`, direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: person.kind, key: person.key, label: person.label }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, nameOf(person, props.profile), !owner && /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, " \xB7 ", person.role)), !closed && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-input", disabled: busy, title: person.kind === "agent" ? "Take it off this task: it's told in the thread to stop" : "Take them off this task", "aria-label": `Take ${nameOf(person, props.profile)} off`, onClick: () => void run({ unassign: [off(person)] }), style: { width: "auto", padding: "0 6px", lineHeight: 1.4, cursor: "pointer" } }, "\xD7"));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "OWNERS"), item.task.question && !closed && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: "you" }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Waiting on your input")), owners2.length ? owners2.map((person) => row(person, true)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No one", helpers.length ? "; agents asked are below" : "", "."), helpers.length > 0 && helpers.map((person) => row(person, false)), !closed && !picked && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assign", disabled: busy || !choices.length, value: "", onChange: (event) => pick(event.target.value), style: { fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("option", { value: "" }, choices.length ? "Assign to\u2026" : "No channel members to assign"), choices.map((member) => /* @__PURE__ */ React.createElement("option", { key: member.key, value: member.key }, member.agent ? "\u{1F916} " : "", member.name))), picked && /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs" }, "Assign ", picked.name, ":"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, title: "Take the current owners off and assign them", onClick: () => void run({ assign: [asOwner(picked)], unassign: owners2.map(off) }) }, "Reassign"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, title: "Keep the current owners", onClick: () => void run({ assign: [asOwner(picked)] }) }, "Add"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => setPicked(void 0) }, "Cancel"))), busy && /* @__PURE__ */ React.createElement(Spinner, { size: 10 }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error));
 }
 function ProvideInput(props) {
   const { task } = props.task;
@@ -1911,7 +1965,10 @@ function TaskView(props) {
   const facts = taskFacts(item);
   const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.flatMap((comment) => [comment.author, ...mentionedKeys(comment.text, npubKey)]))]);
   const who = (key) => props.profile(key) ?? authorProfile(key);
-  const people = item.people.filter((person) => person.kind !== "agent");
+  const people = item.people.filter((person) => person.kind !== "agent" && !person.on);
+  const members = useMembers(props.ctx, props.channel ?? item.task.channel ?? void 0);
+  useProfiles(props.ctx, members);
+  const viewer = optionalService(props.ctx, "relay")?.snapshot().viewer;
   const end = React.useRef(null);
   const count = thread.comments.length;
   React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
@@ -1922,7 +1979,7 @@ function TaskView(props) {
     if (seen.current !== void 0 && count > seen.current) onChange();
     seen.current = count;
   }, [count, thread.status]);
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.reading && /* @__PURE__ */ React.createElement(Spinner, { size: 10, label: "Reading the thread" }), thread.limited && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Only part of the thread can be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), " for the rest."), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSIGNEE"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, assigneeName(assignee, props.profile)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.reading && /* @__PURE__ */ React.createElement(Spinner, { size: 10, label: "Reading the thread" }), thread.limited && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Only part of the thread can be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), " for the rest."), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, members, boardAgents: props.boardAgents, ...viewer && { viewer }, profile: who, onChange: props.onChange }), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
 }
 var VIEW_KEY = "signals.board.view";
 var savedView = () => {
@@ -2018,7 +2075,7 @@ function Board(props) {
   else if (!board.data?.tasks.length && !filtered.data?.length) body = /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "No tasks in this channel", board.data?.account ? "" : " (set it up as an account from the channel menu)", ".");
   else if (viewing !== void 0 && board.data?.tasks.some((item) => item.task.id === viewing)) {
     const item = board.data.tasks.find((found) => found.task.id === viewing);
-    body = /* @__PURE__ */ React.createElement(TaskView, { ctx, hub: hub2, item, channel: channel.id, profile, steer, onChange: refresh, back: () => setViewing(void 0) });
+    body = /* @__PURE__ */ React.createElement(TaskView, { ctx, hub: hub2, item, channel: channel.id, boardAgents: agents, profile, steer, onChange: refresh, back: () => setViewing(void 0) });
   } else if (board.data) {
     const shown = filterTasks(board.data.tasks, filters);
     const grouped = byStatus(shown);
@@ -2160,7 +2217,9 @@ function signalsTools(service) {
           artifact_kind: schema.string("doc, demo, code, email draft\u2026 (default link)."),
           question: schema.string("Needs input: what you need a person to tell you. The task waits until they answer in its thread or on the Tasks board."),
           options: schema.string(`The question's choices, separated by " / " (optional).`),
-          input: schema.string("Answers the task's question (as a person would).")
+          input: schema.string("Answers the task's question (as a person would)."),
+          assign: schema.string("Makes them its owners: npubs (agents) or emails (people), separated by commas. An agent assigned is asked in the thread to work on it."),
+          unassign: schema.string("Takes them off it: npubs or emails, separated by commas. An agent taken off is told in the thread to stop, and isn't woken by the task again. Assign another and unassign yourself to hand it off.")
         },
         ["id"]
       ),
@@ -2174,6 +2233,8 @@ function signalsTools(service) {
           ...typeof args.initiative === "string" && { initiative: args.initiative },
           ...stringArg(args, "question", false) && { question: stringArg(args, "question"), ...stringArg(args, "options", false) && { options: stringArg(args, "options").split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).filter(Boolean) } },
           ...stringArg(args, "input", false) && { input: stringArg(args, "input") },
+          ...stringArg(args, "assign", false) && { assign: owners(stringArg(args, "assign")) },
+          ...stringArg(args, "unassign", false) && { unassign: owners(stringArg(args, "unassign")) },
           ...url && { artifact: { url, ...stringArg(args, "artifact_title", false) && { title: stringArg(args, "artifact_title") }, ...stringArg(args, "artifact_kind", false) && { kind: stringArg(args, "artifact_kind") } } }
         });
         return `Updated: ${line(detail.task)}`;
@@ -2250,6 +2311,9 @@ function signalsTools(service) {
       }
     }
   ];
+}
+function owners(text) {
+  return text.split(/[\s,]+/).filter(Boolean).map((key) => ({ key, kind: key.includes("@") ? "person" : "agent" }));
 }
 
 // plugins/signals/src/index.tsx

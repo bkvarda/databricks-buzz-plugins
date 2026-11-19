@@ -79,7 +79,7 @@ export class HubClient {
   board(channel: string, signal?: AbortSignal) {
     return this.call<{ account: string | null; labels?: ResolvedLabels; tasks: BoardTask[] }>("GET", "/api/board", { query: { channel }, ...(signal && { signal }) });
   }
-  updateTask(input: { id: number; status?: string; note?: string; workstream?: string; initiative?: string; agents?: readonly string[]; question?: string; options?: readonly string[]; input?: string; artifact?: { url: string; title?: string; kind?: string } }) {
+  updateTask(input: { id: number; status?: string; note?: string; workstream?: string; initiative?: string; agents?: readonly string[]; assign?: readonly { key: string; kind: "agent" | "person" }[]; unassign?: readonly { key: string; kind: "agent" | "person" }[]; question?: string; options?: readonly string[]; input?: string; artifact?: { url: string; title?: string; kind?: string } }) {
     return this.call<TaskDetail>("POST", "/api/task", { body: input });
   }
   accounts(signal?: AbortSignal) {

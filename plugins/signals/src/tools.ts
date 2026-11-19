@@ -76,6 +76,8 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           question: schema.string("Needs input: what you need a person to tell you. The task waits until they answer in its thread or on the Tasks board."),
           options: schema.string("The question's choices, separated by \" / \" (optional)."),
           input: schema.string("Answers the task's question (as a person would)."),
+          assign: schema.string("Makes them its owners: npubs (agents) or emails (people), separated by commas. An agent assigned is asked in the thread to work on it."),
+          unassign: schema.string("Takes them off it: npubs or emails, separated by commas. An agent taken off is told in the thread to stop, and isn't woken by the task again. Assign another and unassign yourself to hand it off."),
         },
         ["id"],
       ),
@@ -89,6 +91,8 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           ...(typeof args.initiative === "string" && { initiative: args.initiative }),
           ...(stringArg(args, "question", false) && { question: stringArg(args, "question"), ...(stringArg(args, "options", false) && { options: stringArg(args, "options").split(/\s+\/\s+|\s*\|\s*|\s*;\s*/).filter(Boolean) }) }),
           ...(stringArg(args, "input", false) && { input: stringArg(args, "input") }),
+          ...(stringArg(args, "assign", false) && { assign: owners(stringArg(args, "assign")) }),
+          ...(stringArg(args, "unassign", false) && { unassign: owners(stringArg(args, "unassign")) }),
           ...(url && { artifact: { url, ...(stringArg(args, "artifact_title", false) && { title: stringArg(args, "artifact_title") }), ...(stringArg(args, "artifact_kind", false) && { kind: stringArg(args, "artifact_kind") }) } }),
         });
         return `Updated: ${line(detail.task)}`;
@@ -173,4 +177,9 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
       },
     },
   ];
+}
+
+/** Owners from a tool argument: npubs or hex pubkeys are agents, emails people. */
+function owners(text: string): { key: string; kind: "agent" | "person" }[] {
+  return text.split(/[\s,]+/).filter(Boolean).map((key) => ({ key, kind: key.includes("@") ? "person" : "agent" }));
 }
