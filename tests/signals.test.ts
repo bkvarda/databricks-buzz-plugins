@@ -1041,6 +1041,18 @@ describe("rules for every account", () => {
     expect(decide(config, meeting(["dane.isburgh@x.com", "disburgh@globex.io", "me@x.com"]), { firstRun: false })).toMatchObject({ kind: "none" });
   });
 
+  it("with known_account, opens nothing for an account no one set up", () => {
+    const rules = [{ id: "tickets", action: "task" as const, sources: ["jira"], known_account: true }];
+    const known = withAccounts({ version: 1, rules, default_channel: "fallback", accounts: [{ name: "Acme", ids: { jira_customer: ["Acme"] } }] }, accounts);
+    const ticket = (account: string): EventInput => ({ source: "jira", external_id: `t-${account}`, title: "Help", account });
+    expect(decide(known, ticket("Globex Corp"), { firstRun: false })).toMatchObject({ kind: "task", account: { name: "Globex" }, channel: "globex" });
+    expect(decide(known, ticket("acme"), { firstRun: false })).toMatchObject({ kind: "task", account: { name: "Acme" }, channel: "fallback" });
+    expect(decide(known, ticket("Acme Party Inc"), { firstRun: false })).toMatchObject({ kind: "none", reason: "no rule matches" });
+    // Without it, the unknown name still opens a task in default_channel.
+    expect(decide({ ...known, rules: [{ ...rules[0]!, known_account: false }] }, ticket("Acme Party Inc"), { firstRun: false })).toMatchObject({ kind: "task", account: { name: "Acme Party Inc" }, channel: "fallback" });
+    expect(configProblems({ version: 1, rules: [{ ...rules[0]!, known_account: "yes" as unknown as boolean }] })).toEqual(["rules[0].known_account is true or false"]);
+  });
+
   it("opens Slack mentions from a customer's address or in a channel named for the account, but not your own", () => {
     const slack = (payload: Record<string, unknown>, actor?: string): EventInput => ({ source: "slack", external_id: `s-${JSON.stringify(payload)}${actor}`, title: "<@U1|Me> can you look?", group_key: "1795000000", ...(actor && { actor }), payload });
     expect(decide(config, slack({ channel: "ext-globex-corp-team" }), { firstRun: false })).toMatchObject({ rule: { id: "customer-slack" }, account: { name: "Globex" }, channel: "globex" });
