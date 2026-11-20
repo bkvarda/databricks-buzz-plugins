@@ -68,6 +68,19 @@ function itemOf(line: string): ActionItem | undefined {
   };
 }
 
+/**
+ * The calendar event id in a meeting's link (`…/calendar/event?eid=…`): the eid is
+ * base64 of "<event id> <calendar>", and the id is the one the calendar source keeps
+ * (a recurring meeting's instance id, `abc_20261117T100000Z`, included).
+ */
+export function calendarEventId(link: unknown): string | undefined {
+  if (typeof link !== "string") return undefined;
+  const eid = /[?&]eid=([A-Za-z0-9_-]+)/.exec(link)?.[1];
+  if (!eid) return undefined;
+  const id = Buffer.from(eid, "base64url").toString("utf8").split(" ")[0] ?? "";
+  return /^[A-Za-z0-9_]{1,200}$/.test(id) ? id : undefined;
+}
+
 const letters = (text: string) => text.toLowerCase().normalize("NFKD").replace(/[^a-z]/g, "");
 const words = (text: string) => text.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").split(/[^a-z0-9]+/).filter(Boolean);
 
@@ -92,6 +105,27 @@ function isPerson(name: string, person: Attendee): boolean {
     const first = letters(source.split(/[\s._-]+/)[0] ?? "");
     return first.length >= 3 && first === said;
   });
+}
+
+/** The people a name in the notes is: everyone in `people` it matches (two Sams for "Sam"). */
+export function peopleNamed(name: string, people: readonly Attendee[]): Attendee[] {
+  return people.filter((person) => isPerson(name, person));
+}
+
+/**
+ * What says two versions of a notes doc have the same item: its title and its
+ * text, in letters and digits only. Two items with one title and different
+ * text are two items; an item repeated word for word in a later version is
+ * the same one.
+ */
+export function itemKey(item: ActionItem): string {
+  const plain = (text: string) => text.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, " ").trim();
+  return `${plain(item.title ?? "")}|${plain(item.text)}`;
+}
+
+/** An item as a line, the way the notes write it. */
+export function itemLine(item: ActionItem): string {
+  return `${item.owners.length ? `[${item.owners.join(", ")}] ` : ""}${item.title ? `${item.title}: ` : ""}${item.text}`;
 }
 
 /**

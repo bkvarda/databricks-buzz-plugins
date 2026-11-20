@@ -512,6 +512,18 @@ class Run(unittest.TestCase):
         self.assertEqual([path for path, _ in hub], ["/api/sources", "/api/events", "/api/cursor"])
         self.assertEqual(hub[2][1], {"source": "gmail", "cursor": "2026-11-17T12:00:00Z", "error": ""})
 
+    def test_the_cursor_stays_when_the_hub_says_events_failed_to_save(self):
+        ws = FakeWorkspace(
+            [{"source": "gmail", "enabled": True, "cursor": "2026-11-17T10:00:00Z"}],
+            mcp={"gmail": {"items": [{"id": "m1", "subject": "Q", "threadId": "t1", "from": "x"}]}},
+        )
+        ws.hub = lambda base, method, path, body=None: (ws.calls.append(("hub", method, path, body)), {"sources": ws.sources} if path == "/api/sources" else {"new": 0, "retry": True} if path == "/api/events" else {"ok": True})[1]
+        summary = poller.run(ws, {"sources": [MAIL]}, "https://hub", None, log=lambda _: None, now=NOW)
+        self.assertTrue(summary["gmail"].startswith("failed:"))
+        cursors = [c[3] for c in ws.calls if c[0] == "hub" and c[2] == "/api/cursor"]
+        self.assertEqual(len(cursors), 1)
+        self.assertNotIn("cursor", cursors[0])
+
     def test_not_signed_in_and_missing_tables_are_unavailable_and_reported(self):
         ws = FakeWorkspace(
             [{"source": "gmail", "enabled": True}, {"source": "table.cases", "enabled": True}],

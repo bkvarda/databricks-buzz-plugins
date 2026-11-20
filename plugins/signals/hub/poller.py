@@ -708,14 +708,21 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
             summary[name] = {"events": len(events), "sample": events[:3], "cursor": cursor}
             continue
         totals = {"queued": 0} if inbox else {"new": 0, "changed": 0, "same": 0, "created": 0}
+        retry = False
         for start in range(0, len(events), BATCH):
             reply = call("POST", "/api/events", {"events": events[start : start + BATCH]})
-            if inbox:  # the hub handles it within a minute
+            if inbox:  # the hub handles it within a minute (and again, its cursor waiting, if some failed to save)
                 totals["queued"] += len(events[start : start + BATCH])
                 continue
             for key in ("new", "changed", "same"):
                 totals[key] += reply.get(key, 0)
             totals["created"] += len(reply.get("created", []))
+            retry = retry or bool(reply.get("retry"))
+        if retry:  # some failed to save: the cursor stays, so the next poll reads them again
+            summary[name] = f"failed: some events didn't save, read again next time"
+            log(f"{name}: {summary[name]}")
+            call("POST", "/api/cursor", {"source": name, "error": summary[name]})
+            continue
         # The cursor moves only once the hub has the events (the inbox keeps them in order).
         call("POST", "/api/cursor", {"source": name, "cursor": cursor, "error": ""})
         summary[name] = {"events": len(events), **totals}

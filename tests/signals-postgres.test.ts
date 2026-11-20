@@ -127,3 +127,243 @@ describe.skipIf(!URL)("signals on PostgreSQL: overlapping reply decisions", () =
     expect((await store.task(task!.id))!.status).toBe("open");
   });
 });
+
+describe.skipIf(!URL)("signals on PostgreSQL: meeting action items", () => {
+  const pool = new pg.Pool({ connectionString: URL, max: 10 });
+  afterAll(() => pool.end());
+  const db: Db = { query: async (text, values) => ({ rows: (await pool.query(text, values)).rows }) };
+  const config: SignalsConfig = {
+    version: 1,
+    default_channel: "chan",
+    rules: [{ id: "meeting-notes", sources: ["google_drive"], when: { title: "Notes by Gemini" }, account_named_in: "title", action: "task", title: "Follow up: {title}", group_by: "group_key", action_items: {} }],
+    accounts: [{ name: "Globex", domains: ["globex.io"] }],
+  };
+
+  it("lists the task another post's insert opened while this one waited on it", async () => {
+    const schema = "signals_pg_items";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const store = new SignalsStore(db, schema);
+    await store.setup();
+    for (const source of ["google_drive", "google_calendar"]) {
+      await store.setSource("alice@x.com", source, true);
+      await store.ingest("alice@x.com", [{ source, external_id: `seed-${source}` }], config);
+    }
+    await store.ingest("alice@x.com", [{ source: "google_calendar", external_id: "evt1", payload: { attendees: [{ email: "alice@x.com" }, { email: "ann.lee@x.com", displayName: "Ann Lee" }, { email: "jane@globex.io" }] } }], config);
+    const meeting = `https://calendar.google.com/calendar/event?eid=${Buffer.from("evt1 x@x.com").toString("base64url")}`;
+    const notes = "Next steps\n[Ann Lee] Send pricing: Send the sheet.\nDetails";
+    // Another run is inserting the same item's task and hasn't committed yet.
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      const held = await holder.query(
+        `INSERT INTO ${schema}.tasks (rule_id, group_key, title, created_by, created_at, updated_at, last_event_at) VALUES ('meeting-notes/action-item', $1, 'Action: Send pricing: Send the sheet.', 'alice@x.com', 1, 1, 1) RETURNING id`,
+        ["meeting-notes/action-item|d1|send pricing|send the sheet"],
+      );
+      const posting = store.ingest("alice@x.com", [{ source: "google_drive", external_id: "d1:v1", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T10:00:00Z", payload: { notes, meeting } }], config);
+      for (let i = 0; i < 200; i++) {
+        const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%ON CONFLICT (group_key) DO NOTHING%'`);
+        if (found.rows[0].n >= 1) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await holder.query("COMMIT");
+      const result = await posting;
+      expect(result.errors).toEqual([]);
+      const id = Number(held.rows[0].id);
+      const followUp = (await store.tasks({})).find((task) => task.rule_id === "meeting-notes")!;
+      expect(followUp.checklist).toContain(`- Task ${id}: [Ann Lee] Send pricing: Send the sheet.`);
+      // It didn't open it, so it isn't posted as new from here.
+      expect(result.created.map((task) => task.id)).toEqual([followUp.id]);
+    } finally {
+      holder.release();
+    }
+  });
+
+  it("holds an inbox post past its tenth failed save, its Drive cursor waiting, and saves it before the cursor moves once the write works", async () => {
+    const schema = "signals_pg_inbox";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const { Hub, INBOX_TRIES, INBOX_HOLD_SECONDS } = await import("../plugins/signals/app/hub");
+    let failing = false;
+    // Every write, in order, once the write works: to check the event is saved before the cursor moves.
+    const writes: string[] = [];
+    const flaky: Db = {
+      query: async (text, values) => {
+        if (text.includes(`INSERT INTO ${schema}.events`) && (values as unknown[] | undefined)?.[2] === "d1:v1") {
+          if (failing) throw new Error("write failed");
+          writes.push("event");
+        }
+        if (text.includes(`UPDATE ${schema}.sources SET cursor`)) writes.push("cursor");
+        return { rows: (await pool.query(text, values)).rows };
+      },
+    };
+    const store = new SignalsStore(flaky, schema);
+    await store.setup();
+    const hub = new Hub(store, undefined, { defaultConfig: config });
+    for (const source of ["google_drive", "google_calendar"]) {
+      await store.setSource("alice@x.com", source, true);
+      await store.ingest("alice@x.com", [{ source, external_id: `seed-${source}` }], config);
+    }
+    await store.setCursor("alice@x.com", "google_drive", "c0");
+    writes.length = 0;
+    const notes = { source: "google_drive", external_id: "d1:v1", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T10:00:00Z", payload: { notes: "Next steps\n[Ann Lee] Send pricing: Send the sheet.\nDetails" } };
+    // As the Lakebase poller posts them: the events, then its cursor.
+    await pool.query(`INSERT INTO ${schema}.inbox (owner, kind, body) VALUES ('alice@x.com', 'events', $1), ('alice@x.com', 'cursor', $2)`, [JSON.stringify({ events: [notes] }), JSON.stringify({ source: "google_drive", cursor: "c1" })]);
+    const drive = async () => (await pool.query(`SELECT cursor, last_error FROM ${schema}.sources WHERE owner = 'alice@x.com' AND source = 'google_drive'`)).rows[0];
+    const saved = async () => (await pool.query(`SELECT count(*)::int AS n FROM ${schema}.events WHERE external_id = 'd1:v1'`)).rows[0].n;
+    failing = true;
+    for (let n = 1; n <= INBOX_TRIES + 2; n++) {
+      expect(await hub.drain()).toEqual({ handled: 0, failed: 1 });
+      expect((await drive()).cursor).toBe("c0");
+      expect(await saved()).toBe(0);
+    }
+    expect((await drive()).last_error).toContain(`failed to save ${INBOX_TRIES} times`);
+    expect((await pool.query(`SELECT kind, tries, done_at FROM ${schema}.inbox ORDER BY id`)).rows).toEqual([{ kind: "events", tries: INBOX_TRIES, done_at: null }, { kind: "cursor", tries: 0, done_at: null }]);
+    // The write works, but the hold isn't past: still held, the cursor still waiting.
+    failing = false;
+    expect(await hub.drain()).toEqual({ handled: 0, failed: 1 });
+    expect(await drive()).toMatchObject({ cursor: "c0" });
+    expect(writes).toEqual([]);
+    // Past the hold: the event is saved, then the cursor moves.
+    await pool.query(`UPDATE ${schema}.inbox SET tried_at = tried_at - $1`, [INBOX_HOLD_SECONDS]);
+    expect(await hub.drain()).toEqual({ handled: 2, failed: 0 });
+    expect(writes).toEqual(["event", "cursor"]);
+    expect(await saved()).toBe(1);
+    expect(await drive()).toEqual({ cursor: "c1", last_error: null });
+    expect((await pool.query(`SELECT count(*)::int AS n FROM ${schema}.inbox WHERE done_at IS NULL`)).rows[0].n).toBe(0);
+  });
+  it("opens no follow-up for a notes version a newer one replaces while its follow-up insert waits on the event's row", async () => {
+    const schema = "signals_pg_items_latest";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const holder = await pool.connect();
+    let held = false;
+    let committed: Promise<void> | undefined;
+    // Right before the follow-up's insert: another run records a newer version of the notes and hasn't committed yet.
+    const racing: Db = {
+      query: async (text, values) => {
+        if (!held && text.includes(`INSERT INTO ${schema}.tasks`)) {
+          held = true;
+          await holder.query("BEGIN");
+          await holder.query(`UPDATE ${schema}.events SET versions = versions + 1 WHERE external_id = 'd1'`);
+          committed = (async () => {
+            for (let i = 0; i < 200; i++) {
+              const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO ${schema}.tasks%'`);
+              if (found.rows[0].n >= 1) break;
+              await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            await holder.query("COMMIT");
+          })();
+        }
+        return { rows: (await pool.query(text, values)).rows };
+      },
+    };
+    const store = new SignalsStore(racing, schema);
+    await store.setup();
+    const classified: SignalsConfig = { version: 1, default_channel: "triage", rules: [{ id: "meeting-notes", sources: ["google_drive"], when: { title: "Notes by Gemini" }, action: "task", title: "Follow up: {title}", group_by: "group_key", action_items: {}, classify: { question: "Worth a follow-up?", min: 0.5 } }] };
+    await store.setSource("alice@x.com", "google_drive", true);
+    await store.ingest("alice@x.com", [{ source: "google_drive", external_id: "seed" }], classified);
+    try {
+      const result = await store.ingest("alice@x.com", [{ source: "google_drive", external_id: "d1", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T10:00:00Z", payload: { notes: "Next steps\n[Ann Lee] Send pricing: Send the sheet.\nDetails" } }], classified, async () => 0.9);
+      await committed;
+      expect(held).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.created).toEqual([]);
+      expect(await store.tasks({})).toEqual([]);
+    } finally {
+      holder.release();
+    }
+  });
+  it("opens no stale follow-up from the sweep when a newer revision of the document, under its own id, commits while its insert waits", async () => {
+    const schema = "signals_pg_items_revisions";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const holder = await pool.connect();
+    let failOpen = true;
+    let sweeping = false;
+    let held = false;
+    let committed: Promise<void> | undefined;
+    const notesRule: SignalsConfig = { version: 1, default_channel: "triage", rules: [{ id: "meeting-notes", sources: ["google_drive"], when: { title: "Notes by Gemini" }, action: "task", title: "Follow up: {title}", group_by: "group_key", action_items: {} }] };
+    const racing: Db = {
+      query: async (text, values) => {
+        if (text.includes(`INSERT INTO ${schema}.tasks`)) {
+          if (failOpen) {
+            failOpen = false;
+            throw new Error("write failed");
+          }
+          // The sweep's retry of revision 1: another run saves revision 2 (its own id, as the Drive mapping gives) and hasn't committed yet.
+          if (sweeping && !held) {
+            held = true;
+            await holder.query("BEGIN");
+            await new SignalsStore({ query: async (q, v) => ({ rows: (await holder.query(q, v)).rows }) }, schema).record("alice@x.com", { source: "google_drive", external_id: "d1:v2", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T11:00:00Z", payload: { notes: "Next steps\n[Jane Doe] Share usage: Share the export.\nDetails" } }, true);
+            committed = (async () => {
+              for (let i = 0; i < 200; i++) {
+                const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO ${schema}.tasks%'`);
+                if (found.rows[0].n >= 1) break;
+                await new Promise((resolve) => setTimeout(resolve, 25));
+              }
+              await holder.query("COMMIT");
+            })();
+          }
+        }
+        return { rows: (await pool.query(text, values)).rows };
+      },
+    };
+    const store = new SignalsStore(racing, schema);
+    await store.setup();
+    await store.setSource("alice@x.com", "google_drive", true);
+    await store.ingest("alice@x.com", [{ source: "google_drive", external_id: "seed" }], notesRule);
+    try {
+      const first = await store.ingest("alice@x.com", [{ source: "google_drive", external_id: "d1:v1", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T10:00:00Z", payload: { notes: "Next steps\n[Ann Lee] Send pricing: Send the sheet.\nDetails" } }], notesRule);
+      expect(first.errors.length).toBe(1);
+      sweeping = true;
+      const swept = await store.pendingItems(notesRule);
+      await committed;
+      expect(held).toBe(true);
+      expect(swept.created).toEqual([]);
+      expect(await store.tasks({})).toEqual([]);
+    } finally {
+      holder.release();
+    }
+  });
+  it("keeps no revision of a document when two people forget their copies of it at once", async () => {
+    const schema = "signals_pg_forget_revisions";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const holder = await pool.connect();
+    const store = new SignalsStore({ query: async (text, values) => ({ rows: (await pool.query(text, values)).rows }) }, schema);
+    await store.setup();
+    const copy = (owner: string, version: string, at: string) =>
+      store.record(owner, { source: "google_drive", external_id: `d1:${version}`, group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: at, payload: { notes: "Next steps\nDetails" } }, true);
+    await copy("alice@x.com", "v1", "2026-11-17T10:00:00Z");
+    await copy("bob@x.com", "v2", "2026-11-17T11:00:00Z");
+    expect((await pool.query(`SELECT count(*)::int AS n FROM ${schema}.revisions`)).rows).toEqual([{ n: 1 }]);
+    // Alice's Forget deletes her copy (and refreshes the document, seeing Bob's) and hasn't committed yet while Bob's Forget runs.
+    let held = false;
+    const alice = new SignalsStore({
+      query: async (text, values) => {
+        if (!held && text.includes(`${schema}.forget_events(`)) {
+          held = true;
+          await holder.query("BEGIN");
+          const rows = (await holder.query(text, values)).rows;
+          const bob = store.setSource("bob@x.com", "google_drive", false, undefined, true);
+          // Until Bob's Forget is done or waits on a lock Alice's holds.
+          let done = false;
+          void bob.then(() => (done = true), () => (done = true));
+          for (let i = 0; i < 200 && !done; i++) {
+            const waiting = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%${schema}%'`);
+            if (waiting.rows[0].n >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          await holder.query("COMMIT");
+          await bob;
+          return { rows };
+        }
+        return { rows: (await pool.query(text, values)).rows };
+      },
+    }, schema);
+    try {
+      await alice.setSource("alice@x.com", "google_drive", false, undefined, true);
+      expect(held).toBe(true);
+      expect((await pool.query(`SELECT count(*)::int AS n FROM ${schema}.events WHERE source = 'google_drive'`)).rows).toEqual([{ n: 0 }]);
+      expect((await pool.query(`SELECT * FROM ${schema}.revisions`)).rows).toEqual([]);
+    } finally {
+      holder.release();
+    }
+  });
+});
