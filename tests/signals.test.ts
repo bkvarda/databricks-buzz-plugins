@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_PATHS, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -985,6 +985,41 @@ describe("the plugin's sign-in check", () => {
     expect(rpcSignIn(401, "")).toBe("needed");
     expect(rpcSignIn(200, JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32003, message: "Tool not allowed" } }))).toBe("unknown");
     expect(rpcSignIn(500, "oops")).toBe("unknown");
+  });
+});
+
+describe("onboarding a poller", () => {
+  it("says whether a person has a database role, creates it when it can, and says what to run when it can't", async () => {
+    const pg = new PGlite();
+    const db: Db = { query: async (text, values) => ({ rows: (await pg.query(text, values)).rows as never[] }) };
+    const store = new SignalsStore(db, "signals_onboard");
+    await store.setup();
+    const lakebase = { endpoint: "projects/p1/branches/production/endpoints/primary", host: "ep.example.com", database: "databricks_postgres" };
+    const hub = new Hub(store, undefined, { lakebase });
+    const call = (method: string, user: string) => hub.handle({ method, path: "/api/onboard", query: new URLSearchParams(), user, body: async () => "" });
+
+    // No role yet: GET only looks, and says what someone who can should run.
+    const looked = (await call("GET", "Ann@x.com")).json as Onboarding;
+    expect(looked).toMatchObject({ user: "ann@x.com", role: "waiting", lakebase: { ...lakebase, schema: "signals_onboard" }, args: ["--config", "sources.json", "--lakebase"] });
+    expect(looked.waiting?.command).toBe(`databricks postgres create-role projects/p1/branches/production --json '{"spec":{"identity_type":"USER","postgres_role":"ann@x.com","auth_method":"LAKEBASE_OAUTH_V1"}}'`);
+
+    // Without databricks_create_role (the extension isn't installed), POST says why and still gives the command.
+    const failed = (await call("POST", "ann@x.com")).json as Onboarding;
+    expect(failed.role).toBe("waiting");
+    expect(failed.waiting?.reason).toMatch(/couldn't create your role.*databricks_create_role/);
+    expect(failed.waiting?.command).toContain("create-role");
+
+    // With it, POST creates the role, and then it's ready.
+    await pg.query(`CREATE FUNCTION databricks_create_role(name text, kind text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN EXECUTE format('CREATE ROLE %I LOGIN', name); RETURN name; END $$`);
+    expect(((await call("POST", "ann@x.com")).json as Onboarding).role).toBe("created");
+    expect(((await call("GET", "ANN@x.com")).json as Onboarding)).toMatchObject({ role: "ready" });
+    expect(((await call("POST", "ann@x.com")).json as Onboarding).role).toBe("ready");
+
+    // A hub that doesn't know its database still answers, without the settings or the command.
+    const bare = (await new Hub(store).handle({ method: "GET", path: "/api/onboard", query: new URLSearchParams(), user: "bo@x.com", body: async () => "" })).json as Onboarding;
+    expect(bare).toEqual({ user: "bo@x.com", role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet." }, args: ["--config", "sources.json", "--lakebase"] });
+    // It needs to know who's asking.
+    expect((await hub.handle({ method: "GET", path: "/api/onboard", query: new URLSearchParams(), body: async () => "" })).status).toBe(401);
   });
 });
 

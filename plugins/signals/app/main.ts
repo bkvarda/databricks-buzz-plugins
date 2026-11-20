@@ -82,7 +82,10 @@ async function prepare() {
     const log = (line: string) => console.log(`[signals] ${line}`);
     const endpoint = process.env.SIGNALS_CLASSIFIER?.trim() || DEFAULT_CLASSIFIER_ENDPOINT;
     const classifier = endpoint === "off" ? undefined : jevClassifier((path, init) => app.databricks.api(path, init), endpoint, log);
-    hub = new Hub(store, notifier, { ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), ...(classifier && { classifier }), log });
+    // Where people's poller jobs log in: this app's own database resource.
+    const { LAKEBASE_ENDPOINT, PGHOST, PGDATABASE, PGPORT } = process.env;
+    const lakebaseInfo = LAKEBASE_ENDPOINT && PGHOST && PGDATABASE ? { endpoint: LAKEBASE_ENDPOINT, host: PGHOST, database: PGDATABASE, ...(PGPORT && PGPORT !== "5432" && { port: Number(PGPORT) }) } : undefined;
+    hub = new Hub(store, notifier, { ...(lakebaseInfo && { lakebase: lakebaseInfo }), ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), ...(classifier && { classifier }), log });
     state.ready = true;
     state.setupError = undefined;
     state.stats = await store.stats();

@@ -21,6 +21,8 @@
 //                                         pubkey (hex or npub) or email, or {key, kind: "agent"|"person", label?}
 //   POST /api/task {id, question, options?}  needs input: waiting, with the question (agents ask this way)
 //   POST /api/task {id, input}            answers it: in the thread, mentioning the agents, and the task resumes
+//   GET  /api/onboard | POST /api/onboard   your poller's setup: your database role (POST creates it if it can) and
+//                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
@@ -68,13 +70,30 @@ export type HubOptions = Readonly<{
   defaultConfig?: SignalsConfig;
   /** Asks rules' `classify` questions (see jevClassifier); without it, rules with `classify` open their tasks unasked. */
   classifier?: Classifier;
+  /** Where poller jobs reach the hub's database (from the app's postgres resource), for /api/onboard. */
+  lakebase?: LakebaseInfo;
   log?(line: string): void;
+}>;
+
+/** The hub's database, as a person's poller job reaches it (sources.json's `lakebase`). */
+export type LakebaseInfo = Readonly<{ endpoint: string; host: string; database: string; port?: number }>;
+
+/** What /api/onboard tells a person about their poller: its database role, and the settings it needs. */
+export type Onboarding = Readonly<{
+  user: string;
+  role: "ready" | "created" | "waiting";
+  /** Why the hub couldn't create the role, and what someone who can should run. */
+  waiting?: Readonly<{ reason: string; command?: string }>;
+  /** sources.json's `lakebase`, or undefined when the hub doesn't know its database. */
+  lakebase?: Readonly<{ endpoint: string; host: string; database: string; port?: number; schema: string }>;
+  /** The poller's arguments, for its job. */
+  args: readonly string[];
 }>;
 
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered", "/api/onboard"] as const;
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
@@ -184,6 +203,10 @@ export class Hub {
             },
           };
         }
+        case "GET /api/onboard":
+          return { json: await this.onboard(user, false) };
+        case "POST /api/onboard":
+          return { json: await this.onboard(user, true) };
         case "GET /api/ids":
           return { json: { ids: idsByKind((await this.config()).accounts ?? []) } };
         case "GET /api/accounts":
@@ -215,6 +238,32 @@ export class Hub {
     } catch (error) {
       const status = (error as { status?: number }).status;
       return bad((error as Error).message ?? String(error), status && status < 500 ? status : 500);
+    }
+  }
+
+  /**
+   * A person's poller setup: whether they have a Postgres role in the hub's
+   * database (their job logs in as it to write the inbox), and the settings
+   * their sources.json and job need. With `create`, a missing role is made
+   * (store.createRole); when the hub can't, it says why and what someone with
+   * Can Manage on the database project can run instead.
+   */
+  private async onboard(user: string, create: boolean): Promise<Onboarding> {
+    const info = this.options.lakebase;
+    const lakebase = info && { ...info, schema: this.store.schema };
+    const args = ["--config", "sources.json", "--lakebase"];
+    if (await this.store.hasRole(user)) return { user, role: "ready", ...(lakebase && { lakebase }), args };
+    const branch = info?.endpoint.split("/").slice(0, 4).join("/");
+    const command = branch && /^projects\/[^/]+\/branches\/[^/]+$/.test(branch) ? `databricks postgres create-role ${branch} --json '${JSON.stringify({ spec: { identity_type: "USER", postgres_role: user, auth_method: "LAKEBASE_OAUTH_V1" } })}'` : undefined;
+    if (!create) return { user, role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet.", ...(command && { command }) }, ...(lakebase && { lakebase }), args };
+    try {
+      await this.store.createRole(user);
+      this.log(`created a database role for ${user}`);
+      return { user, role: "created", ...(lakebase && { lakebase }), args };
+    } catch (error) {
+      const reason = `The hub couldn't create your role in its database: ${(error as Error).message}`;
+      this.log(`couldn't create a database role for ${user}: ${(error as Error).message}`);
+      return { user, role: "waiting", waiting: { reason, ...(command && { command }) }, ...(lakebase && { lakebase }), args };
     }
   }
 
