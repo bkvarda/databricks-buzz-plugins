@@ -1,7 +1,9 @@
 // Which parts of an agent's draft a customer would read, and what in them
-// looks internal. Agents mark their draft with headings (see DRAFT_FORMAT);
-// text under no recognized heading counts as customer-facing, so an unmarked
-// draft is checked whole rather than skipped.
+// looks internal. Agents mark their draft with audience headings (see
+// DRAFT_FORMAT). Only an audience heading switches parts: any other heading
+// (### Sources, ## Next steps) stays in the part it's under, and so does text
+// in a code block fenced with ``` or ~~~. Text before the first audience
+// heading is neither part.
 
 /** What agents are asked to do, so the hub can tell the parts apart. */
 export const DRAFT_FORMAT = 'Put what a customer would read under a heading "Customer draft", and anything only for us (sources, tickets, reasoning) under "Internal notes".';
@@ -10,29 +12,30 @@ export type DraftPart = "customer" | "internal";
 export type DraftSections = { customer: string; internal: string; marked: boolean };
 
 const HEADING = /^\s{0,3}(?:#{1,6}\s+|\*\*|__)?\s*(?:\p{Extended_Pictographic}\uFE0F?\s*)?([A-Za-z][A-Za-z '/-]{2,40}?)\s*(?:\*\*|__)?\s*:?\s*(?:\*\*|__)?\s*$/u;
+/** Audience headings: who the text under them is for. */
 const CUSTOMER = /^(customer(?:[- ]facing)?(?: draft| reply| email| response| answer)?|draft (?:reply|email|response)(?: to (?:the )?customer)?|reply to (?:the )?customer|email draft)$/i;
-const INTERNAL = /^(internal(?: notes?| only| context)?|notes? for (?:us|the team)|for (?:us|the team|agents)|sources?|escalation draft|internal ticket)$/i;
+const INTERNAL = /^(internal(?: notes?| only| context)?|notes? for (?:us|the team)|for (?:us|the team))$/i;
+const FENCE = /^\s{0,3}(`{3,}|~{3,})/;
 
-/** Splits a draft by its headings; text before any heading, or under one that isn't recognized, keeps the current part (customer at the start). */
+/** Splits a draft by its audience headings. */
 export function draftSections(text: string): DraftSections {
   const parts: Record<DraftPart, string[]> = { customer: [], internal: [] };
-  let part: DraftPart = "customer";
+  let part: DraftPart | undefined;
   let marked = false;
-  let fence = false;
+  let fence: string | undefined;
   for (const line of text.split(/\r?\n/)) {
-    if (/^\s*```/.test(line)) fence = !fence;
-    const heading = !fence && HEADING.exec(line)?.[1]?.trim();
-    if (heading && CUSTOMER.test(heading)) {
-      part = "customer";
-      marked = true;
-      continue;
+    const opens = FENCE.exec(line)?.[1];
+    if (opens && (!fence || (opens[0] === fence[0] && opens.length >= fence.length))) fence = fence ? undefined : opens;
+    else if (!fence) {
+      const heading = HEADING.exec(line)?.[1]?.trim();
+      const to: DraftPart | undefined = heading && CUSTOMER.test(heading) ? "customer" : heading && INTERNAL.test(heading) ? "internal" : undefined;
+      if (to) {
+        part = to;
+        marked = true;
+        continue;
+      }
     }
-    if (heading && INTERNAL.test(heading)) {
-      part = "internal";
-      marked = true;
-      continue;
-    }
-    parts[part].push(line);
+    if (part) parts[part].push(line);
   }
   return { customer: parts.customer.join("\n").trim(), internal: parts.internal.join("\n").trim(), marked };
 }
@@ -66,8 +69,17 @@ export function internalHits(text: string): Hit[] {
   return [...hits.values()];
 }
 
-/** The internal-looking things in the customer-facing part of a draft. Internal notes may have them. */
-export function disclosureCheck(text: string): { hits: Hit[]; marked: boolean } {
-  const { customer, marked } = draftSections(text);
-  return { hits: internalHits(customer), marked };
+/**
+ * The check's result for one reply: "unchecked" when it has no customer part
+ * to check (no audience headings, only Internal notes, or an empty Customer
+ * draft), "clean" when its customer part has nothing internal-looking, and
+ * "warned" with the kinds of what was found. Kinds only, never the text.
+ */
+export type DisclosureResult = { status: "unchecked" } | { status: "clean" } | { status: "warned"; kinds: string[] };
+
+export function disclosureCheck(text: string): DisclosureResult {
+  const { customer } = draftSections(text);
+  if (!customer) return { status: "unchecked" };
+  const kinds = [...new Set(internalHits(customer).map((hit) => hit.kind))];
+  return kinds.length ? { status: "warned", kinds } : { status: "clean" };
 }

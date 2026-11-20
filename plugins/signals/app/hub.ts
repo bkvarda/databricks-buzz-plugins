@@ -981,20 +981,17 @@ export class Hub {
   }
 
   /**
-   * Advisory only: when the customer-facing part of an inline draft (a reply
-   * with a Customer draft or Internal notes heading) has
-   * internal-looking links or ids, records which kinds (never the flagged
-   * text) on the task and says so once in its thread, mentioning the agent.
-   * Once per reply: collecting the same reply again adds nothing.
+   * Advisory only: records the disclosure check's result for an inline draft
+   * (unchecked, clean or warned), once per reply. When the customer part has
+   * internal-looking links or ids, the run that records it first adds a
+   * warning to the task and says so in its thread, mentioning the agent: the
+   * kinds only, never the flagged text. It never changes the task's status.
    */
   private async warnDisclosure(task: Task, agent: string, reply: ThreadReply): Promise<void> {
-    // Only replies marked as drafts (see DRAFT_FORMAT): an unmarked reply may just link a doc or report work.
-    const { hits, marked } = disclosureCheck(reply.content);
-    if (!marked || !hits.length) return;
-    const marker = `reply ${reply.id}`;
-    if ((await this.store.detail(task.id))?.activities.some((item) => item.kind === "disclosure_warning" && String(item.text).includes(marker))) return;
-    const kinds = [...new Set(hits.map((hit) => hit.kind))];
-    await this.store.activity(task.id, `agent:${npub(agent)}`, "disclosure_warning", `The customer draft in ${marker} has internal-looking content: ${kinds.join(", ")}`);
+    const result = disclosureCheck(reply.content);
+    const kinds = result.status === "warned" ? result.kinds : [];
+    if (!(await this.store.disclosureChecked(task.id, reply.id, result.status, kinds)) || !kinds.length) return;
+    await this.store.activity(task.id, `agent:${npub(agent)}`, "disclosure_warning", `The customer draft in reply ${reply.id} has internal-looking content: ${kinds.join(", ")}`);
     if (this.notifier && task.buzz_root) await this.notifier.updated(task, disclosureMessage(kinds, agent), [agent]).catch(() => {});
   }
 

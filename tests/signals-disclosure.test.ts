@@ -1,5 +1,5 @@
 // Synthetic drafts: an internal link is fine in Internal notes and flagged in
-// the Customer draft, and an unmarked draft is checked whole.
+// the Customer draft; a reply with no customer part is unchecked.
 import { describe, expect, it } from "vitest";
 import { disclosureCheck, draftSections, internalHits } from "../plugins/signals/app/disclosure";
 
@@ -20,23 +20,31 @@ const INTERNAL_LINKS: [string, string][] = [
 
 describe("disclosure check", () => {
   it.each(INTERNAL_LINKS)("flags a %s in the customer draft", (kind, line) => {
-    const { hits, marked } = disclosureCheck(`${customer(line)}\n\n${internal("Nothing here.")}`);
-    expect(marked).toBe(true);
-    expect(hits.map((hit) => hit.kind)).toContain(kind);
+    const result = disclosureCheck(`${customer(line)}\n\n${internal("Nothing here.")}`);
+    expect(result).toMatchObject({ status: "warned", kinds: expect.arrayContaining([kind]) });
   });
 
   it.each(INTERNAL_LINKS)("allows a %s in internal notes", (_kind, line) => {
-    expect(disclosureCheck(`${customer("Managed Iceberg tables follow the open Iceberg spec: https://docs.databricks.com/aws/en/iceberg/")}\n\n${internal(line)}`).hits).toEqual([]);
+    expect(disclosureCheck(`${customer("Managed Iceberg tables follow the open Iceberg spec: https://docs.databricks.com/aws/en/iceberg/")}\n\n${internal(line)}`)).toEqual({ status: "clean" });
   });
 
-  it("checks a draft with no headings as customer-facing", () => {
-    expect(disclosureCheck("Hi Ann, see go/roadmaptool.")).toEqual({ hits: [{ kind: "go link", text: "go/roadmaptool" }], marked: false });
+  it("leaves a reply with no customer part unchecked", () => {
+    expect(disclosureCheck("Hi Ann, see go/roadmaptool.")).toEqual({ status: "unchecked" });
+    expect(disclosureCheck(internal("go/roadmaptool"))).toEqual({ status: "unchecked" });
+    expect(disclosureCheck(`## Customer draft\n\n${internal("go/roadmaptool")}`)).toEqual({ status: "unchecked" });
+    expect(disclosureCheck(`Preamble go/roadmaptool\n${customer("All set.")}`)).toEqual({ status: "clean" });
+  });
+
+  it("keeps a Sources subheading inside the customer draft", () => {
+    const text = "## Customer draft\nHi Ann, here's the plan.\n\n### Sources\n- go/example\n\n## Internal notes\nNothing.";
+    expect(draftSections(text)).toMatchObject({ customer: "Hi Ann, here's the plan.\n\n### Sources\n- go/example", internal: "Nothing." });
+    expect(disclosureCheck(text)).toEqual({ status: "warned", kinds: ["go link"] });
   });
 
   it("goes back to customer text after internal notes when another customer heading follows", () => {
     const text = `${internal("ES-1234567")}\n\n**Customer reply:**\nSee INC-6588.`;
     expect(draftSections(text)).toEqual({ customer: "See INC-6588.", internal: "ES-1234567", marked: true });
-    expect(disclosureCheck(text).hits.map((hit) => hit.text)).toEqual(["INC-6588"]);
+    expect(disclosureCheck(text)).toEqual({ status: "warned", kinds: ["internal ticket"] });
   });
 
   it("reads common heading shapes", () => {
@@ -44,8 +52,12 @@ describe("disclosure check", () => {
       expect(draftSections(`${heading}\nhello\n## Internal notes\nES-1234567`)).toMatchObject({ customer: "hello", marked: true });
   });
 
-  it("doesn't take a heading inside a code block", () => {
-    expect(draftSections("## Customer draft\n```\n## Internal notes\n```\nES-1234567").customer).toContain("ES-1234567");
+  it.each(["```", "~~~", "````"])("doesn't take a heading inside a %s code block", (fence) => {
+    expect(draftSections(`## Customer draft\n${fence}\n## Internal notes\n${fence}\nES-1234567`).customer).toContain("ES-1234567");
+  });
+
+  it("closes a fence only with the same kind of fence", () => {
+    expect(draftSections("## Customer draft\n~~~\n```\n## Internal notes\n~~~\n## Internal notes\nES-1234567")).toMatchObject({ internal: "ES-1234567" });
   });
 
   it("leaves public Databricks docs alone", () => {
