@@ -468,11 +468,19 @@ export class SignalsStore {
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
           if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule);
           // Still on its old rule, and that rule doesn't apply now (a case back to Open, say): its playbook would be the wrong one.
+          // (Checked for every attached event, whatever its rules watch, changed or not: the last event of a post decides the briefing,
+          // and one that changes nothing, a new title say, or that comes through a rule watching nothing, still leaves the task where
+          // the post's earlier events took it.)
           const own = config.rules.find((rule) => rule.id === task.rule_id);
-          if (changes.length && own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
+          if (own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
         const reopened = await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        // A done task isn't taken over above; once this event opened it again, the rule it now matches takes it, as for an open one.
+        if (reopened && changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task") {
+          task = await this.refile(task, placed.rule);
+          outgrown = undefined;
+        }
         if (placed.opened) {
           // Someone on the team already replied in its thread (their reply came in first): done, and never posted.
           let closed = false;

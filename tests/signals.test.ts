@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, mergedChanges, reopenedMessage, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -1293,6 +1293,20 @@ describe("work someone on the team did themselves", () => {
     await call("/api/events", { events: [{ source: "gmail", external_id: "m3", actor: "Ann <ann@globex.io>", title: "Re: Pricing?", group_key: "th1" }] });
     expect(await store.task(task.id)).toMatchObject({ status: "open" });
     expect((await store.people([task.id])).get(task.id)!.map((person) => person.key)).toEqual(["alice@x.com"]);
+    expect(posts.at(-1)).toEqual({ task: task.id, text: reopenedMessage("Re: Pricing?", ["alice@x.com"]), agents: [] });
+    expect(posts.at(-1)!.text).toBe("↩️ Open again: Re: Pricing?\nIt's with **alice@x.com**.");
+
+    // Closed again by her reply; then a post with a delayed customer message older than that reply (it opens
+    // nothing) before a new follow-up (it opens the task): the one notice is about the follow-up.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m4", actor: "Alice <alice@x.com>", title: "Re: Pricing? 2", group_key: "th1", url: "https://mail/m4" }] });
+    expect(await store.task(task.id)).toMatchObject({ status: "done" });
+    posts.length = 0;
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m5", actor: "Ann <ann@globex.io>", title: "Delayed older one", group_key: "th1", url: "https://mail/m5", occurred_at: 1795000100 },
+      { source: "gmail", external_id: "m6", actor: "Ann <ann@globex.io>", title: "New follow-up", group_key: "th1", url: "https://mail/m6", occurred_at: Math.floor(Date.now() / 1000) + 60 },
+    ] });
+    expect(await store.task(task.id)).toMatchObject({ status: "open" });
+    expect(posts).toEqual([{ task: task.id, text: reopenedMessage("[New follow-up](https://mail/m6)", ["alice@x.com"]), agents: [] }]);
   });
 
   it("keeps an owner someone chose, closes from a Slack reply, and leaves other people's and other threads' events alone", async () => {
@@ -2248,7 +2262,7 @@ describe("watched fields", () => {
     await store.setup();
     const replies: { task: number; text: string; agents: readonly string[] }[] = [];
     const watch = ["payload.es_status"];
-    const rules = [
+    const rules: SignalsConfig["rules"] = [
       { id: "case-es-resolved", sources: ["table.cases"], when: { "payload.es_status": ["Resolved"] }, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
       { id: "case-es-open", sources: ["table.cases"], when: { "payload.es_status": "." }, action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
       { id: "case-confirm", sources: ["table.cases"], action: "task" as const, group: "case", group_by: "external_id", workstream: "cases", watch },
@@ -2286,6 +2300,208 @@ describe("watched fields", () => {
     await call("/api/events", { events: [kase(undefined)] });
     expect(replies.at(-1)!.text).toContain("- **es_status:** Resolved → (none)");
     expect(await store.task(1)).toMatchObject({ rule_id: "case-confirm" });
+
+  });
+});
+
+describe("watched fields, reopened", () => {
+  it("a done task a watched change opens again: one post says it's open again with the diff, asks its agent again, records the change", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch_reopen");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const rules = [{ id: "case", sources: ["table.cases"], action: "task" as const, group_by: "payload.case", workstream: "cases", watch: ["payload.es_status"] }];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft" });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (id: string, es_status: string) => ({ source: "table.cases", external_id: id, account: "Globex", title: "Case C-1", payload: { case: "C-1", es_status } });
+    await call("/api/events", { events: [kase("v1", "Open")] });
+    expect((await store.people([1])).get(1)!.map((p) => p.key)).toEqual([genie]);
+    await call("/api/task", { id: 1, status: "done" });
+    expect(await store.task(1)).toMatchObject({ status: "done" });
+    replies.length = 0;
+    await call("/api/events", { events: [kase("v2", "Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ status: "open" });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+    expect(replies[0]!.text).toMatch(/^↩️ Open again: Case C-1\n/);
+    expect(replies[0]!.text).toContain("- **es_status:** Open → Mitigated");
+    expect(replies[0]!.text).toContain(`nostr:${npubEncode(genie)} this changed since you last looked`);
+    expect((await store.detail(1))!.activities.filter((a) => a.kind === "changed")).toHaveLength(1);
+  });
+
+  it("briefs the agents on the rule the task ends on after the post, not one an earlier update in it outgrew", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch_batch");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const watch = ["payload.es_status", "payload.case_status"];
+    const rules: SignalsConfig["rules"] = [
+      { id: "case-es-resolved", sources: ["table.cases"], when: { "payload.es_status": ["Resolved"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+      { id: "case-awaiting", sources: ["table.cases"], when: { "payload.case_status": ["Awaiting Confirmation"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+    ];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-es-resolved": "Draft confirm-or-close.", cases: "General case playbook." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (id: string, case_status: string, es_status: string) => ({ source: "table.cases", external_id: id, account: "Globex", title: `Case C-1 (${es_status})`, payload: { case: "C-1", case_status, es_status } });
+    await call("/api/events", { events: [kase("v1", "Awaiting Confirmation", "Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-awaiting" });
+    replies.length = 0;
+    // In one post the case goes back to Open (no rule of the group applies) and on to Awaiting Confirmation, while its ticket is resolved.
+    await call("/api/events", { events: [kase("v2", "Open", "Investigating"), kase("v3", "Awaiting Confirmation", "Resolved")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-es-resolved" });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+    expect(replies[0]!.text).toContain("- **es_status:** Mitigated → Resolved");
+    expect(replies[0]!.text).not.toContain("no longer applies");
+    expect(replies[0]!.text).not.toContain("Investigating");
+    expect(replies[0]!.text).toContain("Playbook for case-es-resolved");
+    expect(replies[0]!.text).not.toContain("General case playbook.");
+  });
+
+  it("a done task a post reopens through a rule mismatch: links the event that reopened it and briefs on the rule it ends on", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch_batch_reopen");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const watch = ["payload.es_status", "payload.case_status"];
+    const rules: SignalsConfig["rules"] = [
+      { id: "case-es-resolved", sources: ["table.cases"], when: { "payload.es_status": ["Resolved"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+      { id: "case-awaiting", sources: ["table.cases"], when: { "payload.case_status": ["Awaiting Confirmation"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+    ];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-es-resolved": "Draft confirm-or-close.", cases: "General case playbook." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (id: string, case_status: string, es_status: string) => ({ source: "table.cases", external_id: id, account: "Globex", title: `Case C-1 (${es_status})`, url: `https://cases.example/${id}`, payload: { case: "C-1", case_status, es_status } });
+    await call("/api/events", { events: [kase("v1", "Awaiting Confirmation", "Mitigated")] });
+    await call("/api/task", { id: 1, status: "done" });
+    replies.length = 0;
+    await call("/api/events", { events: [kase("v2", "Open", "Investigating"), kase("v3", "Awaiting Confirmation", "Resolved")] });
+    const task = await store.task(1);
+    expect(task).toMatchObject({ status: "open", rule_id: "case-es-resolved" });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+    // v2 matches no rule of the group (it isn't placed); v3 opened it again and is the one linked.
+    expect(replies[0]!.text).toMatch(/^↩️ Open again: \[Case C-1 \(Resolved\)\]\(https:\/\/cases\.example\/v3\)\n/);
+    expect(replies[0]!.text).not.toContain("Investigating");
+    expect(replies[0]!.text).toContain("- **es_status:** Mitigated → Resolved");
+    expect(replies[0]!.text).not.toContain("no longer applies");
+    expect(replies[0]!.text).toContain("Playbook for case-es-resolved");
+    expect(replies[0]!.text).not.toContain("General case playbook.");
+  });
+
+  it("a post whose last event changes no watched field still briefs without a rule the post left behind", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch_batch_title");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const watch = ["payload.es_status", "payload.case_status"];
+    const rules: SignalsConfig["rules"] = [
+      { id: "case-es-resolved", sources: ["table.cases"], when: { "payload.es_status": ["Resolved"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+      { id: "case-awaiting", sources: ["table.cases"], when: { "payload.case_status": ["Awaiting Confirmation"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases", watch },
+      { id: "case-updates", sources: ["table.cases"], action: "update" as const, group: "case", group_by: "payload.case" },
+    ];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-awaiting": "Ask them to confirm the fix.", cases: "General case playbook." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (id: string, title: string, case_status: string, es_status: string) => ({ source: "table.cases", external_id: id, account: "Globex", title, url: `https://cases.example/${id}`, payload: { case: "C-1", case_status, es_status } });
+    await call("/api/events", { events: [kase("v1", "Case C-1", "Awaiting Confirmation", "Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-awaiting" });
+    // The case goes back to Open (the mismatch alone), and then, in one post, back to Open followed by a title-only
+    // update that keeps it Open / Investigating. Both attach through case-updates.
+    const post = async (events: unknown[]) => {
+      replies.length = 0;
+      await call("/api/events", { events });
+      expect(await store.task(1)).toMatchObject({ rule_id: "case-awaiting" });
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+      return replies[0]!.text;
+    };
+    const alone = await post([kase("v2", "Case C-1", "Open", "Investigating")]);
+    await call("/api/events", { events: [kase("v3", "Case C-1", "Awaiting Confirmation", "Mitigated")] });
+    const withTitle = await post([kase("v4", "Case C-1", "Open", "Investigating"), kase("v5", "Case C-1 (renamed)", "Open", "Investigating")]);
+    expect(withTitle).toContain("https://cases.example/v4");
+    for (const text of [alone, withTitle]) {
+      expect(text).toContain("- **es_status:** Mitigated → Investigating");
+      expect(text).toContain("The rule this task is under (case-awaiting) no longer applies");
+      expect(text).not.toContain("Ask them to confirm the fix.");
+      expect(text).toContain("General case playbook.");
+    }
+  });
+
+  it("a post's last event through a rule watching nothing still briefs without a rule the post left behind", async () => {
+    const store = new SignalsStore(pglite(), "signals_watch_batch_mixed");
+    await store.setup();
+    const replies: { task: number; text: string; agents: readonly string[] }[] = [];
+    const rules: SignalsConfig["rules"] = [
+      // The task rule watches nothing; the status update rule watches the ticket; the metadata update rule watches nothing.
+      { id: "case-awaiting", sources: ["table.cases"], when: { "payload.case_status": ["Awaiting Confirmation"] }, action: "task" as const, group: "case", group_by: "payload.case", workstream: "cases" },
+      { id: "case-status", sources: ["table.cases"], when: { "payload.kind": ["status"] }, action: "update" as const, group: "case", group_by: "payload.case", watch: ["payload.es_status"] },
+      { id: "case-meta", sources: ["table.cases"], when: { "payload.kind": ["meta"] }, action: "update" as const, group: "case", group_by: "payload.case" },
+    ];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "f".repeat(63) + task.id, updated: async (task, text, agents = []) => void replies.push({ task: task.id, text, agents }) },
+      { defaultConfig: { version: 1, rules } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const genie = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", agents: [genie], preferences: "cases: draft", playbooks: { "case-awaiting": "Ask them to confirm the fix.", cases: "General case playbook." } });
+    await call("/api/sources", { source: "table.cases", enabled: true });
+    await call("/api/events", { events: [{ source: "table.cases", external_id: "seed" }] });
+    const kase = (id: string, kind: string, title: string, case_status: string, es_status: string) => ({ source: "table.cases", external_id: id, account: "Globex", title, url: `https://cases.example/${id}`, payload: { case: "C-1", kind, case_status, es_status } });
+    await call("/api/events", { events: [kase("v1", "status", "Case C-1", "Awaiting Confirmation", "Mitigated")] });
+    expect(await store.task(1)).toMatchObject({ rule_id: "case-awaiting" });
+    const post = async (events: unknown[]) => {
+      replies.length = 0;
+      await call("/api/events", { events });
+      expect(await store.task(1)).toMatchObject({ rule_id: "case-awaiting" });
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
+      return replies[0]!.text;
+    };
+    // The status update alone, and then the status update followed by a metadata update that leaves the case Open / Investigating.
+    const alone = await post([kase("v2", "status", "Case C-1", "Open", "Investigating")]);
+    expect(alone).toContain("Now: es_status Investigating.");
+    await call("/api/events", { events: [kase("v3", "status", "Case C-1", "Awaiting Confirmation", "Mitigated")] });
+    const withMeta = await post([kase("v4", "status", "Case C-1", "Open", "Investigating"), kase("v5", "meta", "Case C-1 (renamed)", "Open", "Investigating")]);
+    expect(withMeta).toContain("https://cases.example/v4");
+    expect(withMeta).not.toContain("Now:");
+    for (const text of [alone, withMeta]) {
+      expect(text).toContain("- **es_status:** Mitigated → Investigating");
+      expect(text).toContain("The rule this task is under (case-awaiting) no longer applies");
+      expect(text).not.toContain("Ask them to confirm the fix.");
+      expect(text).toContain("General case playbook.");
+    }
+  });
+
+  it("merges one field's changes across a post from its first value to its last", () => {
+    expect(mergedChanges([{ field: "s", from: "A", to: "B" }, { field: "t", from: "x", to: "y" }, { field: "s", from: "B", to: "C" }])).toEqual([{ field: "s", from: "A", to: "C" }, { field: "t", from: "x", to: "y" }]);
+    expect(mergedChanges([{ field: "s", from: "A", to: "B" }, { field: "s", from: "B", to: "A" }])).toEqual([]);
   });
 });
 
