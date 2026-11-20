@@ -8,7 +8,7 @@
 // - tasks: one per rule group across everyone (two people getting the same
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
 import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
@@ -108,6 +108,20 @@ const LATEST_REVISION = (n: number) => `NOT EXISTS (SELECT 1 FROM $S.events o JO
 export type Reply = Readonly<{ group: string; event: number; owner: string; source: string; title: string | null; url: string | null; at: number; micros?: number }>;
 
 export type Outcome = "new" | "changed" | "same" | "skipped";
+/** A meeting's notes moving their prep task to their rule (meeting_task): the task, what changed, whether attaching them opens it again, and whether it was done. */
+type Joined = Readonly<{ task: number; changes: FieldChange[]; reopen: boolean; was_done: boolean; at: number }>;
+
+/** A move taken to report (see claimJoin): the notes event, the claim's token (it must match to clear or release it), and when the move was made. */
+export type JoinClaim = Readonly<{ event: number; claim: string; at: number }>;
+
+/** What resumeItems finished on a notes event: its task, the tasks it opened, the checklist when it changed, and the move it reported (see meetingTask). */
+type Resumed = Readonly<{ task: Task; opened: number[]; checklist?: string | null; joined?: JoinClaim; changes?: FieldChange[]; reopened?: boolean }>;
+
+/** A resumed notes event's update, as an ingest's is (see IngestResult.updated). */
+function resumedUpdate(resumed: Resumed) {
+  return { ...(resumed.checklist !== undefined && { checklist: resumed.checklist }), ...(resumed.joined && { joined: resumed.joined }), ...(resumed.changes && { changes: resumed.changes }), ...(resumed.reopened && { reopened: true }) };
+}
+
 /** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
 export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
 
@@ -132,7 +146,11 @@ export type IngestResult = Readonly<{
   /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
   updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] };
     /** A meeting's follow-up whose checklist this event changed: the checklist now (null: the notes list no items now, so it was cleared). */
-    checklist?: string | null }[];
+    checklist?: string | null;
+    /** A meeting's notes that just moved its prep task to their rule (meeting_task): its agents are the new workstream's. The
+     * claim on the notes event's mark, which keeps the move until it's reported: the hub clears it (reportedJoins) once the update
+     * is posted, or releases it (releaseJoins) when it couldn't be, for the next sweep. */
+    joined?: JoinClaim }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
@@ -144,6 +162,8 @@ const now = () => Math.floor(Date.now() / 1000);
 
 /** Seconds an ingest has to place a pending notes version before the sweep may (see events.placing_at). */
 export const PLACING_LEASE = 600;
+/** Seconds a run that took a notes event's move to report has before another may (see events.join_claimed_at). */
+const JOIN_LEASE = PLACING_LEASE;
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 export const contentHash = (event: EventInput) => createHash("sha256").update(contentKey(event)).digest("hex").slice(0, 32);
@@ -219,6 +239,14 @@ export class SignalsStore {
     // The event version whose action items are being written, until all are: one a failed write cut short is finished by the sweep (or a repost).
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_pending int`);
     await this.q(`CREATE INDEX IF NOT EXISTS events_items_pending ON $S.events (id) WHERE items_pending IS NOT NULL`);
+    // A meeting's notes that just moved their meeting's prep task to their rule (meeting_task), until that move is reported:
+    // {task, changes, reopen, was_done}, set in the statement that moves it, so the sweep finishes a move a failed write cut short
+    // (attaching them, opening it again, asking the follow-up's agents) and the run that clears it is the one that reports it.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS join_pending jsonb`);
+    await this.q(`CREATE INDEX IF NOT EXISTS events_join_pending ON $S.events (id) WHERE join_pending IS NOT NULL`);
+    // When a run took the move to report, and its token (see claimJoin): another run leaves it to that one until JOIN_LEASE has passed.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS join_claimed_at bigint`);
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS join_claim text`);
     // When the sweep last tried a pending event's items: the least recently tried go first, so ones that keep failing don't hold up the rest.
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_tried bigint`);
     // While an ingest is placing a pending notes version (its classifier may take a while): the sweep leaves it to that ingest
@@ -287,6 +315,9 @@ export class SignalsStore {
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.activities (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, text text NOT NULL)`);
     await this.q(`CREATE INDEX IF NOT EXISTS activities_task ON $S.activities (task_id, at)`);
+    // What an activity is about, when it must be recorded once however often it's tried (a move's `changed`, see Hub.changed).
+    await this.q(`ALTER TABLE $S.activities ADD COLUMN IF NOT EXISTS ref text`);
+    await this.q(`CREATE UNIQUE INDEX IF NOT EXISTS activities_ref ON $S.activities (task_id, kind, ref) WHERE ref IS NOT NULL`);
     // The disclosure check's result for each agent reply it looked at, once per reply.
     await this.q(`CREATE TABLE IF NOT EXISTS $S.disclosure_checks (task_id bigint NOT NULL, reply_id text NOT NULL, status text NOT NULL, kinds text[] NOT NULL DEFAULT '{}', at bigint NOT NULL, PRIMARY KEY (task_id, reply_id))`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.artifacts (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, url text NOT NULL, title text)`);
@@ -542,7 +573,8 @@ export class SignalsStore {
         // so the sweep places it as this ingest would (a first run opens tasks only with first_run_seen false; otherwise
         // placing it finds nothing to do and clears the marker).
         const fan = fanOut(config, event, { firstRun: state.firstRun, owner });
-        const recorded = await this.record(owner, event, config.rules.some((rule) => rule.action_items && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
+        // (So is one a rule with meeting_task may take: its placement, which may move a prep task, is finished the same way.)
+        const recorded = await this.record(owner, event, config.rules.some((rule) => (rule.action_items || rule.meeting_task) && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
         counts[recorded.outcome]++;
         saved = true;
         if (recorded.outcome !== "same" && recorded.itemsPending !== undefined) {
@@ -577,7 +609,7 @@ export class SignalsStore {
             const resumed = await this.resumeItems(owner, recorded.id, config, classifier);
             if (resumed) {
               for (const id of resumed.opened) opened.add(id);
-              if (resumed.checklist !== undefined) result.updated.push({ task: (await this.task(resumed.task.id))!, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), checklist: resumed.checklist });
+              if (resumed.checklist !== undefined || resumed.joined) result.updated.push({ task: resumed.task, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...resumedUpdate(resumed) });
             }
           }
           continue;
@@ -613,13 +645,17 @@ export class SignalsStore {
         // A finished task opens again for a new event, when attached (below): not for a message older than a team reply decided on it
         // (that reply answered it), and not for a late event that is itself past done, like a meeting's notes after it ended.
         // (A task this event just opened too: a team reply decided while it was being attached may have closed it already.)
-        const reopen = placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true });
+        // (Notes that just moved their meeting's prep task: as the move decided, saved with it for a sweep that finishes it.)
+        const reopen = placed.joined ? placed.joined.reopen : placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true });
         // What the watched fields were: this event's last version, or else the task's latest event (another event of its group).
         let changes: FieldChange[] = [];
         let outgrown: { rule: string; values: { field: string; value: string }[] } | undefined;
         if (!placed.opened) {
           const watched = [...(placed.rule.watch ?? []), ...(config.rules.find((rule) => rule.id === task.rule_id)?.watch ?? [])];
-          if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
+          // A meeting's notes that just joined its prep task (meeting_task): the move, so its agents are asked to go on with this rule's playbook,
+          // with the watched fields' changes, all saved with the move (see meetingTask), so a retry from the sweep posts the same.
+          if (placed.joined) changes = placed.joined.changes;
+          else if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
           // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
           if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule);
@@ -638,6 +674,9 @@ export class SignalsStore {
           const items = await this.actionItems(owner, event, recorded, task, placed.rule, config);
           for (const id of items.opened) opened.add(id);
           checklist = items.checklist;
+        } else if (recorded.itemsPending !== undefined) {
+          // Placed and attached, with no action items to write (a meeting_task rule without them): nothing left for the sweep.
+          await this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [recorded.id, recorded.itemsPending]);
         }
         // A done task isn't taken over above; once this event opened it again, the rule it now matches takes it, as for an open one.
         if (reopened && changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task") {
@@ -654,8 +693,13 @@ export class SignalsStore {
           }
         }
         const fresh = (await this.task(task.id))!;
+        // The move is reported by the run that takes it (a sweep that finished it first reports it), the last write here,
+        // with everything its update needs already read: a failure before it leaves the move for the sweep. Its mark stays
+        // until the hub has posted the update (see IngestResult.updated's joined).
+        const joined = placed.joined && (await this.claimJoin(recorded.id));
+        if (placed.joined && !joined) changes = changes.slice(placed.joined.changes.length);
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }), ...(joined && { joined: joined.claim }) });
       } catch (error) {
         result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning) && { retry: true }) });
         if (!saved || fanning) retried.add(event.source);
@@ -666,9 +710,15 @@ export class SignalsStore {
       }
     }
     // As they are now: a later event of this post (a team reply) may have closed one it opened. Those aren't new work.
-    for (const id of opened) {
-      const task = await this.task(id);
-      if (task && isOpen(task.status)) result.created.push(task);
+    // (A read failing here returns no update: the moves this post took to report go back to the sweep.)
+    try {
+      for (const id of opened) {
+        const task = await this.task(id);
+        if (task && isOpen(task.status)) result.created.push(task);
+      }
+    } catch (error) {
+      await this.releaseJoins(result.updated.flatMap((update) => (update.joined ? [update.joined] : []))).catch(() => {});
+      throw error;
     }
     const by = new Map<string, number>();
     for (const event of events) by.set(event.source, (by.get(event.source) ?? 0) + 1);
@@ -686,7 +736,7 @@ export class SignalsStore {
    * task asks the team, and the series' other events are held until they
    * answer; a series they said never to work on opens no tasks.
    */
-  private async place(owner: string, event: EventInput, recorded: { id: number; version?: number }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
+  private async place(owner: string, event: EventInput, recorded: { id: number; version?: number; before?: EventInput }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule; joined?: Joined } | undefined> {
     const decision = decide(config, event, { firstRun, owner });
     if (decision.kind === "none") return undefined;
     const rule = decision.rule;
@@ -703,9 +753,132 @@ export class SignalsStore {
       return { task: copy, opened: false, create: decision.create, rule };
     }
     if (!decision.create) return undefined;
+    // A meeting's notes whose meeting has its task (its prep): the notes go there instead, once the rule's classifier
+    // (asked here, before anything moves) passes them, as it would before opening their own follow-up.
+    if (rule.meeting_task) {
+      if (!(await this.classified(event, recorded, decision, classifier, filtered))) return undefined;
+      classifier = undefined;
+      const meeting = await this.meetingTask(event, recorded, decision, config);
+      if (meeting) return { ...meeting, opened: false, create: true, rule };
+    }
     const placed = await this.placeNew(owner, event, recorded, decision, classifier, filtered);
     if (placed && decision.same) await this.copyOf(decision.same, placed.task.id);
     return placed;
+  }
+
+  /**
+   * For a rule with `meeting_task`: the task rule `meeting_task.rule` has for
+   * the calendar event the notes' `payload.meeting` link names (an event of
+   * `meeting_task.source` on it, whoever's calendar it came from: the task is
+   * the team's, in the account's channel, and is the same task for every
+   * attendee's copy). Only when exactly one such task is there, it isn't
+   * asking about its series, and it's the account and channel the notes are
+   * for (the notes' routing decides; a prep task elsewhere is left alone).
+   * The notes' group is linked to it, and it moves to this rule (workstream,
+   * and the team's mode for this rule on the notes' account) with an
+   * activity, and the move is marked on the notes event (join_pending), all
+   * in one statement, so the notes' later versions come to it, its sweep
+   * follows this rule (a prep task's meeting end no longer closes it), and a
+   * failed write after it leaves the move for the sweep to finish. Returns
+   * the task, and the move (only for the call whose statement linked it).
+   * Undefined: the notes open their own task.
+   */
+  private async meetingTask(event: EventInput, recorded: { id: number; version?: number; before?: EventInput }, decision: Extract<Decision, { kind: "task" }>, config: SignalsConfig): Promise<{ task: Task; joined?: Joined } | undefined> {
+    const rule = decision.rule;
+    const spec = rule.meeting_task!;
+    const target = config.rules.find((one) => one.id === spec.rule && one.action === "task");
+    const meetingId = calendarEventId(event.payload?.meeting);
+    if (!target || !meetingId || decision.mode === "off" || !decision.account) return undefined;
+    const prefix = `${target.group ?? target.id}|`;
+    const found = await this.q(
+      `SELECT DISTINCT t.* FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id JOIN $S.tasks t ON t.id = te.task_id
+       WHERE e.source = $1 AND e.external_id = $2 AND left(t.group_key, length($3)) = $3 AND (t.series IS NULL OR t.asked_by IS DISTINCT FROM $4)
+       ORDER BY t.id LIMIT 2`,
+      [spec.source ?? "google_calendar", meetingId, prefix, SERIES_ASKER],
+    );
+    if (found.rows.length !== 1) return undefined;
+    const task = toTask(found.rows[0]!);
+    if (task.account?.toLowerCase() !== decision.account.name.toLowerCase() || (task.channel ?? null) !== (decision.channel ?? null)) return undefined;
+    const time = now();
+    const workstream = rule.workstream ?? task.workstream ?? null;
+    // The move, and the fields the rules watch, as an attached event's update shows them (what they were: this event's last
+    // version, or else the task's latest event): saved with the move, so the handoff a retry posts is the same.
+    const watched = [...(rule.watch ?? []), ...(config.rules.find((one) => one.id === task.rule_id)?.watch ?? [])];
+    const changes: FieldChange[] = [
+      ...(task.workstream && workstream && task.workstream !== workstream ? [{ field: "workstream", from: task.workstream, to: workstream }] : task.rule_id !== rule.id ? [{ field: "rule", from: task.rule_id, to: rule.id }] : []),
+      ...(watched.length ? fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event) : []),
+    ];
+    // Opened again when the notes are attached, unless the notes rule says notes like these are past done.
+    const joined: Joined = { task: task.id, changes, reopen: !doneReason(doneWhenOf(config, rule), event, { at: time, sweep: true }), was_done: !isOpen(task.status), at: time };
+    const linked = await this.q(
+      // Only while this is the notes event's saved version and the doc's newest revision, checked here as openTask does:
+      // an older revision, its classifier finishing late, moves nothing. The event's row is locked for the update up front
+      // (as fan-out's attachment does), since this statement writes join_pending on it: two runs finishing the same move
+      // (the sweep and an identical repost) take turns, where with share locks each would wait on the other's.
+      `WITH l AS (INSERT INTO $S.group_links (group_key, task_id, at) SELECT $1, id, $3 FROM $S.tasks WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM $S.tasks WHERE group_key = $1)
+             AND EXISTS (SELECT 1 FROM $S.events WHERE id = $9::bigint AND ($10::integer IS NULL OR versions = $10::integer) FOR NO KEY UPDATE)
+             AND ($10::integer IS NULL OR ${LATEST_REVISION(9)})
+           ON CONFLICT (group_key) DO NOTHING RETURNING task_id),
+         t AS (UPDATE $S.tasks SET rule_id = $4, workstream = $5, mode = $6, updated_at = $3 WHERE id = $2 AND EXISTS (SELECT 1 FROM l) RETURNING *),
+         act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $3, 'signals', 'rule', $7 FROM t RETURNING 1),
+         ev AS (UPDATE $S.events SET join_pending = $8::jsonb WHERE id = $9 AND EXISTS (SELECT 1 FROM t) RETURNING 1)
+       SELECT * FROM t`,
+      [decision.group, task.id, time, rule.id, workstream, decision.mode,
+        `Now under rule ${rule.id}: this meeting's notes came in (${clip(event.title ?? event.external_id, 200)}), so its follow-up is here.`,
+        JSON.stringify(joined), recorded.id, recorded.version ?? null],
+    );
+    if (!linked.rows[0]) {
+      // Linked meanwhile by another post of these notes (that post tells its agents), or the notes have their own task now.
+      const other = await this.taskByGroup(decision.group);
+      return other ? { task: other } : undefined;
+    }
+    return { task: toTask(linked.rows[0]), joined };
+  }
+
+  /**
+   * A notes event's move of its prep task (see meetingTask), taken to report:
+   * the run whose statement takes it reports it. Its mark stays (the hub
+   * clears it once the update is posted, see reportedJoins), and another run
+   * leaves it alone until JOIN_LEASE has passed or it's released. The claim's
+   * token is new each time: a run whose lease passed (another run took the
+   * move since) can't clear or release the newer claim. Undefined: none, or
+   * another run has it.
+   */
+  private async claimJoin(event: number): Promise<{ joined: Joined; claim: JoinClaim } | undefined> {
+    const at = now();
+    const claim = randomUUID();
+    const found = await this.q<{ join_pending: unknown }>(
+      `UPDATE $S.events SET join_claimed_at = $2, join_claim = $4 WHERE id = $1 AND join_pending IS NOT NULL AND (join_claimed_at IS NULL OR join_claimed_at < $3) RETURNING join_pending`,
+      [event, at, at - JOIN_LEASE, claim],
+    );
+    const raw = found.rows[0]?.join_pending;
+    if (raw === undefined || raw === null) return undefined;
+    const joined = (typeof raw === "string" ? JSON.parse(raw) : raw) as Joined;
+    return { joined, claim: { event, claim, at: joined.at ?? at } };
+  }
+
+  /** Moves the hub has posted the update for (see claimJoin): their marks cleared, each only while it's still that claim. */
+  async reportedJoins(claims: readonly JoinClaim[]): Promise<void> {
+    for (const { event, claim } of claims)
+      await this.q(`UPDATE $S.events SET join_pending = NULL, join_claimed_at = NULL, join_claim = NULL WHERE id = $1 AND join_claim = $2`, [event, claim]);
+  }
+
+  /** Moves the hub couldn't post the update for (a read or the post failed): left for the next sweep, each only while it's still that claim. */
+  async releaseJoins(claims: readonly JoinClaim[]): Promise<void> {
+    for (const { event, claim } of claims) await this.q(`UPDATE $S.events SET join_claimed_at = NULL, join_claim = NULL WHERE id = $1 AND join_claim = $2`, [event, claim]);
+  }
+
+  /** A move with nothing to report (the notes aren't on the task it moved): its mark cleared (this run's claim, or one no run holds). */
+  private async dropJoin(event: number, claim?: JoinClaim): Promise<void> {
+    if (claim) await this.q(`UPDATE $S.events SET join_pending = NULL, join_claimed_at = NULL, join_claim = NULL WHERE id = $1 AND join_claim = $2`, [event, claim.claim]);
+    else await this.q(`UPDATE $S.events SET join_pending = NULL WHERE id = $1 AND join_pending IS NOT NULL AND (join_claimed_at IS NULL OR join_claimed_at < $2)`, [event, now() - JOIN_LEASE]);
+  }
+
+  /** A notes event's pending move (see meetingTask), as saved. */
+  private async pendingJoin(event: number): Promise<Joined | undefined> {
+    const raw = (await this.q<{ join_pending: unknown }>(`SELECT join_pending FROM $S.events WHERE id = $1`, [event])).rows[0]?.join_pending;
+    if (raw === undefined || raw === null) return undefined;
+    return (typeof raw === "string" ? JSON.parse(raw) : raw) as Joined;
   }
 
   /**
@@ -794,26 +967,38 @@ export class SignalsStore {
     return found.rows[0] ? toTask(found.rows[0]) : undefined;
   }
 
+  /**
+   * The rule's classifier on an event that would open (or, with
+   * meeting_task, move) a task: false when it scored it under the rule's
+   * minimum (recorded as filtered, for the channel its task would have gone
+   * to); a passing score is recorded too. Fails open: no classifier, or no
+   * score (the model is down, say), passes.
+   */
+  private async classified(event: EventInput, recorded: { id: number; version?: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<boolean> {
+    const rule = decision.rule;
+    if (!rule.classify || !classifier) return true;
+    const score = await classifier(event, rule.classify).catch(() => undefined);
+    const min = rule.classify.min ?? DEFAULT_CLASSIFY_MIN;
+    if (typeof score === "number" && Number.isFinite(score) && score < min) {
+      // The channel its task would have gone to, so that channel's board can list it.
+      // (Only while this is still the event's latest version: an older one's request, finishing late, leaves the newer one's decision.)
+      await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4, filtered_channel = $5, filtered_version = $6 WHERE id = $1 AND ($6::integer IS NULL OR versions = $6::integer)`, [recorded.id, rule.id, score, now(), decision.channel ?? null, recorded.version ?? null]);
+      filtered?.();
+      return false;
+    }
+    if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL, filtered_channel = NULL, filtered_version = $3 WHERE id = $1 AND ($3::integer IS NULL OR versions = $3::integer)`, [recorded.id, score, recorded.version ?? null]);
+    return true;
+  }
+
   private async placeNew(owner: string, event: EventInput, recorded: { id: number; version?: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const rule = decision.rule;
-    if (rule.classify && classifier) {
-      // Fails open: no score (the model is down, say) opens the task.
-      const score = await classifier(event, rule.classify).catch(() => undefined);
-      const min = rule.classify.min ?? DEFAULT_CLASSIFY_MIN;
-      if (typeof score === "number" && Number.isFinite(score) && score < min) {
-        // The channel its task would have gone to, so that channel's board can list it.
-        // (Only while this is still the event's latest version: an older one's request, finishing late, leaves the newer one's decision.)
-        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4, filtered_channel = $5, filtered_version = $6 WHERE id = $1 AND ($6::integer IS NULL OR versions = $6::integer)`, [recorded.id, rule.id, score, now(), decision.channel ?? null, recorded.version ?? null]);
-        filtered?.();
-        return undefined;
-      }
-      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL, filtered_channel = NULL, filtered_version = $3 WHERE id = $1 AND ($3::integer IS NULL OR versions = $3::integer)`, [recorded.id, score, recorded.version ?? null]);
-    }
+    if (!(await this.classified(event, recorded, decision, classifier, filtered))) return undefined;
     // For a rule with a classifier or action items, the task opens only while this is still the event's latest version, checked in the
     // statement that opens it: whether this run just asked the classifier or the sweep retries a saved version, a newer version recorded
     // meanwhile is that version's to decide (with its own request), not this one's. For notes (action_items) that includes a newer
-    // revision of the same document saved under its own id (see LATEST_REVISION).
-    const latest = (rule.classify || rule.action_items) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items) } : undefined;
+    // revision of the same document saved under its own id (see LATEST_REVISION), as for meeting_task's notes.
+    // (So for a rule with meeting_task: an older revision whose move the newest one's decision stopped opens no follow-up instead.)
+    const latest = (rule.classify || rule.action_items || rule.meeting_task) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
     const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at), latest };
     const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
       const opened = await this.openTask(task);
@@ -860,21 +1045,27 @@ export class SignalsStore {
   }
 
   /**
-   * For a notes event whose action items weren't all written (a write
-   * failed): writes them now, from the saved event (each item once). The
-   * sweep runs it for every such event, so it doesn't wait on the poller
-   * posting the same version again (it won't: it has read it).
+   * For a notes event whose action items weren't all written, or whose move
+   * of its meeting's prep task wasn't reported (a write failed): writes the
+   * items now, from the saved event (each item once), and finishes the move
+   * (attaching the notes, opening the task again when the move said so) and
+   * returns it to be reported, once. The sweep runs it for every such event,
+   * so it doesn't wait on the poller posting the same version again (it
+   * won't: it has read it).
    */
-  private async resumeItems(owner: string, id: number, config: SignalsConfig, classifier?: Classifier): Promise<{ task: Task; opened: number[]; checklist?: string | null } | undefined> {
+  private async resumeItems(owner: string, id: number, config: SignalsConfig, classifier?: Classifier): Promise<Resumed | undefined> {
     // Not one an ingest is placing now (it decides, with its classifier): left to it until it's done or its lease is past.
-    const row = (await this.q(`SELECT * FROM $S.events WHERE id = $1 AND items_pending IS NOT NULL AND (placing_at IS NULL OR placing_at < $2)`, [id, now() - PLACING_LEASE])).rows[0];
+    // (A move another run took to report is left to it, too: see claimJoin.)
+    const row = (await this.q(`SELECT * FROM $S.events WHERE id = $1 AND (items_pending IS NOT NULL OR (join_pending IS NOT NULL AND (join_claimed_at IS NULL OR join_claimed_at < $3))) AND (placing_at IS NULL OR placing_at < $2)`, [id, now() - PLACING_LEASE, now() - JOIN_LEASE])).rows[0];
     if (!row) return undefined;
-    const done = () => this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [id, row.items_pending]);
+    const itemsPending = num(row.items_pending);
+    const done = () => (itemsPending === null ? Promise.resolve() : this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [id, itemsPending]));
     const event: EventInput = { ...toEvent(row), ...(row.group_key ? { group_key: String(row.group_key) } : {}) };
     const placedNow: number[] = [];
     let task = num(row.task_id) === null ? undefined : await this.task(num(row.task_id)!);
     // Never placed on its task (that write failed, after it was saved): placed and attached now, as ingest would have.
-    // (It doesn't open a done task again from here: a sweep isn't the customer's message arriving.)
+    // (It doesn't open a done task again from here: a sweep isn't the customer's message arriving. Unless the notes just
+    // moved their meeting's prep task: that move said whether they open it again, as their ingest would have.)
     // The classifier's decision on this version (filtered, or its passing score), if it made one: an earlier version's is
     // about other content, and this one is asked again.
     const decided = num(row.filtered_version) !== null && num(row.filtered_version) === Number(row.versions) && num(row.filtered_score) !== null;
@@ -884,46 +1075,69 @@ export class SignalsStore {
       // And on a first run as its ingest was (see record).
       const placed = await this.place(owner, event, { id, version: Number(row.versions) }, config, row.items_first_run === true, decided ? undefined : classifier);
       if (placed) {
-        await this.attach(placed.task.id, id, Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen: false });
+        // (The move as saved: by the ingest a failed write cut short, or by place just now.)
+        const join = placed.joined ?? (await this.pendingJoin(id));
+        const reopen = join?.task === placed.task.id && join.reopen;
+        await this.attach(placed.task.id, id, Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
         task = await this.task(placed.task.id);
         if (placed.opened && task) placedNow.push(task.id);
       }
     }
     const rule = task && config.rules.find((one) => one.id === task.rule_id && one.action_items);
-    // Nothing to write now (its task is gone, no rule takes it, or its rule has no action items any more).
-    if (!task || !rule) {
-      await done();
+    // Items to write: a rule with action items takes it and they aren't all written.
+    const written = task && rule && itemsPending !== null ? await this.actionItems(owner, event, { id, version: Number(row.versions), micros: num(row.occurred_us) }, task, rule, config) : undefined;
+    if (!written) await done();
+    if (!task) {
+      await this.dropJoin(id);
       return undefined;
     }
-    const written = await this.actionItems(owner, event, { id, version: Number(row.versions), micros: num(row.occurred_us) }, task, rule, config);
-    return { task, ...written, opened: [...placedNow, ...written.opened] };
+    // Its move, reported by the run that takes it, when the task it moved is the one the notes are on: the last write
+    // here, after the task is read for the update, so a failure before it leaves the move for the next sweep (and the
+    // hub clears its mark once it has posted the update).
+    const current = (await this.task(task.id)) ?? task;
+    const join = await this.claimJoin(id);
+    const moved = join?.joined.task === task.id ? join.joined : undefined;
+    if (join && !moved) await this.dropJoin(id, join.claim);
+    if (!written && !moved) return undefined;
+    // The handoff, as its first post would have been: with the checklist the notes saved on the task (a failed post, or one
+    // whose items were written before), when no items were written now.
+    const checklist = written?.checklist !== undefined ? written.checklist : moved && current.checklist ? current.checklist : undefined;
+    return {
+      task: current,
+      opened: [...placedNow, ...(written?.opened ?? [])],
+      ...(checklist !== undefined && { checklist }),
+      ...(moved && { joined: join!.claim, ...(moved.changes.length && { changes: moved.changes }), ...(moved.was_done && isOpen(current.status) && { reopened: true }) }),
+    };
   }
 
   /**
-   * Finishes the action items of every notes event a failed write cut short
-   * (see resumeItems). Returns the tasks it opened and the follow-ups whose
-   * checklist changed, to be posted as an ingest's are; an event that fails
-   * again stays pending for the next sweep.
+   * Finishes the action items of every notes event a failed write cut short,
+   * and the moves of prep tasks it left unreported (see resumeItems).
+   * Returns the tasks it opened and the follow-ups whose checklist changed or
+   * that moved, to be posted as an ingest's are; an event that fails again
+   * stays pending for the next sweep.
    */
-  async pendingItems(config: SignalsConfig, limit = 20, classifier?: Classifier): Promise<{ created: Task[]; updated: { task: Task; title?: string; url?: string; checklist: string | null }[]; errors: { event: number; error: string }[] }> {
-    const out = { created: [] as Task[], updated: [] as { task: Task; title?: string; url?: string; checklist: string | null }[], errors: [] as { event: number; error: string }[] };
-    if (!config.rules.some((rule) => rule.action_items)) return out;
+  async pendingItems(config: SignalsConfig, limit = 20, classifier?: Classifier): Promise<{ created: Task[]; updated: IngestResult["updated"]; errors: { event: number; error: string }[] }> {
+    const out = { created: [] as Task[], updated: [] as IngestResult["updated"], errors: [] as { event: number; error: string }[] };
+    if (!config.rules.some((rule) => rule.action_items || rule.meeting_task)) return out;
     // Least recently tried first (never tried before those that failed), each marked tried now.
     const found = await this.q<{ id: unknown; owner: string; title: string | null; url: string | null }>(
-      `UPDATE $S.events e SET items_tried = $2 FROM (SELECT id FROM $S.events WHERE items_pending IS NOT NULL ORDER BY items_tried NULLS FIRST, id LIMIT $1) next
+      `UPDATE $S.events e SET items_tried = $2 FROM (SELECT id FROM $S.events WHERE items_pending IS NOT NULL OR (join_pending IS NOT NULL AND (join_claimed_at IS NULL OR join_claimed_at < $3))
+         ORDER BY items_tried NULLS FIRST, id LIMIT $1) next
        WHERE e.id = next.id RETURNING e.id, e.owner, e.title, e.url`,
-      [limit, Date.now()],
+      [limit, Date.now(), now() - JOIN_LEASE],
     );
     found.rows.sort((a, b) => Number(a.id) - Number(b.id));
     for (const row of found.rows) {
       try {
         const resumed = await this.resumeItems(row.owner, Number(row.id), config, classifier);
         if (!resumed) continue;
+        // (Its update first, from what resumeItems read before it cleared the move's mark: a failed read below loses no handoff.)
+        if (resumed.checklist !== undefined || resumed.joined) out.updated.push({ task: resumed.task, ...(row.title && { title: row.title }), ...(row.url && { url: row.url }), ...resumedUpdate(resumed) });
         for (const id of resumed.opened) {
           const task = await this.task(id);
           if (task && isOpen(task.status)) out.created.push(task);
         }
-        if (resumed.checklist !== undefined) out.updated.push({ task: (await this.task(resumed.task.id))!, ...(row.title && { title: row.title }), ...(row.url && { url: row.url }), checklist: resumed.checklist });
       } catch (error) {
         out.errors.push({ event: Number(row.id), error: (error as Error).message });
       }
@@ -1267,8 +1481,15 @@ export class SignalsStore {
     return task ?? (await this.task(id));
   }
 
-  async activity(task: number, actor: string, kind: string, text: string): Promise<void> {
-    await this.q(`INSERT INTO $S.activities (task_id, at, actor, kind, text) VALUES ($1, $2, $3, $4, $5)`, [task, now(), actor, kind, text.slice(0, 4000)]);
+  /** `ref`: what it's about (a move, say), recorded once per task and kind, whatever its text: a retried post records nothing. */
+  async activity(task: number, actor: string, kind: string, text: string, ref?: string): Promise<void> {
+    if (ref === undefined) await this.q(`INSERT INTO $S.activities (task_id, at, actor, kind, text) VALUES ($1, $2, $3, $4, $5)`, [task, now(), actor, kind, text.slice(0, 4000)]);
+    else
+      await this.q(
+        `INSERT INTO $S.activities (task_id, at, actor, kind, text, ref) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (task_id, kind, ref) WHERE ref IS NOT NULL DO NOTHING`,
+        [task, now(), actor, kind, text.slice(0, 4000), ref],
+      );
   }
 
   /**
@@ -1647,8 +1868,26 @@ export class SignalsStore {
     return { task: toTask(raw), by: reply.owner, ...(reply.title && { title: reply.title }), ...(reply.url && { url: reply.url }), agents: list(row!.agents), ...(owners[0] && { owner: owners[0] }) };
   }
 
-  /** Marks a task done by its rule (not a person), clearing any question; undefined if it's gone. */
-  async finish(id: number, reason: string): Promise<Task | undefined> {
+  /**
+   * Marks a task done by its rule (not a person), clearing any question;
+   * undefined if it's gone. With `seen` (the task as the sweep judged it, see
+   * finishable): only while it's still open, asking nothing, under that rule
+   * and with no event since, checked in the statement that closes it, so a
+   * task that moved (a meeting's notes took its prep task over) or got an
+   * event meanwhile is left open, for the next sweep to judge again.
+   */
+  async finish(id: number, reason: string, seen?: Pick<Task, "rule_id" | "event_count">): Promise<Task | undefined> {
+    if (seen) {
+      const at = now();
+      const found = await this.q(
+        `WITH t AS (UPDATE $S.tasks SET status = 'done', question = NULL, options = NULL, asked_by = NULL, updated_at = $2
+             WHERE id = $1 AND status NOT IN ('done', 'dismissed') AND question IS NULL AND rule_id = $3 AND event_count = $4 RETURNING *),
+           act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $2, 'signals', 'status', $5 FROM t RETURNING 1)
+         SELECT * FROM t`,
+        [id, at, seen.rule_id, seen.event_count, `done: ${reason}`.slice(0, 4000)],
+      );
+      return found.rows[0] ? toTask(found.rows[0]) : undefined;
+    }
     await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL WHERE id = $1`, [id]);
     return this.setStatus(id, "done", "signals", reason);
   }
