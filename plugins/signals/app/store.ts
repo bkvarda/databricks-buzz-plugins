@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds, readWorkstreamActions, type WorkstreamActions } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -272,6 +272,8 @@ export class SignalsStore {
     // Playbooks: how the team likes each workstream's work done (workstream → text).
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS playbooks jsonb NOT NULL DEFAULT '{}'`);
     await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS workstream_agents jsonb NOT NULL DEFAULT '{}'`);
+    // Default actions: what each workstream's agents do, and what happens when nothing triggers (workstream → {watch, otherwise}).
+    await this.q(`ALTER TABLE $S.accounts ADD COLUMN IF NOT EXISTS workstream_actions jsonb NOT NULL DEFAULT '{}'`);
     // The first reply an account's agent posted in the task's thread, once the hub has recorded it.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS agent_reply text`);
     // Needs input: what an agent (or a person) asked, its choices, and who asked (an agent's hex pubkey or a person).
@@ -2305,7 +2307,7 @@ export class SignalsStore {
    * gives it a new name and moves its tasks along. A channel belongs to one
    * account at a time.
    */
-  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: AccountIds; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>>; workstream_agents?: Readonly<Record<string, readonly string[]>> }>, by: string): Promise<AccountRecord> {
+  async saveAccount(name: string, fields: Readonly<{ rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: AccountIds; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>>; workstream_agents?: Readonly<Record<string, readonly string[]>>; workstream_actions?: WorkstreamActions }>, by: string): Promise<AccountRecord> {
     const at = now();
     const existing = await this.account({ name });
     const key = existing?.name ?? name.trim();
@@ -2325,6 +2327,7 @@ export class SignalsStore {
     if (fields.profile !== undefined) set("profile", fields.profile);
     if (fields.playbooks) set("playbooks", JSON.stringify(fields.playbooks));
     if (fields.workstream_agents) set("workstream_agents", JSON.stringify(fields.workstream_agents));
+    if (fields.workstream_actions) set("workstream_actions", JSON.stringify(fields.workstream_actions));
     set("updated_by", by);
     set("updated_at", at);
     await this.q(`UPDATE $S.accounts SET ${sets.join(", ")} WHERE name = $1`, values);
@@ -2449,6 +2452,15 @@ const idLists = (value: unknown): Record<string, string[]> =>
 const texts = (value: unknown): Record<string, string> =>
   value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {};
 
+/** Saved rows as they were checked when saved; a row that no longer reads (changed by hand) is left out, so its workstream works as before. */
+function actionRows(value: unknown): WorkstreamActions {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([key, row]) => {
+    const read = readWorkstreamActions({ [key]: row });
+    return typeof read === "string" ? [] : Object.entries(read);
+  }));
+}
+
 function toAccount(row: Row): AccountRecord {
   return {
     name: String(row.name),
@@ -2461,6 +2473,7 @@ function toAccount(row: Row): AccountRecord {
     agents: strings(typeof row.agents === "string" ? JSON.parse(row.agents) : row.agents),
     playbooks: texts(typeof row.playbooks === "string" ? JSON.parse(row.playbooks) : row.playbooks),
     workstream_agents: idLists(typeof row.workstream_agents === "string" ? JSON.parse(row.workstream_agents) : row.workstream_agents),
+    workstream_actions: actionRows(typeof row.workstream_actions === "string" ? JSON.parse(row.workstream_actions) : row.workstream_actions),
     updated_by: (row.updated_by as string | null) ?? null,
     updated_at: num(row.updated_at),
   };

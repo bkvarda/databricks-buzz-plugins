@@ -25,7 +25,7 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts, readWorkstreamActions, type WorkstreamActions } from "./model";
 import type { Classifier, Handled, IngestResult, JoinClaim, SignalsStore, Task, TaskPerson } from "./store";
 import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
 import { decode, npubEncode } from "nostr-tools/nip19";
@@ -614,6 +614,12 @@ export class Hub {
       }
       if (Object.keys(workstreamAgents).length > MAX_PLAYBOOKS) return bad(`An account names agents for at most ${MAX_PLAYBOOKS} workstreams.`);
     }
+    let workstreamActions: WorkstreamActions | undefined;
+    if (input.workstream_actions !== undefined) {
+      const read = readWorkstreamActions(input.workstream_actions);
+      if (typeof read === "string") return bad(read);
+      workstreamActions = read;
+    }
     // The account as it was, to find the agents the save adds (none when it doesn't change who works on what).
     const before = agents || workstreamAgents ? await this.store.account({ name }) : undefined;
     const preferences = text("preferences", 8000);
@@ -647,6 +653,7 @@ export class Hub {
         ...(profile !== undefined && { profile }),
         ...(playbooks && { playbooks }),
         ...(workstreamAgents && { workstream_agents: workstreamAgents }),
+        ...(workstreamActions && { workstream_actions: workstreamActions }),
       },
       user,
     );
