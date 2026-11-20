@@ -15,6 +15,7 @@ import { chosenHub, HUB_PREFERENCE, HubClient, lakebaseSnippet, type Onboarding,
 import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
 import { BOARD_PAGE, boardPage, boardPanel, validBoardRoute } from "./board-panel";
 import { signalsTools } from "./tools";
+import { findPollerJob, type PollerJob, setUpPollerJob } from "./poller-job";
 
 export const inject = ["react", "settingsCards", "panels", "pages"];
 
@@ -97,8 +98,8 @@ function SourceRow(props: { service: DatabricksService; hub: HubClient; info: So
 
 // Your poller job logs in to the hub's database as your own Postgres role; this
 // says whether you have one, makes it when the hub can, and gives the settings.
-function PollerSetup(props: { hub: HubClient }) {
-  const { hub } = props;
+function PollerSetup(props: { hub: HubClient; service: DatabricksService }) {
+  const { hub, service } = props;
   const looked = useAsync(async (signal) => hub.onboarding(signal), [hub]);
   const [state, setState] = React.useState<Onboarding>();
   const [busy, setBusy] = React.useState(false);
@@ -116,6 +117,25 @@ function PollerSetup(props: { hub: HubClient }) {
     }
   };
   const snippet = state && lakebaseSnippet(state);
+  const existing = useAsync(async (signal) => (state ? findPollerJob(await service.ready(signal), state.user, signal) : undefined), [state?.user]);
+  const [slackId, setSlackId] = React.useState("");
+  const [job, setJob] = React.useState<PollerJob>();
+  const [jobBusy, setJobBusy] = React.useState(false);
+  const [jobError, setJobError] = React.useState<string>();
+  const jobId = job?.jobId ?? existing.data;
+  const makeJob = async () => {
+    if (!state) return;
+    setJobBusy(true);
+    setJobError(undefined);
+    try {
+      setJob(await setUpPollerJob(await service.ready(), state, { ...(slackId.trim() && { slackUserId: slackId.trim() }) }));
+    } catch (problem) {
+      setJobError(describeError(problem));
+    } finally {
+      setJobBusy(false);
+    }
+  };
+  const jobUrl = jobId ? service.workspaceUrl(`/jobs/${jobId}`) : undefined;
   return (
     <Stack gap={10}>
       <SectionHeader title="Your poller" description="A job that runs as you reads the sources you turn on and writes what it finds to the hub's database, as your own database role." />
@@ -146,9 +166,38 @@ function PollerSetup(props: { hub: HubClient }) {
           </Stack>
         </div>
       )}
+      {state && state.role !== "waiting" && state.lakebase && (
+        <div className="dbx-card" style={{ padding: 12 }}>
+          <Stack gap={8}>
+            <Stack direction="row" align="center" justify="space-between" gap={10}>
+              <Stack direction="row" gap={6} align="center">
+                <Text weight={500}>Poller job</Text>
+                {existing.loading ? <Spinner size={10} /> : jobId ? <Badge tone="success">Set up</Badge> : <Badge>Not set up</Badge>}
+              </Stack>
+              <Stack direction="row" gap={6} align="center">
+                {jobUrl && <Button size="sm" onClick={() => openExternal(jobUrl)}>Open job</Button>}
+                <Button size="sm" variant={jobId ? "default" : "brand"} disabled={jobBusy || existing.loading} onClick={() => void makeJob()}>
+                  {jobBusy ? <Spinner size={12} /> : null}{jobId ? "Update my job" : "Create my job"}
+                </Button>
+              </Stack>
+            </Stack>
+            <Text tone="subtle" size="sm">
+              Puts poller.py and a sources.json with your personal sources (Gmail, Calendar, Drive, Slack, Jira) in <code>{state.folder}</code>, and runs it as you every 15 minutes on serverless. It only reads the sources you turn on above. Shared table sources aren't in it: one job reads those for everyone.
+            </Text>
+            {!jobId && (
+              <Stack direction="row" gap={6} align="center">
+                <Text size="sm">Your Slack user id</Text>
+                <input className="dbx-input" placeholder="U01ABCDEF (optional; without it, Slack is left out)" value={slackId} onChange={(event) => setSlackId(event.target.value)} style={{ maxWidth: 320 }} />
+              </Stack>
+            )}
+            {job && <Text tone="success" size="sm">{job.created ? "Created your job" : "Updated your job"} and started a first run.{job.keptSources ? " Your sources.json was already there, so it was kept as it is." : ""}</Text>}
+            {jobError && <Text tone="danger" size="sm">{jobError}</Text>}
+          </Stack>
+        </div>
+      )}
       {state && snippet && (
         <Stack gap={4}>
-          <Text tone="subtle" size="sm">Add this to <code>{state.folder}/sources.json</code>, and have your job run <code>{state.folder}/poller.py</code> with <code>{state.args.join(" ")}</code>:</Text>
+          <Text tone="subtle" size="sm">To set it up by hand instead, add this to <code>{state.folder}/sources.json</code>, and have your job run <code>{state.folder}/poller.py</code> with <code>{state.args.join(" ")}</code>:</Text>
           <CodeView code={snippet} language="json" copy />
         </Stack>
       )}
@@ -202,7 +251,7 @@ function SignalsSettings(props: { service: DatabricksService }) {
           <SourceRow key={info.name} service={service} hub={hub} info={info} state={sources?.find((state) => state.source === info.name)} onChange={setSources} />
         ))}
       </Stack>
-      {hub && <PollerSetup hub={hub} />}
+      {hub && <PollerSetup hub={hub} service={service} />}
     </Stack>
   );
 }

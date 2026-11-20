@@ -161,6 +161,20 @@ for (const name of plugins) {
         });
       },
     };
+    // A plugin with deploy/poller.py (signals) gets it and its example sources
+    // embedded as `virtual:signals-poller`, so it can set up a person's job.
+    const pollerFile = join(dir, "deploy/poller.py");
+    const poller = (await exists(pollerFile)) ? { code: await readFile(pollerFile, "utf8"), sources: await readFile(join(dir, "deploy/sources.example.json"), "utf8") } : undefined;
+    const embedPoller = {
+      name: "signals-poller",
+      setup(builder) {
+        builder.onResolve({ filter: /^virtual:signals-poller$/ }, () => ({ path: "signals-poller", namespace: "virtual-poller" }));
+        builder.onLoad({ filter: /.*/, namespace: "virtual-poller" }, () => {
+          if (!poller) throw new Error("virtual:signals-poller needs deploy/poller.py");
+          return { contents: `export const POLLER = ${JSON.stringify(poller.code)};\nexport const EXAMPLE_SOURCES = ${JSON.stringify(poller.sources)};`, loader: "js" };
+        });
+      },
+    };
     const result = await build({
       entryPoints: [join(dir, "src/index.tsx")],
       bundle: true,
@@ -176,7 +190,7 @@ for (const name of plugins) {
       treeShaking: true,
       metafile: true,
       tsconfig: join(root, "tsconfig.json"),
-      plugins: [hostOnly, embed, embedApp],
+      plugins: [hostOnly, embed, embedApp, embedPoller],
       define: { "process.env.NODE_ENV": '"production"', __PLUGIN_VERSION__: JSON.stringify(rootPackage.version) },
       banner: { js: `// ${manifest.name} (${manifest.id}) — built by databricks-buzz-plugins. Apache-2.0.` },
       logLevel: "silent",
