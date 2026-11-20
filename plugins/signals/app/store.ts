@@ -9,7 +9,9 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
+import { attendeesOf, realCustomers } from "./attendees";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -43,6 +45,8 @@ export type Task = Readonly<{
   asked_by?: string | null;
   /** The recurring series it's part of (see Rule.series), when its rule has one. */
   series?: string | null;
+  /** For a meeting's follow-up (a rule's `action_items`): the notes' items that aren't the account team's own tasks, as a checklist, and the tasks the team's items opened. */
+  checklist?: string | null;
 }>;
 
 /** A recurring series and what the team said about it. */
@@ -83,6 +87,20 @@ const EVENT_MICROS = `COALESCE(e.occurred_us,
        THEN substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{16})')::bigint END,
   e.occurred_at * 1000000)`;
 
+/**
+ * SQL that holds while event `$<n>` is still its notes' latest revision: no newer revision of the same document (the same
+ * source and group) is saved. Drive gives each modification of a doc its own event id (`{id}:{modifiedTime}`), so a newer
+ * one is another row of the group, later in time. Each notes revision raises its document's `revisions` row as it's saved
+ * (see record), and this locks that row to share: a newer revision being saved now waits for this statement, or this one
+ * waits for it and sees its time. (`OFFSET 0` keeps the time check out of the locking read: the lock is taken first, then
+ * the time compared, so a row a newer revision raises is compared as raised. A newer version under the same id is checked by the
+ * event's `versions`.)
+ */
+const LATEST_REVISION = (n: number) => `NOT EXISTS (SELECT 1 FROM $S.events o JOIN $S.events r ON r.source = o.source AND r.group_key = o.group_key AND r.id <> o.id
+       AND COALESCE(r.occurred_us, r.occurred_at * 1000000) > COALESCE(o.occurred_us, o.occurred_at * 1000000) WHERE o.id = $${n}::bigint)
+     AND NOT EXISTS (SELECT 1 FROM (SELECT v.latest_us, COALESCE(o.occurred_us, o.occurred_at * 1000000) AS mine FROM $S.revisions v
+       JOIN $S.events o ON v.source = o.source AND v.group_key = o.group_key WHERE o.id = $${n}::bigint OFFSET 0 FOR SHARE OF v) l WHERE l.latest_us > l.mine)`;
+
 /** `at` in seconds; `micros` the same moment in microseconds (Slack's ts keeps them), for ordering it against the customer's messages. */
 export type Reply = Readonly<{ group: string; event: number; owner: string; source: string; title: string | null; url: string | null; at: number; micros?: number }>;
 
@@ -103,12 +121,15 @@ export type IngestResult = Readonly<{
   skipped: number;
   /** Events a rule's classifier judged not worth a task. */
   filtered: number;
-  errors: { index: number; error: string }[];
+  /** `retry`: it may not be saved, or not all of it (a write failed): post it again. */
+  errors: { index: number; error: string; retry?: boolean }[];
   /** Tasks opened by this post. */
   created: Task[];
   /** Tasks an event of this post was added to. */
   /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
-  updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
+  updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] };
+    /** A meeting's follow-up whose checklist this event changed: the checklist now (null: the notes list no items now, so it was cleared). */
+    checklist?: string | null }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
@@ -117,6 +138,10 @@ export type IngestResult = Readonly<{
 }>;
 
 const now = () => Math.floor(Date.now() / 1000);
+
+/** Seconds an ingest has to place a pending notes version before the sweep may (see events.placing_at). */
+export const PLACING_LEASE = 600;
+const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 export const contentHash = (event: EventInput) => createHash("sha256").update(contentKey(event)).digest("hex").slice(0, 32);
 
@@ -181,6 +206,57 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS asked_by text`);
     // Recurring series (a rule's `series`): asked once, and the answer kept.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS series text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS checklist text`);
+    // The newest notes revision (microseconds) whose action items the follow-up took: an older one read late changes nothing.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS items_us bigint`);
+    // The event version whose action items are being written, until all are: one a failed write cut short is finished by the sweep (or a repost).
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_pending int`);
+    await this.q(`CREATE INDEX IF NOT EXISTS events_items_pending ON $S.events (id) WHERE items_pending IS NOT NULL`);
+    // When the sweep last tried a pending event's items: the least recently tried go first, so ones that keep failing don't hold up the rest.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_tried bigint`);
+    // While an ingest is placing a pending notes version (its classifier may take a while): the sweep leaves it to that ingest
+    // until it ends (cleared then) or PLACING_LEASE seconds pass (the hub stopped mid-way).
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS placing_at bigint`);
+    // Whether the pending version came in on its source's first run: the sweep places it as that ingest would have.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_first_run boolean`);
+    // A notes document's newest revision saved (microseconds), by source and group: raised as each is recorded, so placing an older
+    // one can lock it and see a newer one being saved (see LATEST_REVISION).
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.revisions (source text NOT NULL, group_key text NOT NULL, latest_us bigint NOT NULL, PRIMARY KEY (source, group_key))`);
+    // Sets a document's newest revision again from the copies saved now (anyone's), or drops it with none left (after Forget).
+    // Its row is locked first, and each statement after that reads with a new snapshot (PL/pgSQL under read committed), so it
+    // counts every copy committed before it got the lock: one another Forget deleted (that Forget's refresh waits for this one, or
+    // this for it) and one saved meanwhile (record raises the row in the statement that saves it, so it waits too, then raises it).
+    // A document with no row (saved before revisions were kept) has nothing to set: only a row it locked is changed.
+    await this.q(`CREATE OR REPLACE FUNCTION $S.refresh_revision(doc_source text, doc_group text) RETURNS void LANGUAGE plpgsql AS $fn$
+      DECLARE newest bigint;
+      BEGIN
+        PERFORM 1 FROM $S.revisions WHERE source = doc_source AND group_key = doc_group FOR UPDATE;
+        IF NOT FOUND THEN RETURN; END IF;
+        SELECT max(COALESCE(occurred_us, occurred_at * 1000000)) INTO newest FROM $S.events WHERE source = doc_source AND group_key = doc_group;
+        IF newest IS NULL THEN
+          DELETE FROM $S.revisions WHERE source = doc_source AND group_key = doc_group;
+        ELSE
+          UPDATE $S.revisions SET latest_us = newest WHERE source = doc_source AND group_key = doc_group;
+        END IF;
+      END $fn$`);
+    // Forget's delete of a person's events from a source, and the refresh of the documents they were copies of, in one transaction
+    // (one call) as separate statements: the refreshes read after the delete, and a refresh that fails undoes the delete too,
+    // so Forget again finds the events and does both. Returns the tasks the events were on.
+    await this.q(`CREATE OR REPLACE FUNCTION $S.forget_events(of_owner text, of_source text) RETURNS TABLE (task bigint) LANGUAGE plpgsql AS $fn$
+      DECLARE docs text[];
+      BEGIN
+        CREATE TEMP TABLE IF NOT EXISTS forgotten (id bigint, task_id bigint, group_key text) ON COMMIT DROP;
+        DELETE FROM forgotten;
+        WITH del AS (DELETE FROM $S.events WHERE owner = of_owner AND source = of_source RETURNING id, task_id, group_key)
+          INSERT INTO forgotten SELECT * FROM del;
+        SELECT array_agg(DISTINCT f.group_key ORDER BY f.group_key) INTO docs FROM forgotten f WHERE f.group_key IS NOT NULL;
+        IF docs IS NOT NULL THEN
+          FOR i IN 1 .. array_length(docs, 1) LOOP PERFORM $S.refresh_revision(of_source, docs[i]); END LOOP;
+        END IF;
+        RETURN QUERY SELECT f.task_id FROM forgotten f WHERE f.task_id IS NOT NULL
+          UNION SELECT te.task_id FROM $S.task_events te WHERE te.event_id IN (SELECT f.id FROM forgotten f);
+        DELETE FROM forgotten;
+      END $fn$`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.series (
       key text PRIMARY KEY, rule_id text NOT NULL, account text, title text NOT NULL, answer text, asked_task bigint,
       mode text NOT NULL DEFAULT 'draft', answered_by text, answered_at bigint, created_at bigint NOT NULL)`);
@@ -192,6 +268,8 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_score real`);
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_at bigint`);
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_channel text`);
+    // The version the classifier decided on (filtered_rule / filtered_score): a later version is asked again.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS filtered_version int`);
     await this.q(`CREATE INDEX IF NOT EXISTS events_filtered ON $S.events (filtered_at) WHERE filtered_at IS NOT NULL`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
@@ -233,6 +311,10 @@ export class SignalsStore {
       id bigserial PRIMARY KEY, owner text NOT NULL DEFAULT current_user, kind text NOT NULL CHECK (kind IN ('events', 'cursor')),
       body jsonb NOT NULL, at bigint NOT NULL DEFAULT extract(epoch FROM now())::bigint, done_at bigint, result jsonb)`);
     await this.q(`CREATE INDEX IF NOT EXISTS inbox_todo ON $S.inbox (id) WHERE done_at IS NULL`);
+    // Times a post was handled with events that failed to save (a write failed): it's handled again, its owner's later posts (its cursor) waiting, up to INBOX_TRIES times.
+    await this.q(`ALTER TABLE $S.inbox ADD COLUMN IF NOT EXISTS tries int NOT NULL DEFAULT 0`);
+    // When it was last tried (epoch seconds): past INBOX_TRIES it's held, and tried again only every INBOX_HOLD_SECONDS.
+    await this.q(`ALTER TABLE $S.inbox ADD COLUMN IF NOT EXISTS tried_at bigint`);
     await this.q(`ALTER TABLE $S.inbox ENABLE ROW LEVEL SECURITY`);
     await this.q(`DROP POLICY IF EXISTS own_rows ON $S.inbox`);
     await this.q(`CREATE POLICY own_rows ON $S.inbox USING (lower(owner) = lower(current_user)) WITH CHECK (lower(owner) = lower(current_user))`);
@@ -274,10 +356,16 @@ export class SignalsStore {
     if (rows.length) await this.q(`INSERT INTO $S.account_ids (kind, id) SELECT * FROM unnest($1::text[], $2::text[]) ON CONFLICT DO NOTHING`, [rows.map((row) => row[0]), rows.map((row) => row[1])]);
   }
 
-  /** Inbox posts the hub hasn't handled yet, oldest first. */
-  async inbox(limit = 20): Promise<{ id: number; owner: string; kind: "events" | "cursor"; body: unknown }[]> {
-    const found = await this.q<{ id: unknown; owner: string; kind: "events" | "cursor"; body: unknown }>(`SELECT id, owner, kind, body FROM $S.inbox WHERE done_at IS NULL ORDER BY id LIMIT $1`, [limit]);
-    return found.rows.map((row) => ({ ...row, id: Number(row.id) }));
+  /** Inbox posts the hub hasn't handled yet, oldest first (after the post `after`, to page past held ones). */
+  async inbox(limit = 20, after = 0): Promise<{ id: number; owner: string; kind: "events" | "cursor"; body: unknown; tries: number; tried_at: number | null }[]> {
+    const found = await this.q<{ id: unknown; owner: string; kind: "events" | "cursor"; body: unknown; tries: unknown; tried_at: unknown }>(`SELECT id, owner, kind, body, tries, tried_at FROM $S.inbox WHERE done_at IS NULL AND id > $2 ORDER BY id LIMIT $1`, [limit, after]);
+    return found.rows.map((row) => ({ ...row, id: Number(row.id), tries: Number(row.tries ?? 0), tried_at: num(row.tried_at) }));
+  }
+
+  /** Counts a failed attempt at an inbox post, which stays to be handled again. */
+  async inboxRetry(id: number, result: unknown, at = now()): Promise<number> {
+    const found = await this.q<{ tries: unknown }>(`UPDATE $S.inbox SET tries = tries + 1, tried_at = $3, result = $2 WHERE id = $1 RETURNING tries`, [id, JSON.stringify(result ?? null), at]);
+    return Number(found.rows[0]?.tries ?? 0);
   }
 
   async inboxDone(id: number, result: unknown, at = now()): Promise<void> {
@@ -321,11 +409,8 @@ export class SignalsStore {
       // Events first, then their replies, decided or not: a forgotten reply mustn't close (or keep closed) anything.
       // A reply is saved only while its event is there (recordReply), so one saved during this is caught by the second delete.
       // (An event being attached holds its row: the delete waits for it, then returns the task it went to.)
-      const events = await this.q<{ task: unknown }>(
-        `WITH del AS (DELETE FROM $S.events WHERE owner = $1 AND source = $2 RETURNING id, task_id)
-         SELECT task_id AS task FROM del WHERE task_id IS NOT NULL UNION SELECT te.task_id FROM $S.task_events te WHERE te.event_id IN (SELECT id FROM del)`,
-        [owner, source],
-      );
+      // (The documents they were copies of get their newest revision set again in the same call; see forget_events.)
+      const events = await this.q<{ task: unknown }>(`SELECT task FROM $S.forget_events($1, $2)`, [owner, source]);
       const replies = await this.q<{ task: unknown }>(`DELETE FROM $S.replies WHERE owner = lower($1) AND source = $2 RETURNING closed_task AS task`, [owner, source]);
       const tasks = [...new Set([...events.rows, ...replies.rows].map((row) => row.task).filter((task) => task !== null && task !== undefined).map(String))];
       if (tasks.length) await this.retime(tasks);
@@ -349,27 +434,38 @@ export class SignalsStore {
 
   // --- events -------------------------------------------------------------
 
-  /** Records one event: new, changed (a new content hash) or the same. */
-  async record(owner: string, given: EventInput): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput }> {
+  /**
+   * Records one event: new, changed (a new content hash) or the same. With
+   * `items`, a new or changed version is marked as having action items to
+   * write (items_pending) in the same statement, so the sweep finishes them
+   * even when a later write of this post fails and the post is acknowledged.
+   */
+  async record(owner: string, given: EventInput, items = false, firstRun = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number }> {
     const event = await this.keepDetails(owner, given);
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
     const micros = toMicros(event.occurred_at);
-    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros)];
+    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun];
     // xmax = 0 only for a row this statement inserted.
-    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean }>(
-      `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3)
-       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us)
-       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint)
+    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown }>(
+      `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3),
+       doc AS (INSERT INTO $S.revisions (source, group_key, latest_us) SELECT $2, $11, $13::bigint WHERE $14 AND $11::text IS NOT NULL AND $13::bigint IS NOT NULL
+         ON CONFLICT (source, group_key) DO UPDATE SET latest_us = GREATEST($S.revisions.latest_us, excluded.latest_us) RETURNING 1)
+       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us, items_pending, placing_at, items_first_run)
+       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint, CASE WHEN $14 THEN 1 END, CASE WHEN $14 THEN $6::bigint END, CASE WHEN $14 THEN $15::boolean END)
        ON CONFLICT (owner, source, external_id) DO UPDATE SET
          last_seen = excluded.last_seen,
          content_hash = excluded.content_hash,
          versions = $S.events.versions + CASE WHEN $S.events.content_hash = excluded.content_hash THEN 0 ELSE 1 END,
          changed_at = CASE WHEN $S.events.content_hash = excluded.content_hash THEN $S.events.changed_at ELSE excluded.changed_at END,
          occurred_at = excluded.occurred_at, occurred_us = excluded.occurred_us, title = excluded.title, url = excluded.url, actor = excluded.actor,
-         account = excluded.account, group_key = excluded.group_key, payload = excluded.payload
-       RETURNING id, versions, task_id,
+         account = excluded.account, group_key = excluded.group_key, payload = excluded.payload,
+         items_pending = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN $S.events.versions + 1 ELSE $S.events.items_pending END,
+         items_tried = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN NULL ELSE $S.events.items_tried END,
+         placing_at = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.placing_at ELSE $S.events.placing_at END,
+         items_first_run = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.items_first_run ELSE $S.events.items_first_run END
+       RETURNING id, versions, task_id, items_pending,
          (SELECT row_to_json(previous) FROM previous) AS before,
          NOT EXISTS (SELECT 1 FROM previous) AS inserted,
          COALESCE((SELECT content_hash FROM previous) <> $4, false) AS changed`,
@@ -379,7 +475,7 @@ export class SignalsStore {
     // The event as it was before this version (pg gives row_to_json as an object, PGlite may give text).
     const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
     const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
-    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }) };
+    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }) };
   }
 
   /**
@@ -408,9 +504,15 @@ export class SignalsStore {
     const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], handled: [], firstRun: false };
     const counts = result as { -readonly [K in keyof IngestResult]: IngestResult[K] };
     const consent = new Map<string, { enabled: boolean; firstRun: boolean }>();
+    const retried = new Set<string>();
     const touched = new Map<number, Task>();
     const opened = new Set<number>();
     for (const [index, event] of events.entries()) {
+      // Saved: an error after that needn't be posted again (a notes event's items_pending has the sweep finish it;
+      // reposting a saved event changes nothing). Before that, the post is handled again (see Hub.drain).
+      let saved = false;
+      let placing: number | undefined;
+      let placingVersion: number | undefined;
       try {
         let state = consent.get(event.source);
         if (!state) consent.set(event.source, (state = await this.enabled(owner, event.source)));
@@ -419,14 +521,31 @@ export class SignalsStore {
           continue;
         }
         if (state.firstRun) counts.firstRun = true;
-        const recorded = await this.record(owner, event);
+        // A meeting's notes a rule with action_items may take: marked pending as it's recorded, with whether it's a first run,
+        // so the sweep places it as this ingest would (a first run opens tasks only with first_run_seen false; otherwise
+        // placing it finds nothing to do and clears the marker).
+        const recorded = await this.record(owner, event, config.rules.some((rule) => rule.action_items && ruleApplies(config, rule, event, owner)), state.firstRun);
         counts[recorded.outcome]++;
+        saved = true;
+        if (recorded.outcome !== "same" && recorded.itemsPending !== undefined) {
+          placing = recorded.id;
+          placingVersion = recorded.version;
+        }
         const replies = handledBy(config, event, owner);
         if (recorded.outcome === "same") {
           // Seen before, but a closure it started may not have finished (a write failed): finish it.
           if (replies.length) {
             for (const { group } of replies) await this.recordReply(group, recorded.id, owner, event, true);
             for (const reply of await this.pendingReplies({ event: recorded.id })) await this.applyReply(reply, result);
+          }
+          // A meeting's notes whose action items a failed write cut short: written now (each item once),
+          // after placing it on its task first when that failed too (resumeItems does both).
+          if (recorded.itemsPending !== undefined) {
+            const resumed = await this.resumeItems(owner, recorded.id, config, classifier);
+            if (resumed) {
+              for (const id of resumed.opened) opened.add(id);
+              if (resumed.checklist !== undefined) result.updated.push({ task: (await this.task(resumed.task.id))!, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), checklist: resumed.checklist });
+            }
           }
           continue;
         }
@@ -451,7 +570,11 @@ export class SignalsStore {
           const done = await this.applyReply(reply, result);
           if (done && done.task.id === placed?.task.id) finishedHere = true;
         }
-        if (!placed || finishedHere) continue;
+        if (!placed || finishedHere) {
+          // Not placed (no task for it: filtered, a first run, a closed group) or finished here: no action items to write later either.
+          if (recorded.itemsPending !== undefined) await this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [recorded.id, recorded.itemsPending]);
+          continue;
+        }
         let task = placed.task;
         if (placed.opened) opened.add(task.id);
         // A finished task opens again for a new event, when attached (below): not for a message older than a team reply decided on it
@@ -476,6 +599,13 @@ export class SignalsStore {
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
         const reopened = await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        // A meeting's notes: the account team's items get their own tasks, the rest a checklist on this one.
+        let checklist: string | null | undefined;
+        if (placed.rule.action_items) {
+          const items = await this.actionItems(owner, event, recorded, task, placed.rule, config);
+          for (const id of items.opened) opened.add(id);
+          checklist = items.checklist;
+        }
         // A done task isn't taken over above; once this event opened it again, the rule it now matches takes it, as for an open one.
         if (reopened && changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task") {
           task = await this.refile(task, placed.rule);
@@ -492,9 +622,14 @@ export class SignalsStore {
         }
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }) });
       } catch (error) {
-        result.errors.push({ index, error: (error as Error).message });
+        result.errors.push({ index, error: (error as Error).message, ...(!saved && { retry: true }) });
+        if (!saved) retried.add(event.source);
+      } finally {
+        // Done placing it (or failed to): the sweep may finish it now.
+        // (Only its own lease: a newer version recorded since holds the lease for its own ingest, still placing it.)
+        if (placing !== undefined) await this.q(`UPDATE $S.events SET placing_at = NULL WHERE id = $1 AND versions = $2`, [placing, placingVersion]).catch(() => {});
       }
     }
     // As they are now: a later event of this post (a team reply) may have closed one it opened. Those aren't new work.
@@ -504,8 +639,9 @@ export class SignalsStore {
     }
     const by = new Map<string, number>();
     for (const event of events) by.set(event.source, (by.get(event.source) ?? 0) + 1);
+    // (Not for a source with events to post again: its next post is still its first run, when this one was.)
     for (const [source, count] of by)
-      if (consent.get(source)?.enabled) await this.q(`UPDATE $S.sources SET last_post_at = $3, last_count = $4, last_error = NULL WHERE owner = $1 AND source = $2`, [owner, source, now(), count]);
+      if (consent.get(source)?.enabled && !retried.has(source)) await this.q(`UPDATE $S.sources SET last_post_at = $3, last_count = $4, last_error = NULL WHERE owner = $1 AND source = $2`, [owner, source, now(), count]);
     return result;
   }
 
@@ -517,7 +653,7 @@ export class SignalsStore {
    * task asks the team, and the series' other events are held until they
    * answer; a series they said never to work on opens no tasks.
    */
-  private async place(owner: string, event: EventInput, recorded: { id: number }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
+  private async place(owner: string, event: EventInput, recorded: { id: number; version?: number }, config: SignalsConfig, firstRun: boolean, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const decision = decide(config, event, { firstRun, owner });
     if (decision.kind === "none") return undefined;
     const rule = decision.rule;
@@ -549,7 +685,7 @@ export class SignalsStore {
     return found.rows[0] ? toTask(found.rows[0]) : undefined;
   }
 
-  private async placeNew(owner: string, event: EventInput, recorded: { id: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
+  private async placeNew(owner: string, event: EventInput, recorded: { id: number; version?: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const rule = decision.rule;
     if (rule.classify && classifier) {
       // Fails open: no score (the model is down, say) opens the task.
@@ -557,23 +693,34 @@ export class SignalsStore {
       const min = rule.classify.min ?? DEFAULT_CLASSIFY_MIN;
       if (typeof score === "number" && Number.isFinite(score) && score < min) {
         // The channel its task would have gone to, so that channel's board can list it.
-        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4, filtered_channel = $5 WHERE id = $1`, [recorded.id, rule.id, score, now(), decision.channel ?? null]);
+        // (Only while this is still the event's latest version: an older one's request, finishing late, leaves the newer one's decision.)
+        await this.q(`UPDATE $S.events SET filtered_rule = $2, filtered_score = $3, filtered_at = $4, filtered_channel = $5, filtered_version = $6 WHERE id = $1 AND ($6::integer IS NULL OR versions = $6::integer)`, [recorded.id, rule.id, score, now(), decision.channel ?? null, recorded.version ?? null]);
         filtered?.();
         return undefined;
       }
-      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL, filtered_channel = NULL WHERE id = $1`, [recorded.id, score]);
+      if (typeof score === "number") await this.q(`UPDATE $S.events SET filtered_rule = NULL, filtered_score = $2, filtered_at = NULL, filtered_channel = NULL, filtered_version = $3 WHERE id = $1 AND ($3::integer IS NULL OR versions = $3::integer)`, [recorded.id, score, recorded.version ?? null]);
     }
-    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at) };
-    if (!decision.series) return { task: await this.openTask(input), opened: true, create: true, rule };
+    // For a rule with a classifier or action items, the task opens only while this is still the event's latest version, checked in the
+    // statement that opens it: whether this run just asked the classifier or the sweep retries a saved version, a newer version recorded
+    // meanwhile is that version's to decide (with its own request), not this one's. For notes (action_items) that includes a newer
+    // revision of the same document saved under its own id (see LATEST_REVISION).
+    const latest = (rule.classify || rule.action_items) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items) } : undefined;
+    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at), latest };
+    const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
+      const opened = await this.openTask(task);
+      return opened && { task: opened, opened: true, create: true, rule };
+    };
+    if (!decision.series) return open(input);
     const series = await this.seriesFor(decision.series);
     if (series?.answer === "never") return undefined;
-    if (series?.answer === "always") return { task: await this.openTask({ ...input, series: decision.series }), opened: true, create: true, rule };
+    if (series?.answer === "always") return open({ ...input, series: decision.series });
     if (series?.asked_task) {
       await this.q(`UPDATE $S.events SET held_series = $2 WHERE id = $1`, [recorded.id, decision.series]);
       return undefined;
     }
     // A new (or undecided) series: this task asks the team, in ask mode so no agent starts on it yet.
     const asking = await this.openTask({ ...input, mode: "ask", series: decision.series });
+    if (!asking) return undefined;
     await this.q(
       `INSERT INTO $S.series (key, rule_id, account, title, asked_task, mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (key) DO UPDATE SET asked_task = EXCLUDED.asked_task, title = EXCLUDED.title, mode = EXCLUDED.mode`,
@@ -582,16 +729,227 @@ export class SignalsStore {
     return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(decision.title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
   }
 
-  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string }): Promise<Task> {
+  /**
+   * Opens a task (or finds its group's). With `latest`, only while that event is still at that version, checked in the
+   * statement that opens it (the event's row locked to share, so a newer version being recorded waits for it, and one
+   * recorded first fails the check): none is opened for a version a newer one has replaced.
+   */
+  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string; latest?: { event: number; version: number; revisions?: boolean } }): Promise<Task | undefined> {
     const at = now();
     const found = await this.q(
       `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, series)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11) ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
-      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null],
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11
+       WHERE $12::bigint IS NULL OR (EXISTS (SELECT 1 FROM $S.events WHERE id = $12::bigint AND versions = $13::integer FOR SHARE)
+         AND (NOT $14::boolean OR ${LATEST_REVISION(12)}))
+       ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
+      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null, input.latest?.event ?? null, input.latest?.version ?? null, input.latest?.revisions ?? false],
     );
-    const task = toTask(found.rows[0]!);
+    if (!found.rows[0]) return undefined;
+    const task = toTask(found.rows[0]);
     await this.activity(task.id, "signals", "opened", `Opened by rule ${input.rule}.`);
     return task;
+  }
+
+  /**
+   * For a notes event whose action items weren't all written (a write
+   * failed): writes them now, from the saved event (each item once). The
+   * sweep runs it for every such event, so it doesn't wait on the poller
+   * posting the same version again (it won't: it has read it).
+   */
+  private async resumeItems(owner: string, id: number, config: SignalsConfig, classifier?: Classifier): Promise<{ task: Task; opened: number[]; checklist?: string | null } | undefined> {
+    // Not one an ingest is placing now (it decides, with its classifier): left to it until it's done or its lease is past.
+    const row = (await this.q(`SELECT * FROM $S.events WHERE id = $1 AND items_pending IS NOT NULL AND (placing_at IS NULL OR placing_at < $2)`, [id, now() - PLACING_LEASE])).rows[0];
+    if (!row) return undefined;
+    const done = () => this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [id, row.items_pending]);
+    const event: EventInput = { ...toEvent(row), ...(row.group_key ? { group_key: String(row.group_key) } : {}) };
+    const placedNow: number[] = [];
+    let task = num(row.task_id) === null ? undefined : await this.task(num(row.task_id)!);
+    // Never placed on its task (that write failed, after it was saved): placed and attached now, as ingest would have.
+    // (It doesn't open a done task again from here: a sweep isn't the customer's message arriving.)
+    // The classifier's decision on this version (filtered, or its passing score), if it made one: an earlier version's is
+    // about other content, and this one is asked again.
+    const decided = num(row.filtered_version) !== null && num(row.filtered_version) === Number(row.versions) && num(row.filtered_score) !== null;
+    if (num(row.task_id) === null && !(decided && row.filtered_rule)) {
+      // With the rule's classifier, as ingest would have: one it filters isn't placed (and its marker is cleared below).
+      // A decision ingest's classifier already made on this version (its score, kept when it passed) stands: not asked again.
+      // And on a first run as its ingest was (see record).
+      const placed = await this.place(owner, event, { id, version: Number(row.versions) }, config, row.items_first_run === true, decided ? undefined : classifier);
+      if (placed) {
+        await this.attach(placed.task.id, id, Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen: false });
+        task = await this.task(placed.task.id);
+        if (placed.opened && task) placedNow.push(task.id);
+      }
+    }
+    const rule = task && config.rules.find((one) => one.id === task.rule_id && one.action_items);
+    // Nothing to write now (its task is gone, no rule takes it, or its rule has no action items any more).
+    if (!task || !rule) {
+      await done();
+      return undefined;
+    }
+    const written = await this.actionItems(owner, event, { id, version: Number(row.versions), micros: num(row.occurred_us) }, task, rule, config);
+    return { task, ...written, opened: [...placedNow, ...written.opened] };
+  }
+
+  /**
+   * Finishes the action items of every notes event a failed write cut short
+   * (see resumeItems). Returns the tasks it opened and the follow-ups whose
+   * checklist changed, to be posted as an ingest's are; an event that fails
+   * again stays pending for the next sweep.
+   */
+  async pendingItems(config: SignalsConfig, limit = 20, classifier?: Classifier): Promise<{ created: Task[]; updated: { task: Task; title?: string; url?: string; checklist: string | null }[]; errors: { event: number; error: string }[] }> {
+    const out = { created: [] as Task[], updated: [] as { task: Task; title?: string; url?: string; checklist: string | null }[], errors: [] as { event: number; error: string }[] };
+    if (!config.rules.some((rule) => rule.action_items)) return out;
+    // Least recently tried first (never tried before those that failed), each marked tried now.
+    const found = await this.q<{ id: unknown; owner: string; title: string | null; url: string | null }>(
+      `UPDATE $S.events e SET items_tried = $2 FROM (SELECT id FROM $S.events WHERE items_pending IS NOT NULL ORDER BY items_tried NULLS FIRST, id LIMIT $1) next
+       WHERE e.id = next.id RETURNING e.id, e.owner, e.title, e.url`,
+      [limit, Date.now()],
+    );
+    found.rows.sort((a, b) => Number(a.id) - Number(b.id));
+    for (const row of found.rows) {
+      try {
+        const resumed = await this.resumeItems(row.owner, Number(row.id), config, classifier);
+        if (!resumed) continue;
+        for (const id of resumed.opened) {
+          const task = await this.task(id);
+          if (task && isOpen(task.status)) out.created.push(task);
+        }
+        if (resumed.checklist !== undefined) out.updated.push({ task: (await this.task(resumed.task.id))!, ...(row.title && { title: row.title }), ...(row.url && { url: row.url }), checklist: resumed.checklist });
+      } catch (error) {
+        out.errors.push({ event: Number(row.id), error: (error as Error).message });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * A meeting's notes (`payload.notes`, its Next steps) for the rule's
+   * `action_items`: each item the account team owns opens its own task (once
+   * per doc and item: the same item in a later version of the doc is the same
+   * task), assigned to the attendee its name is when it's exactly one. The
+   * others (the customer's, both sides', not clear whose) become the
+   * follow-up's checklist. Whose a name is comes from the meeting's
+   * attendees: the poster's own copy of the calendar event its
+   * `payload.meeting` link names, from a calendar source they have on (no
+   * one else's calendar). Each item is written in one statement (its task,
+   * its owner); the event is marked pending as it's recorded and done only
+   * with the checklist, in one statement, so one a failed write cut short is
+   * finished by the sweep (and its update sent then). Revisions
+   * are ordered by their time: a revision first claims the follow-up (its
+   * time, if no newer one has), and every item task and the checklist are
+   * written only while no newer revision has claimed it, so an older one read
+   * late opens nothing and changes nothing. A newer one with no items clears
+   * the checklist, and notes that couldn't be read (no `notes` text) leave it
+   * as it is. Returns the tasks it opened and, when it
+   * changed, the checklist (null: cleared).
+   */
+  private async actionItems(owner: string, event: EventInput, recorded: { id: number; version: number; micros?: number | null }, followUp: Task, rule: Rule, config: SignalsConfig): Promise<{ opened: number[]; checklist?: string | null }> {
+    const markDone = () => this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [recorded.id, recorded.version]);
+    // (Already marked when the event was recorded, for a rule with action_items that applies to it; this covers any other way here.)
+    // (Not by an older version than the event's latest: that one's own marker stands.)
+    await this.q(`UPDATE $S.events SET items_pending = $2 WHERE id = $1 AND items_pending IS DISTINCT FROM $2 AND versions = $2`, [recorded.id, recorded.version]);
+    // Notes it couldn't read: the checklist stays as it was.
+    if (typeof event.payload?.notes !== "string") {
+      await markDone();
+      return { opened: [] };
+    }
+    const micros = recorded.micros ?? toMicros(event.occurred_at);
+    const at = Number.isNaN(micros) ? now() * 1_000_000 : micros;
+    // Claims the follow-up for this revision. An older one than it has: nothing to do (its items may be gone from the newer one).
+    const claimed = await this.q(`UPDATE $S.tasks SET items_us = $2 WHERE id = $1 AND (items_us IS NULL OR items_us <= $2) RETURNING 1`, [followUp.id, String(at)]);
+    if (!claimed.rows.length) {
+      await markDone();
+      return { opened: [] };
+    }
+    const items = parseNextSteps(event.payload.notes);
+    const account = config.accounts?.find((one) => followUp.account && namesAccount(one, followUp.account.toLowerCase()));
+    const domains = (account?.domains ?? []).map((domain) => domain.toLowerCase());
+    // The meeting's attendees: only the poster's own copy, from a calendar source they have on.
+    const meetingId = items.length ? calendarEventId(event.payload.meeting) : undefined;
+    const meeting = meetingId
+      ? (await this.q<{ payload: unknown }>(
+          `SELECT e.payload FROM $S.events e JOIN $S.sources s ON s.owner = e.owner AND s.source = e.source AND s.enabled
+           WHERE e.owner = $3 AND e.source = $1 AND e.external_id = $2`,
+          [rule.action_items!.meetings ?? "google_calendar", meetingId, owner],
+        )).rows[0]
+      : undefined;
+    const payload = typeof meeting?.payload === "string" ? JSON.parse(meeting.payload) : (meeting?.payload as Record<string, unknown> | undefined);
+    const listed = attendeesOf(payload?.attendees).filter((a) => a.email);
+    const ownDomain = (owner.split("@")[1] ?? "").toLowerCase();
+    const atOwn = (email: string) => Boolean(ownDomain) && atDomains(email.toLowerCase(), [ownDomain]);
+    // The customer's people: at the account's domains (and not a colleague's address there), or, without domains, anyone not at the poster's.
+    const customers = domains.length ? realCustomers(listed, (email) => atDomains(email.toLowerCase(), domains)) : listed.filter((a) => !atOwn(a.email!));
+    const theirs = new Set(customers.map((a) => a.email!.toLowerCase()));
+    const ours = listed.filter((a) => !theirs.has(a.email!.toLowerCase()) && (atOwn(a.email!) || (domains.length > 0 && atDomains(a.email!.toLowerCase(), domains))));
+    const people = { ours, customers, account: account ? [account.name, ...(account.aliases ?? [])] : followUp.account ? [followUp.account] : [] };
+    const workstream = rule.action_items!.workstream ?? "meeting action items";
+    const ruleId = `${rule.id}/action-item`;
+    const mode = modeFor(account?.preferences, { id: ruleId, workstream });
+    const doc = event.group_key ?? event.external_id;
+    const opened: number[] = [];
+    const tasks: string[] = [];
+    const rest: string[] = [];
+    for (const item of items) {
+      const side = sideOf(item, people);
+      // (With the workstream off, the team's items are listed too, rather than opened.)
+      if (side !== "ours" || mode === "off") {
+        rest.push(`- [ ] ${itemLine(item)} (${side === "customer" ? "the customer's" : side === "both" ? "shared" : side === "ours" ? "the account team's" : "owner not clear"})`);
+        continue;
+      }
+      // Theirs when the name is exactly one of the account team's attendees; a name two of them share isn't guessed.
+      const assigned: string[] = [];
+      const unsure: string[] = [];
+      for (const name of item.owners) {
+        const matched = peopleNamed(name, ours);
+        if (matched.length === 1) assigned.push(matched[0]!.email!.toLowerCase());
+        else if (matched.length > 1) unsure.push(`Not assigned: "${name}" could be ${matched.map((a) => a.email).join(" or ")}.`);
+      }
+      const group = `${ruleId}|${doc}|${itemKey(item)}`;
+      const time = now();
+      // One statement: the task, its event, its owners and its activity are all written or none is.
+      const found = await this.q<Row>(
+        `WITH ins AS (
+           INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event)
+           -- Only for the notes' latest revision: its version (locked, so a newer one being saved under this id waits for this), and no
+           -- newer revision of the document saved under its own id. A superseded revision's items may be gone from the newer one.
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, 1, $10 WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $10 AND versions = $11 FOR SHARE)
+             AND ${LATEST_REVISION(10)}
+             -- Only while no newer revision has claimed the follow-up (locked, so one claiming now waits for this, or this sees its claim).
+             AND EXISTS (SELECT 1 FROM $S.tasks WHERE id = $15 AND items_us <= $16 FOR SHARE)
+           ON CONFLICT (group_key) DO NOTHING RETURNING *),
+         te AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT id, $10, $11, $9 FROM ins RETURNING 1),
+         act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $9, 'signals', 'opened', $12 FROM ins
+           UNION ALL SELECT id, $9, 'signals', 'unassigned', u FROM ins, unnest($14::text[]) AS u RETURNING 1),
+         own AS (INSERT INTO $S.task_people (task_id, kind, key, at, assigned_at) SELECT id, 'person', k, $9, $9 FROM ins, unnest($13::text[]) AS k ON CONFLICT DO NOTHING RETURNING 1)
+         SELECT * FROM ins`,
+        [ruleId, group, clip(`Action: ${item.title ? `${item.title}: ` : ""}${item.text}`, 200), followUp.account, followUp.channel, workstream, mode, owner, time, recorded.id, recorded.version,
+          `Opened from the action items in the notes of task ${followUp.id}: ${clip(itemLine(item), 500)}`, [...new Set(assigned)], unsure, followUp.id, String(at)],
+      );
+      // Another post opened it (or did meanwhile: a fresh read sees the row its insert committed).
+      const row = found.rows[0] ?? (await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [group])).rows[0];
+      if (!row) continue;
+      const task = toTask(row);
+      if (found.rows[0]) opened.push(task.id);
+      tasks.push(`- Task ${task.id}: ${itemLine(item)}`);
+    }
+    const checklist = [
+      rest.length ? `**Action items from the notes for this follow-up** (not the account team's own tasks):\n${rest.join("\n")}` : "",
+      tasks.length ? `The account team's items have their own tasks:\n${tasks.join("\n")}` : "",
+    ].filter(Boolean).join("\n") || null;
+    // Only as new as the newest revision it took (a revision read late, at the same time as a newer one, loses here).
+    // The event is marked done in the same statement: a checklist saved is never left without its update being sent (a retry sees it unchanged).
+    const written = await this.q<{ was: unknown }>(
+      `WITH ck AS (UPDATE $S.tasks t SET checklist = $2, items_us = $3 FROM (SELECT checklist AS was FROM $S.tasks WHERE id = $1 FOR UPDATE) old
+         WHERE t.id = $1 AND (t.items_us IS NULL OR t.items_us <= $3)
+           -- Only from the notes' latest revision saved, as for its action tasks: a newer one saved but not yet here writes its own.
+           AND EXISTS (SELECT 1 FROM $S.events WHERE id = $4 AND versions = $5 FOR SHARE) AND ${LATEST_REVISION(4)}
+         RETURNING old.was),
+       ev AS (UPDATE $S.events SET items_pending = NULL WHERE id = $4 AND items_pending = $5 RETURNING 1)
+       SELECT was FROM ck`,
+      [followUp.id, checklist, String(at), recorded.id, recorded.version],
+    );
+    const changed = written.rows.length > 0 && ((written.rows[0]!.was as string | null) ?? null) !== checklist;
+    return { opened, ...(changed && { checklist }) };
   }
 
   /** Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule. */
@@ -1178,7 +1536,7 @@ export class SignalsStore {
     const opened: Task[] = [];
     for (const row of [...found.rows].sort((a, b) => Number(a.occurred_at) - Number(b.occurred_at))) {
       const event = toEvent(row);
-      const placed = await this.place(String(row.owner), event, { id: Number(row.id) }, config, false);
+      const placed = await this.place(String(row.owner), event, { id: Number(row.id), version: Number(row.versions) }, config, false);
       if (!placed) continue;
       await this.attach(placed.task.id, Number(row.id), Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen: false });
       if (placed.opened) opened.push((await this.task(placed.task.id))!);
@@ -1313,6 +1671,7 @@ function toTask(row: Row): Task {
     options: row.options === null || row.options === undefined ? null : strings(typeof row.options === "string" ? JSON.parse(row.options) : row.options),
     asked_by: (row.asked_by as string | null) ?? null,
     series: (row.series as string | null) ?? null,
+    checklist: (row.checklist as string | null) ?? null,
   };
 }
 

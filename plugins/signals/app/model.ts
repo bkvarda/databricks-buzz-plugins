@@ -168,6 +168,16 @@ export type Rule = Readonly<{
    * events go there too.
    */
   same_as?: string;
+  /**
+   * The event is a meeting's notes (`payload.notes`, Gemini's "Next steps"
+   * lines, `[Name] Title: what to do`): each item someone on the account team
+   * owns opens its own task, under `workstream`, assigned to that person when
+   * the name is one attendee. The customer's items, and items whose owner
+   * isn't clear, are listed on this rule's task as a checklist. The meeting's
+   * attendees come from the `meetings` source's event (default
+   * google_calendar) that the notes' `payload.meeting` link names.
+   */
+  action_items?: Readonly<{ workstream?: string; meetings?: string }>;
   /** Rules with the same group share tasks (default: the rule's id). An `update` rule needs the group of the rule that opens the tasks. */
   group?: string;
   /** Overrides the account the event says (a fixed name or `{payload.account_name}`). */
@@ -402,6 +412,12 @@ export function configProblems(raw: unknown): string[] {
     if (rule.same_as !== undefined && (typeof rule.same_as !== "string" || !/\{[a-z_][a-z0-9_.]*\}/i.test(rule.same_as))) problems.push(`${where}.same_as is a {field} template, like {actor}|{title}|{occurred_at}`);
     if (rule.stale_after_hours !== undefined && !(typeof rule.stale_after_hours === "number" && rule.stale_after_hours > 0)) problems.push(`${where}.stale_after_hours must be a positive number`);
     if (rule.done_when !== undefined) problems.push(...doneWhenProblems(rule.done_when, `${where}.done_when`));
+    if (rule.action_items !== undefined) {
+      const a = rule.action_items as Record<string, unknown>;
+      if (!a || typeof a !== "object" || Array.isArray(a) || Object.keys(a).some((key) => key !== "workstream" && key !== "meetings") || [a.workstream, a.meetings].some((value) => value !== undefined && (typeof value !== "string" || !value.trim())))
+        problems.push(`${where}.action_items is {workstream?, meetings?}, like {"workstream": "meeting action items"}`);
+      else if (rule.action !== "task") problems.push(`${where}.action_items needs action task`);
+    }
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
     if (rule.classify !== undefined) {
       const c = rule.classify as Record<string, unknown>;

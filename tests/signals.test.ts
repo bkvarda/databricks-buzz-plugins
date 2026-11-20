@@ -316,8 +316,8 @@ describe("the hub API", () => {
     await call("POST", "/api/events", { events: [{ source: "table.cases", external_id: "C-1", payload: { status: "Awaiting Confirmation" } }] });
     expect(posts).toEqual([]);
     fail = false;
-    expect(await hub.sweep()).toEqual({ posted: 1, nudged: 0, finished: 0 });
-    expect(await hub.sweep(Math.floor(Date.now() / 1000) + 80 * 3600)).toEqual({ posted: 0, nudged: 1, finished: 0 });
+    expect(await hub.sweep()).toEqual({ posted: 1, nudged: 0, finished: 0, resumed: 0 });
+    expect(await hub.sweep(Math.floor(Date.now() / 1000) + 80 * 3600)).toEqual({ posted: 0, nudged: 1, finished: 0, resumed: 0 });
     expect(posts.at(-1)).toEqual({ kind: "updated", task: 1, text: "⏰ Case C-1 has waited 80h for confirmation" });
   });
 });

@@ -313,6 +313,8 @@ export class Hub {
         created: result.created.map((task) => task.id),
         updated: [...new Set(result.updated.map((update) => update.task.id))],
         errors: [...errors, ...result.errors],
+        // Events that failed to save or be placed (a write failed, not a bad event): post them again (the poller keeps its cursor; the inbox handles the post again).
+        ...(result.errors.some((error) => error.retry) && { retry: true }),
       },
     };
   }
@@ -366,6 +368,10 @@ export class Hub {
       const outgrown = last.outgrown;
       const final = (await this.store.task(update.task.id)) ?? last.task;
       let text = `Update: ${what}`;
+      // A meeting's notes changed: the follow-up's checklist as the new version has it.
+      // (The last update of the post that changed it, when the task still has that: null says the notes list no items now.)
+      const checklist = [...updates].reverse().find((one) => one.checklist !== undefined)?.checklist;
+      if (checklist !== undefined && (final.checklist ?? null) === checklist) text += checklist ? `\n\n${checklist}` : "\n\nThe notes list no action items now, so the checklist is cleared.";
       if (update.reopened) {
         // It was done: say it's open again and who has it, not just that something came in.
         const on = (await this.store.people([update.task.id])).get(update.task.id) ?? [];
@@ -845,14 +851,53 @@ export class Hub {
   async drain(limit = 20): Promise<{ handled: number; failed: number }> {
     let handled = 0;
     let failed = 0;
-    for (const post of await this.store.inbox(limit)) {
-      const reply = await this.handle({ method: "POST", path: post.kind === "events" ? "/api/events" : "/api/cursor", query: new URLSearchParams(), user: post.owner, body: async () => JSON.stringify(post.body) });
-      const status = reply.status ?? 200;
-      if (status >= 400) {
-        failed++;
-        this.log(`inbox ${post.id} from ${post.owner} failed: ${(reply.json as { error?: string }).error ?? status}`);
-      } else handled++;
-      await this.store.inboxDone(post.id, { status, ...(reply.json as object) });
+    // An owner's source with a post to be handled again: their later posts of it (its cursor, above all) wait for it.
+    const waiting = new Set<string>();
+    const at = Math.floor(Date.now() / 1000);
+    // `limit` posts handled (or tried): the posts waiting behind a held one don't count, and the pages after them are read,
+    // so one held source doesn't hold up the others (its own posts still wait, in order).
+    let tried = 0;
+    let after = 0;
+    const page = Math.max(limit, 200);
+    for (;;) {
+      const posts = await this.store.inbox(page, after);
+      if (!posts.length) break;
+      for (const post of posts) {
+        if (tried >= limit) break;
+        after = post.id;
+        const keys = inboxSources(post.body).map((source) => `${post.owner}\n${source}`);
+        // (A post whose sources aren't known, "*", waits for and holds up all its owner's posts.)
+        if (keys.some((key) => waiting.has(key) || waiting.has(`${post.owner}\n*`)) || (keys.some((key) => key.endsWith("\n*")) && [...waiting].some((key) => key.startsWith(`${post.owner}\n`)))) continue;
+        // Held (past INBOX_TRIES): tried again only every INBOX_HOLD_SECONDS, its source's later posts still waiting.
+        if (post.tries >= INBOX_TRIES && post.tried_at !== null && at - post.tried_at < INBOX_HOLD_SECONDS) {
+          failed++;
+          for (const key of keys) waiting.add(key);
+          continue;
+        }
+        tried++;
+        const reply = await this.handle({ method: "POST", path: post.kind === "events" ? "/api/events" : "/api/cursor", query: new URLSearchParams(), user: post.owner, body: async () => JSON.stringify(post.body) });
+        const status = reply.status ?? 200;
+        // Events that failed to save: never done (so never lost), its source's cursor waiting behind it.
+        if (status < 400 && (reply.json as { retry?: boolean }).retry) {
+          failed++;
+          for (const key of keys) waiting.add(key);
+          const tries = await this.store.inboxRetry(post.id, { status, ...(reply.json as object) }, at);
+          const error = (reply.json as { errors?: { error: string; retry?: boolean }[] }).errors?.find((one) => one.retry)?.error ?? "a write failed";
+          if (tries >= INBOX_TRIES) {
+            // Reported on the person's source (Settings shows it) and the log; tried again every so often, so it's saved once the write works.
+            const message = `Events failed to save ${tries} times (${error}); held, and tried again every ${INBOX_HOLD_SECONDS / 60} minutes. The source's cursor waits for them.`;
+            for (const source of inboxSources(post.body)) await this.store.sourceError(post.owner, source, message).catch(() => {});
+            this.log(`inbox ${post.id} from ${post.owner} held: ${message}`);
+          } else this.log(`inbox ${post.id} from ${post.owner}: events failed to save (${error}), to be handled again`);
+          continue;
+        }
+        if (status >= 400) {
+          failed++;
+          this.log(`inbox ${post.id} from ${post.owner} failed: ${(reply.json as { error?: string }).error ?? status}`);
+        } else handled++;
+        await this.store.inboxDone(post.id, { status, ...(reply.json as object) });
+      }
+      if (tried >= limit || posts.length < page) break;
     }
     return { handled, failed };
   }
@@ -926,11 +971,16 @@ export class Hub {
     return { recorded };
   }
 
-  /** Finishes tasks by their rules' done_when, posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
-  async sweep(at?: number): Promise<{ posted: number; nudged: number; finished: number }> {
+  /** Finishes meeting notes' action items a failed write cut short, finishes tasks by their rules' done_when, posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
+  async sweep(at?: number): Promise<{ posted: number; nudged: number; finished: number; resumed: number }> {
     let posted = 0;
     let nudged = 0;
     let finished = 0;
+    // Meeting notes whose action items a failed write cut short: finished from the saved event (the poller won't post that version again).
+    const pending = await this.store.pendingItems(await this.config(), 20, this.options.classifier);
+    for (const { event, error } of pending.errors) this.log(`action items of event ${event} failed again: ${error}`);
+    const resumed = pending.created.length + pending.updated.length;
+    if (resumed) await this.announce({ received: 0, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: pending.created, updated: pending.updated, finished: [], handled: [], firstRun: false });
     // Finished tasks first, so they aren't posted or nudged.
     for (const { task, reason } of await this.store.finishable(await this.config(), at)) {
       const done = await this.store.finish(task.id, reason);
@@ -949,8 +999,21 @@ export class Hub {
       await this.store.nudged(task.id, text, at);
       nudged++;
     }
-    return { posted, nudged, finished };
+    return { posted, nudged, finished, resumed };
   }
+}
+
+/** How many times in a row the inbox handles a post whose events failed to save before it's held: reported as the source's error, and tried again only every INBOX_HOLD_SECONDS. It's never dropped. */
+export const INBOX_TRIES = 10;
+export const INBOX_HOLD_SECONDS = 600;
+
+/** The sources an inbox post is about: an events post's events', or a cursor post's. */
+export function inboxSources(body: unknown): string[] {
+  const given = body as { source?: unknown; events?: unknown } | null;
+  if (typeof given?.source === "string") return [given.source];
+  const events = Array.isArray(given?.events) ? given.events : Array.isArray(body) ? body : [body];
+  const sources = events.map((event) => (event as { source?: unknown } | null)?.source).filter((source): source is string => typeof source === "string");
+  return sources.length ? [...new Set(sources)] : ["*"];
 }
 
 /** How long the same update line isn't posted again in a task's thread. */
@@ -1388,6 +1451,7 @@ export function taskMessage(task: Task, detail?: { agents?: readonly string[]; b
     MODE_TEXT[task.mode] ?? "",
     task.question ? `⏸️ **Needs input:** ${task.question}${task.options?.length ? `\nOptions: ${task.options.join(" / ")}` : ""}\nAnswer from the Tasks board (Provide input on its card).` : "",
     detail?.source ? `\n${detail.source}\n` : "",
+    task.checklist ? `${task.checklist}\n` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
     ask,
     asking && detail?.briefing ? `\n${detail.briefing}` : "",
