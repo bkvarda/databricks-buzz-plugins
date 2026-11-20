@@ -1484,6 +1484,64 @@ describe("work someone on the team did themselves", () => {
     expect(task!.status).toBe("open");
   });
 
+  it("keeps a task done for a late customer message that a later saved reply answered", async () => {
+    const { store, call } = await setup("signals_handled_two_saved");
+    const mail = (id: string, actor: string, at: number) => ({ source: "gmail", external_id: id, actor, group_key: "th1", occurred_at: at });
+    // Two team replies come in before the customer's message: the first closes the task, the second finds it done.
+    await call("/api/events", { events: [mail("r1", "alice@x.com", 1795000100), mail("r2", "alice@x.com", 1795000300)] });
+    await call("/api/events", { events: [mail("c0", "ann@globex.io", 1795000000)] });
+    const [task] = await store.tasks({});
+    expect(task!.status).toBe("done");
+    // A late customer message between them: the second reply answered it.
+    await call("/api/events", { events: [mail("c2", "ann@globex.io", 1795000200)] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    await call("/api/events", { events: [mail("c4", "ann@globex.io", 1795000400)] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
+
+  it("doesn't close a task with a reply Forget deleted while it was being decided", async () => {
+    const pg = new PGlite();
+    let paused: (() => Promise<void>) | undefined;
+    const db: Db = {
+      query: async (text, values) => {
+        // Forget runs between the reply's attachment and the closure's statement.
+        if (paused && text.includes("handled it themselves") === false && text.includes("kept AS")) {
+          const run = paused;
+          paused = undefined;
+          await run();
+        }
+        return { rows: (await pg.query(text, values)).rows as never[] };
+      },
+    };
+    const store = new SignalsStore(db, "signals_handled_forget_inflight");
+    await store.setup();
+    for (const source of ["gmail", "slack", "slack.sent"]) {
+      await store.setSource("alice@x.com", source, true);
+      await store.ingest("alice@x.com", [{ source, external_id: "seed" }], config);
+    }
+    await store.ingest("alice@x.com", [{ source: "slack", external_id: "c1", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000100.000000" }], config);
+    const [task] = await store.tasks({});
+    paused = () => store.setSource("alice@x.com", "slack.sent", false, undefined, true);
+    const result = await store.ingest("alice@x.com", [{ source: "slack.sent", external_id: "s1", actor: "alice@x.com", group_key: "C1:1795000000.000001", occurred_at: "1795000200.000000" }], config);
+    expect(paused).toBeUndefined();
+    expect(result.handled).toEqual([]);
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
+
+  it("orders an event saved before the upgrade by its own permalink's ts, not the root's", async () => {
+    const { store, call } = await setup("signals_handled_upgrade_us");
+    const root = "1795001000.000001";
+    // The customer's reply in the thread, at .900000: its permalink is its own ts, thread_ts the root's.
+    await call("/api/events", { events: [{ source: "slack", external_id: "https://x.slack.com/archives/C1/p1795001030900000", url: `https://x.slack.com/archives/C1/p1795001030900000?thread_ts=${root}&cid=C1`, actor: "ann@globex.io", group_key: `C1:${root}`, occurred_at: "1795001030.900000" }] });
+    const [task] = await store.tasks({});
+    // As a row saved before occurred_us existed.
+    await (store as unknown as { q: (text: string) => Promise<unknown> }).q(`UPDATE $S.events SET occurred_us = NULL`);
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "https://x.slack.com/archives/C1/p1795001030100000", actor: "alice@x.com", group_key: `C1:${root}`, occurred_at: "1795001030.100000" }] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "https://x.slack.com/archives/C1/p1795001030950000", actor: "alice@x.com", group_key: `C1:${root}`, occurred_at: "1795001030.950000" }] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+  });
+
   it("closes nothing for a rule without by_owner", async () => {
     const { store, call } = await setup("signals_handled_off");
     await call("/api/events", { events: [{ source: "jira", external_id: "T-1", actor: "ann@globex.io" }] });

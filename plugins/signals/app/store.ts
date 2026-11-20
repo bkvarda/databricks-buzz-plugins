@@ -71,6 +71,18 @@ export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label
 export type Handled = { task: Task; by: string; title?: string; url?: string; agents: string[]; owner?: string };
 
 /** A reply someone on the team sent in a group's thread, as recorded. */
+/**
+ * An event row's time in microseconds: `occurred_us`, or for a row saved
+ * before it, its Slack permalink's own ts (`/p1795001030900000`, the message's,
+ * not `thread_ts=`, which is the root's) when that's in the same second, or
+ * else its second.
+ */
+const EVENT_MICROS = `COALESCE(e.occurred_us,
+  CASE WHEN (e.source = 'slack' OR e.source LIKE 'slack.%') AND substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{16})') IS NOT NULL
+        AND substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{10})[0-9]{6}')::bigint = e.occurred_at
+       THEN substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{16})')::bigint END,
+  e.occurred_at * 1000000)`;
+
 /** `at` in seconds; `micros` the same moment in microseconds (Slack's ts keeps them), for ordering it against the customer's messages. */
 export type Reply = Readonly<{ group: string; event: number; owner: string; source: string; title: string | null; url: string | null; at: number; micros?: number }>;
 
@@ -924,10 +936,19 @@ export class SignalsStore {
     return found.rows.map((row) => ({ group: String(row.group_key), event: Number(row.event_id), owner: String(row.owner), source: String(row.source), title: (row.title as string | null) ?? null, url: (row.url as string | null) ?? null, at: Number(row.at), micros: row.at_us === null || row.at_us === undefined ? Number(row.at) * 1_000_000 : Number(row.at_us) }));
   }
 
-  /** Whether a team reply that closed the task came at or after `micros` (so a customer message from then needs nothing more). */
+  /**
+   * Whether a team reply on the task came at or after `micros` (so a customer
+   * message from then needs nothing more): any saved reply decided against it,
+   * not just the one that closed it (a later reply that found it done already
+   * still answered everything before it).
+   */
   private async answeredAfter(task: number, micros: number): Promise<boolean> {
     if (Number.isNaN(micros)) return false;
-    const found = await this.q(`SELECT 1 FROM $S.replies WHERE closed_task = $1 AND COALESCE(at_us, at * 1000000) >= $2::bigint LIMIT 1`, [task, String(micros)]);
+    const found = await this.q(
+      `SELECT 1 FROM $S.replies r WHERE r.applied_at IS NOT NULL AND COALESCE(r.at_us, r.at * 1000000) >= $2::bigint
+         AND (r.closed_task = $1 OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = r.event_id)) LIMIT 1`,
+      [task, String(micros)],
+    );
     return found.rows.length > 0;
   }
 
@@ -953,13 +974,16 @@ export class SignalsStore {
     const at = now();
     const what = `${reply.owner} handled it themselves (${reply.source})${reply.title ? `: ${reply.title}` : ""}${reply.url ? ` ${reply.url}` : ""}`.slice(0, 4000);
     const found = await this.q<{ task: unknown; agents: unknown; owners: unknown }>(
-      `WITH latest AS (
-         SELECT max(COALESCE(e.occurred_us, e.occurred_at * 1000000)) AS at FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+      `WITH kept AS (SELECT 1 FROM $S.replies WHERE group_key = $2 AND event_id = $5 FOR SHARE),
+       latest AS (
+         SELECT max(${EVENT_MICROS}) AS at FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
          WHERE te.task_id = $1 AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)),
        t AS (
          UPDATE $S.tasks SET status = 'done', question = NULL, options = NULL, asked_by = NULL, updated_at = $3
          WHERE id = $1 AND status NOT IN ('done', 'dismissed') AND NOT (series IS NOT NULL AND asked_by IS NOT DISTINCT FROM $9::text)
            AND $4::bigint >= COALESCE((SELECT at FROM latest), 0)
+           -- (Only while the reply is still saved: Forget deletes it, and a closure it was about to make with it.)
+           AND EXISTS (SELECT 1 FROM kept)
          RETURNING *),
        -- (Never undone: a second delivery of the same reply that finds the task already done keeps the first one's closure.)
        mark AS (UPDATE $S.replies SET applied_at = COALESCE(applied_at, $3), closed_task = COALESCE((SELECT id FROM t), closed_task) WHERE group_key = $2 AND event_id = $5 RETURNING 1),
