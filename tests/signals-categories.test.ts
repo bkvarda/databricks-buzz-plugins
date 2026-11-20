@@ -86,8 +86,10 @@ describe("rule categories", () => {
   });
 
   // The store on its own, with Acme's preferences and these rules, and the seed post that ends jira's first run.
-  const prepare = async (preferences: string, rules: readonly Rule[] = [ESCALATIONS]) => {
-    const store = new SignalsStore(pglite(), "signals_categories");
+  // `hold` runs before each statement: one it returns a promise for waits on it, as a slow connection would.
+  const prepare = async (preferences: string, rules: readonly Rule[] = [ESCALATIONS], hold?: (sql: string, values?: unknown[]) => Promise<void> | undefined) => {
+    const db = pglite();
+    const store = new SignalsStore({ query: async (sql, values) => (await hold?.(sql, values), db.query(sql, values)) }, "signals_categories");
     await store.setup();
     await store.setSource("alice@x.com", "jira", true);
     const config = (preferences: string): SignalsConfig => ({ ...CONFIG, accounts: [{ name: "Acme", channel: "acme", preferences }], rules });
@@ -164,6 +166,49 @@ describe("rule categories", () => {
     expect(after.offrule).toMatchObject({ rule_id: "es_off", workstream: "capacity request", mode: "off" });
     expect((await store.detail(after.offrule!.id))!.activities.map((one) => one.text)).toContain("Now under rule es_off: a new event matched it. Its mode is off now.");
     expect((await store.detail(after.refile!.id))!.activities.map((one) => one.text)).toContain("Now under rule resolved_work: a new event matched it. That rule has no capacity request category, so it's under no workstream now, in draft mode.");
+  });
+
+  it("keeps a filing by hand that a refile overlaps, before its history is saved or after the task was read", async () => {
+    const rules = [
+      { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { id: "case_follow", group: "es", group_by: "external_id", action: "task", sources: ["jira"], workstream: "case follow-up", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "es_later", group: "es", when: { "payload.status": ["Waiting"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    // One statement at a time can be held until the test lets it go.
+    let held: { match: (sql: string, values?: unknown[]) => boolean; reached: () => void; release: Promise<void> } | undefined;
+    const holdNext = (match: (sql: string, values?: unknown[]) => boolean) => {
+      let reached!: () => void;
+      let release!: () => void;
+      const at = new Promise<void>((resolve) => { reached = resolve; });
+      held = { match, reached, release: new Promise<void>((resolve) => { release = resolve; }) };
+      return { at, release };
+    };
+    const { store, post } = await prepare("escalation tracking: ask\ncapacity request: auto\nes_later: draft", rules, (sql, values) => {
+      if (!held?.match(sql, values)) return undefined;
+      const { reached, release } = held;
+      held = undefined;
+      reached();
+      return release;
+    });
+    await post(ticket("early", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("late", "Please increase TPM for our endpoint", { status: "Incoming" }));
+    const byKey = async (): Promise<Record<string, Awaited<ReturnType<SignalsStore["tasks"]>>[number]>> => Object.fromEntries((await store.tasks({})).map((task) => [task.group_key.split("|").pop(), task]));
+    const { early, late } = await byKey();
+    // The filing has saved its workstream, but not yet its history, when the ticket moves to a rule with a workstream of its own.
+    const beforeHistory = holdNext((sql, values) => sql.includes("activities") && values?.[2] === "bob@x.com" && values?.[3] === "workstream");
+    const filing = store.file(early!.id, "bob@x.com", { workstream: "manual review" });
+    await beforeHistory.at;
+    expect((await post(ticket("early", "Please increase TPM for our endpoint", { status: "Investigating" }))).errors).toEqual([]);
+    beforeHistory.release();
+    await filing;
+    expect(await store.task(early!.id)).toMatchObject({ rule_id: "case_follow", workstream: "manual review", mode: "auto" });
+    // The refile read the task under capacity request; the filing lands before its write, which leaves the filing and its mode.
+    const beforeWrite = holdNext((sql) => sql.includes("SET rule_id = $2"));
+    const refiled = post(ticket("late", "Please increase TPM for our endpoint", { status: "Waiting" }));
+    await beforeWrite.at;
+    await store.file(late!.id, "bob@x.com", { workstream: "manual review" });
+    beforeWrite.release();
+    expect((await refiled).errors).toEqual([]);
+    expect(await store.task(late!.id)).toMatchObject({ rule_id: "es_later", workstream: "manual review", mode: "auto" });
   });
 
   it("opens a closed task again only while the team still works on its own category", async () => {

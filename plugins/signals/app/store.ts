@@ -245,6 +245,8 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict_by text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict_at bigint`);
+    // Who filed the task under its workstream by hand (file), saved with the workstream so a refile racing the filing keeps it.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS workstream_by text`);
     // The newest notes revision (microseconds) whose action items the follow-up took: an older one read late changes nothing.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS items_us bigint`);
     // The event version whose action items are being written, until all are: one a failed write cut short is finished by the sweep (or a repost).
@@ -1325,12 +1327,18 @@ export class SignalsStore {
     const automatic = !kept && Boolean(categoryNamed(before, task.workstream)) && task.workstream?.trim().toLowerCase() !== before?.workstream?.trim().toLowerCase();
     const preferences = config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences;
     const found = await this.q(
-      `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS manual)
+      // Filed by hand: the row's own marker, which file() saves with the workstream, or its history, for tasks filed before the
+      // marker. The row is read locked, so a filing that lands while this waits on it is seen; and the workstream and mode this
+      // decided from the task as it was read apply only while the row still has that workstream.
+      `WITH d AS (SELECT t.workstream_by IS NOT NULL OR t.workstream IS DISTINCT FROM $8::text
+                    OR EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS manual,
+                  t.workstream IS DISTINCT FROM $8::text AS stale
+                  FROM $S.tasks t WHERE t.id = $1 FOR UPDATE)
        UPDATE $S.tasks SET rule_id = $2,
          workstream = CASE WHEN d.manual THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
-         mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT d.manual THEN $6 ELSE mode END, updated_at = $4
+         mode = CASE WHEN d.stale THEN mode WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT d.manual THEN $6 ELSE mode END, updated_at = $4
        FROM d WHERE id = $1 RETURNING $S.tasks.*, ($5::boolean AND NOT d.manual) AS dropped`,
-      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null],
+      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null],
     );
     const row = found.rows[0];
     const moved = row ? toTask(row) : task;
@@ -1530,7 +1538,9 @@ export class SignalsStore {
     for (const key of ["workstream", "initiative"] as const) {
       const value = fields[key];
       if (value === undefined) continue;
-      const found = await this.q(`UPDATE $S.tasks SET ${key} = $2, updated_at = $3 WHERE id = $1 RETURNING *`, [id, value.trim().slice(0, 200) || null, now()]);
+      // A workstream saves who filed it in the same write, so a refile can't take it back before the activity below is saved.
+      const by = key === "workstream" ? ", workstream_by = $4" : "";
+      const found = await this.q(`UPDATE $S.tasks SET ${key} = $2, updated_at = $3${by} WHERE id = $1 RETURNING *`, [id, value.trim().slice(0, 200) || null, now(), ...(by ? [actor] : [])]);
       if (!found.rows[0]) return undefined;
       task = toTask(found.rows[0]);
       await this.activity(id, actor, key, value.trim() ? `${key}: ${value.trim()}` : `${key} cleared`);
