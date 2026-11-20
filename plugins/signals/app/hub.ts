@@ -327,7 +327,8 @@ export class Hub {
       seen.add(task.id);
       // A newer customer message later in the same post opened it again: one message says both, and no "Done".
       const now = await this.store.task(task.id);
-      const later = now && isOpen(now.status) ? [...result.updated].reverse().find((update) => update.task.id === task.id) : undefined;
+      // The customer message that opened it again (not a delayed older one in the same post).
+      const later = now && isOpen(now.status) ? [...result.updated].reverse().find((update) => update.task.id === task.id && update.reopened) : undefined;
       const text = now && isOpen(now.status) ? handledThenReopened(by, title, url, agents, owner, later && { title: later.title && plainSlack(later.title), url: later.url }) : handledMessage(by, title, url, agents, owner);
       await this.notifier.updated(now ?? task, text, agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
     }

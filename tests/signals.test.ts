@@ -1488,6 +1488,17 @@ describe("work someone on the team did themselves", () => {
     expect(posts).toEqual([{ task: task.id, text: handledThenReopened("alice@x.com", "Re: Pricing?", "https://mail/m2", [agent], undefined, { title: "One more thing", url: "https://mail/m3" }), agents: [agent] }]);
     expect(posts[0]!.text).not.toContain("Done");
     expect(posts[0]!.text).toContain("[One more thing](https://mail/m3)");
+    // Open again: a reply, a newer follow-up and an older delayed message in one post: the notice quotes the one that opened it again.
+    posts.length = 0;
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m6", actor: "Alice <alice@x.com>", title: "Re: again 2", group_key: "th1", url: "https://mail/m6", occurred_at: 1795000360 },
+      { source: "gmail", external_id: "m7", actor: "Ann <ann@globex.io>", title: "Newer follow-up", group_key: "th1", url: "https://mail/m7", occurred_at: 1795000370 },
+      { source: "gmail", external_id: "m8", actor: "Ann <ann@globex.io>", title: "Delayed older one", group_key: "th1", url: "https://mail/m8", occurred_at: 1795000110 },
+    ] });
+    expect((await store.task(task.id))!.status).toBe("open");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.text).toContain("[Newer follow-up](https://mail/m7)");
+    expect(posts[0]!.text).not.toContain("Delayed older one");
     // In two posts, as before: "Done", then the update.
     await call("/api/events", { events: [{ source: "gmail", external_id: "m4", actor: "Alice <alice@x.com>", title: "Re: one more", group_key: "th1", occurred_at: 1795000400 }] });
     expect((await store.task(task.id))!.status).toBe("done");

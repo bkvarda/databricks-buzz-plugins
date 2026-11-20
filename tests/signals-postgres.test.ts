@@ -87,4 +87,43 @@ describe.skipIf(!URL)("signals on PostgreSQL: overlapping reply decisions", () =
     }
     expect((await store.task(task.id))!.status).toBe("open");
   });
+
+  it("works out a task's times from the rows left when two Forgets overlap", async () => {
+    const schema = "signals_pg_forget_two";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const store = new SignalsStore(db, schema);
+    await store.setup();
+    for (const user of ["alice@x.com", "bob@x.com"]) {
+      await store.setSource(user, "gmail", true);
+      await store.ingest(user, [{ source: "gmail", external_id: "seed" }], config);
+    }
+    await store.ingest("alice@x.com", [{ source: "gmail", external_id: "c1", actor: "ann@globex.io", group_key: "th1", occurred_at: 1795000100 }], config);
+    const [task] = await store.tasks({});
+    // Alice replies at t+200 and Bob at t+300: done, answered at t+300.
+    await store.ingest("alice@x.com", [{ source: "gmail", external_id: "r1", actor: "alice@x.com", group_key: "th1", occurred_at: 1795000200 }], config);
+    await store.ingest("bob@x.com", [{ source: "gmail", external_id: "r2", actor: "bob@x.com", group_key: "th1", occurred_at: 1795000300 }], config);
+    expect((await store.task(task!.id))!.status).toBe("done");
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query(`SELECT 1 FROM ${schema}.tasks WHERE id = $1 FOR UPDATE`, [task!.id]);
+      // Bob's Forget reads the task's rows while Alice's reply is still there (answered at t+200), then waits for the task.
+      // Alice's then deletes hers and reads nothing left, and waits behind it: it must not keep Bob's t+200.
+      const bob = store.setSource("bob@x.com", "gmail", false, undefined, true);
+      await waitFor(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%customer_was%'`, 1);
+      const alice = store.setSource("alice@x.com", "gmail", false, undefined, true);
+      await waitFor(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%customer_was%'`, 2);
+      await holder.query("COMMIT");
+      await Promise.all([alice, bob]);
+    } finally {
+      holder.release();
+    }
+    expect((await pool.query(`SELECT count(*)::int AS n FROM ${schema}.replies`)).rows[0].n).toBe(0);
+    expect((await pool.query(`SELECT customer_us, answered_us FROM ${schema}.tasks WHERE id = $1`, [task!.id])).rows[0]).toEqual({ customer_us: null, answered_us: null });
+    // Nothing of either reply is left: a customer message, even an old one, opens it again.
+    await store.setSource("carol@x.com", "gmail", true);
+    await store.ingest("carol@x.com", [{ source: "gmail", external_id: "seed" }], config);
+    await store.ingest("carol@x.com", [{ source: "gmail", external_id: "c2", actor: "ann@globex.io", group_key: "th1", occurred_at: 1795000150 }], config);
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
 });

@@ -108,7 +108,7 @@ export type IngestResult = Readonly<{
   created: Task[];
   /** Tasks an event of this post was added to. */
   /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
-  updated: { task: Task; title?: string; url?: string; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
+  updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
@@ -454,7 +454,7 @@ export class SignalsStore {
           if (changes.length && own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
-        await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        const reopened = await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
         if (placed.opened) {
           // Someone on the team already replied in its thread (their reply came in first): done, and never posted.
           let closed = false;
@@ -466,7 +466,7 @@ export class SignalsStore {
         }
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
       } catch (error) {
         result.errors.push({ index, error: (error as Error).message });
       }
@@ -619,20 +619,28 @@ export class SignalsStore {
    * statement's snapshot), its value is kept too.
    */
   private async retime(tasks: readonly string[]): Promise<void> {
-    await this.q(
-      `UPDATE $S.tasks t SET
-         customer_us = CASE WHEN t.customer_us IS DISTINCT FROM s.customer_was THEN GREATEST(s.customer, t.customer_us) ELSE s.customer END,
-         answered_us = CASE WHEN t.answered_us IS DISTINCT FROM s.answered_was THEN GREATEST(s.answered, t.answered_us) ELSE s.answered END
-       FROM (
-         SELECT x.id, x.customer_us AS customer_was, x.answered_us AS answered_was,
-           (SELECT max(${EVENT_MICROS}) FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
-             WHERE te.task_id = x.id AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)) AS customer,
-           (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
-             AND (r.closed_task = x.id OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = x.id AND te.event_id = r.event_id))) AS answered
-         FROM $S.tasks x WHERE x.id = ANY($1::bigint[])) s
-       WHERE t.id = s.id`,
-      [tasks],
-    );
+    // Each try reads the rows left and writes only when the task's times are still what that read saw. Otherwise
+    // something changed them meanwhile (an attachment, a closure, another Forget), and it reads again: a value
+    // worked out from an older read never stands.
+    let left = [...tasks];
+    for (let attempt = 0; left.length && attempt < 50; attempt++) {
+      const done = await this.q<{ id: unknown }>(
+        `UPDATE $S.tasks t SET customer_us = s.customer, answered_us = s.answered
+         FROM (
+           SELECT x.id, x.customer_us AS customer_was, x.answered_us AS answered_was,
+             (SELECT max(${EVENT_MICROS}) FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+               WHERE te.task_id = x.id AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)) AS customer,
+             (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
+               AND (r.closed_task = x.id OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = x.id AND te.event_id = r.event_id))) AS answered
+           FROM $S.tasks x WHERE x.id = ANY($1::bigint[])) s
+         WHERE t.id = s.id AND t.customer_us IS NOT DISTINCT FROM s.customer_was AND t.answered_us IS NOT DISTINCT FROM s.answered_was
+         RETURNING t.id`,
+        [left],
+      );
+      const written = new Set(done.rows.map((row) => String(row.id)));
+      left = left.filter((id) => !written.has(id));
+    }
+    if (left.length) throw new Error(`couldn't work out the times of tasks ${left.join(", ")} again`);
   }
 
   /** The task a group's events go to: the one it opened, or the one it joined as a copy of another person's. */
