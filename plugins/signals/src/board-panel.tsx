@@ -19,8 +19,10 @@ import { decode, npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
 import { type Assignee, assigneeOf, type Member, memberChoices, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
 import { type BoardPerson, type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
+import type { LiveTasks } from "./live-tasks";
+import { readTaskTarget } from "./posts";
 
-type Profile = { name?: string; picture?: string; agent?: boolean };
+export type Profile = { name?: string; picture?: string; agent?: boolean };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, { name?: string; picture?: string; isAgent?: true }>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
 type ThreadMessage = { id: string; authorId: string; createdAt: number; content: string; audience?: "agents"; delivery?: unknown };
 type ThreadReader = {
@@ -82,7 +84,7 @@ function useRelay(ctx: Context): RelaySnapshot {
 }
 
 /** Buzz profiles (names and pictures) of the agents on the board, from the host's relay when it has one. */
-function useProfiles(ctx: Context, keys: readonly string[]) {
+export function useProfiles(ctx: Context, keys: readonly string[]) {
   const session = useRelay(ctx).session;
   const profiles = session?.profiles;
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
@@ -141,7 +143,7 @@ function useMembers(ctx: Context, channel: string | undefined): readonly string[
 }
 
 /** An npub's hex key, or undefined when it isn't one. */
-const npubKey = (npub: string): string | undefined => {
+export const npubKey = (npub: string): string | undefined => {
   try {
     const found = decode(npub);
     return found.type === "npub" ? found.data : undefined;
@@ -162,14 +164,14 @@ const npubOf = (key: string): string => {
 const initials = (label: string) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0]!.toUpperCase()).join("") || "?";
 
 /** An assignee's name, from the agent's Buzz profile when there is one. */
-const assigneeName = (assignee: Assignee, profile: (key: string) => Profile | undefined) =>
+export const assigneeName = (assignee: Assignee, profile: (key: string) => Profile | undefined) =>
   assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : (profile(assignee.key)?.name ?? assignee.label);
 
 /** A pubkey's name, or a person's email, for the owner list. */
 const nameOf = (person: { key: string; label: string }, profile: (key: string) => Profile | undefined) => profile(person.key)?.name ?? person.label;
 
 /** The assignee's picture (or initials), like Linear's: round for you, square for agents, dashed for no one. */
-function AssigneeMark(props: { assignee: Assignee; profile(key: string): Profile | undefined; size?: number }) {
+export function AssigneeMark(props: { assignee: Assignee; profile(key: string): Profile | undefined; size?: number }) {
   const size = props.size ?? 20;
   const name = assigneeName(props.assignee, props.profile);
   const title = props.assignee.kind === "you" ? "You: it needs your input" : props.assignee.kind === "agent" ? `${name} (agent)` : props.assignee.kind === "person" ? name : "Unassigned";
@@ -618,7 +620,7 @@ function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | u
 }
 
 /** A task's full view, like a Linear issue: title, details and assets beside its thread as comments, with a reply box. */
-function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; boardAgents: readonly string[]; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back(): void }) {
+function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; boardAgents: readonly string[]; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back?(): void }) {
   const { item } = props;
   const assignee = assigneeOf(item);
   const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? undefined, item.task.buzz_root);
@@ -645,7 +647,7 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
   return (
     <Stack gap={14}>
       <Stack direction="row" gap={8} align="center">
-        <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>
+        {props.back && <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>}
         <Text size="xs" tone="tertiary" mono>#{item.task.id}</Text>
       </Stack>
       <Stack direction="row" gap={8} align="flex-start">
@@ -1078,6 +1080,50 @@ export function boardPage(ctx: Context, service: DatabricksService) {
         action={picker}
         noChannel={accounts.loading ? <Spinner label="Loading accounts" /> : <Notice>{options.length ? "Choose an account to see its tasks." : "No account channels yet. Set one up from a channel's menu (Set up account)."}</Notice>}
       />
+    );
+  };
+}
+
+/**
+ * One task in a panel beside the conversation, opened from its card in the
+ * channel: the same view as the board's Open, with its thread as comments.
+ * The target names the channel and task, so it opens again from Back.
+ */
+export function taskPanel(ctx: Context, live: LiveTasks) {
+  return function TaskPanel({ target, context }: PanelProps) {
+    const at = readTaskTarget(target);
+    React.useSyncExternalStore(live.subscribe, live.snapshot);
+    const connection = useConnection(live.service);
+    const [hub, setHub] = React.useState<HubClient>();
+    const [problem, setProblem] = React.useState<string>();
+    const [attempt, retry] = React.useReducer((n: number) => n + 1, 0);
+    React.useEffect(() => {
+      if (connection.status !== "connected") return;
+      let current = true;
+      setProblem(undefined);
+      live.client().then(
+        (found) => current && (found ? setHub(found) : setProblem("There's no signals hub in this workspace.")),
+        (error: Error) => current && setProblem(describeError(error)),
+      );
+      return () => void (current = false);
+    }, [connection.status, attempt]);
+    const entry = at && connection.status === "connected" ? live.board(at.channel) : undefined;
+    const item = at ? entry?.board?.tasks.find((found) => found.task.id === at.id) : undefined;
+    (ctx.panels as { useTabTitle?(label: string): void }).useTabTitle?.(at ? `Task ${at.id}` : "Task");
+    const agents = item ? [...new Set(item.people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
+    const profile = useProfiles(ctx, agents);
+    const steer = (found: BoardTask) => void (found.thread && context?.canOpen(found.thread) && context.open(found.thread));
+    let body: React.ReactNode;
+    if (!at) body = <Notice tone="danger">This link doesn't name a task.</Notice>;
+    else if (connection.status !== "connected") body = <Notice title="Connect Databricks" action={<Button variant="brand" onClick={() => live.service.openSettings()}>Connect</Button>}>Tasks live in your team's signals hub, a Databricks App.</Notice>;
+    else if (problem || (entry?.error && !entry.board)) body = <Notice tone="danger" title="Couldn't load the task" action={<Button size="sm" onClick={() => (retry(), void live.load(at.channel))}>Try again</Button>}>{problem ?? describeError(entry!.error!)}</Notice>;
+    else if (!hub || !entry?.board) body = <Spinner label="Loading the task" />;
+    else if (!item) body = <Notice title={`Task ${at.id} isn't on this channel's board`}>Done and dismissed tasks leave the board after two weeks.</Notice>;
+    else body = <TaskView ctx={ctx} hub={hub} item={item} channel={at.channel} boardAgents={agents} profile={profile} steer={steer} onChange={() => void live.load(at.channel)} />;
+    return (
+      <DbxRoot style={{ minWidth: 0, maxWidth: "100%", width: "100%", height: "100%", overflow: "auto", boxSizing: "border-box" }}>
+        <div style={{ padding: 16, minWidth: 0, boxSizing: "border-box" }}>{body}</div>
+      </DbxRoot>
     );
   };
 }

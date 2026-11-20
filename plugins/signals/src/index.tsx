@@ -13,11 +13,15 @@ import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choic
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, lakebaseSnippet, type Onboarding, type SignIn, signInPath, signInState, type SourceState } from "./client";
 import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
-import { BOARD_PAGE, boardPage, boardPanel, validBoardRoute } from "./board-panel";
+import { BOARD_PAGE, boardPage, boardPanel, taskPanel, validBoardRoute } from "./board-panel";
+import { optionalService } from "@dbx/core/host-types";
+import { LiveTasks } from "./live-tasks";
+import { type PostMessage, TaskPostCard, ThreadPostCard } from "./post-cards";
+import { isTaskPost, parseThreadPost, readTaskTarget } from "./posts";
 import { signalsTools } from "./tools";
 import { findPollerJob, type PollerJob, setUpPollerJob } from "./poller-job";
 
-export const inject = ["react", "settingsCards", "panels", "pages"];
+export const inject = ["react", "settingsCards", "panels", "pages", "conversation"];
 
 /** In the main connection's preferences: the CLI profile the hub runs in. */
 export const WORKSPACE_PREF = "signalsWorkspace";
@@ -256,6 +260,53 @@ function SignalsSettings(props: { service: DatabricksService }) {
   );
 }
 
+const HUB_AUTHORS_KEY = "signals.hubAuthors";
+
+/**
+ * The hub's posts as cards: a task where it's posted, and the hub's replies in
+ * its thread. Replies are only taken from authors seen posting a task, so an
+ * agent's own "Update:" stays as it wrote it.
+ */
+function registerPosts(ctx: Context, scope: Context, databricks: DatabricksService) {
+  const live = new LiveTasks(databricks);
+  const authors = new Set<string>();
+  try {
+    for (const key of JSON.parse(globalThis.localStorage?.getItem(HUB_AUTHORS_KEY) ?? "[]") as unknown[]) if (typeof key === "string") authors.add(key);
+  } catch {
+    // Learned again from the next task post.
+  }
+  const remember = (author: string) => {
+    if (authors.has(author)) return;
+    authors.add(author);
+    try {
+      globalThis.localStorage?.setItem(HUB_AUTHORS_KEY, JSON.stringify([...authors].slice(-20)));
+    } catch {
+      // Kept for this session only.
+    }
+  };
+  const openBoard = (channel: string) => {
+    const navigation = optionalService<{ open(target: unknown): Promise<unknown> }>(ctx, "navigation");
+    void navigation?.open({ version: 1, kind: "page", pluginId: "bkvarda.databricks-signals", pageId: BOARD_PAGE, route: { version: 1, params: { channel } } });
+  };
+  scope.panels.register({ id: "task", title: "Task", matches: (target: string) => readTaskTarget(target) !== undefined, component: taskPanel(ctx, live) });
+  scope.conversation.registerMessage({
+    id: "task-post",
+    title: "Signals task",
+    matches: (message: PostMessage) => {
+      if (!isTaskPost(message.content)) return false;
+      remember(message.authorId);
+      return true;
+    },
+    component: (props: { message: PostMessage; canOpen(target: string): boolean; open(target: string): boolean }) => <TaskPostCard ctx={ctx} live={live} message={props.message} canOpen={props.canOpen} open={props.open} openBoard={openBoard} />,
+  });
+  scope.conversation.registerMessage({
+    id: "task-reply",
+    title: "Signals update",
+    matches: (message: PostMessage) => Boolean(message.threadRootId) && authors.has(message.authorId) && parseThreadPost(message.content) !== undefined,
+    component: (props: { message: PostMessage }) => <ThreadPostCard ctx={ctx} live={live} message={props.message} />,
+  });
+}
+
 export function apply(ctx: Context) {
   bindReact(ctx.react);
   const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, main) => {
@@ -283,6 +334,7 @@ export function apply(ctx: Context) {
       channelPlacement: "tab",
       component: boardPanel(ctx, databricks),
     });
+    registerPosts(ctx, scope, databricks);
     return { main, databricks, BoardPage: boardPage(ctx, databricks) };
   });
   // The tasks board in a full-window page, opened from the channel tab (with the channel) or from search (pick an account).
