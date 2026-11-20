@@ -49,8 +49,8 @@ export type Hit = { kind: string; text: string };
 const PATTERNS: readonly [string, RegExp][] = [
   ["go link", /\bgo\/[\w-]+(?:\/[\w./-]*)?/gi],
   ["Jira or Confluence", /\bhttps?:\/\/[\w-]+\.atlassian\.net\/\S*/gi],
-  ["internal ticket", /\b(?:ES|INC|NOC|PS|SC|DECO|PLAT)-\d{3,}\b/g],
-  ["Brickroad", /\bbrickroad:\S+|\bbrickroad\s*#\d+/gi],
+  ["internal ticket", /\b(?:ES|INC|NOC|PS|SC|DECO|PLAT|RT)-\d{3,}\b/g],
+  ["Brickroad", /\bbrickroad:\S+|\bbrickroad\s*#\d+|\bBR-\d{3,}\b/gi],
   ["Buzz link", /\bbuzz:\/\/\S+/gi],
   ["Slack link", /\bhttps?:\/\/[\w-]+\.slack\.com\/\S*/gi],
   ["Google Drive", /\bhttps?:\/\/(?:docs|drive)\.google\.com\/\S*/gi],
