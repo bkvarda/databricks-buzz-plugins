@@ -213,6 +213,25 @@ export class SignalsStore {
     await this.q(`GRANT SELECT ON $S.account_ids TO PUBLIC`);
   }
 
+  /**
+   * Whether a person has a Postgres role in the hub's database, which their
+   * poller job logs in as (see setupInbox). Roles are matched without case,
+   * as the row-level security policies match owners.
+   */
+  async hasRole(identity: string): Promise<boolean> {
+    const found = await this.db.query(`SELECT 1 FROM pg_roles WHERE lower(rolname) = lower($1) LIMIT 1`, [identity]);
+    return found.rows.length > 0;
+  }
+
+  /**
+   * Creates a person's Postgres role with Lakebase's databricks_create_role,
+   * which needs the databricks_auth extension and CREATEROLE for the hub's
+   * role. Throws (with Postgres's reason) when it can't.
+   */
+  async createRole(identity: string): Promise<void> {
+    await this.db.query(`SELECT databricks_create_role($1, 'USER')`, [identity]);
+  }
+
   /** Replaces the ids pollers read (kind → ids). */
   async publishIds(ids: Readonly<Record<string, readonly string[]>>): Promise<void> {
     const rows = Object.entries(ids).flatMap(([kind, values]) => values.map((id) => [kind, id]));
