@@ -1561,6 +1561,55 @@ describe("work someone on the team did themselves", () => {
     expect((await store.task(task!.id))!.status).toBe("open");
   });
 
+  for (const existing of [true, false])
+    it(`keeps a task open for a newer customer message an older reply was decided against while it was being attached (${existing ? "existing task" : "task it opens"})`, async () => {
+      const pg = new PGlite();
+      let paused: (() => Promise<void>) | undefined;
+      const db: Db = {
+        query: async (text, values) => {
+          // The team's reply is ingested and decided just before the customer's message is attached.
+          if (paused && text.includes(".task_events (task_id, event_id, version, at)") && values?.[1] === customerId) {
+            const run = paused;
+            paused = undefined;
+            await run();
+          }
+          return { rows: (await pg.query(text, values)).rows as never[] };
+        },
+      };
+      let customerId: unknown;
+      const schema = `signals_handled_attach_${existing ? "old" : "new"}`;
+      const store = new SignalsStore(db, schema);
+      await store.setup();
+      for (const source of ["gmail", "slack", "slack.sent"]) {
+        await store.setSource("alice@x.com", source, true);
+        await store.ingest("alice@x.com", [{ source, external_id: "seed" }], config);
+      }
+      const group = "C1:1795000000.000001";
+      if (existing) await store.ingest("alice@x.com", [{ source: "slack", external_id: "c0", actor: "ann@globex.io", group_key: group, occurred_at: "1795000100.000000" }], config);
+      let reply: Awaited<ReturnType<SignalsStore["ingest"]>> | undefined;
+      paused = async () => {
+        reply = await store.ingest("alice@x.com", [{ source: "slack.sent", external_id: "s1", actor: "alice@x.com", group_key: group, occurred_at: "1795000200.000000" }], config);
+      };
+      const original = pg.query.bind(pg);
+      // (The customer event's row id, once it's written, so the pause is at its own attachment.)
+      pg.query = (async (text: string, values?: unknown[]) => {
+        const out = await original(text, values);
+        if (customerId === undefined && text.includes(".events (owner, source, external_id") && values?.[2] === "c3") customerId = (out.rows[0] as { id: unknown }).id;
+        return out;
+      }) as typeof pg.query;
+      const customer = await store.ingest("alice@x.com", [{ source: "slack", external_id: "c3", actor: "ann@globex.io", group_key: group, occurred_at: "1795000300.000000" }], config);
+      expect(paused).toBeUndefined();
+      expect(reply!.handled.length).toBe(existing ? 1 : 1);
+      const [task] = await store.tasks({});
+      const events = await pg.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${schema}.task_events WHERE task_id = $1`, [task!.id]);
+      expect(events.rows[0]!.n).toBe(existing ? 3 : 2);
+      expect((await store.task(task!.id))!.status).toBe("open");
+      if (!existing) expect(customer.created.map((t) => t.status)).toEqual(["open"]);
+      // And a later reply still closes it.
+      const again = await store.ingest("alice@x.com", [{ source: "slack.sent", external_id: "s2", actor: "alice@x.com", group_key: group, occurred_at: "1795000400.000000" }], config);
+      expect(again.handled.length).toBe(1);
+    });
+
   it("orders an event saved before the upgrade by its own permalink's ts, not the root's", async () => {
     const { store, call } = await setup("signals_handled_upgrade_us");
     const root = "1795001000.000001";
