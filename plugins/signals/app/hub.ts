@@ -349,14 +349,38 @@ export class Hub {
       const text = now && isOpen(now.status) ? handledThenReopened(by, title, url, agents, owner, later && { title: later.title && plainSlack(later.title), url: later.url }) : handledMessage(by, title, url, agents, owner);
       await this.notifier.updated(now ?? task, text, agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
     }
-    for (const update of result.updated) {
+    // One notice per task: about the update that opened it again when one did (not an older, delayed message
+    // earlier in the post), else its first; with the watched-field changes of all its updates in the post.
+    const byTask = new Map<number, (typeof result.updated)[number][]>();
+    for (const update of result.updated) byTask.set(update.task.id, [...(byTask.get(update.task.id) ?? []), update]);
+    for (const updates of byTask.values()) {
+      const update = [...updates].reverse().find((one) => one.reopened) ?? updates[0]!;
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
       seen.add(update.task.id);
       const title = update.title && plainSlack(update.title);
-      const text = `Update: ${update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event")}`;
-      if (update.changes?.length) {
+      const what = update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event");
+      const changes = mergedChanges(updates.flatMap((one) => one.changes ?? []));
+      // The agents are briefed on where the task ended up after the whole post: the last update's task (its rule)
+      // and whether that rule still applies then, not a mismatch an earlier update in the post went through.
+      const last = updates.at(-1)!;
+      const outgrown = last.outgrown;
+      const final = (await this.store.task(update.task.id)) ?? last.task;
+      let text = `Update: ${what}`;
+      if (update.reopened) {
+        // It was done: say it's open again and who has it, not just that something came in.
+        const on = (await this.store.people([update.task.id])).get(update.task.id) ?? [];
+        const people = on.filter((person) => person.kind === "person").map((person) => person.label ?? person.key);
+        text = reopenedMessage(what, people, on.some((person) => person.kind === "agent"));
+      }
+      if (changes.length) {
+        // The changes go the usual way (the diff, the agents asked again, a `changed` activity), under this line.
         this.posted(update.task.id, text);
-        await this.changed(update.task, text, update.changes, update.outgrown).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
+        await this.changed(final, text, changes, outgrown).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
+        continue;
+      }
+      if (update.reopened) {
+        this.posted(update.task.id, text);
+        await this.notifier.updated(final, text).catch((error: Error) => this.log(`couldn't post that task ${update.task.id} is open again: ${error.message}`));
         continue;
       }
       // A source that saves an event again with nothing new to say (a calendar does, hourly) doesn't repeat the line.
@@ -964,6 +988,21 @@ export function handledThenReopened(by: string, title?: string, url?: string, ag
     .join("\n");
 }
 
+/** Watched-field changes across several updates of one task: one per field, from its first value to its last. */
+export function mergedChanges(changes: readonly FieldChange[]): FieldChange[] {
+  const out = new Map<string, FieldChange>();
+  for (const change of changes) {
+    const before = out.get(change.field);
+    out.set(change.field, before ? { field: change.field, from: before.from, to: change.to } : change);
+  }
+  return [...out.values()].filter((change) => change.from !== change.to);
+}
+
+/** A done task a new message opened again: what came in, that it's open, and who has it. */
+export function reopenedMessage(what: string, people: readonly string[], agents = false): string {
+  return `↩️ Open again: ${what}\n${people.length ? `It's with **${people.join("**, **")}**.` : agents ? "Its agents are on it." : "No one has it yet."}`;
+}
+
 /** A task as its Buzz message shows it. */
 /** An account as the API gives it: with its preferences read, so the UI and agents see what took. */
 const withRead = (account: AccountRecord) => ({ ...account, read: parsePreferences(account.preferences) });
@@ -1279,7 +1318,7 @@ export function changedMessage(task: Task, update: string, changes: readonly Fie
   const mode = task.mode === "auto" ? "auto" : "draft";
   return [
     `${update}\n${changes.map((change) => `- **${change.field}:** ${change.from} → ${change.to}`).join("\n")}`,
-    outgrown ? `\nThe rule this task is under (${outgrown.rule}) no longer applies, and no other rule for this kind of work does, so its playbook isn't given. Now: ${outgrown.values.map((item) => `${item.field} ${item.value}`).join(", ")}. Go by the source as it is now${source && agents.length ? " (below)" : ""}.` : "",
+    outgrown ? `\nThe rule this task is under (${outgrown.rule}) no longer applies, and no other rule for this kind of work does, so its playbook isn't given.${outgrown.values.length ? ` Now: ${outgrown.values.map((item) => `${item.field} ${item.value}`).join(", ")}.` : ""} Go by the source as it is now${source && agents.length ? " (below)" : ""}.` : "",
     agents.length ? `\n${agents.map((key) => `nostr:${npub(key)}`).join(" ")} this changed since you last looked: ${AGENT_ASK[mode]} Your next reply in this thread is recorded on the task.` : "",
     agents.length && source ? `\n${source}` : "",
     agents.length && account ? `\n${account}` : "",
