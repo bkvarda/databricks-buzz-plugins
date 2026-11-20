@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryChoices, categoryModeFor, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryChoices, categoryModeFor, categoryNamed, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -669,7 +669,7 @@ export class SignalsStore {
           else if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
           // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
-          if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule);
+          if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule, config);
           // Still on its old rule, and that rule doesn't apply now (a case back to Open, say): its playbook would be the wrong one.
           // (Checked for every attached event, whatever its rules watch, changed or not: the last event of a post decides the briefing,
           // and one that changes nothing, a new title say, or that comes through a rule watching nothing, still leaves the task where
@@ -691,7 +691,7 @@ export class SignalsStore {
         }
         // A done task isn't taken over above; once this event opened it again, the rule it now matches takes it, as for an open one.
         if (reopened && changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task") {
-          task = await this.refile(task, placed.rule);
+          task = await this.refile(task, placed.rule, config);
           outgrown = undefined;
         }
         if (placed.opened) {
@@ -752,16 +752,18 @@ export class SignalsStore {
     if (decision.kind === "none") return undefined;
     const rule = decision.rule;
     const found = await this.taskByGroup(decision.group);
+    // A task already open is under its own category's mode, not under the model's possible pick (see Decision.byCategory).
+    const createFor = (task: Task) => decision.create && (!decision.byCategory || categoryModeFor(decision.account?.preferences, rule, categoryNamed(rule, task.workstream)?.workstream) !== "off");
     if (found) {
       if (decision.same) await this.copyOf(decision.same, found.id);
-      return { task: found, opened: false, create: decision.create, rule };
+      return { task: found, opened: false, create: createFor(found), rule };
     }
     // Another person's copy of it (the same mail in their mailbox) has a task: this group joins it.
     const copy = decision.same ? await this.copyTask(decision.same) : undefined;
     if (copy) {
       await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [decision.group, copy.id, now()]);
       await this.activity(copy.id, "signals", "joined", `${owner}'s copy joined it (${event.source}).`);
-      return { task: copy, opened: false, create: decision.create, rule };
+      return { task: copy, opened: false, create: createFor(copy), rule };
     }
     if (!decision.create) return undefined;
     // A meeting's notes whose meeting has its task (its prep): the notes go there instead, once the rule's classifier
@@ -1018,7 +1020,8 @@ export class SignalsStore {
     // meanwhile is that version's to decide (with its own request), not this one's. For notes (action_items) that includes a newer
     // revision of the same document saved under its own id (see LATEST_REVISION), as for meeting_task's notes.
     // (So for a rule with meeting_task: an older revision whose move the newest one's decision stopped opens no follow-up instead.)
-    const latest = (rule.classify || rule.action_items || rule.meeting_task) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
+    // The same for a rule with categories: the model's pick (asked below) is this version's, and a newer version decides its own.
+    const latest = (rule.classify || rule.action_items || rule.meeting_task || rule.categories) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
     // Its category (see Rule.categories): one whose `when` matched (decide), or the one the model picks, with the team's mode for it.
     let { workstream, mode } = { workstream: decision.workstream ?? rule.workstream, mode: decision.mode };
     if (!decision.category) {
@@ -1026,10 +1029,10 @@ export class SignalsStore {
       if (picked) {
         workstream = picked;
         mode = categoryModeFor(decision.account?.preferences, rule, picked);
-        // The team turned that kind of work off: no task, as for a rule whose work is off.
-        if (mode === "off") return undefined;
       }
     }
+    // The team turned that kind of work off (the category picked, or the rule's own when none was): no task.
+    if (mode === "off") return undefined;
     const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream, mode, by: owner, at: toSeconds(event.occurred_at), latest };
     const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
       const opened = await this.openTask(task);
@@ -1306,13 +1309,28 @@ export class SignalsStore {
     return { opened, ...(changed && { checklist }) };
   }
 
-  /** Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule. */
-  private async refile(task: Task, rule: Rule): Promise<Task> {
-    // A task already under one of the new rule's categories keeps it.
-    const kept = rule.categories?.find((category) => category.workstream.trim().toLowerCase() === task.workstream?.trim().toLowerCase())?.workstream.trim();
-    const found = await this.q(`UPDATE $S.tasks SET rule_id = $2, workstream = COALESCE($3, workstream), updated_at = $4 WHERE id = $1 RETURNING *`, [task.id, rule.id, kept ?? rule.workstream ?? null, now()]);
-    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.`);
-    return found.rows[0] ? toTask(found.rows[0]) : task;
+  /**
+   * Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule.
+   * A task under one of the new rule's categories keeps it. One under a category its old rule's model or `when` gave it (see
+   * Rule.categories) that the new rule doesn't offer takes the new rule's workstream (none, if it names none) and the team's
+   * mode for it, unless a person or agent filed it under that workstream themselves (a `workstream` activity).
+   */
+  private async refile(task: Task, rule: Rule, config: SignalsConfig): Promise<Task> {
+    const kept = categoryNamed(rule, task.workstream)?.workstream.trim();
+    const before = config.rules.find((one) => one.id === task.rule_id);
+    const automatic = !kept && Boolean(categoryNamed(before, task.workstream)) && task.workstream?.trim().toLowerCase() !== before?.workstream?.trim().toLowerCase();
+    const mode = modeFor(config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences, rule);
+    const found = await this.q(
+      `WITH d AS (SELECT $5::boolean AND NOT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS dropped)
+       UPDATE $S.tasks SET rule_id = $2, workstream = CASE WHEN d.dropped THEN $3 ELSE COALESCE($3, workstream) END,
+         mode = CASE WHEN d.dropped THEN $6 ELSE mode END, updated_at = $4
+       FROM d WHERE id = $1 RETURNING $S.tasks.*, d.dropped`,
+      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, mode],
+    );
+    const row = found.rows[0];
+    const dropped = row?.dropped === true;
+    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.${dropped ? ` That rule has no ${task.workstream} category, so it's ${row!.workstream ? `under ${row!.workstream as string}` : "under no workstream"} now, in ${mode} mode.` : ""}`);
+    return row ? toTask(row) : task;
   }
 
   /**

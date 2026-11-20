@@ -869,7 +869,9 @@ export type Decision =
   | Readonly<{ kind: "none"; reason: string }>
   | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string; same?: string;
       /** The workstream a new task opens under: a category's (see Rule.categories) or the rule's. `category`: one of its categories' `when` chose it. */
-      workstream?: string; category?: boolean }>;
+      workstream?: string; category?: boolean;
+      /** `create` holds only because the model may pick a category whose mode isn't off: the rule's own work is off. */
+      byCategory?: boolean }>;
 
 /**
  * What to do with an event that is new or changed. `firstRun` is a source's
@@ -888,12 +890,26 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const category = categoryByWhen(rule, event);
   const workstream = category?.workstream ?? rule.workstream;
   const mode = categoryModeFor(account?.preferences, rule, category?.workstream);
+  // No category's `when` matched and the rule's own work is off, but the model may still pick a category the team didn't
+  // turn off (see Rule.categories): the task opens only if it does (placeNew decides, once it has asked).
+  const byCategory = !category && mode === "off" && rule.action === "task" && pickableCategories(account?.preferences, rule);
   // On a first run, existing things are seen; only updates to tasks that already exist go through.
   // A team that turned a kind of work off still gets updates on tasks already open.
-  const create = rule.action === "task" && mode !== "off" && !(options.firstRun && config.first_run_seen !== false);
+  const create = rule.action === "task" && (mode !== "off" || byCategory) && !(options.firstRun && config.first_run_seen !== false);
   const series = seriesKey(rule, event, account);
   const same = sameKey(rule, event);
-  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }), ...(workstream && { workstream }), ...(category && { category: true }) };
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }), ...(workstream && { workstream }), ...(category && { category: true }), ...(byCategory && { byCategory: true }) };
+}
+
+/** Whether the model could still pick one of a rule's categories (one with an `about`) whose mode isn't off. */
+function pickableCategories(preferences: string | undefined, rule: Rule): boolean {
+  return Boolean(categoryChoices(rule)) && (rule.categories ?? []).some((category) => category.about?.trim() && category.workstream.trim().toLowerCase() !== NO_CATEGORY && categoryModeFor(preferences, rule, category.workstream) !== "off");
+}
+
+/** The one of a rule's categories a workstream names, if any. */
+export function categoryNamed(rule: Pick<Rule, "categories"> | undefined, workstream: string | null | undefined): Category | undefined {
+  const key = workstream?.trim().toLowerCase();
+  return key ? rule?.categories?.find((category) => category.workstream.trim().toLowerCase() === key) : undefined;
 }
 
 /**

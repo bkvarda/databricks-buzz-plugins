@@ -85,6 +85,76 @@ describe("rule categories", () => {
     expect((await store.tasks({})).find((task) => task.group_key.endsWith("t2"))).toMatchObject({ workstream: "capacity request" });
   });
 
+  // The store on its own, with Acme's preferences and these rules, and the seed post that ends jira's first run.
+  const prepare = async (preferences: string, rules: readonly Rule[] = [ESCALATIONS]) => {
+    const store = new SignalsStore(pglite(), "signals_categories");
+    await store.setup();
+    await store.setSource("alice@x.com", "jira", true);
+    const config: SignalsConfig = { ...CONFIG, accounts: [{ name: "Acme", channel: "acme", preferences }], rules };
+    const post = (...events: ReturnType<typeof ticket>[]) => store.ingest("alice@x.com", events, config);
+    await post(ticket("seed", "seed"));
+    return { store, post };
+  };
+
+  it("opens a category the team kept on when the rule's own workstream is off, but not the fallback", async () => {
+    const { store, post } = await prepare("escalation tracking: off\ncapacity request: draft");
+    const asked: string[] = [];
+    store.categorizer = async (event) => (asked.push(event.external_id), event.external_id === "model" ? "capacity request" : NO_CATEGORY);
+    await post(ticket("pattern", "Please increase TPM for our endpoint"), ticket("model", "Need more throughput for our endpoint"), ticket("fallback", "Question about billing"));
+    expect(asked).toEqual(["model", "fallback"]);
+    const opened = (await store.tasks({})).map((task) => ({ key: task.group_key, workstream: task.workstream, mode: task.mode }));
+    expect(opened.sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+      { key: "escalations|model", workstream: "capacity request", mode: "draft" },
+      { key: "escalations|pattern", workstream: "capacity request", mode: "draft" },
+    ]);
+    // A mode on the rule's id still turns all of its work off: the model isn't asked.
+    const off = await prepare("escalations: off\ncapacity request: draft");
+    off.store.categorizer = async () => { throw new Error("not asked"); };
+    expect((await off.post(ticket("pattern2", "Please increase TPM"), ticket("model2", "Need more throughput"))).created).toEqual([]);
+  });
+
+  it("opens nothing from a category picked for an event version a newer one replaced", async () => {
+    const { store, post } = await prepare("escalation tracking: ask\ncapacity request: auto\nfeature request: off");
+    let entered!: () => void;
+    let release!: () => void;
+    const atOld = new Promise<void>((resolve) => (entered = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    store.categorizer = async (event) => {
+      if (event.title !== "Old notes") return "feature request";
+      entered();
+      await gate;
+      return "capacity request";
+    };
+    const earlier = post(ticket("same", "Old notes"));
+    await atOld;
+    // The newer version picks a category the team turned off: no task, and the older one's late pick doesn't open one either.
+    expect((await post(ticket("same", "New notes"))).created).toEqual([]);
+    release();
+    expect((await earlier).created).toEqual([]);
+    expect(await store.tasks({})).toEqual([]);
+  });
+
+  it("moves a task off a category the rule it's refiled to doesn't offer, unless someone filed it there", async () => {
+    const rules = [
+      { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { id: "resolved_work", group: "es", group_by: "external_id", action: "task", sources: ["jira"], when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "es_later", group: "es", when: { "payload.status": ["Waiting"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    const { store, post } = await prepare("escalation tracking: ask\ncapacity request: auto\nresolved_work: draft", rules);
+    await post(ticket("refile", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("kept", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("hand", "Please increase TPM", { status: "Incoming" }));
+    const byKey = async (): Promise<Record<string, Awaited<ReturnType<SignalsStore["tasks"]>>[number]>> => Object.fromEntries((await store.tasks({})).map((task) => [task.group_key.split("|").pop(), task]));
+    expect(Object.values(await byKey()).map((task) => [task.workstream, task.mode])).toEqual([["capacity request", "auto"], ["capacity request", "auto"], ["capacity request", "auto"]]);
+    // Someone filed "hand" under capacity request themselves: that stays.
+    await store.file((await byKey()).hand!.id, "bob@x.com", { workstream: "capacity request" });
+    await post(ticket("refile", "Please increase TPM for our endpoint", { status: "Investigating" }), ticket("kept", "Please increase TPM for our endpoint", { status: "Waiting" }), ticket("hand", "Please increase TPM", { status: "Investigating" }));
+    const after = await byKey();
+    // resolved_work has no workstream and no categories: the task is under none, in the team's mode for that rule.
+    expect(after.refile).toMatchObject({ rule_id: "resolved_work", workstream: null, mode: "draft" });
+    expect(after.kept).toMatchObject({ rule_id: "es_later", workstream: "capacity request", mode: "auto" });
+    expect(after.hand).toMatchObject({ rule_id: "resolved_work", workstream: "capacity request", mode: "auto" });
+    expect((await store.detail(after.refile!.id))!.activities.map((one) => one.text)).toContain("Now under rule resolved_work: a new event matched it. That rule has no capacity request category, so it's under no workstream now, in draft mode.");
+  });
+
   it("asks the endpoint a choice question, and reads its answer", async () => {
     const calls: { path: string; body: unknown }[] = [];
     const categorize = jevCategorizer(async (path, init) => (calls.push({ path, body: init.body }), { answers: { category: { type: "choice", choice: "capacity request", confidence: 0.99 } } }));
