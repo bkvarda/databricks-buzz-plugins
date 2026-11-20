@@ -24,9 +24,11 @@
 //   GET  /api/onboard | POST /api/onboard   your poller's setup: your database role (POST creates it if it can) and
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
+import { randomUUID } from "node:crypto";
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts, readWorkstreamActions, type WorkstreamActions } from "./model";
-import type { Classifier, Handled, IngestResult, JoinClaim, SignalsStore, Task, TaskPerson } from "./store";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts, readWorkstreamActions, type WorkstreamActions, actionsFor, actionsText, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, triggeredLines, type WorkstreamActionsRow } from "./model";
+import { type Classifier, type Handled, type IngestResult, type JoinClaim, CHECK_LEASE, readTriggerState, type SignalsStore, type Task, type TaskPerson } from "./store";
+import type { Triggerer } from "./classify";
 import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -58,8 +60,8 @@ export type Notifier = Readonly<{
   canPost?(channel: string): Promise<string | null | undefined>;
 }>;
 
-/** What a task's post carries besides the task: the account briefing (for agents) and the source event's details. */
-export type PostContext = Readonly<{ briefing?: string; source?: string }>;
+/** What a task's post carries besides the task: the account briefing (for agents), the source event's details, and what its default actions found (`note`). */
+export type PostContext = Readonly<{ briefing?: string; source?: string; note?: string }>;
 
 /** A chat message as the relay gives it: enough to tell who replied in which thread. */
 export type ThreadReply = Readonly<{ id: string; pubkey: string; content: string; created_at: number; tags: readonly (readonly string[])[] }>;
@@ -73,6 +75,8 @@ export type HubOptions = Readonly<{
   classifier?: Classifier;
   /** Where poller jobs reach the hub's database (from the app's postgres resource), for /api/onboard. */
   lakebase?: LakebaseInfo;
+  /** Checks workstreams' default-action triggers (see chatTriggerer); without it, a row with actions to check fails open: its tasks go to agents as without a row. */
+  triggerer?: Triggerer;
   log?(line: string): void;
 }>;
 
@@ -399,18 +403,23 @@ export class Hub {
       const update = [...updates].reverse().find((one) => one.reopened) ?? updates[0]!;
       if (!update.task.buzz_root || seen.has(update.task.id)) {
         // No thread yet (its post briefs the agents it has then), or its closure was posted: no handoff to post.
+        // (Not posted yet: its versions were saved pending as they were attached, for its post's opening check, or after
+        // it, the drain, to decide. Its closure posted: they aren't checked, as they weren't before.)
+        if (update.task.buzz_root) {
+          const versions = updates.flatMap((one) => (one.event ? [{ event: one.event.id, version: one.event.version }] : []));
+          await this.store.dropChecks(update.task.id, versions).catch((error: Error) => this.log(`couldn't drop task ${update.task.id}'s default-actions checks: ${error.message}`));
+        }
         await this.reported(joins, updates);
         continue;
       }
       seen.add(update.task.id);
-      const title = update.title && plainSlack(update.title);
-      const what = update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event");
+      const what = whatOf(update);
       const changes = mergedChanges(updates.flatMap((one) => one.changes ?? []));
       // The agents are briefed on where the task ended up after the whole post: the last update's task (its rule)
       // and whether that rule still applies then, not a mismatch an earlier update in the post went through.
       const last = updates.at(-1)!;
       const outgrown = last.outgrown;
-      const final = (await this.store.task(update.task.id)) ?? last.task;
+      let final = (await this.store.task(update.task.id)) ?? last.task;
       let text = `Update: ${what}`;
       // A meeting's notes changed: the follow-up's checklist as the new version has it.
       // (The last update of the post that changed it, when the task still has that: null says the notes list no items now.)
@@ -422,11 +431,30 @@ export class Hub {
         const people = on.filter((person) => person.kind === "person").map((person) => person.label ?? person.key);
         text = reopenedMessage(what, people, on.some((person) => person.kind === "agent"));
       }
+      // Its workstream's default actions, checked against each event version the post attached, in the order they were
+      // attached (after any another post attached first): one that holds now (and didn't) is told in the thread, waking the
+      // agents, from the notice saved with the check (the sweep sends it again when this post fails). A check that found
+      // none holding, that another post decides, or that's left pending after an error (the sweep's check decides), keeps
+      // the post's changes quiet: they're shown, nobody's woken.
+      const extra = [changes.map((change) => `- **${change.field}:** ${change.from} → ${change.to}`).join("\n"), listed.trim()].filter(Boolean).join("\n\n");
+      const checked = await this.checkUpdates(final, updates, { ...(extra && { extra }), ...(update.reopened && { reopened: true as const }) }).catch(
+        (error: Error) => (this.log(`couldn't check task ${final.id}'s default actions: ${error.message}`), { outcome: "failed" as const, task: final }),
+      );
+      final = checked.task;
+      if (checked.outcome === "fired") {
+        const joined = updates.find((one) => one.joined)?.joined;
+        if (changes.length) await this.store.activity(final.id, "hub", "changed", changes.map(changeLine).join("; "), joined && `move:${joined.event}:${joined.at}`);
+        this.posted(update.task.id, text + listed);
+        await this.deliverNotices(final.id);
+        // (Reported either way: the notice, saved, carries the update until it's sent.)
+        await this.reported(joins, updates);
+        continue;
+      }
       if (changes.length) {
         // The changes go the usual way (the diff, the agents asked again, a `changed` activity), under this line,
         // and the checklist under them (notes that just came to their meeting's prep task, which may have been done).
         this.posted(update.task.id, text + listed);
-        const sent = await this.changed(final, text, changes, outgrown, listed.trim(), updates.find((one) => one.joined)?.joined).then(
+        const sent = await this.changed(final, text, changes, outgrown, listed.trim(), updates.find((one) => one.joined)?.joined, checked.outcome === "quiet" || checked.outcome === "pending").then(
           () => true,
           (error: Error) => (this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`), false),
         );
@@ -475,6 +503,39 @@ export class Hub {
   }
 
   /**
+   * Sends a task's undelivered trigger notices (see TriggerNotice) in its
+   * thread, oldest first, each asking the agents to do what fired, once:
+   * whoever claims one sends it (one at a time per task); a send that fails
+   * leaves it, and the ones after it, for the sweep.
+   */
+  private async deliverNotices(id: number) {
+    if (!this.notifier) return;
+    for (let sent = 0; sent < 20; sent++) {
+      const claimed = await this.store.claimNotice(id).catch((error: Error) => (this.log(`couldn't take task ${id}'s trigger notice: ${error.message}`), undefined));
+      if (!claimed) return;
+      const { task, notice, claim } = claimed;
+      try {
+        const account = task.account ? await this.store.account({ name: task.account }) : undefined;
+        const agents = await this.triggerAgents(task, account, notice.fired);
+        if (agents.length) await this.store.askAgain(task.id, agents);
+        const labels = labelsOf(await this.config());
+        // The event that fired them, as it was checked (older notices: the latest).
+        const latest = agents.length && !notice.source ? await this.store.latestEvent(task.id) : undefined;
+        const source = agents.length ? (notice.source ?? (latest && eventDetails(latest, account?.domains ?? [], labels, task))) : undefined;
+        // (The Triggered lines right under the update's line, then its changes, as changedMessage puts them: the channel cards read that.)
+        const head = `${notice.reopened ? "↩️ Open again" : "Update"}: ${notice.what}\n\n${triggeredLines(notice.fired)}${notice.extra ? `\n${notice.extra}` : ""}`;
+        const brief = account && account.channel === task.channel ? briefing(account, labels, task) : undefined;
+        await this.notifier.updated(task, triggeredMessage(task, head, agents, brief, source), agents);
+        await this.store.doneNotice(claimed.id, claim);
+      } catch (error) {
+        this.log(`couldn't post task ${id}'s triggered actions: ${(error as Error).message}`);
+        await this.store.failedNotice(claimed.id, claim).catch(() => {});
+        return;
+      }
+    }
+  }
+
+  /**
    * A watched field changed: says what changed, and asks the task's agents to
    * go on with the playbook of the rule it's under now. Tasks in ask or off
    * mode, or no agent on, only get the line. `joined`: a meeting's notes just
@@ -483,13 +544,15 @@ export class Hub {
    * workstream, as a new task's are), added to it, not the ones it had for its
    * old workstream; never one someone took off it. A task someone chose people
    * for (an owner or an agent assigned) keeps those: its agents are asked.
-   * (`joined` is the move's claim: its `changed` activity is recorded once
+   * `quiet`: the update's default-actions check found nothing firing, so no
+   * agent is asked. (`joined` is the move's claim: its `changed` activity is recorded once
    * for the move, however many posts of the handoff it takes and whatever
    * each one's changes say.)
    */
-  private async changed(task: Task, update: string, changes: readonly FieldChange[], outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, checklist?: string, joined?: JoinClaim) {
+  private async changed(task: Task, update: string, changes: readonly FieldChange[], outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, checklist?: string, joined?: JoinClaim, quiet = false) {
     const people = (await this.store.people([task.id])).get(task.id) ?? [];
-    const working = task.mode === "auto" || task.mode === "draft";
+    // (quiet: its workstream's default actions were checked and none fired, so the change is shown and nobody's asked.)
+    const working = (task.mode === "auto" || task.mode === "draft") && !quiet;
     let agents = working ? [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
     let added: string[] = [];
     const routing = joined && working && task.account && !people.some((person) => person.assigned_at) ? await this.store.account({ name: task.account }) : undefined;
@@ -526,24 +589,302 @@ export class Hub {
 
   private async publish(given: Task) {
     if (!this.notifier || !given.channel || given.buzz_root) return;
-    const task = await this.store.task(given.id);
-    if (!task || !task.channel || task.buzz_root || !isOpen(task.status)) return;
+    const found = await this.store.task(given.id);
+    // (A task its default actions dismissed as it opened is posted too, folded: the team sees it was tracked.)
+    if (!found || !found.channel || found.buzz_root || !(isOpen(found.status) || quietlyDismissed(found))) return;
+    // (Not before its first event is attached: the post again that attaches it posts it, checked against its default actions.)
+    if (!(await this.store.attached(found.id))) return;
     try {
-      // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
-      const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
+      const full = found.account ? await this.store.account({ name: found.account }) : undefined;
+      // An event it read changed while it was checked: checked again as it is now (after OPENING_TRIES, the sweep's post does).
+      let check: TriggerCheck = await this.checkOpening(found, full);
+      for (let attempt = 1; attempt < OPENING_TRIES && check.kind === "stale"; attempt++) {
+        const now = await this.store.task(found.id);
+        if (!now || !now.channel || now.buzz_root || !(isOpen(now.status) || quietlyDismissed(now))) return;
+        check = await this.checkOpening(now, full);
+      }
+      if (check.kind === "stale") return;
+      const task = check.kind === "checked" ? check.task : found;
+      // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off,
+      // or its workstream's default actions found none of their triggers holding.
+      const working = (task.mode === "auto" || task.mode === "draft") && isOpen(task.status) && !(check.kind === "checked" && !check.fired.length);
+      const account = working ? full : undefined;
       const agents = account && account.channel === task.channel ? agentsFor(account, task) : [];
-      const event = await this.store.latestEvent(task.id);
+      // (Its source: the event that fired its first triggered action, else its latest.)
+      const event = (check.kind === "checked" && check.source) || (await this.store.latestEvent(task.id));
       const labels = labelsOf(await this.config());
-      const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
-      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels, task) }) };
+      const domains = full?.domains ?? [];
+      const note = check.kind === "checked" ? openingNote(check) : undefined;
+      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels, task) }), ...(note && { note }) };
       const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
-      if (root) this.postFailures.delete(task.channel);
+      if (root) this.postFailures.delete(task.channel!);
       if (root && agents.length) await this.store.addPeople(task.id, agents.map((key) => ({ kind: "agent", key })));
+      // Versions that came while it was being posted: checked now, as updates.
+      if (root) await this.drainTriggers(task.id).catch((error: Error) => this.log(`couldn't check task ${task.id}'s waiting default actions: ${error.message}`));
     } catch (error) {
-      this.postFailures.set(task.channel, `Task ${task.id} couldn't be posted here: ${(error as Error).message}`);
-      this.log(`couldn't post task ${task.id}: ${(error as Error).message}`);
+      this.postFailures.set(found.channel, `Task ${found.id} couldn't be posted here: ${(error as Error).message}`);
+      this.log(`couldn't post task ${found.id}: ${(error as Error).message}`);
     }
+  }
+
+  /**
+   * Which of its row's actions hold for an event on a task: `always` ones
+   * hold without the model; mode off asks no model and nothing holds.
+   * Undefined when the model can't answer (no answer, or one that leaves an
+   * action out): it fails open, with a `trigger` activity saying so.
+   */
+  private async askTriggers(task: Task, found: Readonly<{ key: string; row: WorkstreamActionsRow }>, event: EventInput, key: string): Promise<TriggerResult[] | undefined> {
+    const asked = task.mode === "off" ? [] : found.row.watch.filter((action) => !action.always);
+    let answer: Readonly<Record<string, Readonly<{ holds: boolean; why: string }>>> | undefined = {};
+    if (asked.length) {
+      const now = Math.floor(Date.now() / 1000);
+      answer = this.options.triggerer ? await this.options.triggerer({ task: { title: task.title, workstream: task.workstream, opened_at: task.created_at, now }, event, actions: asked }).catch(() => undefined) : undefined;
+    }
+    // (An answer that leaves an action out, or doesn't say whether it holds, is no answer.)
+    if (answer && asked.some((action) => typeof answer![action.id]?.holds !== "boolean")) answer = undefined;
+    if (!answer) {
+      const why = this.options.triggerer ? "the model gave no usable answer" : "the hub has no trigger model";
+      await this.store.activity(task.id, "hub", "trigger", `Default actions for ${found.key} not checked (${why}), so it goes on as without them`, `failed:${key}`);
+      return undefined;
+    }
+    return task.mode === "off" ? [] : found.row.watch.map((action) => (action.always ? { id: action.id, label: action.label, held: true, why: "always" } : { id: action.id, label: action.label, held: answer[action.id]!.holds, why: answer[action.id]!.why }));
+  }
+
+  /**
+   * A new task's check against its workstream's default actions
+   * (Account.workstream_actions), as it's posted: its first OPENING_EVENTS
+   * events in the order they were attached (the one that opened it first),
+   * so a batch's later update doesn't hide the event that opened it; any
+   * after those stay pending, checked as updates once it's posted, in order. The first fires every action that holds, each later one those
+   * that hold and didn't before; when none fired, its row's Otherwise applies
+   * (dismiss marks it dismissed by them), and one that fired opens a task
+   * their Otherwise dismissed again. Saved with each event's results, only
+   * while every event it checked is still at the version it checked, taking
+   * those versions off its pending checks (a newer one stays, checked as an
+   * update once it's posted). `source`: the event that fired the first
+   * action. `failed`: the model couldn't answer for one (it goes on as
+   * without a row). `stale`: an event moved on, or it was posted meanwhile,
+   * so nothing was saved. `none`: no row applies.
+   */
+  private async checkOpening(task: Task, account: AccountRecord | undefined): Promise<TriggerCheck> {
+    const found = account && account.channel === task.channel ? actionsFor(account.workstream_actions, task) : undefined;
+    if (!found) return { kind: "none" };
+    const first = await this.store.triggersOf(task.id);
+    const all = await this.store.taskEvents(task.id);
+    if (!first || !all.length) return { kind: "none" };
+    const events = all.slice(0, OPENING_EVENTS);
+    const read = events.map((one) => ({ event: one.id, version: one.version }));
+    const checks: { event: number; version: number; results: TriggerResult[]; subject: EventInput }[] = [];
+    for (const one of events) {
+      const results = await this.askTriggers(task, found, one.event, `${one.id}:${one.version}`);
+      if (!results) {
+        // (It goes on as without them: the versions it checked aren't checked again as updates.)
+        await this.store.dropChecks(task.id, read);
+        return { kind: "failed" };
+      }
+      checks.push({ event: one.id, version: one.version, results, subject: one.event });
+    }
+    const fired = new Map<string, TriggerResult>();
+    let source: EventInput | undefined;
+    let held: Record<string, boolean> = {};
+    for (const check of checks) {
+      for (const result of check.results)
+        if (result.held && !held[result.id] && !fired.has(result.id)) {
+          fired.set(result.id, result);
+          source ??= check.subject;
+        }
+      held = Object.fromEntries(check.results.map((result) => [result.id, result.held]));
+    }
+    const last = checks.at(-1)!;
+    let seen = first;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (seen.task.buzz_root) return { kind: "stale" };
+      const reopen = fired.size > 0 && quietlyDismissed(seen.task);
+      const dismiss = !fired.size && found.row.otherwise === "dismiss" && isOpen(seen.task.status);
+      const then = {
+        ...(reopen && { reopen: `${[...fired.values()].map((result) => result.label).join(", ")} triggered` }),
+        ...(dismiss && { dismiss: `Not triggered: ${clip(last.results.map((result) => `${result.label}${result.why ? ` (${result.why})` : ""}`).join("; ") || (task.mode === "off" ? "mode off" : "no actions ticked"), 900)}` }),
+        also: checks.slice(0, -1).map(({ event, version, results }) => ({ event, version, results })),
+        done: read,
+      };
+      const saved = await this.store.saveTriggers(task.id, { event: last.event, version: last.version, prior: seen.prior }, { held, event: last.event, version: last.version }, last.results, then);
+      if (saved) return { kind: "checked", key: found.key, task: saved, fired: [...fired.values()], results: last.results, ...(source && { source }), ...(reopen && { reopened: true }) };
+      // Not saved: another check saved first (save again over it), or an event it checked moved on (stale).
+      const again = await this.store.triggersOf(task.id);
+      if (!again || again.prior === seen.prior) return { kind: "stale" };
+      seen = again;
+    }
+    return { kind: "stale" };
+  }
+
+  /**
+   * An update's checks against its workstream's default actions: each event
+   * version the post attached to the task was saved pending as it was
+   * attached (see PendingCheck), ordered by its attachment. They're checked
+   * and decided in that order (commitTriggers), so a check that finishes
+   * first waits for the ones attached before it, whichever post has them.
+   * `fired` when one of this post's fired and it decided it (its notice
+   * carries the post's changes), else `failed` when one failed open, else
+   * `quiet` (checked, decided by another post, or decided already), else
+   * `none` (no row applies, or mode off). `pending`: a check it couldn't
+   * finish (an error), left for the sweep at once, whose decision wakes the
+   * agents or not, so the post stays quiet.
+   */
+  private async checkUpdates(task: Task, updates: IngestResult["updated"], notice: Readonly<{ extra?: string; reopened?: true }>): Promise<{ outcome: "none" | "failed" | "quiet" | "fired" | "pending"; task: Task }> {
+    const account = task.account ? await this.store.account({ name: task.account }) : undefined;
+    const found = account && account.channel === task.channel ? actionsFor(account.workstream_actions, task) : undefined;
+    // (Mode off on an update: nothing to wake, and the last check's results stay for when the mode changes.)
+    if (task.mode === "off" || !account || !found) {
+      await this.store.dropChecks(task.id);
+      return { outcome: "none", task };
+    }
+    const lines = new Map(updates.flatMap((one) => (one.event ? [[`${one.event.id}:${one.event.version}`, whatOf(one)] as const] : [])));
+    const me = randomUUID();
+    let outcome: "none" | "failed" | "quiet" | "fired" | "pending" = "quiet";
+    let mine: PendingCheck[] = [];
+    try {
+      // (No version given, as for meeting notes a sweep finished: the ones waiting unchecked are this post's.)
+      mine = (await this.store.pendingChecks(task.id)).filter((one) => !one.result && (lines.size ? lines.has(`${one.event}:${one.version}`) : true));
+      for (const entry of mine) {
+        if (!(await this.store.claimCheck(task.id, entry, -1))) continue;
+        const what = lines.get(`${entry.event}:${entry.version}`) ?? whatOf(updates[0] ?? {});
+        if ((await this.checkPending(task, found, account, entry, { owner: me, what, ...notice })) === "failed") outcome = "failed";
+      }
+      const decided = await this.commitTriggers(task.id, me);
+      if (decided.some((one) => one.mine && one.fired)) outcome = "fired";
+      // (Another post's that fired, decided here as this one waited on it: its notice goes now, before this post's line.)
+      else if (decided.some((one) => one.fired)) await this.deliverNotices(task.id);
+    } catch (error) {
+      // (Still pending, for the sweep at once: its check decides whether the agents are woken, so this post's changes are quiet.)
+      this.log(`couldn't check task ${task.id}'s default actions, left for the sweep: ${(error as Error).message}`);
+      await this.store.releaseChecks(task.id, mine).catch(() => {});
+      outcome = "pending";
+    }
+    return { outcome, task: (await this.store.task(task.id).catch(() => undefined)) ?? task };
+  }
+
+  /**
+   * Checks a pending version, keeping the model's answer and its event's
+   * details on it for commitTriggers (`meta`: the update's line and, for its
+   * post, its changes). `stale` when its event moved on (the newer version is
+   * pending too) and `failed` when the model couldn't answer, both taken off
+   * the pending ones.
+   */
+  private async checkPending(
+    task: Task,
+    found: Readonly<{ key: string; row: WorkstreamActionsRow }>,
+    account: AccountRecord,
+    entry: PendingCheck,
+    meta: Readonly<{ owner: string; what?: string; extra?: string; reopened?: true }>,
+  ): Promise<"checked" | "stale" | "failed"> {
+    const subject = await this.store.triggerSubject(task.id, entry.event);
+    if (!subject || subject.id !== entry.event || subject.version !== entry.version) {
+      await this.store.dropChecks(task.id, [entry]);
+      return "stale";
+    }
+    const results = await this.askTriggers(task, found, subject.event, `${entry.event}:${entry.version}`);
+    if (!results) {
+      await this.store.dropChecks(task.id, [entry]);
+      return "failed";
+    }
+    const source = eventDetails(subject.event, account.domains ?? [], labelsOf(await this.config()), task);
+    await this.store.storeCheck(task.id, {
+      event: entry.event,
+      version: entry.version,
+      results,
+      what: meta.what ?? whatOf(subject.event),
+      owner: meta.owner,
+      ...(meta.extra && { extra: clip(meta.extra, 3000) }),
+      ...(meta.reopened && { reopened: true as const }),
+      source: clip(source, 6000),
+    });
+    return "checked";
+  }
+
+  /**
+   * Decides a task's pending checks that are done, in the order they were
+   * attached, stopping at the first one that isn't: each fires the actions
+   * that hold and didn't at the check before it (edge-triggered), saved with
+   * its notice (the line of the update that fired it, its event's details,
+   * and the post's changes when `me` checked it, as that post shows them
+   * otherwise) and, for a task their Otherwise dismissed, opening it again.
+   * One whose event moved on or left the task is dropped. The ones decided,
+   * with whether each fired and was `me`'s.
+   */
+  private async commitTriggers(id: number, me: string): Promise<{ event: number; version: number; fired: boolean; mine: boolean }[]> {
+    const decided: { event: number; version: number; fired: boolean; mine: boolean }[] = [];
+    let extraGiven = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const seen = await this.store.triggersOf(id);
+      const [head] = seen ? await this.store.pendingChecks(id) : [];
+      if (!seen || !head?.result) break;
+      const state = readTriggerState(seen.prior) ?? { held: {} };
+      const { results, source, what, owner } = head.result;
+      const { event, version } = head;
+      const fired = results.filter((result) => result.held && !state.held[result.id]);
+      const reopen = fired.length > 0 && quietlyDismissed(seen.task);
+      const mine = Boolean(me) && owner === me;
+      const extra = mine && !extraGiven ? head.result.extra : undefined;
+      const notice: TriggerNotice | undefined = fired.length
+        ? { fired, what, ...(extra && { extra }), ...((reopen || (mine && head.result.reopened)) && { reopened: true as const }), ...(source && { source }) }
+        : undefined;
+      // (`seq`: the attachment decided, so two decisions never save the same state.)
+      const next: TriggerState = { held: Object.fromEntries(results.map((result) => [result.id, result.held])), event, version, seq: head.seq };
+      const then = { ...(reopen && { reopen: `${fired.map((result) => result.label).join(", ")} triggered` }), ...(notice && { notice }), done: [{ event, version }] };
+      if (await this.store.saveTriggers(id, { event, version, pending: true, prior: seen.prior }, next, results, then)) {
+        if (notice?.extra) extraGiven = true;
+        decided.push({ event, version, fired: fired.length > 0, mine });
+        continue;
+      }
+      // Not saved: another check saved first (read again), or its event moved on or left the task (dropped: a newer version is pending too).
+      const again = await this.store.triggersOf(id);
+      if (again && again.prior === seen.prior) await this.store.dropChecks(id, [{ event, version }]);
+    }
+    return decided;
+  }
+
+  /**
+   * A posted task's pending checks: the ones not checked yet checked (with
+   * `lease`, only those no post took within that many seconds, so one a post
+   * is still checking isn't repeated; negative, all of them), the done ones
+   * decided, and their notices sent. A task no row applies to now has them
+   * dropped.
+   */
+  private async drainTriggers(id: number, lease = -1) {
+    const task = await this.store.task(id);
+    if (!task?.buzz_root) return;
+    const pending = await this.store.pendingChecks(id);
+    if (!pending.length) return;
+    const account = task.account ? await this.store.account({ name: task.account }) : undefined;
+    const found = account && account.channel === task.channel && task.mode !== "off" ? actionsFor(account.workstream_actions, task) : undefined;
+    if (!account || !found) {
+      await this.store.dropChecks(id);
+      return;
+    }
+    for (const entry of pending) if (!entry.result && (await this.store.claimCheck(id, entry, lease))) await this.checkPending(task, found, account, entry, { owner: "" });
+    await this.commitTriggers(id, "");
+    await this.deliverNotices(id);
+  }
+
+  /**
+   * The agents a trigger notice asks (none in ask or off mode, or on a task
+   * that isn't open): the task's own, or the ones the account names for it
+   * when none is on it (a task the actions dismissed as it opened has none),
+   * never one someone took off it.
+   */
+  private async triggerAgents(task: Task, account: AccountRecord | undefined, fired: readonly TriggerResult[]): Promise<string[]> {
+    if (!(task.mode === "auto" || task.mode === "draft") || !isOpen(task.status)) return [];
+    const people = (await this.store.people([task.id])).get(task.id) ?? [];
+    const agents = [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))];
+    if (agents.length || !account || account.channel !== task.channel) return agents;
+    const gone = (await this.store.removed([task.id])).get(task.id);
+    const named = agentsFor(account, task).filter((key) => !gone?.has(key));
+    if (named.length) {
+      await this.store.addPeople(task.id, named.map((key) => ({ kind: "agent", key })));
+      await this.store.activity(task.id, "hub", "agents_asked", `Asked ${named.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it (${fired.map((result) => result.label).join(", ")} triggered)`);
+    }
+    return named;
   }
 
   /** Why tasks can't be posted in a channel: the notifier's check, else the last failed post there. */
@@ -1108,6 +1449,9 @@ export class Hub {
         await this.post(task);
         if ((await this.store.task(task.id))?.buzz_root) posted++;
       }
+      // Default-actions checks a post left waiting (it stopped, say), then notices whose post failed: done and sent now.
+      for (const id of await this.store.pendingTriggers()) await this.drainTriggers(id, CHECK_LEASE).catch((error: Error) => this.log(`couldn't check task ${id}'s waiting default actions: ${error.message}`));
+      for (const id of await this.store.undeliveredNotices()) await this.deliverNotices(id);
     }
     for (const { task, text } of await this.store.stale(await this.config(), at)) {
       if (this.notifier && task.buzz_root) await this.notifier.updated(task, `⏰ ${text}`).catch(() => {});
@@ -1177,6 +1521,46 @@ export function mergedChanges(changes: readonly FieldChange[]): FieldChange[] {
 }
 
 /** A done task a new message opened again: what came in, that it's open, and who has it. */
+/** What checkOpening found (see there). */
+type TriggerCheck =
+  | Readonly<{ kind: "none" | "failed" | "stale" }>
+  | Readonly<{ kind: "checked"; key: string; task: Task; results: readonly TriggerResult[]; fired: readonly TriggerResult[]; source?: EventInput; reopened?: true }>;
+
+/** An update's line: its title, linked to its source when it has a URL. */
+const whatOf = (update: Readonly<{ title?: string | null; url?: string | null }>) => {
+  const title = update.title ? plainSlack(update.title) : undefined;
+  return update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event");
+};
+
+/** How many of a new task's events its opening check goes through (the first ones attached; the rest are checked as updates). */
+const OPENING_EVENTS = 6;
+/** How many times a new task's post checks its opening again when an event it read changed meanwhile. */
+const OPENING_TRIES = 3;
+
+/** A task its workstream's default actions dismissed as it opened (none of their triggers held): one that holds later opens it again. */
+const quietlyDismissed = (task: Task) => task.status === "dismissed" && task.triggers?.dismissed === true;
+
+/** The line a new task's post gets from its default actions: which triggered, or that none did and what that means. */
+export function openingNote(check: Readonly<{ key: string; task: Task; fired: readonly TriggerResult[] }>): string {
+  if (check.fired.length) return triggeredLines(check.fired);
+  return check.task.status === "dismissed"
+    ? `No default action for ${check.key} is triggered, so it's dismissed. It opens again if one is.`
+    : `No default action for ${check.key} is triggered, so it's tracked with no agent asked.`;
+}
+
+/** An update whose default actions fired: the line and the Triggered lines, asking `agents` to do them under the mode. */
+export function triggeredMessage(task: Task, text: string, agents: readonly string[], account?: string, source?: string): string {
+  const mode = task.mode === "auto" ? "auto" : "draft";
+  return [
+    text,
+    agents.length ? `\n${agents.map((key) => `nostr:${npub(key)}`).join(" ")} the default actions above are triggered now: ${AGENT_ASK[mode]} Your next reply in this thread is recorded on the task.` : "",
+    agents.length && source ? `\n${source}` : "",
+    agents.length && account ? `\n${account}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function reopenedMessage(what: string, people: readonly string[], agents = false): string {
   return `↩️ Open again: ${what}\n${people.length ? `It's with **${people.join("**, **")}**.` : agents ? "Its agents are on it." : "No one has it yet."}`;
 }
@@ -1227,6 +1611,7 @@ const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0
 export function briefing(account: AccountRecord, labels: ResolvedLabels = labelsOf(undefined), task?: Readonly<{ rule_id: string; workstream: string | null }>): string {
   const read = parsePreferences(account.preferences);
   const playbook = task && playbookFor(account.playbooks, task);
+  const actions = task && actionsFor(account.workstream_actions, task);
   const modes = Object.entries(read.modes).map(([key, mode]) => `${key}: ${mode}`).join("; ");
   return [
     `**For agents: ${account.name}**`,
@@ -1234,6 +1619,7 @@ export function briefing(account: AccountRecord, labels: ResolvedLabels = labels
     account.domains.length ? `${capitalized(labels.customer)} domains: ${account.domains.join(", ")}` : "",
     read.guidance && `Team guidance:\n${clip(read.guidance, 2000)}`,
     playbook && `Playbook for ${playbook.key} (how the team likes this done; follow it):\n${clip(playbook.text, 3000)}`,
+    actions && actionsText(actions),
     account.profile.trim() && `Profile:\n${clip(account.profile.trim(), 3000)}`,
   ]
     .filter(Boolean)
@@ -1568,7 +1954,7 @@ export function askMessage(task: Task, agents: readonly string[], user: string, 
     .join("\n");
 }
 
-export function taskMessage(task: Task, detail?: { agents?: readonly string[]; briefing?: string; source?: string }): string {
+export function taskMessage(task: Task, detail?: { agents?: readonly string[]; briefing?: string; source?: string; note?: string }): string {
   const asking = Boolean(detail?.agents?.length && (task.mode === "auto" || task.mode === "draft"));
   const ask = asking ? `${detail!.agents!.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode as "auto" | "draft"]} ${AGENT_RECORD}` : "";
   return [
@@ -1578,6 +1964,7 @@ export function taskMessage(task: Task, detail?: { agents?: readonly string[]; b
     task.question ? `⏸️ **Needs input:** ${task.question}${task.options?.length ? `\nOptions: ${task.options.join(" / ")}` : ""}\nAnswer from the Tasks board (Provide input on its card).` : "",
     detail?.source ? `\n${detail.source}\n` : "",
     task.checklist ? `${task.checklist}\n` : "",
+    detail?.note ? `${detail.note}\n` : "",
     `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
     ask,
     asking && detail?.briefing ? `\n${detail.briefing}` : "",

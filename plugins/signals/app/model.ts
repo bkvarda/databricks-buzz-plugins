@@ -1131,6 +1131,8 @@ export function readWorkstreamActions(raw: unknown): WorkstreamActions | string 
       if (typeof id !== "string" || !ACTION_ID.test(id)) return `A ${name} action's id is 1-40 lowercase letters, digits and dashes.`;
       if (actions.some((other) => other.id === id)) return `${name} has the action ${id} twice.`;
       if (typeof label !== "string" || !label.trim() || label.trim().length > MAX_ACTION_LABEL) return `The ${name} action ${id} needs a label of 1-${MAX_ACTION_LABEL} characters.`;
+      // (A Triggered line is "<label> — <why>": the cards split it at the first " — ".)
+      if (label.includes("—")) return `The ${name} action ${id}'s label can't contain —.`;
       if (always !== undefined && always !== true && always !== false) return `The ${name} action ${id}: always is true or left out.`;
       if (trigger !== undefined && typeof trigger !== "string") return `The ${name} action ${id}: trigger must be text.`;
       const text = typeof trigger === "string" ? trigger.trim() : "";
@@ -1155,6 +1157,74 @@ export function actionsFor(rows: WorkstreamActions | undefined, task: Readonly<{
     if (found) return { key: found[0], row: found[1] };
   }
   return undefined;
+}
+
+/** One action's check on one version of a task's event: whether its trigger holds, and why (the model's words, or "always"). */
+export type TriggerResult = Readonly<{ id: string; label: string; held: boolean; why: string }>;
+
+/**
+ * What a task's last trigger check found (tasks.triggers): each action's
+ * result then, by id, for the event version it checked (`seq`: the attachment
+ * of it that check decided, see PendingCheck); `dismissed`: its row's
+ * Otherwise dismissed it (none held when it opened), so a trigger that holds
+ * later opens it again. A person's dismissal never sets it.
+ */
+export type TriggerState = Readonly<{ held: Readonly<Record<string, boolean>>; event?: number; version?: number; seq?: number; dismissed?: true }>;
+
+/**
+ * A pending version's check, done (task_events.trigger_result), waiting for
+ * the ones attached before it to be decided: its event's results; `what`:
+ * its update's line, `extra` and `reopened` as its notice would have them,
+ * `owner`: the post that checked it (its own message shows the update's
+ * changes, so a notice another post saves for it leaves them out);
+ * `source`: its event's details for the thread.
+ */
+export type CheckResult = Readonly<{
+  event: number;
+  version: number;
+  results: readonly TriggerResult[];
+  what: string;
+  owner: string;
+  extra?: string;
+  reopened?: true;
+  source?: string;
+}>;
+
+/**
+ * An event version attached to a task and not decided yet (task_events with
+ * trigger_pending): saved by the statement that attached it, so it can't be
+ * lost after it, and ordered by `seq`, taken under the task's lock as it
+ * was: each is decided only after the ones before it. `claimed_at`: when a
+ * post last took it to check (the attaching post, as it attached it); the
+ * sweep checks one left longer than its lease. `result`: its check, done.
+ */
+export type PendingCheck = Readonly<{ event: number; version: number; seq: number; claimed_at: number | null; result?: CheckResult }>;
+
+/**
+ * Actions that fired on an update, for its thread (trigger_notices): saved
+ * with the check that fired them, so a post that fails is sent again by the
+ * sweep, each on its own (one being sent isn't changed by a later one).
+ * `what`: the line of the update that fired them; `extra`: what else it says
+ * (the watched fields' changes, a checklist); `reopened`: it opened the task
+ * again; `source`: the details of the event that fired them.
+ */
+export type TriggerNotice = Readonly<{ fired: readonly TriggerResult[]; what: string; extra?: string; reopened?: true; source?: string }>;
+
+/** A row as agents read it in their brief. */
+export function actionsText(found: Readonly<{ key: string; row: WorkstreamActionsRow }>): string {
+  const { key, row } = found;
+  const watch = row.watch.map((action) => `- ${action.label}: ${action.always ? "always" : action.trigger}`);
+  const otherwise = row.otherwise === "dismiss" ? "the task is dismissed" : "the task stays open, with no agent asked";
+  return [
+    `Default actions for ${key} (do each one whose trigger holds, under the mode; the hub says which it found):`,
+    ...(watch.length ? watch : ["- none ticked"]),
+    `Otherwise (none holds): ${otherwise}.`,
+  ].join("\n");
+}
+
+/** The lines a post or update gives the actions a check found holding (just now, for an update): `**Triggered:** <label> — <why>` (labels never contain —), or just the label for an always action. */
+export function triggeredLines(results: readonly TriggerResult[]): string {
+  return results.map((result) => `**Triggered:** ${result.label}${result.why && result.why !== "always" ? ` — ${result.why}` : ""}`).join("\n");
 }
 
 /** A catalog action: as stored, and whether setup ticks it to start with. */
