@@ -11,6 +11,8 @@ const INTERNAL_LINKS: [string, string][] = [
   ["Jira or Confluence", "Tracked in https://databricks.atlassian.net/browse/ES-1234567."],
   ["internal ticket", "Root cause is in ES-2331845."],
   ["Brickroad", "There's already brickroad:issue/11732 for this."],
+  ["Brickroad", "Please add your vote to BR-90003 in the form."],
+  ["internal ticket", "The rollout is tracked in RT-4521."],
   ["Buzz link", "Discussed in buzz://message?channel=c1&id=abc."],
   ["Slack link", "Per https://databricks.slack.com/archives/C01/p1700000000."],
   ["Google Drive", "The FAQ is at https://drive.google.com/file/d/1bXh/view."],
@@ -74,6 +76,7 @@ describe("disclosure check", () => {
     expect(internalHits("Enable serverless compute (optional) before continuing.")).toEqual([]);
     expect(internalHits("Set a budget policy (optional: recommended for production).")).toEqual([]);
     expect(internalHits("(Optional) Add a tag.")).toEqual([]);
+    expect(internalHits("Use the BR-1 or RT-5 cable kits, and ABR-12345 is a part number.")).toEqual([]);
     expect(internalHits("Set up a budget alert (optional: decide who should receive notifications).")).toEqual([]);
     expect(internalHits("Pick a region (optional: your decision, defaults to us-east-1).")).toEqual([]);
   });
