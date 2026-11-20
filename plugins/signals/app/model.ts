@@ -178,6 +178,16 @@ export type Rule = Readonly<{
    * google_calendar) that the notes' `payload.meeting` link names.
    */
   action_items?: Readonly<{ workstream?: string; meetings?: string }>;
+  /**
+   * `accounts`: the event is about every account, not one (a new feature or
+   * a preview announced to the field): it opens a candidate task for each
+   * account whose team opted in to the rule's workstream (see fanOut), one
+   * per account and group (so the same
+   * announcement posted again, or a reminder of it with the same group,
+   * comes back to the same candidates). Candidates are judged one by one (a task's
+   * `verdict`); an event that comes back never opens a judged one again.
+   */
+  fan_out?: "accounts";
   /** Rules with the same group share tasks (default: the rule's id). An `update` rule needs the group of the rule that opens the tasks. */
   group?: string;
   /** Overrides the account the event says (a fixed name or `{payload.account_name}`). */
@@ -417,6 +427,14 @@ export function configProblems(raw: unknown): string[] {
       if (!a || typeof a !== "object" || Array.isArray(a) || Object.keys(a).some((key) => key !== "workstream" && key !== "meetings") || [a.workstream, a.meetings].some((value) => value !== undefined && (typeof value !== "string" || !value.trim())))
         problems.push(`${where}.action_items is {workstream?, meetings?}, like {"workstream": "meeting action items"}`);
       else if (rule.action !== "task") problems.push(`${where}.action_items needs action task`);
+    }
+    if (rule.fan_out !== undefined) {
+      if (rule.fan_out !== "accounts") problems.push(`${where}.fan_out is "accounts"`);
+      else if (rule.action !== "task") problems.push(`${where}.fan_out needs action task`);
+      else
+        // (classify: not supported on fan-out yet, so a rule with one is refused rather than its question skipped.)
+        for (const key of ["account", "series", "same_as", "action_items", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify"] as const)
+          if (rule[key] !== undefined) problems.push(`${where}.fan_out is about every account, so it takes no ${key}`);
     }
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
     if (rule.classify !== undefined) {
@@ -812,6 +830,7 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const rule = ruleFor(config, event, options.owner);
   if (!rule) return { kind: "none", reason: "no rule matches" };
   if (rule.action === "ignore") return { kind: "none", reason: `rule ${rule.id} ignores it` };
+  if (rule.fan_out) return { kind: "none", reason: `rule ${rule.id} is about every account (see fanOut)` };
   const account = accountFor(config, event, rule);
   const channel = account?.channel ?? config.default_channel;
   const group = groupKey(rule, event);
@@ -824,6 +843,49 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const same = sameKey(rule, event);
   return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }) };
 }
+
+/**
+ * For an event a `fan_out` rule takes: one candidate per account the config
+ * has (by name, once each) whose team opted in, in the account's channel and
+ * its team's mode. Opted in is a line for the rule's id or workstream in the
+ * team's preferences (`feature evaluation: draft`) that isn't `off`; neither
+ * `everything:` nor the default mode counts. Accounts not opted in are left
+ * out, so their candidates (from before they opted out) aren't updated.
+ * Each candidate's group is the rule's group of the event and the account,
+ * so an announcement posted again comes back to the same candidates. `create`
+ * is false for an account whose team turned the work off, and on a first run
+ * (as decide): those only update candidates that exist.
+ */
+export function fanOut(config: SignalsConfig, event: EventInput, options: Readonly<{ firstRun: boolean; owner?: string }>): { rule: Rule; decisions: Extract<Decision, { kind: "task" }>[] } | undefined {
+  const rule = ruleFor(config, event, options.owner);
+  if (!rule?.fan_out || rule.action !== "task") return undefined;
+  const base = groupKey(rule, event);
+  const title = (rule.title ? fill(rule.title, event) : event.title || `${event.source} ${event.external_id}`).trim();
+  const seen = new Set<string>();
+  const decisions: Extract<Decision, { kind: "task" }>[] = [];
+  for (const account of config.accounts ?? []) {
+    const key = account.name.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    // Only accounts whose team said they do this work (a mode for the rule or its workstream, not off): the default mode isn't a yes.
+    const mode = explicitModeFor(account.preferences, rule);
+    if (!mode || mode === "off") continue;
+    const channel = account.channel ?? config.default_channel;
+    const create = !(options.firstRun && config.first_run_seen !== false);
+    decisions.push({ kind: "task", rule, group: `${base}|${key}`, title: `${account.name}: ${title}`.slice(0, 500), account, ...(channel && { channel }), create, mode });
+  }
+  return { rule, decisions };
+}
+
+/** The mode a team set for a rule or its workstream itself (not `everything`, not the default), or undefined. */
+export function explicitModeFor(preferences: string | undefined, rule: Pick<Rule, "id" | "workstream">): Mode | undefined {
+  const { modes } = preferencesOf(preferences);
+  return modes[rule.id.toLowerCase()] ?? (rule.workstream ? modes[rule.workstream.toLowerCase()] : undefined);
+}
+
+/** What an agent or a person decided about a fan-out candidate (see Rule.fan_out). */
+export const VERDICTS = ["qualified", "disqualified", "unsure"] as const;
+export type Verdict = (typeof VERDICTS)[number];
 
 // ---------------------------------------------------------------------------
 // Team preferences

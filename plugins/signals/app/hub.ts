@@ -25,7 +25,7 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
 import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -629,6 +629,13 @@ export class Hub {
     if (input.workstream !== undefined || input.initiative !== undefined)
       task = (await this.store.file(id, user, { ...(input.workstream !== undefined && { workstream: input.workstream as string }), ...(input.initiative !== undefined && { initiative: input.initiative as string }) }))!;
     const note = typeof input.note === "string" && input.note.trim() ? input.note.trim() : undefined;
+    // A fan-out candidate's verdict (see Rule.fan_out), with the note as its reason.
+    if (input.verdict !== undefined) {
+      if (!VERDICTS.includes(input.verdict as Verdict)) return bad(`verdict must be one of ${VERDICTS.join(", ")}`);
+      if (!(await this.config()).rules.find((rule) => rule.id === task!.rule_id)?.fan_out) return bad("Only a candidate a fan_out rule opened has a verdict.", 409);
+      task = (await this.store.setVerdict(id, input.verdict as Verdict, user, note))!;
+      if (this.notifier && task.buzz_root) await this.notifier.updated(task, `${user} judged this **${input.verdict}**${note ? `: ${note}` : ""}`).catch(() => {});
+    }
     if (input.status !== undefined) {
       if (!TASK_STATUSES.includes(input.status as TaskStatus)) return bad(`status must be one of ${TASK_STATUSES.join(", ")}`);
       task = (await this.store.setStatus(id, input.status as TaskStatus, user, note))!;
@@ -642,7 +649,7 @@ export class Hub {
           for (const opened of await this.store.releaseHeld(asking, await this.config())) await this.post(opened);
         }
       }
-    } else if (note && input.agents === undefined && input.assign === undefined && input.unassign === undefined) await this.store.activity(id, user, "note", note);
+    } else if (note && input.verdict === undefined && input.agents === undefined && input.assign === undefined && input.unassign === undefined) await this.store.activity(id, user, "note", note);
     if (input.agents !== undefined) {
       const keys = Array.isArray(input.agents) ? [...new Set(input.agents.map((item) => agentKey(String(item))))] : [];
       if (!keys.length || keys.some((key) => !key) || keys.length > 10) return bad("agents is a list of up to 10 Buzz pubkeys (hex or npub).");

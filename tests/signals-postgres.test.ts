@@ -367,3 +367,50 @@ describe.skipIf(!URL)("signals on PostgreSQL: meeting action items", () => {
     }
   });
 });
+
+describe.skipIf(!URL)("signals on PostgreSQL: fan-out", () => {
+  const pool = new pg.Pool({ connectionString: URL, max: 10 });
+  afterAll(() => pool.end());
+  const db: Db = { query: async (text, values) => ({ rows: (await pool.query(text, values)).rows }) };
+  const config: SignalsConfig = {
+    version: 1,
+    default_channel: "triage",
+    rules: [{ id: "feature-announcement", sources: ["slack"], when: { "payload.channel": "^field-announcements$" }, action: "task", title: "Evaluate: {title}", workstream: "feature evaluation", group_by: "payload.feature", fan_out: "accounts" }],
+    accounts: [{ name: "Alpha", channel: "alpha", preferences: "feature evaluation: draft" }, { name: "Beta", channel: "beta", preferences: "feature evaluation: ask" }],
+  };
+  const announcement = (text: string) => ({ source: "slack", external_id: "C1:1", title: "Preview", occurred_at: "2026-11-20T10:00:00Z", payload: { channel: "field-announcements", feature: "f1", text } });
+
+  it("attaches an edit to two candidates at once without a deadlock", async () => {
+    const schema = "signals_pg_fanout";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const store = new SignalsStore(db, schema);
+    await store.setup();
+    await store.setSource("pm@x.com", "slack", true);
+    await store.ingest("pm@x.com", [{ source: "slack", external_id: "seed" }], config);
+    await store.ingest("pm@x.com", [announcement("PrPr recruiting.")], config);
+    const candidates = await store.tasks({});
+    expect(candidates.length).toBe(2);
+    const edit = await store.record("pm@x.com", announcement("Reminder."), false, false, true);
+    const holder = await pool.connect();
+    try {
+      // Holds the event's row, so both attachments get as far as it and wait there together.
+      await holder.query("BEGIN");
+      await holder.query(`SELECT 1 FROM ${schema}.events WHERE id = $1 FOR SHARE`, [edit.id]);
+      const attach = (store as unknown as { attachOnce: (task: number, event: number, version: number, at: number, customer: undefined, current: boolean) => Promise<{ attached?: { id: number } }> }).attachOnce.bind(store);
+      const both = candidates.map((task) => attach(task.id, edit.id, edit.version, 1795000000, undefined, true));
+      for (let i = 0; ; i++) {
+        const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO ${schema}.task_events%'`);
+        if (found.rows[0].n >= 2) break;
+        if (i > 200) throw new Error("the attachments never waited");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await holder.query("COMMIT");
+      const results = await Promise.allSettled(both);
+      expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(results.map((result) => (result.status === "fulfilled" ? result.value.attached?.id : undefined)).sort()).toEqual(candidates.map((task) => task.id).sort());
+    } finally {
+      holder.release();
+    }
+    expect((await store.tasks({})).map((task) => task.event_count)).toEqual([2, 2]);
+  });
+});
