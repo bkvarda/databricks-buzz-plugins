@@ -98,7 +98,7 @@ describe("rule categories", () => {
     await post(ticket("seed", "seed"));
     /** The team changes its preferences. */
     const prefer = (text: string) => void (current = config(text));
-    return { store, post, prefer };
+    return { store, post, prefer, sql: (text: string) => db.query(text) };
   };
 
   it("opens a category the team kept on when the rule's own workstream is off, but not the fallback", async () => {
@@ -217,6 +217,21 @@ describe("rule categories", () => {
     beforeOther.release();
     expect((await moving).errors).toEqual([]);
     expect(await store.task(other!.id)).toMatchObject({ rule_id: "es_later", workstream: "incident", mode: "draft" });
+  });
+
+  it("matches a category with an accented capital as categoryNamed does when a task moves to a rule turned off", async () => {
+    const categories = [{ workstream: "Éscalade", when: { title: "increase TPM" } }];
+    const rules = [
+      { ...ESCALATIONS, categories, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, categories, id: "resolved", group: "es", workstream: "case follow-up", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    const { store, post, sql } = await prepare("Éscalade: auto\nresolved: off", rules);
+    // As on a database whose ctype is C, where the database's lower() leaves É as it is (JavaScript's gives é).
+    await sql(`ALTER TABLE signals_categories.tasks ALTER COLUMN workstream TYPE text COLLATE "C"`);
+    await post(ticket("ES-1", "Please increase TPM", { status: "Incoming" }));
+    expect((await store.tasks({}))[0]).toMatchObject({ rule_id: "escalations", workstream: "Éscalade", mode: "auto" });
+    await post(ticket("ES-1", "Please increase TPM", { status: "Investigating" }));
+    expect((await store.tasks({}))[0]).toMatchObject({ rule_id: "resolved", workstream: "Éscalade", mode: "off" });
   });
 
   it("opens a closed task again only while the team still works on its own category", async () => {

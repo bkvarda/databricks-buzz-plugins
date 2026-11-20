@@ -1316,34 +1316,41 @@ export class SignalsStore {
 
   /**
    * Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule.
-   * A task someone filed under a workstream themselves (a `workstream` activity) keeps it. Otherwise, one under one of the new
+   * A task someone filed under a workstream themselves (file() marks the row; older ones have a `workstream` activity) keeps it. Otherwise, one under one of the new
    * rule's categories keeps it; one under a category its old rule gave it (see Rule.categories) that the new rule doesn't offer
    * takes the new rule's workstream (none, if it names none). Either way, a task under a category takes the team's mode for it
    * under the new rule (its id first, so a rule turned off stays off); others keep their mode, as before.
    */
-  private async refile(task: Task, rule: Rule, config: SignalsConfig): Promise<Task> {
-    const kept = categoryNamed(rule, task.workstream)?.workstream.trim();
-    const before = config.rules.find((one) => one.id === task.rule_id);
-    const automatic = !kept && Boolean(categoryNamed(before, task.workstream)) && task.workstream?.trim().toLowerCase() !== before?.workstream?.trim().toLowerCase();
-    const preferences = config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences;
-    const categoryModes = Object.fromEntries((rule.categories ?? []).map((category) => [category.workstream.trim().toLowerCase(), categoryModeFor(preferences, rule, category.workstream.trim())]));
-    const found = await this.q(
-      // Filed by hand: the row's own marker, which file() saves with the workstream, or its history, for tasks filed before the
-      // marker. The row is read locked, so a filing that lands while this waits on it is seen; a workstream other than the one
-      // this decided from counts as filed by hand too. The mode follows the workstream the row has: one of the new rule's
-      // categories takes the team's mode for it there ($7, by category), whoever filed it; a dropped category takes the rule's.
-      `WITH d AS (SELECT t.workstream_by IS NOT NULL OR t.workstream IS DISTINCT FROM $8::text
-                    OR EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS manual,
-                  $7::jsonb ->> lower(btrim(t.workstream)) AS category_mode
-                  FROM $S.tasks t WHERE t.id = $1 FOR UPDATE)
-       UPDATE $S.tasks SET rule_id = $2,
-         workstream = CASE WHEN d.manual THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
-         mode = CASE WHEN d.category_mode IS NOT NULL THEN d.category_mode WHEN $5::boolean AND NOT d.manual THEN $6 ELSE mode END, updated_at = $4
-       FROM d WHERE id = $1 RETURNING $S.tasks.*, ($5::boolean AND NOT d.manual) AS dropped`,
-      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), JSON.stringify(categoryModes), task.workstream ?? null],
-    );
-    const row = found.rows[0];
-    const moved = row ? toTask(row) : task;
+  private async refile(read: Task, rule: Rule, config: SignalsConfig): Promise<Task> {
+    // Decided here from the task as read, and written only while the row still has that workstream (so a filing that lands
+    // meanwhile is seen, and the mode follows the workstream the row has, normalized as categoryNamed does); if it changed,
+    // read it again and decide again.
+    let task = read;
+    let row: Row | undefined;
+    for (let attempt = 1; ; attempt++) {
+      const kept = categoryNamed(rule, task.workstream)?.workstream.trim();
+      const before = config.rules.find((one) => one.id === task.rule_id);
+      const automatic = !kept && Boolean(categoryNamed(before, task.workstream)) && task.workstream?.trim().toLowerCase() !== before?.workstream?.trim().toLowerCase();
+      const preferences = config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences;
+      const found = await this.q(
+        // Filed by hand: the row's own marker, which file() saves with the workstream, or its history, for tasks filed before
+        // the marker. A category of the new rule takes the team's mode for it there ($7), whoever filed it; a dropped one, the rule's.
+        `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS history)
+         UPDATE $S.tasks SET rule_id = $2,
+           workstream = CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
+           mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT (d.history OR workstream_by IS NOT NULL) THEN $6 ELSE mode END, updated_at = $4
+         FROM d WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text
+         RETURNING $S.tasks.*, ($5::boolean AND NOT (d.history OR $S.tasks.workstream_by IS NOT NULL)) AS dropped`,
+        [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null],
+      );
+      row = found.rows[0];
+      if (row) break;
+      const again = await this.task(task.id);
+      if (!again) return task;
+      if (attempt >= 5) throw new Error(`task ${task.id}'s workstream kept changing while it moved to rule ${rule.id}`);
+      task = again;
+    }
+    const moved = toTask(row);
     const why = row?.dropped === true ? ` That rule has no ${task.workstream} category, so it's ${moved.workstream ? `under ${moved.workstream}` : "under no workstream"} now, in ${moved.mode} mode.` : moved.mode !== task.mode ? ` Its mode is ${moved.mode} now.` : "";
     await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.${why}`);
     return moved;
