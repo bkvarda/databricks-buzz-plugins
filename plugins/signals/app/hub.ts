@@ -89,7 +89,6 @@ export type Onboarding = Readonly<{
   waiting?: Readonly<{ reason: string; command?: string }>;
   /** sources.json's `lakebase`, or undefined when the hub doesn't know its database. */
   lakebase?: Readonly<{ endpoint: string; host: string; database: string; port?: number; schema: string }>;
-  /** The poller's arguments, for its job. */
   /** The workspace folder the person's poller.py and sources.json go in. */
   folder: string;
   /** The job's arguments, with sources.json's full workspace path (a job's working directory isn't the folder). */
