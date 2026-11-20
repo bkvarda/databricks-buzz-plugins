@@ -168,6 +168,15 @@ export type IngestResult = Readonly<{
 
 const now = () => Math.floor(Date.now() / 1000);
 
+/**
+ * A refile whose every write lost to a filing by hand (each changed the workstream it had read): the task is left on its rule,
+ * and ingest marks the event's version to be placed again (events.place_pending) and asks for the post again.
+ */
+class RefileConflict extends Error {}
+
+/** A version to be placed again (see RefileConflict): as the ingest that stopped had it. */
+type PlacePending = { version: number; outcome: Exclude<Outcome, "skipped">; before?: EventInput; changes?: FieldChange[]; reopened: boolean };
+
 /** Seconds an ingest has to place a pending notes version before the sweep may (see events.placing_at). */
 export const PLACING_LEASE = 600;
 /** Seconds a run that took a notes event's move to report has before another may (see events.join_claimed_at). */
@@ -271,6 +280,9 @@ export class SignalsStore {
     // in on its source's first run: posting it again finishes that version as its first ingest would have, and changes nothing else.
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS fan_pending int`);
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS fan_first_run boolean`);
+    // A version whose placement stopped at a refile that lost every write to filings by hand (see RefileConflict), until it's
+    // placed: {version, outcome, before, changes, reopened}, as that ingest had them, so posting it again places it as that ingest would have.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS place_pending jsonb`);
     // A notes document's newest revision saved (microseconds), by source and group: raised as each is recorded, so placing an older
     // one can lock it and see a newer one being saved (see LATEST_REVISION).
     await this.q(`CREATE TABLE IF NOT EXISTS $S.revisions (source text NOT NULL, group_key text NOT NULL, latest_us bigint NOT NULL, PRIMARY KEY (source, group_key))`);
@@ -497,7 +509,7 @@ export class SignalsStore {
    * write (items_pending) in the same statement, so the sweep finishes them
    * even when a later write of this post fails and the post is acknowledged.
    */
-  async record(owner: string, given: EventInput, items = false, firstRun = false, fan = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number; fanPending?: { version: number; firstRun: boolean } }> {
+  async record(owner: string, given: EventInput, items = false, firstRun = false, fan = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number; fanPending?: { version: number; firstRun: boolean }; placePending?: PlacePending }> {
     const event = await this.keepDetails(owner, given);
     const hash = contentHash(event);
     const at = now();
@@ -505,7 +517,7 @@ export class SignalsStore {
     const micros = toMicros(event.occurred_at);
     const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun, fan];
     // xmax = 0 only for a row this statement inserted.
-    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown; fan_pending: unknown; fan_first_run: unknown }>(
+    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown; fan_pending: unknown; fan_first_run: unknown; place_pending: unknown }>(
       `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3),
        doc AS (INSERT INTO $S.revisions (source, group_key, latest_us) SELECT $2, $11, $13::bigint WHERE $14 AND $11::text IS NOT NULL AND $13::bigint IS NOT NULL
          ON CONFLICT (source, group_key) DO UPDATE SET latest_us = GREATEST($S.revisions.latest_us, excluded.latest_us) RETURNING 1)
@@ -524,8 +536,9 @@ export class SignalsStore {
          placing_at = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.placing_at ELSE $S.events.placing_at END,
          items_first_run = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.items_first_run ELSE $S.events.items_first_run END,
          fan_pending = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $S.events.versions + 1 ELSE $S.events.fan_pending END,
-         fan_first_run = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $15::boolean ELSE $S.events.fan_first_run END
-       RETURNING id, versions, task_id, items_pending, fan_pending, fan_first_run,
+         fan_first_run = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $15::boolean ELSE $S.events.fan_first_run END,
+         place_pending = CASE WHEN $S.events.content_hash <> excluded.content_hash THEN NULL ELSE $S.events.place_pending END
+       RETURNING id, versions, task_id, items_pending, fan_pending, fan_first_run, place_pending,
          (SELECT row_to_json(previous) FROM previous) AS before,
          NOT EXISTS (SELECT 1 FROM previous) AS inserted,
          COALESCE((SELECT content_hash FROM previous) <> $4, false) AS changed`,
@@ -535,7 +548,9 @@ export class SignalsStore {
     // The event as it was before this version (pg gives row_to_json as an object, PGlite may give text).
     const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
     const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
-    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }), ...(num(row.fan_pending) !== null && { fanPending: { version: num(row.fan_pending)!, firstRun: row.fan_first_run === true } }) };
+    const pendingRaw = typeof row.place_pending === "string" ? (JSON.parse(row.place_pending) as PlacePending) : (row.place_pending as PlacePending | null | undefined);
+    const placePending = pendingRaw && pendingRaw.version === row.versions ? pendingRaw : undefined;
+    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }), ...(num(row.fan_pending) !== null && { fanPending: { version: num(row.fan_pending)!, firstRun: row.fan_first_run === true } }), ...(placePending && { placePending }) };
   }
 
   /**
@@ -569,11 +584,14 @@ export class SignalsStore {
     const opened = new Set<number>();
     for (const [index, event] of events.entries()) {
       // Saved: an error after that needn't be posted again (a notes event's items_pending has the sweep finish it;
-      // reposting a saved event changes nothing). Before that, the post is handled again (see Hub.drain).
+      // reposting a saved event changes nothing, but for a refile that gave up: see RefileConflict). Before that, the post is handled again (see Hub.drain).
       let saved = false;
       let fanning = false;
       let placing: number | undefined;
       let placingVersion: number | undefined;
+      let resume: PlacePending | undefined;
+      let pending: PlacePending | undefined;
+      let pendingEvent: number | undefined;
       try {
         let state = consent.get(event.source);
         if (!state) consent.set(event.source, (state = await this.enabled(owner, event.source)));
@@ -587,13 +605,20 @@ export class SignalsStore {
         // placing it finds nothing to do and clears the marker).
         const fan = fanOut(config, event, { firstRun: state.firstRun, owner });
         // (So is one a rule with meeting_task may take: its placement, which may move a prep task, is finished the same way.)
-        const recorded = await this.record(owner, event, config.rules.some((rule) => (rule.action_items || rule.meeting_task) && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
-        counts[recorded.outcome]++;
+        const stored = await this.record(owner, event, config.rules.some((rule) => (rule.action_items || rule.meeting_task) && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
+        counts[stored.outcome]++;
         saved = true;
-        if (recorded.outcome !== "same" && recorded.itemsPending !== undefined) {
-          placing = recorded.id;
-          placingVersion = recorded.version;
+        if (stored.outcome !== "same" && stored.itemsPending !== undefined) {
+          placing = stored.id;
+          placingVersion = stored.version;
         }
+        // Seen before, but its placement stopped at a refile that lost every write (see RefileConflict): placed now, as that ingest
+        // would have (its outcome and the version before it, as saved), and its mark cleared once it is.
+        resume = stored.outcome === "same" && !fan ? stored.placePending : undefined;
+        const recorded = resume ? { ...stored, outcome: resume.outcome, ...(resume.before ? { before: resume.before } : {}) } : stored;
+        pendingEvent = recorded.id;
+        pending = { version: recorded.version, outcome: recorded.outcome, ...(recorded.before && { before: recorded.before }), reopened: Boolean(resume?.reopened) };
+        const placedNow = () => (resume ? this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND (place_pending->>'version')::int = $2`, [recorded.id, recorded.version]) : Promise.resolve());
         const replies = handledBy(config, event, owner);
         // About every account (a new feature announced): a candidate per opted-in account, then nothing else to do with it.
         // Its version is pending (fan_pending) until placed on every candidate: a failure asks for the post again, and posting it
@@ -651,6 +676,7 @@ export class SignalsStore {
         if (!placed || finishedHere) {
           // Not placed (no task for it: filtered, a first run, a closed group) or finished here: no action items to write later either.
           if (recorded.itemsPending !== undefined) await this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [recorded.id, recorded.itemsPending]);
+          await placedNow();
           continue;
         }
         let task = placed.task;
@@ -668,7 +694,10 @@ export class SignalsStore {
           // A meeting's notes that just joined its prep task (meeting_task): the move, so its agents are asked to go on with this rule's playbook,
           // with the watched fields' changes, all saved with the move (see meetingTask), so a retry from the sweep posts the same.
           if (placed.joined) changes = placed.joined.changes;
+          // (Placed again after a refile gave up: the changes that ingest found, since the event may be the task's latest now.)
+          else if (resume?.changes) changes = resume.changes;
           else if (watched.length) changes = fieldChanges(watched, recorded.before ?? (await this.latestEvent(task.id)), event);
+          pending.changes = changes;
           // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
           if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule, config);
@@ -680,7 +709,9 @@ export class SignalsStore {
           if (own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
-        const reopened = await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        // (Resumed: it may have opened the task again the first time; this attach finds it attached and open.)
+        const reopened = (await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen })) || Boolean(resume?.reopened);
+        pending.reopened = reopened;
         // A meeting's notes: the account team's items get their own tasks, the rest a checklist on this one.
         let checklist: string | null | undefined;
         if (placed.rule.action_items) {
@@ -702,6 +733,7 @@ export class SignalsStore {
           for (const reply of await this.pendingReplies({ group: task.group_key })) if (await this.applyReply(reply)) closed = true;
           if (closed) {
             opened.delete(task.id);
+            await placedNow();
             continue;
           }
         }
@@ -711,11 +743,17 @@ export class SignalsStore {
         // until the hub has posted the update (see IngestResult.updated's joined).
         const joined = placed.joined && (await this.claimJoin(recorded.id));
         if (placed.joined && !joined) changes = changes.slice(placed.joined.changes.length);
+        // (Its mark cleared before its update is reported: a failure clearing it reports nothing, and a post again places it again.)
+        await placedNow();
         touched.set(fresh.id, fresh);
         if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }), ...(joined && { joined: joined.claim }) });
       } catch (error) {
-        result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning) && { retry: true }) });
-        if (!saved || fanning) retried.add(event.source);
+        // A refile that lost every write to filings by hand: the version is marked to be placed again, and the post is asked for
+        // again (posted again, the same event takes that mark, above). Only while it's still the version saved: a newer one places itself.
+        const again = error instanceof RefileConflict && saved && !fanning && pending !== undefined
+          && (await this.q(`UPDATE $S.events SET place_pending = $3::jsonb WHERE id = $1 AND versions = $2 RETURNING 1`, [pendingEvent, pending.version, JSON.stringify(pending)]).then((found) => found.rows.length > 0, () => false));
+        result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning || again) && { retry: true }) });
+        if (!saved || fanning || again) retried.add(event.source);
       } finally {
         // Done placing it (or failed to): the sweep may finish it now.
         // (Only its own lease: a newer version recorded since holds the lease for its own ingest, still placing it.)
@@ -1347,7 +1385,7 @@ export class SignalsStore {
       if (row) break;
       const again = await this.task(task.id);
       if (!again) return task;
-      if (attempt >= 5) throw new Error(`task ${task.id}'s workstream kept changing while it moved to rule ${rule.id}`);
+      if (attempt >= 5) throw new RefileConflict(`task ${task.id}'s workstream kept changing while it moved to rule ${rule.id}`);
       task = again;
     }
     const moved = toTask(row);

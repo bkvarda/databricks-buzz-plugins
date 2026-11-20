@@ -234,6 +234,60 @@ describe("rule categories", () => {
     expect((await store.tasks({}))[0]).toMatchObject({ rule_id: "resolved", workstream: "Éscalade", mode: "off" });
   });
 
+  it("places again, posted again, an update whose refile lost every write to a filing by hand, as it would have been placed", async () => {
+    const rules = [
+      { ...ESCALATIONS, group: "es", group_by: "payload.case", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "resolved", group: "es", group_by: "payload.case", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    // While on, someone files the task by hand before each refile write, so the workstream it read is never the row's.
+    let filing: { id: number; attempts: number } | undefined;
+    const { store, post, prefer, sql } = await prepare("capacity request: auto\nresolved: off", rules, (text, values) => {
+      if (!filing || !text.includes("SET rule_id = $2") || Number(values?.[0]) !== filing.id) return undefined;
+      filing.attempts++;
+      return store.file(filing.id, "bob@x.com", { workstream: filing.attempts % 2 ? "incident" : "capacity request" }).then(() => undefined);
+    });
+    await post(ticket("open", "Please increase TPM", { case: "open", status: "Incoming" }), ticket("done", "Please increase TPM", { case: "done", status: "Incoming" }));
+    const tasks = Object.fromEntries((await store.tasks({})).map((task) => [task.group_key.split("|").pop(), task]));
+    // An open task: the update is saved, but the refile gives up, and the post is asked for again.
+    filing = { id: tasks.open!.id, attempts: 0 };
+    const update = ticket("open", "Please increase TPM", { case: "open", status: "Investigating" });
+    const conflict = await post(update);
+    expect(filing.attempts).toBe(5);
+    expect(conflict.errors).toEqual([{ index: 0, error: expect.stringContaining("workstream kept changing"), retry: true }]);
+    expect(await store.task(tasks.open!.id)).toMatchObject({ rule_id: "escalations", event_count: 1 });
+    // Posted again once the filings stop: placed as the first post would have been, with the change it made.
+    filing = undefined;
+    const again = await post(update);
+    expect(again.errors).toEqual([]);
+    expect(again.updated).toEqual([expect.objectContaining({ task: expect.objectContaining({ id: tasks.open!.id, rule_id: "resolved", workstream: "incident", mode: "off" }), changes: [{ field: "status", from: "Incoming", to: "Investigating" }] })]);
+    expect(await store.task(tasks.open!.id)).toMatchObject({ rule_id: "resolved", workstream: "incident", mode: "off", event_count: 2 });
+    // Then it's placed: posted once more, it's the same event, and nothing happens.
+    expect(await post(update)).toMatchObject({ same: 1, updated: [], errors: [] });
+    // A finished task a new ticket of its case opens again: the refile after that gives up; posted again, the task is open and
+    // moved, and its update says it was opened again.
+    // (A rule turned off opens nothing again: resolved is in draft mode for this.)
+    prefer("capacity request: auto\nresolved: draft");
+    await store.setStatus(tasks.done!.id, "done", "bob@x.com");
+    filing = { id: tasks.done!.id, attempts: 0 };
+    const reopening = ticket("done-2", "Please increase TPM", { case: "done", status: "Investigating" });
+    expect((await post(reopening)).errors).toEqual([expect.objectContaining({ retry: true })]);
+    filing = undefined;
+    const reopened = await post(reopening);
+    expect(reopened.updated).toEqual([expect.objectContaining({ task: expect.objectContaining({ id: tasks.done!.id, status: "open", rule_id: "resolved", workstream: "incident", mode: "draft" }), reopened: true, changes: [{ field: "status", from: "Incoming", to: "Investigating" }] })]);
+    // A newer version saved meanwhile places itself: the mark on the one before it is gone. (Filed under incident already, so
+    // the filings start with the other one.)
+    filing = { id: tasks.open!.id, attempts: 1 };
+    const back = ticket("open", "Please increase TPM", { case: "open", status: "Incoming" });
+    const mark = async () => (await sql(`SELECT place_pending FROM signals_categories.events WHERE external_id = 'open'`)).rows[0] as unknown as { place_pending: unknown };
+    expect((await post(back)).errors).toEqual([expect.objectContaining({ retry: true })]);
+    expect((await mark()).place_pending).toMatchObject({ outcome: "changed", changes: [{ field: "status", from: "Investigating", to: "Incoming" }] });
+    filing = undefined;
+    const newer = ticket("open", "Please increase TPM", { case: "open", status: "Investigating", note: "x" });
+    expect((await post(newer)).errors).toEqual([]);
+    expect((await mark()).place_pending).toBeNull();
+    expect(await store.task(tasks.open!.id)).toMatchObject({ rule_id: "resolved" });
+  });
+
   it("opens a closed task again only while the team still works on its own category", async () => {
     const rules = [{ ...ESCALATIONS, group_by: "payload.case" }] satisfies readonly Rule[];
     const { store, post, prefer } = await prepare("escalation tracking: ask\ncapacity request: auto", rules);
