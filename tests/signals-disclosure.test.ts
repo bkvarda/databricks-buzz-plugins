@@ -16,6 +16,8 @@ const INTERNAL_LINKS: [string, string][] = [
   ["Google Drive", "The FAQ is at https://drive.google.com/file/d/1bXh/view."],
   ["workspace link", "Repro in https://fevm-buzz-lakebase-lab.cloud.databricks.com/jobs/1."],
   ["internal date", "Eng availability is 2027-02-15."],
+  ["layout note", "Serverless is supported *(full size, not a footnote)*."],
+  ["layout note", "(optional: SA decides) We can also set up a call."],
 ];
 
 describe("disclosure check", () => {
@@ -65,6 +67,21 @@ describe("disclosure check", () => {
 
   it("closes a fence only with the same kind of fence", () => {
     expect(draftSections("## Customer draft\n~~~\n```\n## Internal notes\n~~~\n## Internal notes\nES-1234567")).toMatchObject({ internal: "ES-1234567" });
+  });
+
+  it("leaves ordinary parentheses alone", () => {
+    expect(internalHits("Ingest (optionally with Auto Loader) is supported (see the docs).")).toEqual([]);
+    expect(internalHits("Enable serverless compute (optional) before continuing.")).toEqual([]);
+    expect(internalHits("Set a budget policy (optional: recommended for production).")).toEqual([]);
+    expect(internalHits("(Optional) Add a tag.")).toEqual([]);
+    expect(internalHits("Set up a budget alert (optional: decide who should receive notifications).")).toEqual([]);
+    expect(internalHits("Pick a region (optional: your decision, defaults to us-east-1).")).toEqual([]);
+  });
+
+  it("flags optional only with a sender cue", () => {
+    for (const text of ["(optional: SA decides) Add a call.", "Add a slide *(optional, AE decision)*.", "(Optional - SA decides whether to include)", "(optional: AE's call)"])
+      expect(internalHits(text).map((hit) => hit.kind)).toEqual(["layout note"]);
+    expect(disclosureCheck(`${customer("Enable serverless compute (optional) before continuing.")}\n\n${internal("(optional: SA decides) Mention the roadmap.")}`)).toMatchObject({ status: "clean" });
   });
 
   it("leaves public Databricks docs alone", () => {

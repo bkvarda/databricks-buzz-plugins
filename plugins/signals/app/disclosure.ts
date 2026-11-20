@@ -57,6 +57,9 @@ const PATTERNS: readonly [string, RegExp][] = [
   ["workspace link", /\bhttps?:\/\/(?:[\w-]+\.)*(?:cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com|databricksapps\.com)\S*/gi],
   ["Glean", /\bhttps?:\/\/[\w-]+\.glean\.com\/\S*|\bglean\b/gi],
   ["internal date", /\beng(?:ineering)?[- ]availability(?: date)?\b/gi],
+  // A note to whoever sends it, left in the text: "(full size, not a footnote)", "*(optional: SA decides)*".
+  // (A plain "(optional)" step is for the customer: "optional" counts only with a sender cue naming who decides, as in "(optional: SA decides)" or "(optional, AE's call)"; "(optional: decide who gets alerts)" is for the customer.)
+  ["layout note", /\*?\((?:(?:full size|not a footnote|SA decides|AE decision)\b[^)\n]*|optional\s*[:;,\u2013-][^)\n]*\b(?:SA|AE)(?:\/(?:SA|AE))?(?:'s)?\s+(?:decides?|decision|call)\b[^)\n]*)\)\*?/gi],
 ];
 
 /** Hosts a customer can open, which a pattern above would otherwise catch. */
