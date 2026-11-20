@@ -1271,9 +1271,22 @@ export class SignalsStore {
     await this.q(`INSERT INTO $S.activities (task_id, at, actor, kind, text) VALUES ($1, $2, $3, $4, $5)`, [task, now(), actor, kind, text.slice(0, 4000)]);
   }
 
-  /** Records the disclosure check's result for a reply; true only for the call that recorded it first (atomic, so overlapping collectors warn once). */
-  async disclosureChecked(task: number, reply: string, status: string, kinds: readonly string[] = []): Promise<boolean> {
-    const inserted = await this.q(`INSERT INTO $S.disclosure_checks (task_id, reply_id, status, kinds, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING task_id`, [task, reply, status, [...kinds], now()]);
+  /**
+   * Records the disclosure check's result for a reply and, for a warning, its
+   * activity on the task, in one statement: both are saved or neither is, so a
+   * failed write leaves the reply to be checked again. True only for the call
+   * that recorded it first, so overlapping collectors warn once.
+   */
+  async disclosureChecked(task: number, reply: string, status: string, kinds: readonly string[] = [], warning?: { actor: string; text: string }): Promise<boolean> {
+    const inserted = await this.q(
+      `WITH checked AS (
+         INSERT INTO $S.disclosure_checks (task_id, reply_id, status, kinds, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING task_id, at
+       ), warned AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT task_id, at, $6, 'disclosure_warning', $7 FROM checked WHERE $7::text IS NOT NULL RETURNING id
+       )
+       SELECT task_id FROM checked`,
+      [task, reply, status, [...kinds], now(), warning?.actor ?? "", warning?.text.slice(0, 4000) ?? null],
+    );
     return inserted.rows.length > 0;
   }
 

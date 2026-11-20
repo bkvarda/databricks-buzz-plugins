@@ -24,8 +24,11 @@ export function draftSections(text: string): DraftSections {
   let marked = false;
   let fence: string | undefined;
   for (const line of text.split(/\r?\n/)) {
-    const opens = FENCE.exec(line)?.[1];
-    if (opens && (!fence || (opens[0] === fence[0] && opens.length >= fence.length))) fence = fence ? undefined : opens;
+    const marker = FENCE.exec(line);
+    const opens = marker?.[1];
+    // A fence closes only on the same character, at least as long, with nothing but whitespace after it ("~~~ snippet" doesn't close it).
+    if (opens && !fence) fence = opens;
+    else if (opens && fence && opens[0] === fence[0] && opens.length >= fence.length && !line.slice(marker![0].length).trim()) fence = undefined;
     else if (!fence) {
       const heading = HEADING.exec(line)?.[1]?.trim();
       const to: DraftPart | undefined = heading && CUSTOMER.test(heading) ? "customer" : heading && INTERNAL.test(heading) ? "internal" : undefined;

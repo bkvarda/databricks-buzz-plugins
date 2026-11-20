@@ -983,15 +983,16 @@ export class Hub {
   /**
    * Advisory only: records the disclosure check's result for an inline draft
    * (unchecked, clean or warned), once per reply. When the customer part has
-   * internal-looking links or ids, the run that records it first adds a
-   * warning to the task and says so in its thread, mentioning the agent: the
+   * internal-looking links or ids, the warning activity is saved with the
+   * result, and the run that saved them says so in the task's thread, mentioning the agent: the
    * kinds only, never the flagged text. It never changes the task's status.
    */
   private async warnDisclosure(task: Task, agent: string, reply: ThreadReply): Promise<void> {
     const result = disclosureCheck(reply.content);
     const kinds = result.status === "warned" ? result.kinds : [];
-    if (!(await this.store.disclosureChecked(task.id, reply.id, result.status, kinds)) || !kinds.length) return;
-    await this.store.activity(task.id, `agent:${npub(agent)}`, "disclosure_warning", `The customer draft in reply ${reply.id} has internal-looking content: ${kinds.join(", ")}`);
+    const warning = kinds.length ? { actor: `agent:${npub(agent)}`, text: `The customer draft in reply ${reply.id} has internal-looking content: ${kinds.join(", ")}` } : undefined;
+    // The result and its warning activity are saved together; only the run that saved them posts.
+    if (!(await this.store.disclosureChecked(task.id, reply.id, result.status, kinds, warning)) || !warning) return;
     if (this.notifier && task.buzz_root) await this.notifier.updated(task, disclosureMessage(kinds, agent), [agent]).catch(() => {});
   }
 

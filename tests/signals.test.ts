@@ -2578,7 +2578,7 @@ describe("disclosure warning", () => {
       await db.query(`UPDATE ${schema}.tasks SET agent_reply = NULL WHERE id = 1`);
       await db.query(`UPDATE ${schema}.task_people SET replied_at = NULL WHERE task_id = 1`);
     };
-    return { store, hub, posts, agent, reply, warnings, results, again };
+    return { db, store, hub, posts, agent, reply, warnings, results, again };
   };
 
   it("warns once about an internal link under Customer draft, by kind only", async () => {
@@ -2618,6 +2618,23 @@ describe("disclosure warning", () => {
     expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
     expect(await warnings()).toHaveLength(1);
     expect(posts).toHaveLength(1);
+  });
+
+  it("saves the result and the warning together, so a failed write is retried and warns once", async () => {
+    const { db, hub, posts, reply, warnings, results } = await setup("signals_disclose_retry", "draft");
+    // The warning's activity write fails once, inside the same statement as the result.
+    await db.query(`ALTER TABLE signals_disclose_retry.activities ADD CONSTRAINT fail_once CHECK (kind <> 'disclosure_warning')`);
+    await expect(hub.collect(async () => reply(drafts.customer))).rejects.toThrow();
+    expect(await results()).toEqual([]);
+    expect(await warnings()).toEqual([]);
+    expect(posts).toEqual([]);
+    await db.query(`ALTER TABLE signals_disclose_retry.activities DROP CONSTRAINT fail_once`);
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
+    expect(await warnings()).toHaveLength(1);
+    expect(posts).toHaveLength(1);
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 0 });
+    expect(await warnings()).toHaveLength(1);
   });
 
   it("records clean for the same link under Internal notes", async () => {

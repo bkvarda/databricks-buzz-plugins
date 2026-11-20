@@ -56,6 +56,13 @@ describe("disclosure check", () => {
     expect(draftSections(`## Customer draft\n${fence}\n## Internal notes\n${fence}\nES-1234567`).customer).toContain("ES-1234567");
   });
 
+  it("doesn't close a fence on a marker with text after it", () => {
+    const text = "## Customer draft\n~~~text\n~~~ snippet\n## Internal notes\ngo/example";
+    expect(draftSections(text)).toMatchObject({ internal: "" });
+    expect(disclosureCheck(text)).toEqual({ status: "warned", kinds: ["go link"] });
+    expect(draftSections("## Customer draft\n~~~\nx\n~~~   \n## Internal notes\ngo/example")).toMatchObject({ internal: "go/example" });
+  });
+
   it("closes a fence only with the same kind of fence", () => {
     expect(draftSections("## Customer draft\n~~~\n```\n## Internal notes\n~~~\n## Internal notes\nES-1234567")).toMatchObject({ internal: "ES-1234567" });
   });
