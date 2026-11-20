@@ -218,7 +218,7 @@ export function accountPanel(service: DatabricksService) {
                 </Stack>
                 {account.domains.length > 0 && <Text size="sm" tone="subtle">{capitalized(account.labels?.customer ?? "customer")} domains: {account.domains.join(", ")}</Text>}
                 {Object.keys(account.ids ?? {}).length > 0 && <Text size="sm" tone="subtle">Ids: {Object.entries(account.ids).map(([kind, values]) => `${kind} ${values.join(", ")}`).join(" · ")}</Text>}
-                <Text size="sm" tone="subtle">{account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? "" : "s"} work on new tasks` : "No agents work on new tasks yet"}</Text>
+                <Text size="sm" tone="subtle">{account.agents.length ? `${account.agents.length} agent${account.agents.length === 1 ? " works" : "s work"} on new tasks` : "No agents work on new tasks yet"}</Text>
                 <Stack direction="row" gap={6} wrap>
                   {Object.entries(account.read.modes).map(([key, mode]) => <Badge key={key}>{`${key}: ${mode}`}</Badge>)}
                 </Stack>

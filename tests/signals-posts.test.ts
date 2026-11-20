@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { npubEncode } from "nostr-tools/nip19";
 import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage } from "../plugins/signals/app/hub";
 import type { Task } from "../plugins/signals/app/store";
+import { ago } from "../packages/core/src/ui/components";
 import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
 
 const AGENT = "09fea0492c475c37e6e96b6e4e47a7b8f0670fd319c667b45ab8f49aa85602f2";
@@ -105,7 +106,21 @@ describe("helpers", () => {
     // The hub cuts long replies short, sometimes inside a link's URL.
     expect(plainLine("See [the doc](https://adb-123.azuredatabricks.net/one/chat/thr…")).toBe("See the doc");
     expect(plainLine(`nostr:${genie} ok`)).toBe(`@${genie.slice(0, 12)}… ok`);
+    // The hub's activity names who it assigned as agent:npub… / person:npub…, without nostr:.
+    expect(plainLine(`Assigned agent:${genie}, person:${genie}, carol@x.com`, (npub) => (npub === genie ? "Genie" : undefined))).toBe("Assigned @Genie, @Genie, carol@x.com");
+    expect(plainLine(`Took agent:${genie} off it`)).toBe(`Took @${genie.slice(0, 12)}… off it`);
     expect(plainLine("```sql\nselect 1\n```\n![chart](https://x/y.png) <https://x.example/a> 2 * 3 = 6, snake_case_name")).toBe("select 1 chart https://x.example/a 2 * 3 = 6, snake_case_name");
+  });
+
+  it("reads a time ahead, like a meeting's start, as in …", () => {
+    const now = 1_795_000_000_000;
+    expect(ago(now - 30_000, now)).toBe("just now");
+    expect(ago(now + 30_000, now)).toBe("just now");
+    expect(ago(now - 5 * 60_000, now)).toBe("5m ago");
+    expect(ago(now + 5 * 60_000, now)).toBe("in 5m");
+    expect(ago(now + 3 * 3_600_000, now)).toBe("in 3h");
+    expect(ago(now + 2_200_000_000, now)).toBe("in 25d");
+    expect(ago(now - 2 * 86_400_000, now)).toBe("2d ago");
   });
 
   it("round-trips the task panel's target", () => {

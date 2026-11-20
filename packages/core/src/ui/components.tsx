@@ -470,13 +470,13 @@ export function Modal(props: { title: string; onClose(): void; children: ReactNo
   );
 }
 
-/** Formats relative age like "2m ago". */
+/** Formats relative age like "2m ago", or a time ahead like "in 5d" (a meeting's start). */
 export function ago(ms: number, now = Date.now()) {
-  const s = Math.max(0, Math.round((now - ms) / 1000));
+  const diff = Math.round((now - ms) / 1000);
+  const s = Math.abs(diff);
   if (s < 45) return "just now";
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
   const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
+  const span = m < 60 ? `${m}m` : h < 24 ? `${h}h` : `${Math.round(h / 24)}d`;
+  return diff < 0 ? `in ${span}` : `${span} ago`;
 }

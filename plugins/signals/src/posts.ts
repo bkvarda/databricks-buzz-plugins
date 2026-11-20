@@ -48,6 +48,8 @@ export type ThreadPost =
 const TASK_LINE = /^📌 \*\*Task (\d+): (.+)\*\*\s*$/u;
 const REPLY_HERE = "Reply in this thread to work on it.";
 const NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
+/** A person named in a text: a nostr: mention, or the hub's agent:/person: actor. */
+const NAMED = /(?:nostr|agent|person):(npub1[02-9ac-hj-np-z]{58})/g;
 const OPTIONS = /^Options: (.+)$/;
 
 /** Whether a message is a task the hub posted: its first line and the line every task post has. */
@@ -253,7 +255,8 @@ export function parseThreadPost(content: string): ThreadPost | undefined {
 /**
  * A Markdown text as one plain line, for a short preview: links and images as
  * their text (a link cut off mid-URL too), no formatting marks, and nostr:npub…
- * mentions as @Name, or a short npub when no name is known.
+ * mentions as @Name, or a short npub when no name is known. The hub's activity
+ * names people as agent:npub… and person:npub…; those read as @Name too.
  */
 export function plainLine(text: string, name: (npub: string) => string | undefined = () => undefined): string {
   return text
@@ -263,7 +266,7 @@ export function plainLine(text: string, name: (npub: string) => string | undefin
     .join(" ")
     .replace(/!?\[([^\]\n]*)\]\([^)\s]*(?:\s+"[^"]*")?\)?/g, "$1")
     .replace(/<((?:https?|mailto):[^>\s]+)>/g, "$1")
-    .replace(NPUB, (found) => `@${name(found.slice(6)) ?? `${found.slice(6, 18)}…`}`)
+    .replace(NAMED, (_found, npub: string) => `@${name(npub) ?? `${npub.slice(0, 12)}…`}`)
     .replace(/`([^`]+)`/g, "$1")
     .replace(/(\*\*|__|~~)(?=\S)(.+?)(?<=\S)\1/g, "$2")
     .replace(/(^|[^\w*])\*(?=\S)([^*]+?)(?<=\S)\*(?!\w)/g, "$1$2")
