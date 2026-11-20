@@ -235,11 +235,58 @@ export type Rule = Readonly<{
    * Decided once, when the task opens.
    */
   categories?: readonly Category[];
+  /**
+   * Asks a small chat model (see Titler) to shorten the event's title, once,
+   * when the task opens: at most 60 characters, plain text. The rule's `title`
+   * template is then filled with the short one, so "Prep: {title}" keeps its
+   * prefix. The task keeps the original as `source_title`. A category with its
+   * own `title` doesn't ask. When the model can't answer, or its title fails
+   * the checks (see shortTitle), the task keeps the normal title.
+   */
+  summarize_title?: boolean;
 }>;
 
 /** One kind of a rule's work (see Rule.categories). */
-export type Category = Readonly<{ workstream: string; when?: Readonly<Record<string, Condition>>; about?: string }>;
+export type Category = Readonly<{ workstream: string; when?: Readonly<Record<string, Condition>>; about?: string;
+  /** Its tasks' title, as a rule's `title` (`{field}` takes an event field): used instead of the rule's, with no model call. */
+  title?: string }>;
 export const MAX_CATEGORIES = 20;
+
+/** A new task's title: its category's `title`, else the rule's, filled from the event (with `short` as its title, when given). */
+export function taskTitle(rule: Pick<Rule, "title">, event: EventInput, category?: Pick<Category, "title">, short?: string): string {
+  const template = category?.title ?? rule.title;
+  const filled = { ...event, ...(short && { title: short }) };
+  return (template ? fill(template, filled) : filled.title || `${event.source} ${event.external_id}`).trim().slice(0, 500);
+}
+
+/**
+ * The original title a task keeps (`source_title`): the event's own, when the
+ * task's title doesn't already show it (a shortened title, or a category's or
+ * rule's template that leaves it out). Undefined when it does.
+ */
+export function sourceTitle(event: EventInput, title: string): string | undefined {
+  const original = (event.title ?? "").replace(/\s+/g, " ").trim();
+  if (!original) return undefined;
+  return title.toLowerCase().includes(original.toLowerCase()) ? undefined : original.slice(0, 500);
+}
+
+export const MAX_SHORT_TITLE = 60;
+/** Source words the card shows with its icon instead: a short title doesn't start with one. */
+const SOURCE_WORD = /^(slack|reply|jira|email|e-mail|gmail|mail|calendar|meeting|docs?|drive|from)\s*:/i;
+
+/**
+ * A model's short title, checked: one line of plain text, at most 60
+ * characters, with no @mention, Markdown, emoji or source word ("Slack:").
+ * Surrounding quotes and a trailing period are dropped, and the first letter
+ * is capitalized. Undefined when it fails a check (the task keeps its normal title).
+ */
+export function shortTitle(text: unknown): string | undefined {
+  if (typeof text !== "string") return undefined;
+  let title = text.trim().replace(/^(title\s*:\s*)/i, "").replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim().replace(/\.$/, "").trim();
+  if (!title || /[\r\n]/.test(title) || title.length > MAX_SHORT_TITLE) return undefined;
+  if (/@|[*_`#~|<>\[\]]|\]\(|^\s*[-+>]\s/.test(title) || /\p{Extended_Pictographic}/u.test(title) || SOURCE_WORD.test(title)) return undefined;
+  return title[0]!.toUpperCase() + title.slice(1);
+}
 
 /** The first of a rule's categories whose `when` matches the event. */
 export function categoryByWhen(rule: Pick<Rule, "categories">, event: EventInput): Category | undefined {
@@ -479,10 +526,12 @@ export function configProblems(raw: unknown): string[] {
       else if (rule.action !== "task") problems.push(`${where}.fan_out needs action task`);
       else
         // (classify: not supported on fan-out yet, so a rule with one is refused rather than its question skipped.)
-        for (const key of ["account", "series", "same_as", "action_items", "meeting_task", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify", "categories"] as const)
+        for (const key of ["account", "series", "same_as", "action_items", "meeting_task", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify", "categories", "summarize_title"] as const)
           if (rule[key] !== undefined) problems.push(`${where}.fan_out is about every account, so it takes no ${key}`);
     }
     if (rule.categories !== undefined) problems.push(...categoryProblems(rule, where));
+    if (rule.summarize_title !== undefined && typeof rule.summarize_title !== "boolean") problems.push(`${where}.summarize_title is true or false`);
+    else if (rule.summarize_title && rule.action !== "task") problems.push(`${where}.summarize_title needs action task`);
     if (rule.categories !== undefined && rule.meeting_task !== undefined) problems.push(`${where}.categories and meeting_task don't go together (a moved task keeps the rule's workstream)`);
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
     if (rule.classify !== undefined) {
@@ -884,8 +933,8 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const account = accountFor(config, event, rule);
   const channel = account?.channel ?? config.default_channel;
   const group = groupKey(rule, event);
-  const title = (rule.title ? fill(rule.title, event) : event.title || `${event.source} ${event.external_id}`).trim().slice(0, 500);
   const category = categoryByWhen(rule, event);
+  const title = taskTitle(rule, event, category);
   const workstream = category?.workstream ?? rule.workstream;
   const mode = categoryModeFor(account?.preferences, rule, category?.workstream);
   // No category's `when` matched and the rule's own work is off, but the model may still pick a category the team didn't
@@ -1174,13 +1223,14 @@ export const isOpen = (status: string) => status !== "done" && status !== "dismi
 
 function categoryProblems(rule: Pick<Rule, "action" | "categories"> | Record<string, unknown>, where: string): string[] {
   const list = rule.categories as unknown;
-  if (!Array.isArray(list) || !list.length || list.length > MAX_CATEGORIES) return [`${where}.categories is a list of 1 to ${MAX_CATEGORIES} {workstream, when?, about?}`];
+  if (!Array.isArray(list) || !list.length || list.length > MAX_CATEGORIES) return [`${where}.categories is a list of 1 to ${MAX_CATEGORIES} {workstream, when?, about?, title?}`];
   if (rule.action !== "task") return [`${where}.categories needs action task`];
   const problems: string[] = [];
   const seen = new Set<string>();
   list.forEach((item: Record<string, unknown>, i) => {
     const at = `${where}.categories[${i}]`;
-    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).some((key) => !["workstream", "when", "about"].includes(key))) return void problems.push(`${at} is {workstream, when?, about?}`);
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).some((key) => !["workstream", "when", "about", "title"].includes(key))) return void problems.push(`${at} is {workstream, when?, about?, title?}`);
+    if (item.title !== undefined && (typeof item.title !== "string" || !item.title.trim() || item.title.length > 300)) problems.push(`${at}.title is a title template, like "Capacity request: {payload.model}"`);
     const name = typeof item.workstream === "string" ? item.workstream.trim().toLowerCase() : "";
     if (!name) problems.push(`${at}.workstream is the workstream its tasks open under, like "capacity request"`);
     else if (name === NO_CATEGORY) problems.push(`${at}.workstream can't be "${NO_CATEGORY}"`);

@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryChoices, categoryModeFor, categoryNamed, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -50,7 +50,15 @@ export type Task = Readonly<{
   /** For a fan-out candidate (a rule's `fan_out`): what was decided about it for its account, and who decided. */
   verdict?: Verdict | null;
   verdict_by?: string | null;
+  /** The source's own title, when the task's title doesn't show it (a short title, or a template that leaves it out). */
+  source_title?: string | null;
+  /** How its workstream was chosen when it opened: its rule's, a category's `when` (match), or the classifier's pick (with its confidence). Null for tasks opened before this was kept. */
+  filed_by?: FiledBy | null;
+  filed_score?: number | null;
 }>;
+
+export type FiledBy = "rule" | "match" | "classifier";
+const FILED_BY: readonly FiledBy[] = ["rule", "match", "classifier"];
 
 /** A recurring series and what the team said about it. */
 export type Series = Readonly<{
@@ -131,7 +139,10 @@ export type Classifier = (event: EventInput, classify: import("./model").Classif
  * chosen workstream, or undefined when it can't tell (the task keeps the
  * rule's workstream).
  */
-export type Categorizer = (event: EventInput, choices: Readonly<Record<string, string>>) => Promise<string | undefined>;
+export type Categorizer = (event: EventInput, choices: Readonly<Record<string, string>>) => Promise<string | Readonly<{ choice: string; score?: number }> | undefined>;
+
+/** Shortens an event's title (see Rule.summarize_title): the short title, already checked (shortTitle), or undefined when it can't. */
+export type Titler = (event: EventInput) => Promise<string | undefined>;
 
 /** An event a classifier filtered out, as the hub lists them. */
 export type FilteredEvent = Readonly<{ id: number; owner: string; source: string; external_id: string; title?: string; url?: string; actor?: string; account?: string; occurred_at: number; rule: string; score: number; filtered_at: number; channel?: string;
@@ -203,6 +214,8 @@ export class SignalsStore {
 
   /** Picks a new task's category when none of its rule's categories' `when` matched (see Rule.categories); the hub sets it. */
   categorizer?: Categorizer;
+  /** Shortens new tasks' titles for rules with summarize_title; the hub sets it. */
+  titler?: Titler;
 
   private q<T extends Row = Row>(text: string, values: unknown[] = []) {
     return this.db.query<T>(text.replaceAll("$S.", `${this.schema}.`), values);
@@ -232,6 +245,14 @@ export class SignalsStore {
       created_at bigint NOT NULL, updated_at bigint NOT NULL, last_event_at bigint NOT NULL, event_count int NOT NULL DEFAULT 0,
       latest_event bigint, buzz_root text, nudged_at bigint)`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS initiative text`);
+    // The source's own title when the task's is shorter (Rule.summarize_title), and how its workstream was chosen (Rule.categories).
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS source_title text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS filed_by text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS filed_score real`);
+    // The event that opened the task (its title came from it): the board's `origin`. Null for tasks opened before it was kept.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS title_event bigint`);
+    // That event's title as it opened the task: a later edit of the same event changes the event's row, not where the task came from.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS origin_title text`);
     // The newest customer message on the task, and the newest team reply decided on it (both microseconds): on the row,
     // so a closure and a customer message decided at once see each other (each waits for the other's row lock, then rereads them).
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS customer_us bigint`);
@@ -905,7 +926,7 @@ export class SignalsStore {
              AND EXISTS (SELECT 1 FROM $S.events WHERE id = $9::bigint AND ($10::integer IS NULL OR versions = $10::integer) FOR NO KEY UPDATE)
              AND ($10::integer IS NULL OR ${LATEST_REVISION(9)})
            ON CONFLICT (group_key) DO NOTHING RETURNING task_id),
-         t AS (UPDATE $S.tasks SET rule_id = $4, workstream = $5, mode = $6, updated_at = $3 WHERE id = $2 AND EXISTS (SELECT 1 FROM l) RETURNING *),
+         t AS (UPDATE $S.tasks SET rule_id = $4, workstream = $5, mode = $6, updated_at = $3, ${UNFILED("$5")} WHERE id = $2 AND EXISTS (SELECT 1 FROM l) RETURNING *),
          act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $3, 'signals', 'rule', $7 FROM t RETURNING 1),
          ev AS (UPDATE $S.events SET join_pending = $8::jsonb WHERE id = $9 AND EXISTS (SELECT 1 FROM t) RETURNING 1)
        SELECT * FROM t`,
@@ -989,9 +1010,9 @@ export class SignalsStore {
         // announcement at the same time inserts nothing, and finds the one it committed (read again below).
         const inserted = await this.q(
           `WITH ins AS (
-             INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event)
+             INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event, title_event, origin_title)
              -- Only while this is the event's saved version (locked, as in attach): a superseded ingest opens nothing.
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, 1, $11 WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $11 AND versions = $12 FOR SHARE)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, 1, $11, $11, (SELECT title FROM $S.events WHERE id = $11) WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $11 AND versions = $12 FOR SHARE)
              ON CONFLICT (group_key) DO NOTHING RETURNING *),
            te AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT id, $11, $12, $9 FROM ins RETURNING 1),
            act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $9, 'signals', 'opened', $13 FROM ins RETURNING 1)
@@ -1077,12 +1098,21 @@ export class SignalsStore {
   }
 
   /** The category the categorizer picks for an event its rule's categories' `when` didn't place, if it picks one of them. */
-  private async category(event: EventInput, rule: Rule): Promise<string | undefined> {
+  private async category(event: EventInput, rule: Rule): Promise<{ category: Category; score?: number } | undefined> {
     const choices = categoryChoices(rule);
     if (!choices || !this.categorizer) return undefined;
-    const picked = await this.categorizer(event, choices).catch(() => undefined);
-    const key = picked?.trim().toLowerCase();
-    return rule.categories?.find((category) => category.about?.trim() && category.workstream.trim().toLowerCase() === key)?.workstream.trim();
+    const answer = await this.categorizer(event, choices).catch(() => undefined);
+    const picked = typeof answer === "string" ? { choice: answer } : answer;
+    const key = picked?.choice?.trim().toLowerCase();
+    const category = rule.categories?.find((c) => c.about?.trim() && c.workstream.trim().toLowerCase() === key);
+    const score = picked?.score;
+    return category && { category, ...(typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 1 && { score }) };
+  }
+
+  /** The short title the titler gives for an event, checked again; undefined when it can't. */
+  private async shortened(event: EventInput): Promise<string | undefined> {
+    if (!this.titler || !event.title?.trim()) return undefined;
+    return shortTitle(await this.titler(event).catch(() => undefined));
   }
 
   private async placeNew(owner: string, event: EventInput, recorded: { id: number; version?: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
@@ -1094,19 +1124,27 @@ export class SignalsStore {
     // revision of the same document saved under its own id (see LATEST_REVISION), as for meeting_task's notes.
     // (So for a rule with meeting_task: an older revision whose move the newest one's decision stopped opens no follow-up instead.)
     // The same for a rule with categories: the model's pick (asked below) is this version's, and a newer version decides its own.
-    const latest = (rule.classify || rule.action_items || rule.meeting_task || rule.categories) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
+    // And for a rule with summarize_title: the short title (asked below) is for this version, and a newer one (withdrawn, say) decides its own.
+    const latest = (rule.classify || rule.action_items || rule.meeting_task || rule.categories || rule.summarize_title) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
     // Its category (see Rule.categories): one whose `when` matched (decide), or the one the model picks, with the team's mode for it.
     let { workstream, mode } = { workstream: decision.workstream ?? rule.workstream, mode: decision.mode };
+    let category = decision.category ? categoryByWhen(rule, event) : undefined;
+    let filed: { by: "rule" | "match" | "classifier"; score?: number } = { by: category ? "match" : "rule" };
     if (!decision.category) {
       const picked = await this.category(event, rule);
       if (picked) {
-        workstream = picked;
-        mode = categoryModeFor(decision.account?.preferences, rule, picked);
+        category = picked.category;
+        workstream = picked.category.workstream.trim();
+        mode = categoryModeFor(decision.account?.preferences, rule, workstream);
+        filed = { by: "classifier", ...(picked.score !== undefined && { score: picked.score }) };
       }
     }
     // The team turned that kind of work off (the category picked, or the rule's own when none was): no task.
     if (mode === "off") return undefined;
-    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream, mode, by: owner, at: toSeconds(event.occurred_at), latest };
+    // Its title: the category's, else the rule's, with the event's title shortened first when the rule asks (and no category title replaces it).
+    const short = rule.summarize_title && !category?.title ? await this.shortened(event) : undefined;
+    const title = taskTitle(rule, event, category, short);
+    const input = { rule: decision.rule.id, group: decision.group, title, source_title: sourceTitle(event, title), filed, title_event: recorded.id, origin_title: event.title ?? undefined, account: decision.account?.name, channel: decision.channel, workstream, mode, by: owner, at: toSeconds(event.occurred_at), latest };
     const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
       const opened = await this.openTask(task);
       return opened && { task: opened, opened: true, create: true, rule };
@@ -1125,9 +1163,9 @@ export class SignalsStore {
     await this.q(
       `INSERT INTO $S.series (key, rule_id, account, title, asked_task, mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (key) DO UPDATE SET asked_task = EXCLUDED.asked_task, title = EXCLUDED.title, mode = EXCLUDED.mode`,
-      [decision.series, decision.rule.id, decision.account?.name ?? null, decision.title, asking.id, decision.mode, now()],
+      [decision.series, decision.rule.id, decision.account?.name ?? null, title, asking.id, decision.mode, now()],
     );
-    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(decision.title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
+    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
   }
 
   /**
@@ -1135,19 +1173,20 @@ export class SignalsStore {
    * statement that opens it (the event's row locked to share, so a newer version being recorded waits for it, and one
    * recorded first fails the check): none is opened for a version a newer one has replaced.
    */
-  private async openTask(input: { rule: string; group: string; title: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string; latest?: { event: number; version: number; revisions?: boolean } }): Promise<Task | undefined> {
+  private async openTask(input: { rule: string; group: string; title: string; source_title?: string; filed?: { by: FiledBy; score?: number }; title_event?: number; origin_title?: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string; latest?: { event: number; version: number; revisions?: boolean } }): Promise<Task | undefined> {
     const at = now();
     const found = await this.q(
-      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, series)
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11
+      `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, series, source_title, filed_by, filed_score, title_event, origin_title)
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $15, $16, $17::real, $18::bigint, $19
        WHERE $12::bigint IS NULL OR (EXISTS (SELECT 1 FROM $S.events WHERE id = $12::bigint AND versions = $13::integer FOR SHARE)
          AND (NOT $14::boolean OR ${LATEST_REVISION(12)}))
        ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
-      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null, input.latest?.event ?? null, input.latest?.version ?? null, input.latest?.revisions ?? false],
+      [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null, input.latest?.event ?? null, input.latest?.version ?? null, input.latest?.revisions ?? false,
+        input.source_title ?? null, input.filed?.by ?? null, input.filed?.score ?? null, input.title_event ?? null, input.title_event === undefined ? null : input.origin_title ?? null],
     );
     if (!found.rows[0]) return undefined;
     const task = toTask(found.rows[0]);
-    await this.activity(task.id, "signals", "opened", `Opened by rule ${input.rule}.`);
+    await this.activity(task.id, "signals", "opened", openedText(input));
     return task;
   }
 
@@ -1339,10 +1378,10 @@ export class SignalsStore {
       // One statement: the task, its event, its owners and its activity are all written or none is.
       const found = await this.q<Row>(
         `WITH ins AS (
-           INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event)
+           INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event, title_event, origin_title)
            -- Only for the notes' latest revision: its version (locked, so a newer one being saved under this id waits for this), and no
            -- newer revision of the document saved under its own id. A superseded revision's items may be gone from the newer one.
-           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, 1, $10 WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $10 AND versions = $11 FOR SHARE)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, 1, $10, $10, (SELECT title FROM $S.events WHERE id = $10) WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $10 AND versions = $11 FOR SHARE)
              AND ${LATEST_REVISION(10)}
              -- Only while no newer revision has claimed the follow-up (locked, so one claiming now waits for this, or this sees its claim).
              AND EXISTS (SELECT 1 FROM $S.tasks WHERE id = $15 AND items_us <= $16 FOR SHARE)
@@ -1412,7 +1451,7 @@ export class SignalsStore {
          lk AS (SELECT id FROM $S.tasks WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text FOR UPDATE),
          mk AS (UPDATE $S.events SET place_pending = NULL WHERE id = $11 AND versions = $12 AND (place_pending->>'version')::int = $12 AND EXISTS (SELECT 1 FROM lk) RETURNING 1)` : ""},
          u AS (UPDATE $S.tasks SET rule_id = $2,
-           workstream = CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
+           workstream = CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END, ${UNFILED(`CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END`)},
            mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT (d.history OR workstream_by IS NOT NULL) THEN $6 ELSE mode END, updated_at = $4
          FROM d WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text${owned ? " AND EXISTS (SELECT 1 FROM mk)" : ""}
          RETURNING $S.tasks.*, ($5::boolean AND NOT (d.history OR $S.tasks.workstream_by IS NOT NULL)) AS dropped),
@@ -1631,7 +1670,7 @@ export class SignalsStore {
       const value = fields[key];
       if (value === undefined) continue;
       // A workstream saves who filed it in the same write, so a refile can't take it back before the activity below is saved.
-      const by = key === "workstream" ? ", workstream_by = $4" : "";
+      const by = key === "workstream" ? `, workstream_by = $4, ${UNFILED("$2")}` : "";
       const found = await this.q(`UPDATE $S.tasks SET ${key} = $2, updated_at = $3${by} WHERE id = $1 RETURNING *`, [id, value.trim().slice(0, 200) || null, now(), ...(by ? [actor] : [])]);
       if (!found.rows[0]) return undefined;
       task = toTask(found.rows[0]);
@@ -1775,11 +1814,17 @@ export class SignalsStore {
   }
 
   /** Each task's latest event, artifacts (newest first) and latest activity, for the tasks board. */
-  async extras(tasks: readonly number[]): Promise<Map<number, { event?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }>> {
-    const out = new Map(tasks.map((id) => [id, { artifacts: [] as { at: number; actor: string; kind: string; url: string; title?: string }[] } as { event?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }]));
+  async extras(tasks: readonly number[]): Promise<Map<number, { event?: EventInput; origin?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }>> {
+    const out = new Map(tasks.map((id) => [id, { artifacts: [] as { at: number; actor: string; kind: string; url: string; title?: string }[] } as { event?: EventInput; origin?: EventInput; artifacts: { at: number; actor: string; kind: string; url: string; title?: string }[]; activity?: { at: number; actor: string; kind: string; text: string } }]));
     if (!tasks.length) return out;
-    const events = await this.q(`SELECT t.id AS task_id, e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = ANY($1::bigint[])`, [tasks]);
-    for (const row of events.rows) out.get(Number(row.task_id))!.event = toEvent(row);
+    // (The board task's id under its own name: `e.*` has a task_id of its own, null for an event a fan-out candidate holds through task_events.)
+    const events = await this.q(`SELECT t.id AS board_task, e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = ANY($1::bigint[])`, [tasks]);
+    for (const row of events.rows) out.get(Number(row.board_task))!.event = toEvent(row);
+    // The event the task opened with (its title came from it), for tasks that keep it.
+    // The title the event had when it opened the task (origin_title), not its row's, which a later edit of the event rewrites.
+    // Tasks opened before origin_title was kept fall back to the row's.
+    const origins = await this.q(`SELECT t.id AS board_task, e.*, COALESCE(t.origin_title, e.title) AS title FROM $S.tasks t JOIN $S.events e ON e.id = t.title_event WHERE t.id = ANY($1::bigint[])`, [tasks]);
+    for (const row of origins.rows) out.get(Number(row.board_task))!.origin = toEvent(row);
     const artifacts = await this.q(`SELECT task_id, at, actor, kind, url, title FROM $S.artifacts WHERE task_id = ANY($1::bigint[]) ORDER BY at DESC, id DESC`, [tasks]);
     for (const row of artifacts.rows) out.get(Number(row.task_id))!.artifacts.push({ at: Number(row.at), actor: String(row.actor), kind: String(row.kind), url: String(row.url), ...(row.title ? { title: String(row.title) } : {}) });
     const activities = await this.q(`SELECT DISTINCT ON (task_id) task_id, at, actor, kind, text FROM $S.activities WHERE task_id = ANY($1::bigint[]) ORDER BY task_id, at DESC, id DESC`, [tasks]);
@@ -2205,6 +2250,19 @@ function toEvent(row: Row): EventInput {
   };
 }
 
+/**
+ * SET clauses clearing how a task's workstream was chosen (filed_by, filed_score) when an update moves it to another
+ * workstream: the reason was for the one it opened under. (In a SET, `workstream` is the row's value before the update.)
+ */
+const UNFILED = (next: string) => `filed_by = CASE WHEN workstream IS DISTINCT FROM ${next} THEN NULL ELSE filed_by END, filed_score = CASE WHEN workstream IS DISTINCT FROM ${next} THEN NULL ELSE filed_score END`;
+
+/** A new task's opened activity: its rule, and how its workstream and title were chosen. */
+function openedText(input: Readonly<{ rule: string; workstream?: string; filed?: { by: FiledBy; score?: number }; source_title?: string; title: string }>): string {
+  const filed = input.filed?.by === "match" ? ` · filed under ${input.workstream} (matched a category rule)`
+    : input.filed?.by === "classifier" ? ` · filed under ${input.workstream} (picked by the classifier${input.filed.score !== undefined ? `, ${Math.round(input.filed.score * 100)}%` : ""})` : "";
+  return `Opened by rule ${input.rule}${filed}${input.source_title ? " · title shortened" : ""}`;
+}
+
 function toTask(row: Row): Task {
   return {
     id: Number(row.id),
@@ -2232,6 +2290,9 @@ function toTask(row: Row): Task {
     checklist: (row.checklist as string | null) ?? null,
     verdict: VERDICTS.includes(row.verdict as Verdict) ? (row.verdict as Verdict) : null,
     verdict_by: (row.verdict_by as string | null) ?? null,
+    source_title: typeof row.source_title === "string" && row.source_title ? plainSlack(row.source_title) : null,
+    filed_by: FILED_BY.includes(row.filed_by as FiledBy) ? (row.filed_by as FiledBy) : null,
+    filed_score: num(row.filed_score),
   };
 }
 

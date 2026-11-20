@@ -25,7 +25,7 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
 import type { Classifier, Handled, IngestResult, JoinClaim, SignalsStore, Task, TaskPerson } from "./store";
 import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
 import { decode, npubEncode } from "nostr-tools/nip19";
@@ -498,7 +498,7 @@ export class Hub {
     // A rule that no longer applies gives no playbook of its own: the workstream's, if any.
     const playbookTask = outgrown ? { rule_id: "", workstream: task.workstream } : task;
     const event = agents.length ? await this.store.latestEvent(task.id) : undefined;
-    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels), checklist), agents);
+    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels, task), checklist), agents);
   }
 
   /**
@@ -523,7 +523,7 @@ export class Hub {
       const event = await this.store.latestEvent(task.id);
       const labels = labelsOf(await this.config());
       const domains = account?.domains ?? (task.account ? ((await this.store.account({ name: task.account }))?.domains ?? []) : []);
-      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels) }) };
+      const context: PostContext = { ...(agents.length && { briefing: briefing(account!, labels, task) }), ...(event && { source: eventDetails(event, domains, labels, task) }) };
       const root = await this.notifier.opened(task, agents, context);
       if (root) await this.store.setBuzzRoot(task.id, root);
       if (root) this.postFailures.delete(task.channel);
@@ -678,7 +678,7 @@ export class Hub {
       try {
         const event = await this.store.latestEvent(task.id);
         const why = handOffReason(agentListFor(account, task).key, fellBack(task));
-        await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels), why), asked);
+        await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels, task), why), asked);
         await this.store.addPeople(task.id, asked.map((key) => ({ kind: "agent", key })));
         await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
@@ -727,7 +727,7 @@ export class Hub {
       const account = task.account ? await this.store.account({ name: task.account }) : undefined;
       const event = await this.store.latestEvent(id);
       const labels = labelsOf(await this.config());
-      await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels, task), event && eventDetails(event, account?.domains ?? [], labels)), keys);
+      await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels, task), event && eventDetails(event, account?.domains ?? [], labels, task)), keys);
       // Asking an agent taken off it puts it back.
       for (const key of keys) await this.store.assign(id, "agent", key, false);
       await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
@@ -794,7 +794,7 @@ export class Hub {
       const account = agents && task.account ? await this.store.account({ name: task.account }) : undefined;
       const labels = labelsOf(await this.config());
       const event = agents ? await this.store.latestEvent(task.id) : undefined;
-      const text = ownersMessage(updated, user, on, off, note, account && briefing(account, labels, updated), event && eventDetails(event, account?.domains ?? [], labels));
+      const text = ownersMessage(updated, user, on, off, note, account && briefing(account, labels, updated), event && eventDetails(event, account?.domains ?? [], labels, updated));
       const mentions = [...new Set([...on, ...off.filter((owner) => owner.kind === "agent")].map((owner) => owner.key).filter((key) => HEX64.test(key)))];
       await this.notifier.updated(updated, text, mentions).catch((error) => this.log(`couldn't post the owners of task ${task.id}: ${(error as Error).message}`));
     }
@@ -833,7 +833,7 @@ export class Hub {
       const event = await this.store.latestEvent(task.id);
       const account = task.account ? await this.store.account({ name: task.account }) : undefined;
       const labels = labelsOf(await this.config());
-      const text = taskMessage(task, event ? { source: eventDetails(event, account?.domains ?? [], labels) } : {});
+      const text = taskMessage(task, event ? { source: eventDetails(event, account?.domains ?? [], labels, task) } : {});
       await this.notifier.edited(task, note ? `${text}\n${note}` : text);
     } catch (error) {
       this.log(`couldn't update task ${task.id}'s first message: ${(error as Error).message}`);
@@ -873,7 +873,7 @@ export class Hub {
       if (this.notifier && resumed.buzz_root) {
         const labels = labelsOf(await this.config());
         const event = await this.store.latestEvent(task.id);
-        const ask = agents.length ? `\n\n${askMessage(resumed, agents, user, choice ? undefined : text, account && briefing(account, labels, resumed), event && eventDetails(event, account?.domains ?? [], labels))}` : "";
+        const ask = agents.length ? `\n\n${askMessage(resumed, agents, user, choice ? undefined : text, account && briefing(account, labels, resumed), event && eventDetails(event, account?.domains ?? [], labels, resumed))}` : "";
         await this.notifier.updated(resumed, `${user} answered: ${said}${ask}`, agents).catch((error) => this.log(`couldn't post the series answer on task ${task.id}: ${(error as Error).message}`));
       }
       if (agents.length) {
@@ -912,6 +912,7 @@ export class Hub {
         task,
         people: whoIsOn(people.get(task.id) ?? [], actors.get(task.id) ?? [], extra.event, await domainsOf(task.account), labels, rules.get(task.rule_id)),
         ...(extra.event && { source: { source: extra.event.source, ...(extra.event.title && { title: plainSlack(extra.event.title) }), ...(extra.event.url && { url: extra.event.url }), occurred_at: Number(extra.event.occurred_at ?? 0) } }),
+        ...(extra.origin && { origin: { source: extra.origin.source, external_id: extra.origin.external_id, ...(extra.origin.title && { title: plainSlack(extra.origin.title) }), ...(extra.origin.url && { url: extra.origin.url }) } }),
         artifacts: extra.artifacts.slice(0, 10),
         ...(extra.activity && { activity: extra.activity }),
         ...(task.buzz_root && { thread: `buzz://message?channel=${task.channel}&id=${task.buzz_root}` }),
@@ -1260,7 +1261,7 @@ const MAX_ATTENDEES = 30;
  * at the account's domains marked as customers), the description and a short
  * excerpt of its other fields.
  */
-export function eventDetails(event: EventInput, domains: readonly string[] = [], labels: ResolvedLabels = labelsOf(undefined)): string {
+export function eventDetails(event: EventInput, domains: readonly string[] = [], labels: ResolvedLabels = labelsOf(undefined), task?: Readonly<{ title: string }>): string {
   const payload = event.payload ?? {};
   const lower = domains.map((domain) => domain.toLowerCase());
   const customer = (email?: string) => Boolean(email && lower.some((domain) => email.toLowerCase().endsWith(`@${domain}`) || email.toLowerCase().endsWith(`.${domain}`)));
@@ -1287,9 +1288,12 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [],
   const notes = typeof payload.notes === "string" ? payload.notes.replace(/\v/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim() : "";
   const rest = Object.entries(payload).filter(([key, value]) => !SHOWN.has(key) && value !== null && value !== undefined && value !== "" && !(Array.isArray(value) && !value.length));
   const excerpt = rest.map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("; ");
+  const original = task ? sourceTitle(event, task.title) : undefined;
   const place = [typeof payload.location === "string" && payload.location, typeof payload.hangoutLink === "string" && payload.hangoutLink].filter(Boolean).join(" · ");
   return plainSlack([
     `**Source** (${event.source})${event.url ? `: ${event.url}` : ""}`,
+    // The source's own title, when the task's (shortened, or a template) doesn't show it: one line.
+    original && `Title: ${clip(original, 300)}`,
     when,
     event.actor ? `From: ${event.actor}` : "",
     place && `Where: ${place}`,
@@ -1318,6 +1322,8 @@ export type BoardTask = Readonly<{
   task: Task;
   people: readonly BoardPerson[];
   source?: Readonly<{ source: string; title?: string; url?: string; occurred_at: number }>;
+  /** The event the task opened with, whose title it took (left out for tasks opened before this was kept). */
+  origin?: Readonly<{ source: string; external_id: string; title?: string; url?: string }>;
   artifacts: readonly Readonly<{ at: number; actor: string; kind: string; url: string; title?: string }>[];
   activity?: Readonly<{ at: number; actor: string; kind: string; text: string }>;
   /** The task's Buzz thread, to steer its agents there. */
