@@ -13,7 +13,7 @@ import { assigneeOf, STATUS_GROUPS, withMentionNames } from "./board-view";
 import { AssigneeMark, assigneeName, npubKey, type Profile, StatusIcon, useProfiles } from "./board-panel";
 import type { BoardTask } from "./client";
 import type { LiveTasks } from "./live-tasks";
-import { mentionedNpubs, parseTaskPost, parseThreadPost, shortWhen, sourceName, type TaskPost, taskTarget, type ThreadPost } from "./posts";
+import { mentionedNpubs, parseTaskPost, parseThreadPost, plainLine, shortWhen, sourceName, type TaskPost, taskTarget, type ThreadPost } from "./posts";
 
 /** What a message renderer gets from the host (ChannelMessage, the parts used here). */
 export type PostMessage = Readonly<{ id: string; channelId: string; authorId: string; content: string; createdAt: number; threadRootId?: string }>;
@@ -41,9 +41,11 @@ function useLiveTask(live: LiveTasks, channel: string, by: { id?: number; root?:
 /** The original post, for "Full post": Buzz's own Markdown when it has it, so mentions show as names. */
 function FullPost(props: { ctx: Context; content: string; profile(key: string): Profile | undefined }) {
   const HostMarkdown = (props.ctx as unknown as { conversation?: { ui?: { Markdown?: React.ComponentType<{ content: string; scale?: "message" | "document" }> } } }).conversation?.ui?.Markdown;
+  const named = withMentionNames(props.content, npubKey, (key) => props.profile(key)?.name);
   return (
     <div style={{ borderTop: "1px solid var(--dbx-border)", paddingTop: 8, overflowWrap: "anywhere" }}>
-      {HostMarkdown ? <HostMarkdown content={props.content} /> : <Markdown source={withMentionNames(props.content, npubKey, (key) => props.profile(key)?.name)} size="sm" />}
+      {/* Mentions read as @Name in either renderer; the host's Markdown leaves nostr:npub… as it is. */}
+      {HostMarkdown ? <HostMarkdown content={named} /> : <Markdown source={named} size="sm" />}
     </div>
   );
 }
@@ -145,7 +147,8 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
   const post = React.useMemo(() => parseTaskPost(message.content), [message.content]);
   const item = useLiveTask(live, message.channelId, { ...(post && { id: post.id }) });
   const [full, setFull] = React.useState(false);
-  const mentioned = React.useMemo(() => mentionedNpubs(message.content).map(npubKey).filter((key): key is string => Boolean(key)), [message.content]);
+  const latest = item?.activity?.text ?? "";
+  const mentioned = React.useMemo(() => mentionedNpubs(`${message.content}\n${latest}`).map(npubKey).filter((key): key is string => Boolean(key)), [message.content, latest]);
   const assignee = item && assigneeOf(item);
   const profile = useProfiles(props.ctx, [...mentioned, ...(assignee && (assignee.kind === "agent" || assignee.kind === "person") ? [assignee.key] : [])]);
   if (!post) return null;
@@ -199,7 +202,10 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
           {item?.activity && !question && (
             <Text size="xs" tone="subtle" style={{ overflowWrap: "anywhere", ...clamp(2) }}>
               <span style={{ color: "var(--dbx-tertiary)" }}>{item.activity.kind === "agent_reply" ? "Agent" : "Latest"} · {ago(item.activity.at * 1000)} · </span>
-              <span title={item.activity.text}>{item.activity.text}</span>
+              {(() => {
+                const line = plainLine(item.activity.text, (npub) => profile(npubKey(npub) ?? "")?.name);
+                return <span title={line}>{line}</span>;
+              })()}
             </Text>
           )}
           <Stack direction="row" gap={6} align="center" wrap>

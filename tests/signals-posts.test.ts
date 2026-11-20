@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { npubEncode } from "nostr-tools/nip19";
 import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage } from "../plugins/signals/app/hub";
 import type { Task } from "../plugins/signals/app/store";
-import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
+import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
 
 const AGENT = "09fea0492c475c37e6e96b6e4e47a7b8f0670fd319c667b45ab8f49aa85602f2";
 const task = (over: Partial<Task> = {}) => ({ id: 65, title: "Incident ES-2373918 (Sev1, Mitigated): Model Serving", account: "Block", workstream: "escalations", initiative: null, rule_id: "incidents", mode: "draft", question: null, options: null, channel: "c1", buzz_root: "r".repeat(64), status: "open", ...over }) as unknown as Task;
@@ -95,6 +95,17 @@ describe("helpers", () => {
     expect(personName("h@x.com")).toBe("h@x.com");
     expect(sourceName("table.incident")).toBe("Incident");
     expect(sourceName("google_calendar")).toBe("Calendar");
+  });
+
+  it("previews an agent's reply as one plain line", () => {
+    const genie = npubEncode(AGENT);
+    // As seen on task 79's card: a link, a mention, formatting and a list.
+    expect(plainLine(`## Done\n**Draft** ready: [Globex test one-line format](https://adb-1.azuredatabricks.net/x?o=1) for nostr:${genie}\n- uses \`ai_query\`\n> *quoted*`, (npub) => (npub === genie ? "Genie" : undefined)))
+      .toBe("Done Draft ready: Globex test one-line format for @Genie uses ai_query quoted");
+    // The hub cuts long replies short, sometimes inside a link's URL.
+    expect(plainLine("See [the doc](https://adb-123.azuredatabricks.net/one/chat/thr…")).toBe("See the doc");
+    expect(plainLine(`nostr:${genie} ok`)).toBe(`@${genie.slice(0, 12)}… ok`);
+    expect(plainLine("```sql\nselect 1\n```\n![chart](https://x/y.png) <https://x.example/a> 2 * 3 = 6, snake_case_name")).toBe("select 1 chart https://x.example/a 2 * 3 = 6, snake_case_name");
   });
 
   it("round-trips the task panel's target", () => {

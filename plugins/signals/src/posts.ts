@@ -250,6 +250,28 @@ export function parseThreadPost(content: string): ThreadPost | undefined {
   return undefined;
 }
 
+/**
+ * A Markdown text as one plain line, for a short preview: links and images as
+ * their text (a link cut off mid-URL too), no formatting marks, and nostr:npub…
+ * mentions as @Name, or a short npub when no name is known.
+ */
+export function plainLine(text: string, name: (npub: string) => string | undefined = () => undefined): string {
+  return text
+    .split("\n")
+    .filter((line) => !/^\s*(?:```|~~~)/.test(line))
+    .map((line) => line.replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)/, ""))
+    .join(" ")
+    .replace(/!?\[([^\]\n]*)\]\([^)\s]*(?:\s+"[^"]*")?\)?/g, "$1")
+    .replace(/<((?:https?|mailto):[^>\s]+)>/g, "$1")
+    .replace(NPUB, (found) => `@${name(found.slice(6)) ?? `${found.slice(6, 18)}…`}`)
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/(\*\*|__|~~)(?=\S)(.+?)(?<=\S)\1/g, "$2")
+    .replace(/(^|[^\w*])\*(?=\S)([^*]+?)(?<=\S)\*(?!\w)/g, "$1$2")
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** The agents a post mentions, as npubs, once each. */
 export const mentionedNpubs = (content: string) => [...new Set((content.match(NPUB) ?? []).map((found) => found.slice(6)))];
 

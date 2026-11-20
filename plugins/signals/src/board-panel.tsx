@@ -20,7 +20,7 @@ import { TASK_STATUSES } from "../app/model";
 import { type Assignee, assigneeOf, type Member, memberChoices, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
 import { type BoardPerson, type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 import type { LiveTasks } from "./live-tasks";
-import { readTaskTarget } from "./posts";
+import { plainLine, readTaskTarget } from "./posts";
 
 export type Profile = { name?: string; picture?: string; agent?: boolean };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, { name?: string; picture?: string; isAgent?: true }>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
@@ -204,6 +204,7 @@ function Chip(props: { children: React.ReactNode; title?: string; tone?: "brand"
 }
 
 const ASSET_ICON: Record<string, string> = { doc: "📄", sheet: "📊", slides: "📽", form: "📝", drive: "📁", pr: "⇄", issue: "◎", code: "</>", app: "▣", dashboard: "📈", notebook: "📓", slack: "#", link: "🔗" };
+const shorten = (text: string, most: number) => (text.length > most ? `${text.slice(0, most - 1)}…` : text);
 const link = (url: string) => (event: React.MouseEvent) => (event.preventDefault(), event.stopPropagation(), openExternal(url));
 
 function AddAgent(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
@@ -391,7 +392,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
       {!props.full && props.assigning && <Owners hub={props.hub} item={item} {...props.assigning} onChange={props.onChange} compact />}
       {!props.full && item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
-      {!props.full && item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}…` : item.activity.text} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
+      {!props.full && item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{shorten(plainLine(item.activity.text, (npub) => props.assigning?.profile(npubKey(npub) ?? "")?.name), 280)} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
       {!props.full && assets.length > 0 && (
         <Stack direction="row" gap={6} wrap>
           {assets.map((artifact) => (
