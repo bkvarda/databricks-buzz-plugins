@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { slackThreadKey, toMicros, type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -350,7 +350,8 @@ export class SignalsStore {
   // --- events -------------------------------------------------------------
 
   /** Records one event: new, changed (a new content hash) or the same. */
-  async record(owner: string, event: EventInput): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput }> {
+  async record(owner: string, given: EventInput): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput }> {
+    const event = await this.keepDetails(owner, given);
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
@@ -379,6 +380,23 @@ export class SignalsStore {
     const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
     const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
     return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }) };
+  }
+
+  /**
+   * The event with the details an earlier version had and this one lacks (a notes doc read before, not this time):
+   * a version without them is the same event, not one whose notes were removed.
+   */
+  private async keepDetails(owner: string, event: EventInput): Promise<EventInput> {
+    const payload = (event.payload ?? {}) as Record<string, unknown>;
+    const missing = KEPT_DETAILS.filter((key) => payload[key] === undefined || payload[key] === null);
+    // Only events that carry these fields (null when unread) and lack one.
+    if (!missing.length || !KEPT_DETAILS.some((key) => key in payload)) return event;
+    const found = await this.q<{ payload: unknown }>(`SELECT payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3`, [owner, event.source, event.external_id]);
+    const raw = found.rows[0]?.payload;
+    const before = (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown> | null | undefined;
+    if (!before) return event;
+    const kept = Object.fromEntries(missing.filter((key) => before[key] !== undefined && before[key] !== null).map((key) => [key, before[key]]));
+    return Object.keys(kept).length ? { ...event, payload: { ...payload, ...kept } } : event;
   }
 
   /**

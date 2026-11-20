@@ -39,6 +39,15 @@ The config lists sources (see sources.example.json):
   leave fields out (calendar_event_list has no attendees or description):
   {"tool": "calendar_event_get", "args": {"event_id": "{id}"}, "max": 50}.
   A detail call that fails leaves the item as the list gave it.
+  `when` ({path: regex}) fetches it only for the items it matches; `named_in`
+  (a path) only for items whose field names an account (its name or another
+  name, as whole words; the hub serves them with the ids). With `after` (a path
+  to the item's time), the versions not read before are read, oldest first.
+  The cursor keeps which versions (id and time) were read: one read
+  before isn't read or posted again, and one past `max`, or whose read failed,
+  isn't posted and is read by a later poll. `max` counts reads tried, failed or
+  not; versions never tried go before those that failed, which take turns. A source with `named_in` is
+  unavailable (its cursor held) when the account names can't be read.
   `sections` (optional) is for tools that answer with Markdown instead of a JSON
   list (Slack search): {"split": "^### Result \\d+ of \\d+$"} cuts the text at
   `items` into one item per section, and each "Key: value" line starts a field
@@ -78,10 +87,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import sys
 import time
+import unicodedata
 from typing import Any, Callable, Iterable
 
 PROTOCOL = "2025-06-18"
@@ -209,7 +220,9 @@ def to_event(source: str, item: dict, mapping: dict, clock: dict[str, dt.datetim
 
     def value(spec: Any) -> Any:
         if isinstance(spec, dict) and "match" in spec:
-            return extract(value(spec.get("from", "")), spec["match"], spec.get("replace"))
+            found = extract(value(spec.get("from", "")), spec["match"], spec.get("replace"))
+            # `max`: at most this many characters (long text, like a doc's notes, stays small on the hub).
+            return found[: int(spec["max"])] if isinstance(found, str) and spec.get("max") else found
         if isinstance(spec, str) and "{" not in spec:
             return get_path(item, spec)  # a plain path
         return fill(spec, item, clock)
@@ -454,7 +467,8 @@ class LakebaseInbox:
                 ids: dict[str, list[str]] = {}
                 for kind, value in cursor.fetchall():
                     ids.setdefault(kind, []).append(value)
-                return {"ids": ids}
+                # The hub keeps accounts' names there as kind `_name` (an id kind starts with a letter).
+                return {"ids": {kind: values for kind, values in ids.items() if kind != "_name"}, "names": ids.get("_name", [])}
             if (method, path) == ("GET", "/api/sources"):
                 # Row-level security returns only this person's sources.
                 cursor.execute(f"SELECT source, enabled, cursor FROM {self.schema}.sources")
@@ -469,6 +483,31 @@ class LakebaseInbox:
 # Polling
 
 
+def name_words(text: str) -> str:
+    """Text as its lowercase words, each with a space either side (the hub's whole-word name test)."""
+    return " " + " ".join(re.findall(r"[^\W_]+", unicodedata.normalize("NFKD", text.lower()))) + " "
+
+
+def names_one(value: Any, names: Iterable[str]) -> bool:
+    """Whether the text names one of `names` (an account's name or other name) as whole words."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = name_words(value)
+    return any(spelled.strip() and spelled in text for spelled in (name_words(name) for name in names))
+
+
+def detail_applies(detail: dict, item: dict, names: Iterable[str] | None = None) -> bool:
+    """Whether `detail` is fetched for this item: every `when` field (a path) matches its pattern (case-insensitive),
+    and with `named_in` (a path), that field names an account (`names`; none known reads nothing)."""
+    for path, pattern in (detail.get("when") or {}).items():
+        value = get_path(item, path)
+        if value is None or not re.search(pattern, value if isinstance(value, str) else json.dumps(value, default=str), re.I):
+            return False
+    if detail.get("named_in") and not names_one(get_path(item, detail["named_in"]), names or ()):
+        return False
+    return True
+
+
 def with_detail(ws: Workspace, service: str, detail: dict, item: dict, clock: dict[str, dt.datetime]) -> dict:
     """The item with its full record (from `detail`'s tool) merged in; the item as it was when that fails."""
     try:
@@ -480,13 +519,106 @@ def with_detail(ws: Workspace, service: str, detail: dict, item: dict, clock: di
     return {**item, **found} if isinstance(found, dict) else item
 
 
-def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str | None, now: dt.datetime, ids: dict[str, list[str]] | None = None) -> tuple[list[dict], str]:
-    """One source's events since its cursor, and its next cursor. `ids`: every account's ids, by kind."""
+READ_KEEP = 150  # 17 characters each: the hub keeps 4,000 of a cursor
+
+
+def version_key(item: dict, after: str) -> str:
+    """A short key for one version of an item (its id and its time): which versions a poll read is kept in the cursor."""
+    return hashlib.sha256(json.dumps([item.get("id"), get_path(item, after)], default=str).encode()).hexdigest()[:16]
+
+
+def split_cursor(cursor: str | None) -> tuple[str | None, list[str], list[str]]:
+    """A cursor's time and, for a source that reads details by version (`detail.after`), the versions it read and
+    those whose read failed (least recently failed first)."""
+    if cursor and cursor.startswith("{"):
+        try:
+            data = json.loads(cursor)
+            return data.get("at"), [str(key) for key in data.get("read") or []], [str(key) for key in data.get("failed") or []]
+        except ValueError:
+            return None, [], []
+    return cursor, [], []
+
+
+def detailed(ws: Workspace, source: dict, detail: dict, items: list[dict], clock: dict[str, dt.datetime], read_before: list[str], names: Iterable[str] | None, failed_before: list[str] | None = None) -> tuple[list[dict], list[str], dt.datetime | None, list[str]]:
+    """The items with `detail` fetched for those it applies to (at most `max` reads tried), the versions read so far,
+    the time of the oldest one left unread (past the cap, or its read failed), and the versions whose read failed.
+
+    Without `after`, the first `max` in the listing's order are read and the rest go as listed. With `after` (a
+    path to the item's time), at most `max` reads are tried, failed or not, so an outage of the detail service costs
+    one poll `max` calls at most. Versions never tried go first, oldest first, then those whose read failed before,
+    least recently failed first, so a doc that keeps failing doesn't keep healthy ones waiting and each failed one
+    gets its turn. One read before (it's in the cursor) isn't read or posted again, and one not read (past the cap,
+    or its read failed) isn't posted (a version without its details would replace the one with them) and waits.
+    Being read is tracked per version, not by time, so a burst within one second, equal times, or a doc that's
+    listed late (older than the cursor) are all read in time.
+    """
+    service = source.get("service", source["name"])
+    cap = int(detail.get("max", 50))
+    after = detail.get("after")
+    if not after:
+        fetched, out = 0, []
+        for item in items:
+            if fetched < cap and detail_applies(detail, item, names):
+                fetched += 1
+                item = with_detail(ws, service, detail, item, clock)
+            out.append(item)
+        return out, [], None, []
+    def when(item: dict) -> dt.datetime | None:
+        value = get_path(item, after)
+        return parse_time(value) if isinstance(value, str) else None
+    seen = set(read_before)
+    failed_rank = {key: n for n, key in enumerate(failed_before or [])}
+    eligible = [item for item in items if detail_applies(detail, item, names)]
+    keys = [version_key(item, after) for item in eligible]
+    oldest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    # Never tried first, oldest first (an item without a time after the timed ones, in the listing's order); then
+    # the ones that failed before, least recently failed first.
+    order = sorted(range(len(eligible)), key=lambda i: (keys[i] in failed_rank, failed_rank.get(keys[i], 0), when(eligible[i]) is None, when(eligible[i]) or oldest, i))
+    read: dict[int, dict] = {}
+    now_read: list[str] = []
+    now_failed: list[str] = []
+    tried = 0
+    held: dt.datetime | None = None
+    def hold(time_: dt.datetime | None) -> None:
+        nonlocal held
+        if time_ and (held is None or time_ < held):
+            held = time_
+    for i in order:
+        item, key = eligible[i], keys[i]
+        if key in seen:
+            continue  # read by an earlier poll
+        if tried >= cap:
+            hold(when(item))
+            continue
+        tried += 1
+        found = with_detail(ws, service, detail, item, clock)
+        if found is item:  # the read failed: it waits for a later poll, behind the ones not tried yet
+            hold(when(item))
+            now_failed.append(key)
+            continue
+        read[id(item)] = found
+        now_read.append(key)
+        seen.add(key)
+    # Keep the versions the listing still shows (older ones won't come back): read ones newest last, failed ones
+    # least recently failed first, READ_KEEP in all (failed ones first, as they're still to read).
+    listed = set(keys)
+    failed = [key for key in failed_before or [] if key in listed and key not in seen and key not in now_failed] + now_failed
+    failed = failed[-READ_KEEP:]
+    kept = [key for key in read_before if key in listed and key not in now_read] + now_read
+    remaining = READ_KEEP - len(failed)
+    kept = kept[-remaining:] if remaining > 0 else []
+    chosen = {id(item) for item in eligible}
+    return [read[id(item)] if id(item) in read else item for item in items if id(item) not in chosen or id(item) in read], kept, held, failed
+
+
+def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str | None, now: dt.datetime, ids: dict[str, list[str]] | None = None, names: Iterable[str] | None = None) -> tuple[list[dict], str]:
+    """One source's events since its cursor, and its next cursor. `ids`: every account's ids, by kind; `names`: every account's names and other names."""
     lookback = dt.timedelta(hours=float(source.get("lookback_hours", 24)))
     name = source["name"]
     used = needed_ids(source, ids or {})
     if source["kind"] == "mcp":
-        since = parse_time(cursor) or now - lookback
+        at, read_before, failed_before = split_cursor(cursor)
+        since = parse_time(at) or now - lookback
         # Look back a little past the cursor: the hub dedupes, and sources index late.
         since = min(since, now) - dt.timedelta(minutes=float(source.get("overlap_minutes", 10)))
         clock = {"now": now, "since": since}
@@ -496,10 +628,20 @@ def poll_source(ws: Workspace, source: dict, cursor: str | None, warehouse: str 
             items = sections(items, source["sections"].get("split", r"^#+ .*$"), source["sections"].get("keys"))
         items = [item for item in items or [] if isinstance(item, dict)]
         detail = source.get("detail")
-        if detail:
-            items = [with_detail(ws, source.get("service", name), detail, item, clock) if i < int(detail.get("max", 50)) else item for i, item in enumerate(items)]
+        next_cursor = iso(now)
+        if detail and detail.get("after"):
+            items, read_now, held, failed = detailed(ws, source, detail, items, clock, read_before, names, failed_before)
+            # The versions read (and those that failed) go in the cursor; one left unread keeps its time from passing
+            # (to the microsecond).
+            at_ = min(held - dt.timedelta(microseconds=1), now) if held else now
+            state = {"at": at_.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), "read": read_now}
+            if failed:
+                state["failed"] = failed
+            next_cursor = json.dumps(state, separators=(",", ":"))
+        elif detail:
+            items, _, _, _ = detailed(ws, source, detail, items, clock, [], names)
         events = [e for e in (to_event(name, item, source.get("map", {}), clock) for item in items) if e]
-        return events, iso(now)
+        return events, next_cursor
     if source["kind"] == "table":
         if not warehouse:
             raise Unavailable("a table source needs --warehouse")
@@ -529,11 +671,14 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
     state = {} if dry_run else {s["source"]: s for s in call("GET", "/api/sources")["sources"]}
     summary: dict[str, Any] = {}
     ids: dict[str, list[str]] = {}
+    names: list[str] = []
     ids_error = ""
-    wanted = [s for s in config.get("sources", []) if s.get("ids") and (dry_run or (state.get(s["name"]) or {}).get("enabled"))]
+    on = [s for s in config.get("sources", []) if dry_run or (state.get(s["name"]) or {}).get("enabled")]
+    wanted = [s for s in on if s.get("ids") or (s.get("detail") or {}).get("named_in")]
     if wanted and (hub or inbox):
         try:
-            ids = call("GET", "/api/ids").get("ids") or {}
+            known_ids = call("GET", "/api/ids")
+            ids, names = known_ids.get("ids") or {}, known_ids.get("names") or []
         except Exception as error:  # the sources that need ids are skipped, saying why
             ids_error = f"couldn't read account ids: {error}"[:600]
             log(ids_error)
@@ -544,9 +689,9 @@ def run(ws: Workspace, config: dict, hub: str | None, warehouse: str | None, dry
             summary[name] = "off"
             continue
         try:
-            if ids_error and source.get("ids"):
+            if ids_error and (source.get("ids") or (source.get("detail") or {}).get("named_in")):
                 raise Unavailable(ids_error)
-            events, cursor = poll_source(ws, source, known.get("cursor") if known else None, warehouse or config.get("warehouse"), now, ids)
+            events, cursor = poll_source(ws, source, known.get("cursor") if known else None, warehouse or config.get("warehouse"), now, ids, names)
         except (NotSignedIn, Unavailable) as error:
             summary[name] = f"unavailable: {error}"
             log(f"{name}: {summary[name]}")

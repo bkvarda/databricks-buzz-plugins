@@ -57,13 +57,19 @@
       "tool": "google_drive_list_recent",
       "args": { "days": 1, "max_results": 50 },
       "items": "items",
+      "detail": { "tool": "google_file_read", "args": { "file_id": "{id}", "file_type": "doc", "limit": 20000 }, "when": { "name": "Notes by Gemini" }, "named_in": "name", "after": "modifiedTime", "max": 10 },
       "map": {
         "external_id": "{id}:{modifiedTime}",
         "group_key": "id",
         "title": "name",
         "url": "webViewLink",
         "occurred_at": "modifiedTime",
-        "payload": ["mimeType", "modifiedTime"]
+        "payload": {
+          "mimeType": "mimeType",
+          "modifiedTime": "modifiedTime",
+          "notes": { "from": "content", "match": "(?ms)^(Summary:?[ \\t]*$.*?)^(?:Details|Transcript|Attachments):?[ \\t]*$", "max": 6000 },
+          "meeting": { "from": "content", "match": "(https://calendar\\.google\\.com/calendar/event\\?eid=[A-Za-z0-9_-]+)" }
+        }
       }
     },
     {

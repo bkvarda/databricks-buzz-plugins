@@ -422,6 +422,42 @@ describe("account channels", () => {
     expect(agentKey(` nostr:${npubEncode(key)}`)).toBe(key);
   });
 
+  it("shows a notes doc's summary and next steps to agents, with Docs' soft breaks as lines, and not again under Details", () => {
+    const notes = "Summary\nBilling pushed back.\u000b\u000bReorg\u000bSquads.\nNext steps\n[Josh Herman] Visit Undisputed: in 2 days.";
+    const text = eventDetails({ source: "google_drive", external_id: "d:1", url: "https://docs/d", payload: { mimeType: "application/vnd.google-apps.document", notes, meeting: "https://calendar.google.com/calendar/event?eid=abc" } }, []);
+    expect(text).toContain("Meeting notes (summary and next steps):\nSummary\nBilling pushed back.\n\nReorg\nSquads.\nNext steps\n[Josh Herman] Visit Undisputed: in 2 days.");
+    expect(text).not.toContain("\u000b");
+    expect(text).toContain("Details: mimeType: application/vnd.google-apps.document; meeting: https://calendar.google.com/calendar/event?eid=abc");
+    expect(text.match(/Visit Undisputed/g)).toHaveLength(1);
+    expect(eventDetails({ source: "google_drive", external_id: "d:2", payload: { notes: "x".repeat(5000) } }, []).length).toBeLessThan(4200);
+  });
+
+  it("keeps a notes doc's saved notes when a later version of it comes without them, and posts no update for it", async () => {
+    const store = new SignalsStore(pglite(), "signals_kept_notes");
+    await store.setup();
+    const updates: number[] = [];
+    const hub = new Hub(store, { opened: async (task) => `root-${task.id}`, updated: async (task) => void updates.push(task.id) }, { defaultConfig: { version: 1, rules: [
+      { id: "meeting-notes", sources: ["google_drive"], when: { title: "Notes by Gemini" }, account_named_in: "title", action: "task", title: "Follow up: {title}", workstream: "meeting follow-up", group_by: "group_key" },
+    ], accounts: [{ name: "Globex", aliases: ["Globex Corp"] }] } });
+    const call = (method: string, path: string, body?: unknown) => hub.handle({ method, path, query: new URLSearchParams(), user: "alice@x.com", body: async () => (body === undefined ? "" : JSON.stringify(body)) });
+    // Pollers get the account names, to read only these meetings' notes (and through Lakebase too).
+    expect((await call("GET", "/api/ids")).json).toEqual({ ids: {}, names: ["Globex", "Globex Corp"] });
+    expect((await store["db"].query("SELECT kind, id FROM signals_kept_notes.account_ids WHERE kind = '_name' ORDER BY id")).rows).toEqual([{ kind: "_name", id: "Globex" }, { kind: "_name", id: "Globex Corp" }]);
+    await call("POST", "/api/sources", { source: "google_drive", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "google_drive", external_id: "seed" }] });
+    const doc = { source: "google_drive", external_id: "d1:2026-11-17T10:00:00Z", group_key: "d1", title: "Globex QBR - Notes by Gemini" };
+    const notes = { mimeType: "doc", notes: "Summary\nBilling pushed back.\nNext steps\n[Ann] Send pricing.", meeting: "https://calendar.google.com/calendar/event?eid=abc" };
+    expect((await call("POST", "/api/events", { events: [{ ...doc, payload: notes }] })).json).toMatchObject({ new: 1 });
+    // The same doc, unread this time: the same event, with its notes kept.
+    expect((await call("POST", "/api/events", { events: [{ ...doc, payload: { mimeType: "doc", notes: null, meeting: null } }] })).json).toMatchObject({ same: 1, changed: 0 });
+    const saved = await store["db"].query<{ payload: unknown }>("SELECT payload FROM signals_kept_notes.events WHERE external_id = $1", [doc.external_id]);
+    const payload = typeof saved.rows[0]!.payload === "string" ? JSON.parse(saved.rows[0]!.payload as string) : saved.rows[0]!.payload;
+    expect(payload).toEqual(notes);
+    expect(updates).toEqual([]);
+    // New notes in a later read still replace them.
+    expect((await call("POST", "/api/events", { events: [{ ...doc, payload: { ...notes, notes: "Summary\nRevised." } }] })).json).toMatchObject({ changed: 1 });
+  });
+
   it("doesn't mark a colleague's customer-domain address as a customer", () => {
     const text = eventDetails({ source: "google_calendar", external_id: "c", payload: { attendees: [
       { email: "dane.isburgh@x.com" }, { email: "disburgh@globex.io" },
@@ -1810,9 +1846,9 @@ describe("account ids", () => {
     const saved = await call("POST", "/api/account", { name: "Globex", channel: "globex", ids: { CRM: "001-GLX, 001-GLX2", jira_customer: ["Globex", "Globex Corp", "Globex"], empty: [] } });
     expect(saved.json).toMatchObject({ account: { ids: { crm: ["001-GLX", "001-GLX2"], jira_customer: ["Globex", "Globex Corp"] } } });
     // Every account's ids by kind, registered and config accounts.
-    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-GLX", "001-GLX2", "001-INI"], jira_customer: ["Globex", "Globex Corp"] } });
+    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-GLX", "001-GLX2", "001-INI"], jira_customer: ["Globex", "Globex Corp"] }, names: ["Globex", "Initech"] });
     // The same, for pollers that reach the hub through Lakebase.
-    expect((await store["db"].query("SELECT kind, id FROM signals_ids.account_ids ORDER BY kind, id")).rows).toEqual([
+    expect((await store["db"].query("SELECT kind, id FROM signals_ids.account_ids WHERE kind <> '_name' ORDER BY kind, id")).rows).toEqual([
       { kind: "crm", id: "001-GLX" },
       { kind: "crm", id: "001-GLX2" },
       { kind: "crm", id: "001-INI" },
@@ -1831,7 +1867,7 @@ describe("account ids", () => {
     await call("POST", "/api/account", { name: "Globex", preferences: "questions: ask" });
     expect((await store.account({ name: "Globex" }))!.ids).toEqual({ crm: ["001-GLX", "001-GLX2"], jira_customer: ["Globex", "Globex Corp"] });
     await call("POST", "/api/account", { name: "Globex", ids: {} });
-    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-INI"] } });
+    expect((await call("GET", "/api/ids")).json).toEqual({ ids: { crm: ["001-INI"] }, names: ["Globex", "Initech"] });
   });
 });
 
