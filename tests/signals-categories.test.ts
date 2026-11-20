@@ -334,6 +334,68 @@ describe("rule categories", () => {
     }
   });
 
+  it("keeps a replay to be placed again when its move's activity fails, and reports nothing once a newer version passed it", async () => {
+    const rules = [
+      { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "investigating", group: "es", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "verified", group: "es", when: { "payload.status": ["Verified"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    for (const scenario of ["activity", "newer"] as const) {
+      // conflict: a filing by hand before each refile write; pause: the replay's attach waits until it's let go.
+      let stage: "open" | "conflict" | "pause" = "open";
+      let attempts = 0;
+      let reached!: () => void;
+      let release!: () => void;
+      const paused = new Promise<void>((resolve) => { reached = resolve; });
+      const resumed = new Promise<void>((resolve) => { release = resolve; });
+      const { store, post, sql } = await prepare("capacity request: auto\nverified: auto\ninvestigating: off", rules, (text, values) => {
+        if (stage === "conflict" && text.includes("SET rule_id = $2")) {
+          attempts++;
+          return store.file(Number(values?.[0]), "bob@x.com", { workstream: attempts % 2 ? "incident" : "capacity request" }).then(() => undefined);
+        }
+        if (stage === "pause" && text.includes("INSERT INTO signals_categories.task_events") && text.includes("FOR NO KEY UPDATE")) {
+          stage = "open";
+          reached();
+          return resumed;
+        }
+        return undefined;
+      });
+      await post(ticket("ES-990", "Please increase TPM", { status: "Incoming" }));
+      const task = (await store.tasks({}))[0]!;
+      const older = ticket("ES-990", "Please increase TPM", { status: "Investigating" });
+      stage = "conflict";
+      expect((await post(older)).errors).toEqual([expect.objectContaining({ retry: true })]);
+      stage = "open";
+      const mark = async () => ((await sql(`SELECT place_pending FROM signals_categories.events WHERE external_id = 'ES-990'`)).rows[0] as unknown as { place_pending: unknown }).place_pending;
+      const moves = async () => (await store.detail(task.id))!.activities.filter((one) => one.kind === "rule").length;
+      if (scenario === "activity") {
+        // The replay's move can't write its activity: the move and the mark's taking go back with it, and the post is asked for again.
+        await sql(`CREATE FUNCTION signals_categories.no_rule() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind = 'rule' THEN RAISE EXCEPTION 'activity failed'; END IF; RETURN NEW; END $$`);
+        await sql(`CREATE TRIGGER no_rule BEFORE INSERT ON signals_categories.activities FOR EACH ROW EXECUTE FUNCTION signals_categories.no_rule()`);
+        const failed = await post(older);
+        expect(failed).toMatchObject({ updated: [], errors: [expect.objectContaining({ retry: true })] });
+        expect({ task: await store.task(task.id), mark: await mark(), moves: await moves() }).toMatchObject({ task: { rule_id: "escalations", event_count: 1 }, mark: { version: 2 }, moves: 0 });
+        await sql(`DROP TRIGGER no_rule ON signals_categories.activities`);
+        const again = await post(older);
+        expect(again).toMatchObject({ errors: [] });
+        expect(again.updated).toEqual([expect.objectContaining({ task: expect.objectContaining({ id: task.id }), changes: [expect.objectContaining({ to: "Investigating" })] })]);
+        expect({ task: await store.task(task.id), mark: await mark(), moves: await moves() }).toMatchObject({ task: { rule_id: "investigating", mode: "off", event_count: 2 }, mark: null, moves: 1 });
+        continue;
+      }
+      // The replay moves the task and takes the mark, then waits at its attach while a newer version is placed and reported.
+      stage = "pause";
+      const replay = post(older);
+      await paused;
+      expect(await store.task(task.id)).toMatchObject({ rule_id: "investigating", event_count: 1 });
+      const newer = await post(ticket("ES-990", "Please increase TPM", { status: "Verified" }));
+      expect(newer.updated.map((one) => one.task.id)).toEqual([task.id]);
+      release();
+      // Its version isn't the saved one now: it attaches and reports nothing, after the newer one's change.
+      expect(await replay).toMatchObject({ updated: [], errors: [] });
+      expect({ task: await store.task(task.id), mark: await mark(), moves: await moves() }).toMatchObject({ task: { rule_id: "verified", mode: "auto", event_count: 2 }, mark: null, moves: 2 });
+    }
+  });
+
   it("opens a closed task again only while the team still works on its own category", async () => {
     const rules = [{ ...ESCALATIONS, group_by: "payload.case" }] satisfies readonly Rule[];
     const { store, post, prefer } = await prepare("escalation tracking: ask\ncapacity request: auto", rules);

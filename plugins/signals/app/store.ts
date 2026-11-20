@@ -628,10 +628,14 @@ export class SignalsStore {
         pending = { version: recorded.version, outcome: recorded.outcome, ...(recorded.before && { before: recorded.before }), reopened: Boolean(resume?.reopened) };
         // A replay places and reports only while it holds the mark: the refile that moves the task takes it in the same statement
         // (see refile's `owned`), or else this does, before its update is reported. One that finds it gone stops (ReplayTaken).
+        // (One that took it already checks again, before reporting, that its version is still the saved one: a newer version saved
+        // meanwhile reports its own change, and this one's would come after it, older.)
         const owned = resume ? { event: recorded.id, version: recorded.version } : undefined;
         const placedNow = async () => {
-          if (!resume || took) return;
-          const found = await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2 RETURNING 1`, [recorded.id, recorded.version]);
+          if (!resume) return;
+          const found = took
+            ? await this.q(`SELECT 1 FROM $S.events WHERE id = $1 AND versions = $2`, [recorded.id, recorded.version])
+            : await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2 RETURNING 1`, [recorded.id, recorded.version]);
           if (!found.rows.length) throw new ReplayTaken();
           took = true;
         };
@@ -773,10 +777,10 @@ export class SignalsStore {
         // again (posted again, the same event takes that mark, above). Only while it's still the version saved: a newer one places itself.
         // A replay another post or a newer version took over: nothing to report.
         if (error instanceof ReplayTaken) continue;
-        // (A replay that took its mark and then failed puts back the one it took; one that didn't writes it only while it's still there,
-        // so a replay another post finished meanwhile isn't marked again.)
-        const mark = took ? resume : pending;
-        const again = (error instanceof RefileConflict || took) && saved && !fanning && mark !== undefined
+        // (A replay, whatever failed, keeps its mark as saved, with whether it has reopened the task now: one that took it puts it
+        // back, one that didn't writes it only while it's still there, so a replay another post finished meanwhile isn't marked again.)
+        const mark = resume ? { ...resume, reopened: pending?.reopened ?? resume.reopened } : pending;
+        const again = (error instanceof RefileConflict || resume !== undefined) && saved && !fanning && mark !== undefined
           && (await this.q(`UPDATE $S.events SET place_pending = $3::jsonb WHERE id = $1 AND versions = $2 AND ${took ? "place_pending IS NULL" : resume ? "place_pending IS NOT NULL" : "true"} RETURNING 1`, [pendingEvent, mark.version, JSON.stringify(mark)]).then((found) => found.rows.length > 0, () => false));
         result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning || again) && { retry: true }) });
         if (!saved || fanning || again) retried.add(event.source);
@@ -1403,15 +1407,26 @@ export class SignalsStore {
         // the marker. A category of the new rule takes the team's mode for it there ($7), whoever filed it; a dropped one, the rule's.
         // (A replay: the task row locked while it has that workstream, then the mark taken only then, and the move only with it.
         // A second replay or a newer version's save waits on the event row and then finds the mark gone.)
+        // (Its rule activity is written in the same statement: a failed insert leaves the task where it was, and a replay's mark there.)
         `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS history)${owned ? `,
          lk AS (SELECT id FROM $S.tasks WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text FOR UPDATE),
-         mk AS (UPDATE $S.events SET place_pending = NULL WHERE id = $9 AND versions = $10 AND (place_pending->>'version')::int = $10 AND EXISTS (SELECT 1 FROM lk) RETURNING 1)` : ""}
-         UPDATE $S.tasks SET rule_id = $2,
+         mk AS (UPDATE $S.events SET place_pending = NULL WHERE id = $11 AND versions = $12 AND (place_pending->>'version')::int = $12 AND EXISTS (SELECT 1 FROM lk) RETURNING 1)` : ""},
+         u AS (UPDATE $S.tasks SET rule_id = $2,
            workstream = CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
            mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT (d.history OR workstream_by IS NOT NULL) THEN $6 ELSE mode END, updated_at = $4
          FROM d WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text${owned ? " AND EXISTS (SELECT 1 FROM mk)" : ""}
-         RETURNING $S.tasks.*, ($5::boolean AND NOT (d.history OR $S.tasks.workstream_by IS NOT NULL)) AS dropped`,
-        [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null, ...(owned ? [owned.event, owned.version] : [])],
+         RETURNING $S.tasks.*, ($5::boolean AND NOT (d.history OR $S.tasks.workstream_by IS NOT NULL)) AS dropped),
+         -- (As the task now reads: a dropped category says where it went; otherwise a mode that changed.)
+         a AS (INSERT INTO $S.activities (task_id, at, actor, kind, text)
+           SELECT u.id, $4, 'signals', 'rule', left($9::text || CASE
+             WHEN u.dropped THEN ' That rule has no ' || $8::text || ' category, so it''s '
+               || CASE WHEN COALESCE(u.workstream, '') <> '' THEN 'under ' || u.workstream ELSE 'under no workstream' END
+               || ' now, in ' || COALESCE(u.mode, 'draft') || ' mode.'
+             WHEN COALESCE(u.mode, 'draft') IS DISTINCT FROM $10::text THEN ' Its mode is ' || COALESCE(u.mode, 'draft') || ' now.'
+             ELSE '' END, 4000) FROM u RETURNING 1)
+         SELECT u.* FROM u`,
+        [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null,
+          `Now under rule ${rule.id}: a new event matched it.`, task.mode, ...(owned ? [owned.event, owned.version] : [])],
       );
       row = found.rows[0];
       if (row) break;
@@ -1421,10 +1436,7 @@ export class SignalsStore {
       if (attempt >= 5) throw new RefileConflict(`task ${task.id}'s workstream kept changing while it moved to rule ${rule.id}`);
       task = again;
     }
-    const moved = toTask(row);
-    const why = row?.dropped === true ? ` That rule has no ${task.workstream} category, so it's ${moved.workstream ? `under ${moved.workstream}` : "under no workstream"} now, in ${moved.mode} mode.` : moved.mode !== task.mode ? ` Its mode is ${moved.mode} now.` : "";
-    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.${why}`);
-    return moved;
+    return toTask(row);
   }
 
   /**
