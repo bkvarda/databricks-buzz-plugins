@@ -1474,6 +1474,34 @@ describe("work someone on the team did themselves", () => {
     expect((await store.task(task!.id))!.status).toBe("done");
   });
 
+  it("doesn't post a task a reply in the same post already closed, and posts it once a customer message opens it again", async () => {
+    const store = new SignalsStore(pglite(), "signals_handled_unposted");
+    await store.setup();
+    const opened: { task: number; status: string; agents: readonly string[] }[] = [];
+    const updates: { task: number; text: string }[] = [];
+    const hub = new Hub(store, { opened: async (task, agents = []) => (opened.push({ task: task.id, status: task.status, agents }), `root-${task.id}`), updated: async (task, text) => void updates.push({ task: task.id, text }) }, { defaultConfig: config });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [npubEncode(agent)], preferences: "questions: draft" });
+    await call("/api/sources", { source: "gmail", enabled: true });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "th1", occurred_at: 1795000100 },
+      { source: "gmail", external_id: "m2", actor: "Alice <alice@x.com>", title: "Re: Pricing?", group_key: "th1", occurred_at: 1795000200 },
+    ] });
+    const task = (await store.tasks({}))[0]!;
+    expect(task.status).toBe("done");
+    expect(task.channel).toBe("globex");
+    expect(opened).toEqual([]);
+    expect(updates).toEqual([]);
+    expect(await store.unposted()).toEqual([]);
+    // The customer writes again: now it's work, posted once, with the account's agent asked.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m3", actor: "Ann <ann@globex.io>", title: "One more thing", group_key: "th1", occurred_at: 1795000300 }] });
+    expect((await store.task(task.id))!.status).toBe("open");
+    expect(opened).toEqual([{ task: task.id, status: "open", agents: [agent] }]);
+    expect(updates).toEqual([]);
+    expect((await store.task(task.id))!.buzz_root).toBe(`root-${task.id}`);
+  });
+
   it("posts one message, not a stale stop notice, when a reply and a newer customer message come in one post", async () => {
     const { store, posts, call } = await setup("signals_handled_batch");
     await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "th1", occurred_at: 1795000100 }] });

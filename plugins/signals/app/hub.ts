@@ -316,6 +316,11 @@ export class Hub {
   private async announce(result: IngestResult) {
     if (!this.notifier) return;
     for (const task of result.created) await this.post(task);
+    // A task never posted (a reply closed it before it was) that a customer message made open again: post it now.
+    for (const id of new Set(result.updated.filter((update) => !update.task.buzz_root).map((update) => update.task.id))) {
+      const task = await this.store.task(id);
+      if (task && !task.buzz_root && isOpen(task.status)) await this.post(task);
+    }
     const seen = new Set<number>();
     for (const { task, reason } of result.finished) {
       if (!task.buzz_root || seen.has(task.id)) continue;

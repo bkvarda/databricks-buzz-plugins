@@ -471,7 +471,11 @@ export class SignalsStore {
         result.errors.push({ index, error: (error as Error).message });
       }
     }
-    for (const id of opened) result.created.push(touched.get(id) ?? (await this.task(id))!);
+    // As they are now: a later event of this post (a team reply) may have closed one it opened. Those aren't new work.
+    for (const id of opened) {
+      const task = await this.task(id);
+      if (task && isOpen(task.status)) result.created.push(task);
+    }
     const by = new Map<string, number>();
     for (const event of events) by.set(event.source, (by.get(event.source) ?? 0) + 1);
     for (const [source, count] of by)
