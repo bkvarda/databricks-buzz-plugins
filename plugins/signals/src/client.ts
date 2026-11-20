@@ -5,7 +5,7 @@ import { type DatabricksApp, Apps } from "@dbx/core/api/apps";
 import { gatewayMcpPath } from "@dbx/core/api/mcp";
 import type { DatabricksClient } from "@dbx/core/client";
 import type { DatabricksService } from "@dbx/core/service";
-import type { AccountRecord, Preferences, ResolvedLabels, SourceInfo } from "../app/model";
+import type { AccountRecord, Preferences, ResolvedLabels, SourceInfo, WorkstreamActions } from "../app/model";
 import type { BoardPerson, BoardTask, Onboarding } from "../app/hub";
 import type { FilteredEvent, Task } from "../app/store";
 
@@ -87,7 +87,14 @@ export class HubClient {
   }
   /** The account set up for a channel (or by name), or null. */
   account(by: { channel?: string; name?: string }, signal?: AbortSignal) {
-    return this.call<{ account: AccountView | null; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => (reply.account ? { ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) } : null));
+    return this.accountLookup(by, signal).then((found) => found.account);
+  }
+  /** The account and the hub's workstreams, which setup offers even before there's an account. */
+  accountLookup(by: { channel?: string; name?: string }, signal?: AbortSignal): Promise<{ account: AccountView | null; workstreams: readonly string[] }> {
+    return this.call<{ account: AccountView | null; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("GET", "/api/account", { query: { ...by }, ...(signal && { signal }) }).then((reply) => ({
+      account: reply.account ? { ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) } : null,
+      workstreams: reply.workstreams ?? [],
+    }));
   }
   saveAccount(input: AccountInput) {
     return this.call<{ account: AccountView; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) }));
@@ -115,7 +122,7 @@ export class HubClient {
 /** An account as the hub shows it, with what the deployment calls the account's people (labels.customer). */
 /** `warning`: why the hub can't post tasks in the account's channel (it isn't a member, say). */
 export type AccountView = AccountRecord & Readonly<{ read: Preferences; labels?: ResolvedLabels; workstreams?: readonly string[]; warning?: string }>;
-export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: Readonly<Record<string, readonly string[]>>; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>>; workstream_agents?: Readonly<Record<string, readonly string[]>> }>;
+export type AccountInput = Readonly<{ name: string; rename?: string; channel?: string | null; aliases?: readonly string[]; domains?: readonly string[]; ids?: Readonly<Record<string, readonly string[]>>; agents?: readonly string[]; preferences?: string; profile?: string; playbooks?: Readonly<Record<string, string>>; workstream_agents?: Readonly<Record<string, readonly string[]>>; workstream_actions?: WorkstreamActions }>;
 
 export type TaskDetail = Readonly<{
   task: Task;

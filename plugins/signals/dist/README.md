@@ -144,13 +144,14 @@ Map the source's account column to `account`. An account's ids count as its name
 Open a channel's menu and choose **Set up account** to make it an account channel. You give it:
 - **Account:** the name tasks show, plus any other names sources use for it.
 - **Customer email domains:** mail, meetings and Slack messages from people at these domains open tasks in this channel, with the example rules. Meetings count when a real customer attends, even when one of your own people organized it.
-- **Team preferences:** plain text the team edits whenever it wants.
+- **Workstreams:** a row for each kind of work, with its mode, its agents, what they watch for and the team's playbook (below).
+- **Team guidance:** plain text the team edits whenever it wants.
 
 **Add the hub to the channel.** The hub posts tasks as its own Buzz identity (Signals App, say), so add it to the channel with **Add people**, along with the agents that work on tasks. Until it's a member, tasks open but aren't posted, and the panel shows a warning saying so. The relay shows a channel's member list only to its members, so the warning says the hub most likely isn't one; once a post fails, it gives the relay's reason instead. Saving the account checks again.
 
 Tasks for the account are then posted in this channel. That includes tasks already open that had no channel yet. The panel lists the open tasks, grouped by initiative and workstream. Anyone who can use the hub can set up a channel, and the hub records who changed what. A registered account wins over a config account with the same name.
 
-**Preferences.** A line `<workstream or rule id>: <mode>` sets how agents handle that kind of work, and `everything: <mode>` sets the default (`draft` when nothing says):
+**Preferences.** A line `<workstream or rule id>: <mode>` sets how agents handle that kind of work, and `everything: <mode>` sets the default (`draft` when nothing says). Each workstream row's mode menu, and **Mode for everything else**, write these lines for you:
 
 ```text
 - everything: draft
@@ -168,14 +169,18 @@ Keep customer replies short. Copy the account owner on anything about pricing.
 
 Every other line is guidance that agents follow. A task keeps the mode it had when it opened, and its Buzz message shows it.
 
-**Playbooks.** Beside the preferences, the team can write a playbook for each workstream: how it likes that kind of work done (the steps, what to include, the tone, who to copy). The panel lists the workstreams the rules use, and you can add others, or a rule id for one rule's tasks. An agent working on a task gets only that task's playbook: the one named by its rule id, then by its workstream (any case). It comes in the task's wake under "Playbook for …", and from `signals_account` with `workstream`. An empty playbook is the same as none. `POST /api/account` takes `playbooks` as `{workstream: text}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 30 of up to 6,000 characters each.
+**Workstreams.** The panel lists the workstreams the rules use, then any the account's preferences, agents, actions or playbooks name, and **Add workstream** adds another, or a rule id for one rule's tasks. Folded, a row says its mode and what its agents do ("Watch for 3 · otherwise dismiss", "Agents work every task"); open, it sets the rest.
 
-**Agents that work on tasks.** List agents (npubs or hex pubkeys) in the account's setup, and each new task's message mentions them, which wakes them in the task's thread:
+**Default actions.** A row that isn't set up works as before: its agents work every task. **Choose actions** starts it with the usual actions for that kind of work, from a built-in set for support cases, capacity requests, escalations, tickets, questions, meeting prep and meeting follow-up (matched by name or a common alias, so `escalation tracking` gets the tickets set). Under **Watch for**, tick the actions agents should look out for, each with a one-line trigger the team can reword with **Edit** (**Work it** has none: it applies to every task), or add your own with **+ Add action**. Agents check each update against every ticked action and do each one whose trigger holds, under the row's mode. **Otherwise** says what happens when none holds: **Track** keeps the task open without asking agents, and **Dismiss** records it and folds it away in the channel, opening it again if a trigger holds later. Nothing ticked with Track means track only. **Stop using actions** takes the row back to working every task. `POST /api/account` takes `workstream_actions` as `{workstream: {watch: [{id, label, trigger, always?}], otherwise: "track" | "dismiss"}}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 8 actions of a 60-character label and a 300-character trigger each.
+
+**Playbooks.** In each workstream's row, the team can write a playbook: how it likes that kind of work done (the steps, what to include, the tone, who to copy). An agent working on a task gets only that task's playbook: the one named by its rule id, then by its workstream (any case). It comes in the task's wake under "Playbook for …", and from `signals_account` with `workstream`. An empty playbook is the same as none. `POST /api/account` takes `playbooks` as `{workstream: text}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 30 of up to 6,000 characters each.
+
+**Agents that work on tasks.** Pick agents from the channel's members in the account's setup, and each new task's message mentions them, which wakes them in the task's thread:
 - In `auto`, they are asked to do the work and report it.
 - In `draft`, they are asked to post a draft for a person to send.
 - In `ask` and `off`, nobody is mentioned, and a person starts the work.
 
-**Agents for one kind of work.** Each workstream in the panel (next to its playbook) can name its own agents. Its tasks then mention those agents instead of the account's, so Genie can take meeting prep while another agent takes tickets. A rule id works too, and wins over its workstream, the same way playbooks are found. A workstream without agents uses the account's. Naming agents for a workstream later asks them to pick up its open untouched tasks, as adding an account agent does. `POST /api/account` takes `workstream_agents` as `{workstream: [npub or hex, ...]}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 10 agents each.
+**Agents for one kind of work.** Each workstream's row can pick its own agents. Its tasks then mention those agents instead of the account's, so Genie can take meeting prep while another agent takes tickets. A rule id works too, and wins over its workstream, the same way playbooks are found. A workstream without agents uses the account's. Naming agents for a workstream later asks them to pick up its open untouched tasks, as adding an account agent does. `POST /api/account` takes `workstream_agents` as `{workstream: [npub or hex, ...]}`, which replaces them all (`{}` clears them; leave it out to keep them), with up to 10 agents each.
 
 The agents must be members of the channel. The hub needs a Buzz identity to post at all.
 

@@ -2,68 +2,27 @@
 // in the signals hub. Its tasks are posted there, the team writes how agents
 // should handle each kind of work, and agents keep a profile of the account.
 // Everything runs as the person opening it; the hub records who changed what.
+import type { Context } from "@buzz/author";
 import type { PanelProps } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
 import { ago, Badge, Button, Card, DbxRoot, Disclosure, Field, Notice, SectionHeader, Spinner, Stack, Text } from "@dbx/core/ui/components";
-import { npubEncode } from "nostr-tools/nip19";
-import { capitalized, MAX_PLAYBOOK, MODES, parsePreferences } from "../app/model";
+import { capitalized, DEFAULT_MODE, type Mode, MODES, parsePreferences, readWorkstreamActions, type WorkstreamActionsRow } from "../app/model";
 import type { Task } from "../app/store";
+import { useMembers, useProfiles } from "./board-panel";
+import { memberChoices } from "./board-view";
 import { type AccountView, chosenHub, HubClient } from "./client";
+import { rowSummary, withMode } from "./workstream-actions";
+import { AgentsPicker, MODE_LABEL, type RowChange, WorkstreamRow } from "./workstream-rows";
 
 /** What a new account channel's preferences start as. */
 export const PREFERENCES_TEMPLATE = `How agents handle each kind of work: auto (do it and report), draft (prepare it for one of us to send), ask (ask first) or off (no tasks).
 
 - everything: draft
 - meeting prep: auto
-- tickets: draft
-- questions: draft
 
 Anything else you write here is guidance agents follow, for example:
 Keep customer replies short. Copy the account owner on anything about pricing.`;
-
-/**
- * The team's playbooks, one per workstream: the config's workstreams first,
- * then any others the team added. An empty playbook is dropped on save.
- */
-function Playbooks(props: { workstreams: readonly string[]; value: Record<string, string>; onChange(next: Record<string, string>): void; agents: Record<string, string>; onAgents(next: Record<string, string>): void }) {
-  const { value, onChange, agents, onAgents } = props;
-  const [adding, setAdding] = React.useState("");
-  const known = new Set(props.workstreams.map((name) => name.toLowerCase()));
-  const extra = [...Object.keys(value), ...Object.keys(agents)].filter((name, index, all) => !known.has(name.toLowerCase()) && all.findIndex((other) => other.toLowerCase() === name.toLowerCase()) === index);
-  const names = [...props.workstreams, ...extra];
-  const keyOf = (name: string) => Object.keys(value).find((key) => key.toLowerCase() === name.toLowerCase()) ?? name;
-  const agentKeyOf = (name: string) => Object.keys(agents).find((key) => key.toLowerCase() === name.toLowerCase()) ?? name;
-  const add = () => {
-    const name = adding.trim();
-    if (!name) return;
-    if (!names.some((other) => other.toLowerCase() === name.toLowerCase())) onChange({ ...value, [name]: "" });
-    setAdding("");
-  };
-  return (
-    <Stack gap={8}>
-      {names.length === 0 && <Text size="xs" tone="subtle">No workstreams yet. Add one below (a workstream your rules use, or a rule id).</Text>}
-      {names.map((name) => {
-        const key = keyOf(name);
-        const text = value[key] ?? "";
-        const who = agents[agentKeyOf(name)] ?? "";
-        const named = who.split(/[,\s]+/).filter(Boolean).length;
-        return (
-          <Disclosure key={name} summary={`${name}${text.trim() ? "" : " (no playbook)"}${named ? ` · ${named} agent${named === 1 ? "" : "s"}` : ""}`}>
-            <Stack gap={6}>
-              <input className="dbx-input" placeholder="Agents for this work (npubs); empty: the account's agents" value={who} onChange={(event) => onAgents({ ...agents, [agentKeyOf(name)]: event.target.value })} />
-              <textarea className="dbx-textarea" rows={6} maxLength={MAX_PLAYBOOK} placeholder={`How you like ${name} done: steps, what to include, tone, who to copy…`} value={text} onChange={(event) => onChange({ ...value, [key]: event.target.value })} />
-            </Stack>
-          </Disclosure>
-        );
-      })}
-      <Stack direction="row" gap={6} align="center">
-        <input className="dbx-input" placeholder="Another workstream or rule id" value={adding} onChange={(event) => setAdding(event.target.value)} onKeyDown={(event) => event.key === "Enter" && add()} />
-        <Button size="sm" disabled={!adding.trim()} onClick={add}>Add workstream</Button>
-      </Stack>
-    </Stack>
-  );
-}
 
 const splitList = (text: string) => text.split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
 
@@ -81,20 +40,67 @@ const parseIds = (text: string): Record<string, string[]> => {
   return out;
 };
 
-function Form(props: { hub: HubClient; channel: { id: string; name: string }; account?: AccountView; workstreams?: readonly string[]; onSaved(account: AccountView): void }) {
+/** The entry for a name in a map keyed by workstream (or rule id), whatever its case. */
+const keyIn = (map: Readonly<Record<string, unknown>>, name: string) => Object.keys(map).find((key) => key.toLowerCase() === name.toLowerCase());
+/** A map with one name's entry set (keeping the key's case) or, with undefined, removed. */
+function withEntry<T>(map: Readonly<Record<string, T>>, name: string, value: T | undefined): Record<string, T> {
+  const key = keyIn(map, name) ?? name;
+  const { [key]: _, ...rest } = map;
+  return value === undefined ? rest : { ...rest, [key]: value };
+}
+
+/** The workstreams setup shows: the hub's, then the ones only this account names, then the ones added here. */
+function workstreamNames(configured: readonly string[], ...maps: readonly (readonly string[])[]): string[] {
+  const out: string[] = [];
+  for (const name of [...configured, ...maps.flat()]) if (name.trim() && name.toLowerCase() !== "everything" && !out.some((other) => other.toLowerCase() === name.toLowerCase())) out.push(name);
+  return out;
+}
+
+const AddWorkstream = (props: { onAdd(name: string): void }) => {
+  const [adding, setAdding] = React.useState("");
+  const add = () => {
+    if (!adding.trim()) return;
+    props.onAdd(adding.trim());
+    setAdding("");
+  };
+  return (
+    <form onSubmit={(event) => (event.preventDefault(), add())} style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", borderTop: "1px solid var(--dbx-border)", paddingTop: 10 }}>
+      <input className="dbx-input" aria-label="Another workstream or rule id" placeholder="Another workstream or rule id" value={adding} maxLength={80} onChange={(event) => setAdding(event.target.value)} style={{ flex: "1 1 180px", minWidth: 0 }} />
+      <Button size="sm" type="submit" disabled={!adding.trim()}>Add workstream</Button>
+    </form>
+  );
+};
+
+function Form(props: { ctx: Context; hub: HubClient; channel: { id: string; name: string }; account?: AccountView; workstreams?: readonly string[]; onSaved(account: AccountView): void }) {
   const { hub, channel, account } = props;
   const [name, setName] = React.useState(account?.name ?? channel.name.replace(/[-_]+/g, " "));
   const [aliases, setAliases] = React.useState(account?.aliases.join(", ") ?? "");
   const [domains, setDomains] = React.useState(account?.domains.join(", ") ?? "");
   const [ids, setIds] = React.useState(idsText(account?.ids));
-  const [agents, setAgents] = React.useState(account?.agents.join(", ") ?? "");
+  const [agents, setAgents] = React.useState<readonly string[]>(account?.agents ?? []);
   const [preferences, setPreferences] = React.useState(account?.preferences ?? PREFERENCES_TEMPLATE);
   const [playbooks, setPlaybooks] = React.useState<Record<string, string>>({ ...(account?.playbooks ?? {}) });
-  const [workstreamAgents, setWorkstreamAgents] = React.useState<Record<string, string>>(Object.fromEntries(Object.entries(account?.workstream_agents ?? {}).map(([name, keys]) => [name, keys.map((key) => npubEncode(key)).join(", ")])));
+  const [workstreamAgents, setWorkstreamAgents] = React.useState<Record<string, readonly string[]>>({ ...(account?.workstream_agents ?? {}) });
+  const [actions, setActions] = React.useState<Record<string, WorkstreamActionsRow>>({ ...(account?.workstream_actions ?? {}) });
+  const [added, setAdded] = React.useState<readonly string[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
   const read = React.useMemo(() => parsePreferences(preferences), [preferences]);
+  const members = useMembers(props.ctx, channel.id);
+  const named = [...agents, ...Object.values(workstreamAgents).flat()];
+  const profile = useProfiles(props.ctx, [...new Set([...members, ...named])]);
+  const choices = memberChoices(members, named, [], profile);
+  const inherited: Mode = read.modes.everything ?? DEFAULT_MODE;
+  const names = workstreamNames(props.workstreams ?? account?.workstreams ?? [], Object.keys(read.modes), Object.keys(actions), Object.keys(workstreamAgents), Object.keys(playbooks), added);
+  const change = (workstream: string, next: RowChange) => {
+    if (next.mode !== undefined) setPreferences((text) => withMode(text, workstream, next.mode ?? undefined, MODES));
+    if (next.agents) setWorkstreamAgents((map) => withEntry(map, workstream, next.agents!.length ? next.agents : undefined));
+    if (next.actions !== undefined) setActions((map) => withEntry(map, workstream, next.actions ?? undefined));
+    if (next.playbook !== undefined) setPlaybooks((map) => withEntry(map, workstream, next.playbook));
+  };
   const save = async () => {
+    const checked = readWorkstreamActions(actions);
+    if (typeof checked === "string") return setError(checked);
     setBusy(true);
     setError(undefined);
     try {
@@ -105,10 +111,11 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         aliases: splitList(aliases),
         domains: splitList(domains),
         ids: parseIds(ids),
-        agents: splitList(agents),
+        agents,
         preferences,
         playbooks: Object.fromEntries(Object.entries(playbooks).filter(([, text]) => text.trim())),
-        workstream_agents: Object.fromEntries(Object.entries(workstreamAgents).map(([name, text]) => [name, splitList(text.replace(/\s+/g, ","))] as const).filter(([, keys]) => keys.length)),
+        workstream_agents: Object.fromEntries(Object.entries(workstreamAgents).filter(([, keys]) => keys.length)),
+        workstream_actions: checked,
       });
       props.onSaved(saved);
     } catch (problem) {
@@ -132,20 +139,43 @@ function Form(props: { hub: HubClient; channel: { id: string; name: string }; ac
         <Field label="Ids in other systems" hint={<>A line per kind of id, like <code>crm: 0016100000AbCdE</code> or <code>jira_customer: Example, Example Co</code>. Sources that ask for a kind get every account's ids of it, and events that carry one of these ids find this account.</>}>
           <textarea className="dbx-textarea" rows={3} placeholder="crm: 0016100000AbCdE" value={ids} onChange={(event) => setIds(event.target.value)} />
         </Field>
-        <Field label="Agents that work on tasks" hint="Their npubs or hex pubkeys, comma-separated. Each new task mentions them (in auto and draft mode), so they start on it in its thread, unless its workstream names its own agents below. They must be members of this channel.">
-          <input className="dbx-input" placeholder="npub1…" value={agents} onChange={(event) => setAgents(event.target.value)} />
+        <Field label="Agents that work on tasks" hint="Agents in this channel. Each new task mentions them (in auto and draft mode), so they start on it in its thread, unless its workstream picks its own agents below.">
+          <AgentsPicker name="the account" empty="None yet" value={agents} choices={choices} profile={profile} onChange={setAgents} />
         </Field>
-        <Field label="Team preferences" hint={<>Lines like <code>meeting prep: auto</code> set how agents handle that workstream (or rule); <code>everything:</code> sets the rest. Modes: {MODES.join(", ")}. Every other line is guidance agents follow.</>}>
-          <textarea className="dbx-textarea" rows={12} value={preferences} onChange={(event) => setPreferences(event.target.value)} />
+        <Field label="Workstreams" hint="For each kind of work: its mode, the agents that work on it, what they watch for and the team's playbook. Agents check each update against every action you tick and do each one that applies.">
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", paddingBottom: 10 }}>
+              <Text size="xs" tone="subtle" style={{ flex: "1 1 160px" }}>Mode for everything else</Text>
+              <select className="dbx-input" aria-label="Mode for everything else" value={read.modes.everything ?? ""} onChange={(event) => setPreferences((text) => withMode(text, "everything", (event.target.value || undefined) as Mode | undefined, MODES))} style={{ width: "auto", maxWidth: "100%", fontSize: "0.75rem" }}>
+                <option value="">{`Default (${DEFAULT_MODE})`}</option>
+                {MODES.map((mode) => <option key={mode} value={mode}>{MODE_LABEL[mode]}</option>)}
+              </select>
+            </div>
+            {names.length === 0 && <Text size="xs" tone="subtle" as="div" style={{ borderTop: "1px solid var(--dbx-border)", padding: "10px 0" }}>No workstreams yet. Add one below: a workstream your rules use, or a rule id.</Text>}
+            {names.map((workstream) => (
+              <WorkstreamRow
+                key={workstream.toLowerCase()}
+                name={workstream}
+                value={{
+                  ...(read.modes[workstream.toLowerCase()] && { mode: read.modes[workstream.toLowerCase()]! }),
+                  inherited,
+                  agents: workstreamAgents[keyIn(workstreamAgents, workstream) ?? workstream] ?? [],
+                  ...(keyIn(actions, workstream) && { actions: actions[keyIn(actions, workstream)!]! }),
+                  playbook: playbooks[keyIn(playbooks, workstream) ?? workstream] ?? "",
+                }}
+                choices={choices}
+                profile={profile}
+                defaultOpen={added.some((other) => other.toLowerCase() === workstream.toLowerCase())}
+                onChange={(next) => change(workstream, next)}
+              />
+            ))}
+            <AddWorkstream onAdd={(next) => setAdded((list) => [...list, next])} />
+          </div>
         </Field>
-        <Stack direction="row" gap={6} wrap align="center">
-          <Text size="xs" tone="subtle">Reads as:</Text>
-          {Object.entries(read.modes).length ? Object.entries(read.modes).map(([key, mode]) => <Badge key={key} tone={mode === "off" ? "neutral" : mode === "auto" ? "success" : "warning"}>{`${key}: ${mode}`}</Badge>) : <Text size="xs" tone="subtle">no modes (everything is draft)</Text>}
-        </Stack>
+        <Field label="Team guidance" hint={<>Everything here is guidance agents follow. Lines like <code>meeting prep: auto</code> set a mode, as the workstreams above do; <code>everything:</code> sets the rest. Modes: {MODES.join(", ")}.</>}>
+          <textarea className="dbx-textarea" rows={8} value={preferences} onChange={(event) => setPreferences(event.target.value)} />
+        </Field>
         {read.problems.map((problem) => <Text key={problem} size="xs" tone="danger">{problem}</Text>)}
-        <Field label="Workstreams" hint="For each kind of work: the agents that work on its tasks (instead of the account's agents above, when you name any) and its playbook, how your team likes it done. An agent working on a task gets only its workstream's playbook (or its rule's, when one is named by the rule id).">
-          <Playbooks workstreams={props.workstreams ?? account?.workstreams ?? []} value={playbooks} onChange={setPlaybooks} agents={workstreamAgents} onAgents={setWorkstreamAgents} />
-        </Field>
         {error && <Text tone="danger" size="sm">{error}</Text>}
         <Stack direction="row" gap={8}>
           <Button variant="brand" disabled={busy || !name.trim()} onClick={() => void save()}>{busy ? <Spinner size={12} /> : null}{account ? "Save" : "Set up account"}</Button>
@@ -185,13 +215,13 @@ function Tasks(props: { hub: HubClient; channel: string }) {
 }
 
 /** The "Set up account" channel panel. */
-export function accountPanel(service: DatabricksService) {
+export function accountPanel(ctx: Context, service: DatabricksService) {
   return function AccountPanel({ channelContext }: PanelProps) {
     const connection = useConnection(service);
     const hubs = useAsync(async (signal) => (connection.status === "connected" ? chosenHub(service, signal) : undefined), [connection.status]);
     const app = hubs.data?.app;
     const hub = React.useMemo(() => (app ? new HubClient(service.client()!, app) : undefined), [app?.name, app?.url]);
-    const found = useAsync(async (signal) => (hub && channelContext ? hub.account({ channel: channelContext.channelId }, signal) : undefined), [hub, channelContext?.channelId]);
+    const found = useAsync(async (signal) => (hub && channelContext ? hub.accountLookup({ channel: channelContext.channelId }, signal) : undefined), [hub, channelContext?.channelId]);
     const [saved, setSaved] = React.useState<AccountView>();
     const [editing, setEditing] = React.useState(false);
 
@@ -202,11 +232,11 @@ export function accountPanel(service: DatabricksService) {
     else if (hubs.error || found.error) body = <Notice tone="danger">{describeError((hubs.error ?? found.error)!)}</Notice>;
     else if (!hub) body = <Notice title="No signals hub in this workspace">Deploy one first (see the Signals plugin's README), then set up account channels here.</Notice>;
     else {
-      const account = saved ?? found.data ?? undefined;
+      const account = saved ?? found.data?.account ?? undefined;
       const channel = { id: channelContext.channelId, name: channelContext.channelName };
       body =
         !account || editing ? (
-          <Form hub={hub} channel={channel} {...(account && { account })} onSaved={(next) => (setSaved(next), setEditing(false))} />
+          <Form ctx={ctx} hub={hub} channel={channel} {...(account && { account })} workstreams={account?.workstreams ?? found.data?.workstreams ?? []} onSaved={(next) => (setSaved(next), setEditing(false))} />
         ) : (
           <Stack gap={16}>
             {account.warning && <Notice tone="warning">{account.warning}</Notice>}
@@ -224,6 +254,7 @@ export function accountPanel(service: DatabricksService) {
                 </Stack>
                 {Object.keys(account.playbooks ?? {}).length > 0 && <Text size="sm" tone="subtle">Playbooks: {Object.keys(account.playbooks).join(", ")}</Text>}
                 {Object.keys(account.workstream_agents ?? {}).length > 0 && <Text size="sm" tone="subtle">Own agents: {Object.entries(account.workstream_agents).map(([name, keys]) => `${name} (${keys.length})`).join(", ")}</Text>}
+                {Object.keys(account.workstream_actions ?? {}).length > 0 && <Text size="sm" tone="subtle">Actions: {Object.entries(account.workstream_actions).map(([name, row]) => `${name} (${rowSummary(row).replace(/^./, (first) => first.toLowerCase())})`).join(", ")}</Text>}
                 {account.updated_by && <Text size="xs" tone="tertiary">Changed by {account.updated_by}{account.updated_at ? ` ${ago(account.updated_at * 1000)}` : ""}</Text>}
               </Stack>
             </Card>
