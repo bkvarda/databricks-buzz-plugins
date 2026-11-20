@@ -1,7 +1,7 @@
 // Signals: events → dedupe → rules → tasks, on a real Postgres (PGlite).
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
@@ -1500,6 +1500,35 @@ describe("work someone on the team did themselves", () => {
     expect(opened).toEqual([{ task: task.id, status: "open", agents: [agent] }]);
     expect(updates).toEqual([]);
     expect((await store.task(task.id))!.buzz_root).toBe(`root-${task.id}`);
+  });
+
+  it("posts a task once while its first post is still in flight, also when a reply closed and a follow-up reopened it", async () => {
+    const store = new SignalsStore(pglite(), "signals_post_once");
+    await store.setup();
+    const opened: number[] = [];
+    let release: (() => void) | undefined;
+    const paused = new Promise<void>((resolve) => (release = resolve));
+    let first = true;
+    const hub = new Hub(store, { opened: async (task) => { opened.push(task.id); if (first) { first = false; await paused; } return `root-${task.id}-${opened.length}`; }, updated: async () => {} }, { defaultConfig: config });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [npubEncode(agent)], preferences: "questions: draft" });
+    await call("/api/sources", { source: "gmail", enabled: true });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    // The first post waits for the relay; meanwhile the customer writes again, and a reply closes it and a follow-up reopens it.
+    const firstPost = call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "th1", occurred_at: 1795000100 }] });
+    await vi.waitFor(() => expect(opened).toHaveLength(1));
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "Ann <ann@globex.io>", title: "Also", group_key: "th1", occurred_at: 1795000150 }] });
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m3", actor: "Alice <alice@x.com>", title: "Re: Pricing?", group_key: "th1", occurred_at: 1795000200 },
+      { source: "gmail", external_id: "m4", actor: "Ann <ann@globex.io>", title: "One more", group_key: "th1", occurred_at: 1795000300 },
+    ] });
+    const [task] = await store.tasks({});
+    expect(task!.status).toBe("open");
+    release!();
+    await firstPost;
+    expect(opened).toEqual([task!.id]);
+    expect((await store.task(task!.id))!.buzz_root).toBe(`root-${task!.id}-1`);
+    expect(((await store.people([task!.id])).get(task!.id) ?? []).filter((person) => person.kind === "agent")).toHaveLength(1);
   });
 
   it("posts one message, not a stale stop notice, when a reply and a newer customer message come in one post", async () => {

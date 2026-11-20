@@ -105,6 +105,8 @@ export class Hub {
   private publishedIds?: string;
   /** The last failure to post a task in each channel, until a post there works. */
   private readonly postFailures = new Map<string, string>();
+  /** Tasks being posted now, so overlapping posts of one task send one Buzz thread. */
+  private readonly posting = new Map<number, Promise<void>>();
 
   constructor(
     readonly store: SignalsStore,
@@ -316,10 +318,10 @@ export class Hub {
   private async announce(result: IngestResult) {
     if (!this.notifier) return;
     for (const task of result.created) await this.post(task);
-    // A task never posted (a reply closed it before it was) that a customer message made open again: post it now.
-    for (const id of new Set(result.updated.filter((update) => !update.task.buzz_root).map((update) => update.task.id))) {
+    // A task never posted (a reply closed it before it was) that a customer message opened again: post it now.
+    for (const id of new Set(result.updated.filter((update) => update.reopened && !update.task.buzz_root).map((update) => update.task.id))) {
       const task = await this.store.task(id);
-      if (task && !task.buzz_root && isOpen(task.status)) await this.post(task);
+      if (task) await this.post(task);
     }
     const seen = new Set<number>();
     for (const { task, reason } of result.finished) {
@@ -396,8 +398,21 @@ export class Hub {
     await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels)), agents);
   }
 
-  private async post(task: Task) {
-    if (!this.notifier || !task.channel || task.buzz_root) return;
+  /**
+   * Posts a task once: a call for a task already being posted leaves it to that post (without waiting on the
+   * relay), and the task is read again first, so one posted (or closed) since isn't posted again.
+   */
+  private post(task: Task): Promise<void> {
+    if (this.posting.has(task.id)) return Promise.resolve();
+    const run = this.publish(task).finally(() => this.posting.delete(task.id));
+    this.posting.set(task.id, run);
+    return run;
+  }
+
+  private async publish(given: Task) {
+    if (!this.notifier || !given.channel || given.buzz_root) return;
+    const task = await this.store.task(given.id);
+    if (!task || !task.channel || task.buzz_root || !isOpen(task.status)) return;
     try {
       // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
