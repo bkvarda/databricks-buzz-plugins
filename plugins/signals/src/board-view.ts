@@ -1,6 +1,7 @@
 // What the tasks board shows, apart from how it draws it: each task's
 // assignee, the filters, and the list and swimlane views' groups.
 import type { BoardPerson, BoardTask, FilteredEvent } from "./client";
+import { parseTaskPost, parseThreadPost, type TaskPost, type ThreadPost } from "./posts";
 
 /** The views of the board: rows grouped by status, a column per status, or the events the classifier held back. */
 export const VIEWS = ["list", "swimlanes", "filtered"] as const;
@@ -170,20 +171,74 @@ export function replyText(text: string, mentions: readonly { npub: string }[]): 
   return mentions.length ? `${mentions.map((mention) => `nostr:${mention.npub}`).join(" ")} ${body}` : body;
 }
 
-/** The task's details, as label and value pairs, for its view. */
-export function taskFacts(item: BoardTask): { label: string; value: string }[] {
+/**
+ * The task's details for its view's sidebar, as label and value pairs:
+ * dates in the viewer's own time, with the exact UTC time as `title`. A
+ * meeting's last event is when it starts, so a time ahead reads "Starts".
+ * Status isn't here: the sidebar sets it.
+ */
+export function taskFacts(item: BoardTask, now = Date.now() / 1000): { label: string; value: string; title?: string }[] {
   const { task } = item;
-  const date = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const utc = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const local = (seconds: number) => {
+    const at = new Date(seconds * 1000);
+    const sameYear = at.getFullYear() === new Date(now * 1000).getFullYear();
+    return at.toLocaleString([], { month: "short", day: "numeric", ...(!sameYear && { year: "numeric" }), hour: "numeric", minute: "2-digit" });
+  };
+  const ahead = task.last_event_at > now;
   return [
-    { label: "Status", value: STATUS_GROUPS.find((group) => group.status === task.status)?.title ?? task.status },
-    { label: "Mode", value: task.mode },
+    { label: "Mode", value: MODE_NAMES[task.mode]?.name ?? task.mode, ...(MODE_NAMES[task.mode] && { title: MODE_NAMES[task.mode]!.title }) },
     ...(task.workstream ? [{ label: "Workstream", value: task.workstream }] : []),
     ...(task.initiative ? [{ label: "Initiative", value: task.initiative }] : []),
     ...(task.account ? [{ label: "Account", value: task.account }] : []),
-    ...(item.source ? [{ label: "Source", value: item.source.title ? `${item.source.source}: ${item.source.title}` : item.source.source }] : []),
-    { label: "Opened", value: date(task.created_at) },
-    { label: "Last event", value: `${date(task.last_event_at)}${task.event_count > 1 ? ` (${task.event_count} events)` : ""}` },
+    { label: "Opened", value: local(task.created_at), title: utc(task.created_at) },
+    { label: ahead ? "Starts" : "Last event", value: `${local(task.last_event_at)}${!ahead && task.event_count > 1 ? ` · ${task.event_count} events` : ""}`, title: utc(task.last_event_at) },
   ];
+}
+
+/** Each mode as people say it, and what it means. */
+export const MODE_NAMES: Readonly<Record<string, { name: string; title: string }>> = {
+  auto: { name: "Auto", title: "Agents do it and report" },
+  draft: { name: "Draft", title: "Agents prepare it, a person sends it" },
+  ask: { name: "Ask", title: "Agents ask before doing anything" },
+  off: { name: "Off", title: "Agents leave it alone" },
+};
+
+/**
+ * One entry of a task's activity: the task post that opened it, a line the
+ * hub posted (an update, an answer, an assignment), a note agents left each
+ * other, or a comment. A run of more than three lines in a row is folded
+ * into one `lines` entry, so a busy day of updates doesn't bury the comments.
+ */
+export type ActivityLine = Readonly<{ kind: "opened"; comment: Comment; post: TaskPost }> | Readonly<{ kind: "event"; comment: Comment; post: ThreadPost }> | Readonly<{ kind: "note"; comment: Comment }>;
+export type ActivityEntry = ActivityLine | Readonly<{ kind: "comment"; comment: Comment }> | Readonly<{ kind: "lines"; lines: readonly ActivityLine[] }>;
+
+/**
+ * A task's thread as activity. The hub is whoever posted the task (the
+ * thread's first message); only its replies are read as lines, so an
+ * agent's own "Update:" stays a comment.
+ */
+export function taskActivity(comments: readonly Comment[], fold = 3): ActivityEntry[] {
+  const first = comments[0];
+  const opened = first && parseTaskPost(first.text);
+  const hub = opened ? first.author : undefined;
+  const out: ActivityEntry[] = [];
+  let run: ActivityLine[] = [];
+  const flush = () => {
+    if (run.length > fold) out.push({ kind: "lines", lines: run });
+    else out.push(...run);
+    run = [];
+  };
+  comments.forEach((comment, at) => {
+    if (at === 0 && opened) return void run.push({ kind: "opened", comment, post: opened });
+    const post = hub && comment.author === hub ? parseThreadPost(comment.text) : undefined;
+    if (post) return void run.push({ kind: "event", comment, post });
+    if (comment.agents) return void run.push({ kind: "note", comment });
+    flush();
+    out.push({ kind: "comment", comment });
+  });
+  flush();
+  return out;
 }
 
 /** Why the classifier held an event back, in a line: its rule, its score against the one it needed, and the question. */

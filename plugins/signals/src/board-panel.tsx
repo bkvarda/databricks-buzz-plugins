@@ -5,22 +5,23 @@
 // agent on it, otherwise no one. Opening a task shows its latest activity,
 // the links made for it, and what you can do: answer what an agent asked
 // (Provide input), add an agent, open its thread to steer the agents there,
-// change its status or dismiss it. Its full view (Open) shows its details,
-// every asset, and its thread as comments, with a box to reply that mentions
-// the agent it's with.
+// change its status or dismiss it. Its full view (Open) shows where it came
+// from, its activity as a timeline (the hub's updates as quiet lines, comments
+// as cards, a box to reply that mentions the agent it's with) and a sidebar
+// with its status, owners, details and assets.
 import type { Context } from "@buzz/author";
 import type { PanelProps } from "@dbx/core/host-types";
 import { optionalService } from "@dbx/core/host-types";
 import { React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection } from "@dbx/core/service";
-import { ago, Button, Disclosure, DbxRoot, Notice, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { ago, Button, CopyButton, DbxRoot, Disclosure, Notice, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { Markdown } from "@dbx/core/ui/markdown";
 import { decode, npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type Assignee, assigneeOf, type Member, memberChoices, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskFacts, threadComments, withMentionNames } from "./board-view";
+import { type ActivityEntry, type ActivityLine, type Assignee, assigneeOf, type Member, memberChoices, MODE_NAMES, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskActivity, taskFacts, threadComments, withMentionNames } from "./board-view";
 import { type BoardPerson, type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 import type { LiveTasks } from "./live-tasks";
-import { plainLine, readTaskTarget } from "./posts";
+import { plainLine, readTaskTarget, sourceName } from "./posts";
 
 export type Profile = { name?: string; picture?: string; agent?: boolean };
 type ProfileQueries = { snapshot(): ReadonlyMap<string, { name?: string; picture?: string; isAgent?: true }>; subscribe(listener: () => void): () => void; ensure(ids: readonly string[]): Promise<void> };
@@ -315,9 +316,9 @@ function Owners(props: { hub: HubClient; item: BoardTask; members: readonly stri
 }
 
 /** What a waiting task asks, with its choices and a box for any other answer; the answer goes to its thread. */
-export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone(): void }) {
+export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone(): void; startOpen?: boolean }) {
   const { task } = props.task;
-  const [open, setOpen] = React.useState(false);
+  const [open, setOpen] = React.useState(Boolean(props.startOpen));
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -368,7 +369,7 @@ export function ProvideInput(props: { hub: HubClient; task: BoardTask; onDone():
 /** What the owner pickers need: the channel's members, the board's agents, who's viewing, and their names. */
 type Assigning = Readonly<{ members: readonly string[]; boardAgents: readonly string[]; viewer?: string; profile(key: string): Profile | undefined }>;
 
-function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void; open?(item: BoardTask): void; full?: boolean; assigning?: Assigning }) {
+function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTask): void; onChange(): void; open?(item: BoardTask): void; assigning?: Assigning }) {
   const { item } = props;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
@@ -390,13 +391,13 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
   return (
     <Stack gap={8} style={{ paddingTop: 8 }}>
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
-      {!props.full && props.assigning && <Owners hub={props.hub} item={item} {...props.assigning} onChange={props.onChange} compact />}
-      {!props.full && item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
-      {!props.full && item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{shorten(plainLine(item.activity.text, (npub) => props.assigning?.profile(npubKey(npub) ?? "")?.name), 280)} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
-      {!props.full && assets.length > 0 && (
+      {props.assigning && <Owners hub={props.hub} item={item} {...props.assigning} onChange={props.onChange} compact />}
+      {item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a className="dbx-link" href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
+      {item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{shorten(plainLine(item.activity.text, (npub) => props.assigning?.profile(npubKey(npub) ?? "")?.name), 280)} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
+      {assets.length > 0 && (
         <Stack direction="row" gap={6} wrap>
           {assets.map((artifact) => (
-            <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem" }}>
+            <a className="dbx-link" key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem" }}>
               {ASSET_ICON[artifact.kind] ?? "🔗"} {artifact.title ?? artifact.kind}
             </a>
           ))}
@@ -408,7 +409,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
         <Button size="sm" disabled={!item.thread} title="Open its thread to steer the agents there" onClick={() => props.steer(item)}>Steer</Button>
         {!closed && <AddAgent hub={props.hub} task={item} onDone={props.onChange} />}
         <select className="dbx-input" aria-label="Status" disabled={busy} value={item.task.status} onChange={(event) => void setStatus(event.target.value)} style={{ width: "auto", fontSize: "0.75rem" }}>
-          {TASK_STATUSES.map((status) => <option key={status} value={status}>{status.replace("_", " ")}</option>)}
+          {TASK_STATUSES.map((status) => <option key={status} value={status}>{STATUS_GROUPS.find((group) => group.status === status)?.title ?? status}</option>)}
         </select>
         {!closed && <Button size="sm" variant="danger" disabled={busy} onClick={() => void setStatus("dismissed")}>Dismiss</Button>}
       </Stack>
@@ -450,7 +451,7 @@ function Meta(props: { item: BoardTask }) {
       {item.task.mode !== "draft" && <Chip tone={item.task.mode === "auto" ? "success" : undefined} title="How agents handle it">{item.task.mode}</Chip>}
       {item.source && <Text size="xs" tone="tertiary">{item.source.source}</Text>}
       {assets.slice(0, 3).map((artifact) => (
-        <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.title ?? artifact.url} style={{ fontSize: "0.75rem", textDecoration: "none" }}>{ASSET_ICON[artifact.kind] ?? "🔗"}</a>
+        <a className="dbx-link" key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.title ?? artifact.url} style={{ fontSize: "0.75rem", textDecoration: "none" }}>{ASSET_ICON[artifact.kind] ?? "🔗"}</a>
       ))}
       {assets.length > 3 && <Text size="xs" tone="tertiary">+{assets.length - 3}</Text>}
     </>
@@ -558,38 +559,211 @@ function useThread(ctx: Context, channel: string | undefined, root: string | nul
   };
 }
 
-/** A comment in the task's thread: who wrote it, when, and what it says. Agents' notes to each other are folded away. */
-function CommentItem(props: { comment: Comment; profile(key: string): Profile | undefined }) {
-  const { comment } = props;
-  const who = props.profile(comment.author);
-  const name = who?.name ?? `${npubOf(comment.author).slice(0, 12)}…`;
-  const mark = who?.picture ? <img src={who.picture} alt={name} style={{ width: 22, height: 22, borderRadius: 999, objectFit: "cover", flex: "none" }} /> : <span style={{ width: 22, height: 22, borderRadius: 999, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, background: "var(--dbx-inset)", color: "var(--dbx-subtle)", border: "1px solid var(--dbx-border)" }}>{initials(name)}</span>;
-  const raw = comment.text.length > 6000 ? `${comment.text.slice(0, 5999)}…` : comment.text;
-  const text = withMentionNames(raw, npubKey, (key) => props.profile(key)?.name);
+const fullTime = (seconds: number) => new Date(seconds * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+/** An address as the part before the @, which is how the team reads it in a line; the whole address is on hover. */
+const shortEmails = (text: string) => text.replace(/\b([\w.+-]+)@[\w-]+(?:\.[\w-]+)+\b/g, "$1");
+/** A line the hub wrote, as plain text with mentions as @Name and addresses short. */
+const lineText = (text: string, profile: (key: string) => Profile | undefined) => shortEmails(plainLine(text, (npub) => profile(npubKey(npub) ?? "")?.name));
+
+/** A message's Markdown in Buzz's own renderer when the host has one, so it reads like the conversation; mentions show as @Name either way. */
+function RichText(props: { ctx: Context; text: string; profile(key: string): Profile | undefined }) {
+  const HostMarkdown = (props.ctx as unknown as { conversation?: { ui?: { Markdown?: React.ComponentType<{ content: string; scale?: "message" | "document" }> } } }).conversation?.ui?.Markdown;
+  const named = withMentionNames(props.text, npubKey, (key) => props.profile(key)?.name);
+  return <div style={{ overflowWrap: "anywhere", minWidth: 0 }}>{HostMarkdown ? <HostMarkdown content={named} /> : <Markdown source={named} size="sm" />}</div>;
+}
+
+/**
+ * One step of the activity, like GitHub's timeline: a mark in the left
+ * gutter, joined to the next step by a thin line, and the step beside it.
+ */
+function Step(props: { mark: React.ReactNode; last?: boolean; children: React.ReactNode }) {
   return (
-    <div style={{ display: "flex", gap: 10, alignItems: "flex-start", opacity: comment.pending ? 0.6 : 1 }}>
-      {mark}
-      <div style={{ flex: "1 1 auto", minWidth: 0 }}>
-        <Stack direction="row" gap={6} align="baseline">
-          <Text size="sm" weight={600}>{name}</Text>
-          <Text size="xs" tone="tertiary">{ago(comment.at * 1000)}{comment.pending ? " · sending" : ""}</Text>
-          {comment.failed && <Text size="xs" tone="danger">Not sent</Text>}
-        </Stack>
-        <div style={{ overflowWrap: "anywhere" }}>
-          {comment.agents ? <Disclosure summary="Note between agents">{<Markdown source={text} size="sm" />}</Disclosure> : <Markdown source={text} size="sm" />}
-        </div>
+    <div style={{ display: "flex", gap: 10, minWidth: 0 }}>
+      <div style={{ flex: "none", width: 24, display: "flex", flexDirection: "column", alignItems: "center" }}>
+        {props.mark}
+        {!props.last && <span aria-hidden style={{ flex: "1 1 auto", width: 1, minHeight: 8, marginTop: 4, background: "var(--dbx-border)" }} />}
       </div>
+      <div style={{ flex: "1 1 auto", minWidth: 0, paddingBottom: props.last ? 0 : 14 }}>{props.children}</div>
     </div>
   );
 }
 
-/** The box under the comments: a reply in the task's thread, mentioning the agent it's with. */
+/** A line's small round mark in the gutter. */
+function LineMark(props: { icon: React.ReactNode; tone?: "success" | "warning" }) {
+  const color = props.tone === "success" ? "var(--dbx-success)" : props.tone === "warning" ? "var(--dbx-warning)" : "var(--dbx-subtle)";
+  return <span aria-hidden style={{ width: 24, height: 24, flex: "none", boxSizing: "border-box", borderRadius: 999, border: "1px solid var(--dbx-border)", background: "var(--dbx-inset)", color, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, lineHeight: 1 }}>{props.icon}</span>;
+}
+
+/** Someone's picture in the gutter: round for people, square for agents, as on the board. */
+function PersonMark(props: { id: string; profile(key: string): Profile | undefined; size?: number }) {
+  const found = props.profile(props.id);
+  const label = found?.name ?? `${npubOf(props.id).slice(0, 12)}…`;
+  return <AssigneeMark assignee={{ kind: found?.agent ? "agent" : "person", key: props.id, label }} profile={props.profile} size={props.size ?? 24} />;
+}
+
+const Who = (props: { children: React.ReactNode }) => <span style={{ color: "var(--dbx-ink)", fontWeight: 600 }}>{props.children}</span>;
+const When = (props: { at: number }) => <span title={fullTime(props.at)} style={{ color: "var(--dbx-tertiary)", whiteSpace: "nowrap" }}>{ago(props.at * 1000)}</span>;
+const STATUS_WORD = /^(.+?) set this to \*\*(\w[\w ]*)\*\*(?::\s*(.*))?$/;
+
+/** What a line in the activity says, its mark, and whether it has more for agents. */
+function describeLine(line: ActivityLine, profile: (key: string) => Profile | undefined): { mark: React.ReactNode; body: React.ReactNode; more: boolean } {
+  const text = (value: string) => lineText(value, profile);
+  if (line.kind === "opened") {
+    const from = line.post.source && sourceName(line.post.source.kind);
+    return { mark: <LineMark icon="📌" />, body: <span>Task opened{from ? <> from <Who>{from}</Who></> : null}{line.post.source?.from ? ` · ${shortEmails(line.post.source.from)}` : ""}</span>, more: true };
+  }
+  if (line.kind === "note") {
+    const name = profile(line.comment.author)?.name ?? "An agent";
+    return { mark: <LineMark icon="✎" />, body: <span><Who>{name}</Who> left a note for agents</span>, more: true };
+  }
+  const { post } = line;
+  switch (post.kind) {
+    case "question":
+      return { mark: <LineMark icon="?" tone="warning" />, body: <span><Who>{text(post.by)}</Who> asked: “{shorten(post.question, 160)}”</span>, more: false };
+    case "answered":
+      return { mark: <LineMark icon="↳" />, body: <span><Who>{text(post.who)}</Who> answered <Who>{text(post.answer)}</Who></span>, more: post.forAgents };
+    case "status": {
+      const found = STATUS_WORD.exec(post.text);
+      const status = found?.[2]?.trim().replace(" ", "_");
+      const title = STATUS_GROUPS.find((group) => group.status === status)?.title ?? found?.[2];
+      return found
+        ? { mark: <LineMark icon={<StatusIcon status={status ?? ""} size={11} />} />, body: <span><Who>{text(found[1]!)}</Who> moved it to <Who>{title}</Who>{found[3] ? `: ${text(found[3])}` : ""}</span>, more: false }
+        : { mark: <LineMark icon="●" />, body: <span>{text(post.text)}</span>, more: false };
+    }
+    case "assigned":
+      return { mark: <LineMark icon="👤" />, body: <span>{text(post.text)}</span>, more: post.forAgents };
+    case "update":
+      return {
+        mark: <LineMark icon="↻" />,
+        body: (
+          <span>
+            Source updated: {post.url ? <a className="dbx-link" href={post.url} onClick={link(post.url)} title={post.url}>{post.title}</a> : post.title}
+            {post.changes.map((change) => <span key={change.field} style={{ marginLeft: 6 }}><Chip title={`${change.field}: ${change.from} → ${change.to}`}>{change.field} → {change.to}</Chip></span>)}
+          </span>
+        ),
+        more: post.forAgents,
+      };
+    case "done":
+      return { mark: <LineMark icon="✓" tone="success" />, body: <span><Who>Done</Who>: {text(post.reason)}</span>, more: false };
+    case "nudge":
+      return { mark: <LineMark icon="⏱" />, body: <span>{text(post.text)}</span>, more: false };
+    case "asked":
+      return { mark: <LineMark icon="→" />, body: <span>{post.text}</span>, more: true };
+  }
+}
+
+/** A line in the activity: what happened and when, with what the hub wrote for agents folded under it. */
+function LineStep(props: { ctx: Context; line: ActivityLine; profile(key: string): Profile | undefined; last?: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const { mark, body, more } = describeLine(props.line, props.profile);
+  const label = props.line.kind === "note" ? "Show" : "For agents";
+  return (
+    <Step mark={mark} {...(props.last && { last: true })}>
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", columnGap: 6, rowGap: 2, minHeight: 24, paddingTop: 4, boxSizing: "border-box", fontSize: "0.75rem", color: "var(--dbx-subtle)", overflowWrap: "anywhere" }}>
+        {body}
+        <When at={props.line.comment.at} />
+        {more && (
+          <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} style={{ border: 0, background: "transparent", padding: 0, cursor: "pointer", color: "var(--dbx-tertiary)", fontSize: "0.75rem", textDecoration: "underline dotted" }}>
+            {open ? "Hide" : label}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div style={{ marginTop: 6, padding: "8px 12px", borderRadius: 8, border: "1px solid var(--dbx-border)", background: "var(--dbx-inset)" }}>
+          <RichText ctx={props.ctx} text={props.line.comment.text} profile={props.profile} />
+        </div>
+      )}
+    </Step>
+  );
+}
+
+/** The thread message the hub recorded as the agent's reply (or draft) for the task, the newest one, by id. */
+const recordedReply = (item: BoardTask) =>
+  item.artifacts
+    .filter((artifact) => artifact.kind === "reply" || artifact.kind === "draft")
+    .sort((a, b) => a.at - b.at)
+    .map((artifact) => /[?&]id=([0-9a-f]{64})/.exec(artifact.url)?.[1])
+    .filter(Boolean)
+    .at(-1);
+
+/** How tall a comment shows before "Show more". */
+const COMMENT_HEIGHT = 280;
+
+/** A comment: who wrote it and when, over what they said; a long one is cut short until you open it. */
+function CommentStep(props: { ctx: Context; comment: Comment; profile(key: string): Profile | undefined; expanded: boolean }) {
+  const { comment } = props;
+  const name = props.profile(comment.author)?.name ?? `${npubOf(comment.author).slice(0, 12)}…`;
+  const [open, setOpen] = React.useState(props.expanded);
+  const [long, setLong] = React.useState(false);
+  const body = React.useRef<HTMLDivElement>(null);
+  const text = comment.text.length > 20000 ? `${comment.text.slice(0, 19999)}…` : comment.text;
+  React.useLayoutEffect(() => {
+    const element = body.current;
+    if (!element) return;
+    const measure = () => setLong(element.scrollHeight > COMMENT_HEIGHT + 60);
+    measure();
+    const Observer = (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    if (!Observer) return;
+    const observer = new Observer(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [text]);
+  const cut = long && !open;
+  const fade = "linear-gradient(to bottom, #000 65%, transparent)";
+  return (
+    <Step mark={<PersonMark id={comment.author} profile={props.profile} />}>
+      <div style={{ border: "1px solid var(--dbx-border)", borderRadius: 8, background: "var(--dbx-surface)", minWidth: 0, opacity: comment.pending ? 0.6 : 1 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 6px 0 12px", minWidth: 0 }}>
+          <Text size="sm" weight={600} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</Text>
+          <Text size="xs" tone="tertiary" style={{ flex: "1 1 auto", whiteSpace: "nowrap" }}>
+            <When at={comment.at} />
+            {comment.pending ? " · sending" : ""}
+          </Text>
+          {comment.failed && <Text size="xs" tone="danger">Not sent</Text>}
+          {/* A long comment is usually a draft someone will send: copy it as written. */}
+          {long && <CopyButton text={comment.text} />}
+        </div>
+        <div ref={body} style={{ padding: "0 12px 10px", ...(cut && { maxHeight: COMMENT_HEIGHT, overflow: "hidden", maskImage: fade, WebkitMaskImage: fade }) }}>
+          <RichText ctx={props.ctx} text={text} profile={props.profile} />
+        </div>
+        {long && (
+          <div style={{ padding: "0 12px 8px" }}>
+            <button type="button" className="dbx-link" aria-expanded={open} onClick={() => setOpen(!open)} style={{ border: 0, background: "transparent", padding: 0, cursor: "pointer", fontSize: "0.75rem" }}>
+              {open ? "Show less" : "Show more"}
+            </button>
+          </div>
+        )}
+      </div>
+    </Step>
+  );
+}
+
+/** A run of lines, folded: the last two show, and the rest open with one click. */
+function LinesStep(props: { ctx: Context; lines: readonly ActivityLine[]; profile(key: string): Profile | undefined; last?: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const shown = open ? props.lines : props.lines.slice(-2);
+  const hidden = props.lines.length - shown.length;
+  return (
+    <>
+      {hidden > 0 && (
+        <Step mark={<LineMark icon="⋯" />}>
+          <button type="button" onClick={() => setOpen(true)} style={{ border: 0, background: "transparent", padding: "4px 0 0", cursor: "pointer", color: "var(--dbx-subtle)", fontSize: "0.75rem", minHeight: 24 }}>
+            Show {hidden} earlier {hidden === 1 ? "update" : "updates"}
+          </button>
+        </Step>
+      )}
+      {shown.map((line, at) => <LineStep key={line.comment.id} ctx={props.ctx} line={line} profile={props.profile} {...(props.last && at === shown.length - 1 && { last: true })} />)}
+    </>
+  );
+}
+
+/** The box at the end of the activity: a reply in the task's thread, mentioning the agent it's with. */
 function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | undefined; send?: (content: string, mentions: readonly string[]) => string; steer(): void }) {
   const [text, setText] = React.useState("");
   const [error, setError] = React.useState<string>();
   const mentions = replyMentions(props.assignee);
   const to = props.assignee.kind === "agent" ? (props.profile(props.assignee.key)?.name ?? props.assignee.label) : undefined;
-  if (!props.send) return <Text size="xs" tone="subtle">Replying needs Buzz's thread view here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer())}>Open the thread</a> to reply.</Text>;
+  if (!props.send) return <Text size="xs" tone="subtle">Replying needs Buzz's thread view here. <a className="dbx-link" href="#" onClick={(event) => (event.preventDefault(), props.steer())}>Open the thread</a> to reply.</Text>;
   const send = () => {
     if (!text.trim()) return;
     setError(undefined);
@@ -610,22 +784,84 @@ function ReplyBox(props: { assignee: Assignee; profile(key: string): Profile | u
         value={text}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={(event) => (event.key === "Enter" && (event.metaKey || event.ctrlKey)) && (event.preventDefault(), send())}
+        style={{ resize: "vertical", minHeight: 64 }}
       />
       {error && <Text size="xs" tone="danger">{error}</Text>}
-      <Stack direction="row" gap={8} align="center" justify="space-between">
-        <Text size="xs" tone="tertiary">{to ? `Mentions ${to}, the agent it's with.` : props.assignee.kind === "you" ? "Mentions no one: it's waiting on your answer." : "Mentions no one: no agent is on it."} ⌘↵ sends.</Text>
+      <Stack direction="row" gap={8} align="center" justify="space-between" wrap>
+        <Text size="xs" tone="tertiary">{to ? `Mentions ${to}, the agent it's with` : props.assignee.kind === "you" ? "Mentions no one: it's waiting on your answer" : "Mentions no one: no agent is on it"} · ⌘↵ sends</Text>
         <Button size="sm" variant="brand" disabled={!text.trim()} onClick={send}>Reply</Button>
       </Stack>
     </Stack>
   );
 }
 
-/** A task's full view, like a Linear issue: title, details and assets beside its thread as comments, with a reply box. */
+/** Whether an element is at least `min` px wide, kept current as it resizes; read before paint, so the layout doesn't jump. */
+function useWide(ref: React.RefObject<HTMLElement | null>, min: number): boolean {
+  const [wide, setWide] = React.useState(true);
+  React.useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const measure = () => setWide(element.getBoundingClientRect().width >= min);
+    measure();
+    const Observer = (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    if (!Observer) return;
+    const observer = new Observer(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [min]);
+  return wide;
+}
+
+/** A section of the task's sidebar: a quiet label over its contents. */
+function Section(props: { title: string; children: React.ReactNode }) {
+  return (
+    <Stack gap={6}>
+      <Text size="xs" tone="tertiary" weight={600}>{props.title.toUpperCase()}</Text>
+      {props.children}
+    </Stack>
+  );
+}
+
+/** Setting a task's status from its view, with what went wrong if it didn't. */
+function useSetStatus(hub: HubClient, id: number, onChange: () => void) {
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string>();
+  const set = async (status: string) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await hub.updateTask({ id, status });
+      onChange();
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, error, set };
+}
+
+/** The status picker, with each status named as the board names it. */
+function StatusPicker(props: { status: string; busy: boolean; set(status: string): void }) {
+  return (
+    <select className="dbx-input" aria-label="Status" disabled={props.busy} value={props.status} onChange={(event) => props.set(event.target.value)} style={{ width: "auto", maxWidth: "100%", fontSize: "0.75rem" }}>
+      {TASK_STATUSES.map((status) => <option key={status} value={status}>{STATUS_GROUPS.find((group) => group.status === status)?.title ?? status}</option>)}
+    </select>
+  );
+}
+
+/**
+ * A task's full view, like a Linear issue: its title and where it came from,
+ * what it needs from you, then its activity as a timeline: the hub's
+ * updates as quiet lines, comments as cards (long ones cut short), and a box
+ * to reply. Its status, owners, details and assets are in a sidebar beside
+ * it, or above the activity when the view is narrow.
+ */
 function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channel?: string; boardAgents: readonly string[]; profile(key: string): Profile | undefined; steer(item: BoardTask): void; onChange(): void; back?(): void }) {
   const { item } = props;
   const assignee = assigneeOf(item);
   const thread = useThread(props.ctx, props.channel ?? item.task.channel ?? undefined, item.task.buzz_root);
-  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url));
+  const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && !["reply", "draft"].includes(artifact.kind));
   const facts = taskFacts(item);
   const authorProfile = useProfiles(props.ctx, [...new Set(thread.comments.flatMap((comment) => [comment.author, ...mentionedKeys(comment.text, npubKey)]))]);
   const who = (key: string) => props.profile(key) ?? authorProfile(key);
@@ -634,82 +870,145 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
   const members = useMembers(props.ctx, props.channel ?? item.task.channel ?? undefined);
   useProfiles(props.ctx, members);
   const viewer = useRelay(props.ctx).viewer;
+  const status = useSetStatus(props.hub, item.task.id, props.onChange);
+  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  const box = React.useRef<HTMLDivElement>(null);
+  const wide = useWide(box, 680);
+  const entries = React.useMemo(() => taskActivity(thread.comments), [thread.comments]);
+  const opened = entries.find((entry): entry is Extract<ActivityEntry, { kind: "opened" }> => entry.kind === "opened")?.post;
+  // The newest comment shows in full, and so does the agent's reply the hub recorded on the task (the draft it's for, say).
+  const comments = entries.flatMap((entry) => (entry.kind === "comment" ? [entry.comment] : []));
+  const expanded = new Set([comments.at(-1)?.id, recordedReply(item)]);
+  const commentCount = comments.length;
   const end = React.useRef<HTMLDivElement>(null);
   const count = thread.comments.length;
-  React.useEffect(() => end.current?.scrollIntoView?.({ block: "nearest" }), [count]);
-  // A new comment can come with a status change or an asset (agents post them in the thread), so reload the task then.
+  // A new comment can come with a status change or an asset (agents post them in the thread), so reload the task then, and show it.
   const seen = React.useRef<number | undefined>(undefined);
   const { onChange } = props;
   React.useEffect(() => {
     if (thread.status !== "ready") return;
-    if (seen.current !== undefined && count > seen.current) onChange();
+    if (seen.current !== undefined && count > seen.current) (onChange(), end.current?.scrollIntoView?.({ block: "nearest" }));
     seen.current = count;
   }, [count, thread.status]);
-  return (
-    <Stack gap={14}>
-      <Stack direction="row" gap={8} align="center">
-        {props.back && <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>}
-        <Text size="xs" tone="tertiary" mono>#{item.task.id}</Text>
-      </Stack>
-      <Stack direction="row" gap={8} align="flex-start">
-        <span style={{ paddingTop: 4 }}><StatusIcon status={item.task.status} size={15} /></span>
-        <Text as="h2" size="xl" weight={600} style={{ overflowWrap: "anywhere" }}>{item.task.title}</Text>
-      </Stack>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 }}>
-        <div style={{ flex: "2 1 360px", minWidth: 0 }}>
-          <Stack gap={14}>
-            <TaskBody hub={props.hub} item={item} steer={props.steer} onChange={props.onChange} full />
-            <div style={{ borderTop: "1px solid var(--dbx-border)", paddingTop: 12 }}>
-              <Stack gap={12}>
-                <Text size="sm" weight={600}>Activity</Text>
-                {!item.thread ? <Text size="xs" tone="subtle">Not posted in Buzz yet.</Text>
-                  : !thread.available ? <Text size="xs" tone="subtle">The thread can't be read here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a>.</Text>
-                  : thread.status === "error" ? <Text size="xs" tone="danger">{thread.error ?? "Couldn't read the thread."}</Text>
-                  : thread.status !== "ready" && !count ? <Spinner label="Loading the thread" />
-                  : (
-                    <Stack gap={14}>
-                      {thread.more && <Button size="sm" variant="ghost" onClick={thread.more}>Earlier comments</Button>}
-                      {thread.reading && <Spinner size={10} label="Reading the thread" />}
-                      {thread.limited && <Text size="xs" tone="subtle">Only part of the thread can be read here. <a href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a> for the rest.</Text>}
-                      {thread.comments.map((comment) => <CommentItem key={comment.id} comment={comment} profile={who} />)}
-                      <div ref={end} />
-                    </Stack>
-                  )}
-                {item.thread && <ReplyBox assignee={assignee} profile={props.profile} {...(thread.reply && { send: thread.reply })} steer={() => props.steer(item)} />}
-              </Stack>
-            </div>
-          </Stack>
+  const source = item.source;
+  const sourceLine = [source && sourceName(source.source), opened?.source?.from && shortEmails(opened.source.from)].filter(Boolean).join(" · ");
+  const quote = opened?.source?.quote;
+  const sourceFacts = opened?.source?.facts ?? [];
+  const openThread = item.thread ? () => props.steer(item) : undefined;
+
+  // Beside the activity, everything shows; above it, in a narrow view, the details fold away under status and owners.
+  const more = (
+    <Stack gap={16}>
+      <Section title="Details">
+        <div style={{ display: "grid", gridTemplateColumns: "auto minmax(0, 1fr)", columnGap: 12, rowGap: 4, fontSize: "0.75rem" }}>
+          {facts.map((fact) => (
+            <React.Fragment key={fact.label}>
+              <span style={{ color: "var(--dbx-tertiary)", whiteSpace: "nowrap" }}>{fact.label}</span>
+              <span title={fact.title} style={{ minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" }}>{fact.value}</span>
+            </React.Fragment>
+          ))}
         </div>
-        <aside style={{ flex: "1 1 220px", minWidth: 0, maxWidth: 340 }}>
-          <Stack gap={12}>
-            <Owners hub={props.hub} item={item} members={members} boardAgents={props.boardAgents} {...(viewer && { viewer })} profile={who} onChange={props.onChange} />
-            <Stack gap={4}>
-              <Text size="xs" tone="tertiary" weight={600}>DETAILS</Text>
-              {facts.map((fact) => (
-                <div key={fact.label} style={{ display: "flex", gap: 8, fontSize: "0.75rem" }}>
-                  <span style={{ flex: "0 0 84px", color: "var(--dbx-tertiary)" }}>{fact.label}</span>
-                  <span style={{ minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" }}>{fact.label === "Source" && item.source?.url ? <a href={item.source.url} onClick={link(item.source.url)}>{fact.value}</a> : fact.value}</span>
-                </div>
-              ))}
-            </Stack>
-            {people.length > 0 && (
-              <Stack gap={4}>
-                <Text size="xs" tone="tertiary" weight={600}>PEOPLE</Text>
-                {people.map((person) => <Text key={`${person.kind}:${person.key}`} size="xs">{person.label} <span style={{ color: "var(--dbx-tertiary)" }}>· {person.role}</span></Text>)}
-              </Stack>
-            )}
-            <Stack gap={4}>
-              <Text size="xs" tone="tertiary" weight={600}>ASSETS</Text>
-              {!assets.length ? <Text size="xs" tone="subtle">Nothing made for it yet.</Text> : assets.map((artifact) => (
-                <a key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 }}>
-                  {ASSET_ICON[artifact.kind] ?? "🔗"} {artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60)} <span style={{ color: "var(--dbx-tertiary)" }}>· {artifact.kind}</span>
-                </a>
-              ))}
-            </Stack>
-          </Stack>
-        </aside>
-      </div>
+      </Section>
+      {people.length > 0 && (
+        <Section title="People">
+          {people.map((person) => <Text key={`${person.kind}:${person.key}`} size="xs" style={{ overflowWrap: "anywhere" }}>{person.label} <span style={{ color: "var(--dbx-tertiary)" }}>· {person.role}</span></Text>)}
+        </Section>
+      )}
+      <Section title="Assets">
+        {!assets.length ? <Text size="xs" tone="subtle">Nothing made for it yet.</Text> : assets.map((artifact) => (
+          <a className="dbx-link" key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.url} style={{ display: "flex", gap: 6, alignItems: "baseline", fontSize: "0.75rem", minWidth: 0, textDecoration: "none", opacity: artifact.kind === "workspace" ? 0.7 : 1 }}>
+            <span aria-hidden style={{ flex: "none" }}>{ASSET_ICON[artifact.kind] ?? "🔗"}</span>
+            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{artifact.title ?? artifact.url.replace(/^https?:\/\//, "")}</span>
+          </a>
+        ))}
+      </Section>
     </Stack>
+  );
+  const sidebar = (
+    <Stack gap={16}>
+      <Section title="Status">
+        <StatusPicker status={item.task.status} busy={status.busy} set={(next) => void status.set(next)} />
+        {status.error && <Text size="xs" tone="danger">{status.error}</Text>}
+      </Section>
+      <Owners hub={props.hub} item={item} members={members} boardAgents={props.boardAgents} {...(viewer && { viewer })} profile={who} onChange={props.onChange} />
+      {wide ? more : <Disclosure summary={`Details${assets.length ? ` and ${assets.length} ${assets.length === 1 ? "asset" : "assets"}` : ""}`}>{more}</Disclosure>}
+      {!closed && (
+        <div>
+          <Button size="sm" disabled={status.busy} title="Close it without doing it; agents stop working on it" onClick={() => void status.set("dismissed")}>Dismiss task</Button>
+        </div>
+      )}
+    </Stack>
+  );
+
+  return (
+    <div ref={box} style={{ minWidth: 0 }}>
+      <Stack gap={16}>
+        <Stack gap={8}>
+          <Stack direction="row" gap={8} align="center">
+            {props.back && <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>}
+            <Text size="xs" tone="tertiary" mono>Task {item.task.id}</Text>
+            {item.task.workstream && <Chip>{item.task.workstream}</Chip>}
+            {item.task.mode !== "draft" && <Chip tone={item.task.mode === "auto" ? "success" : undefined} title={MODE_NAMES[item.task.mode]?.title}>{item.task.mode}</Chip>}
+          </Stack>
+          <Stack direction="row" gap={8} align="flex-start">
+            <span style={{ paddingTop: 5 }}><StatusIcon status={item.task.status} size={15} /></span>
+            <Text as="h2" size="xl" weight={600} style={{ overflowWrap: "anywhere", margin: 0 }}>{item.task.title}</Text>
+          </Stack>
+          {source && (
+            <Text size="xs" tone="subtle" style={{ overflowWrap: "anywhere" }}>
+              {sourceLine}
+              {source.title && <> · {source.url ? <a className="dbx-link" href={source.url} onClick={link(source.url)} title={source.url}>{source.title}</a> : source.title}</>}
+              <span style={{ color: "var(--dbx-tertiary)" }}> · {ago(source.occurred_at * 1000)}</span>
+            </Text>
+          )}
+        </Stack>
+        {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} startOpen />}
+        {(quote || sourceFacts.length > 0) && (
+          <Stack gap={8}>
+            {quote && <div style={{ borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 10 }}><Text size="sm" tone="subtle" style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}>{quote}</Text></div>}
+            {sourceFacts.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 }}>
+                {sourceFacts.map((fact) => <Text key={fact.label} size="xs" tone="subtle"><span style={{ color: "var(--dbx-tertiary)" }}>{fact.label}</span> {fact.value}</Text>)}
+              </div>
+            )}
+          </Stack>
+        )}
+        <div style={{ display: "flex", flexDirection: wide ? "row" : "column", gap: wide ? 28 : 16, alignItems: wide ? "flex-start" : "stretch", minWidth: 0 }}>
+          {!wide && <div className="dbx-card" style={{ padding: 12, borderRadius: 8 }}>{sidebar}</div>}
+          <div style={{ flex: "1 1 0", minWidth: 0 }}>
+            <Stack gap={12}>
+              <Stack direction="row" gap={8} align="center" justify="space-between">
+                <Text size="sm" weight={600}>Activity{commentCount ? <span style={{ color: "var(--dbx-tertiary)", fontWeight: 400 }}> · {commentCount} {commentCount === 1 ? "comment" : "comments"}</span> : null}</Text>
+                {openThread && <Button size="sm" variant="ghost" title="Open its thread in Buzz to steer the agents there" onClick={openThread}>Open thread ↗</Button>}
+              </Stack>
+              {!item.thread ? <Text size="xs" tone="subtle">Not posted in Buzz yet.</Text>
+                : !thread.available ? <Text size="xs" tone="subtle">The thread can't be read here. <a className="dbx-link" href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a>.</Text>
+                : thread.status === "error" ? <Text size="xs" tone="danger">{thread.error ?? "Couldn't read the thread."} <a className="dbx-link" href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a>.</Text>
+                : thread.status !== "ready" && !count ? <Spinner label="Loading the activity" />
+                : (
+                  <div>
+                    {thread.more && <Step mark={<LineMark icon="⋯" />}><Button size="sm" variant="ghost" onClick={thread.more}>Earlier activity</Button></Step>}
+                    {thread.limited && <Step mark={<LineMark icon="⋯" />}><Text size="xs" tone="subtle">Only part of the thread can be read here. <a className="dbx-link" href="#" onClick={(event) => (event.preventDefault(), props.steer(item))}>Open it in Buzz</a> for the rest.</Text></Step>}
+                    {entries.map((entry) =>
+                      entry.kind === "comment" ? <CommentStep key={entry.comment.id} ctx={props.ctx} comment={entry.comment} profile={who} expanded={expanded.has(entry.comment.id)} />
+                      : entry.kind === "lines" ? <LinesStep key={entry.lines[0]!.comment.id} ctx={props.ctx} lines={entry.lines} profile={who} />
+                      : <LineStep key={entry.comment.id} ctx={props.ctx} line={entry} profile={who} />,
+                    )}
+                    {thread.reading && <Step mark={<LineMark icon={<Spinner size={10} />} />}><Text size="xs" tone="tertiary">Reading the thread…</Text></Step>}
+                    {item.thread && (
+                      <Step mark={viewer ? <PersonMark id={viewer} profile={who} /> : <LineMark icon="✎" />} last>
+                        <ReplyBox assignee={assignee} profile={props.profile} {...(thread.reply && { send: thread.reply })} steer={() => props.steer(item)} />
+                      </Step>
+                    )}
+                    <div ref={end} />
+                  </div>
+                )}
+            </Stack>
+          </div>
+          {wide && <aside style={{ flex: "0 0 240px", minWidth: 0 }}>{sidebar}</aside>}
+        </div>
+      </Stack>
+    </div>
   );
 }
 
@@ -742,7 +1041,7 @@ function FilteredList(props: { events: readonly FilteredEvent[] | undefined; loa
             <Stack gap={2}>
               <Stack direction="row" gap={8} align="center" wrap>
                 <span style={{ fontSize: "0.8125rem", fontWeight: 500, minWidth: 0, flex: "1 1 200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={event.title}>
-                  {event.url ? <a href={event.url} onClick={(click) => (click.preventDefault(), openExternal(event.url!))}>{event.title || event.external_id}</a> : event.title || event.external_id}
+                  {event.url ? <a className="dbx-link" href={event.url} onClick={(click) => (click.preventDefault(), openExternal(event.url!))}>{event.title || event.external_id}</a> : event.title || event.external_id}
                 </span>
                 <Text size="xs" tone="tertiary">{event.source} · {ago(event.filtered_at * 1000)}</Text>
               </Stack>
