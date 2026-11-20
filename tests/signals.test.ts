@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
-import { rpcSignIn } from "../plugins/signals/src/client";
+import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
 import { assigneeOf, memberChoices, ownersOf, removable, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
@@ -1020,6 +1020,14 @@ describe("onboarding a poller", () => {
     expect(bare).toEqual({ user: "bo@x.com", role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet." }, args: ["--config", "sources.json", "--lakebase"] });
     // It needs to know who's asking.
     expect((await hub.handle({ method: "GET", path: "/api/onboard", query: new URLSearchParams(), body: async () => "" })).status).toBe(401);
+  });
+});
+
+describe("the poller setup card", () => {
+  it("gives the lakebase block for sources.json, or nothing when the hub doesn't know its database", () => {
+    const lakebase = { endpoint: "projects/p/branches/b/endpoints/e", host: "h", database: "databricks_postgres", schema: "signals_x" };
+    expect(JSON.parse(lakebaseSnippet({ user: "a@x.com", role: "ready", lakebase, args: [] })!)).toEqual({ lakebase });
+    expect(lakebaseSnippet({ user: "a@x.com", role: "waiting", args: [] })).toBeUndefined();
   });
 });
 

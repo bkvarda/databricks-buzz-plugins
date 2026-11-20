@@ -6,12 +6,12 @@ import { gatewayMcpPath } from "@dbx/core/api/mcp";
 import type { DatabricksClient } from "@dbx/core/client";
 import type { DatabricksService } from "@dbx/core/service";
 import type { AccountRecord, Preferences, ResolvedLabels, SourceInfo } from "../app/model";
-import type { BoardPerson, BoardTask } from "../app/hub";
+import type { BoardPerson, BoardTask, Onboarding } from "../app/hub";
 import type { FilteredEvent, Task } from "../app/store";
 
 export type { FilteredEvent };
 
-export type { BoardPerson, BoardTask };
+export type { BoardPerson, BoardTask, Onboarding };
 
 /** Hub apps are made with this description, so the plugin can find them. */
 export const HUB_PREFIX = "Signals hub";
@@ -99,6 +99,14 @@ export class HubClient {
   filtered(channel: string, signal?: AbortSignal) {
     return this.call<{ events: FilteredEvent[] }>("GET", "/api/filtered", { query: { channel, days: 14, limit: 100 }, ...(signal && { signal }) }).then((reply) => reply.events);
   }
+  /** Your poller's setup: your database role, and the settings for your sources.json and job. */
+  onboarding(signal?: AbortSignal) {
+    return this.call<Onboarding>("GET", "/api/onboard", { ...(signal && { signal }) });
+  }
+  /** Creates your database role if the hub can. */
+  createRole() {
+    return this.call<Onboarding>("POST", "/api/onboard");
+  }
   events(events: readonly unknown[]) {
     return this.call<{ new: number; changed: number; same: number; skipped: number; created: number[]; updated: number[]; errors: { index: number; error: string }[] }>("POST", "/api/events", { body: { events } });
   }
@@ -150,4 +158,7 @@ export function rpcSignIn(status: number, body: string): SignIn {
 }
 
 /** Databricks' page where a person signs in to a system.ai service. */
+/** sources.json's `lakebase`, as the hub gives it. */
+export const lakebaseSnippet = (onboarding: Onboarding) => (onboarding.lakebase ? JSON.stringify({ lakebase: onboarding.lakebase }, null, 2) : undefined);
+
 export const signInPath = (service: string) => `/explore/mcp-services/system/ai/${service}`;
