@@ -621,7 +621,7 @@ function BrowserWait(props) {
 }
 function WorkspaceStatus(props) {
   const { service, snapshot } = props;
-  const signIn = (label) => service.reauthenticate ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => void service.reauthenticate() }, label) : void 0;
+  const signIn = (label2) => service.reauthenticate ? /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", onClick: () => void service.reauthenticate() }, label2) : void 0;
   switch (snapshot.status) {
     case "checking":
     case "connecting":
@@ -1059,9 +1059,9 @@ function afn(input) {
     throw new Error("function expected");
   return true;
 }
-function astr(label, input) {
+function astr(label2, input) {
   if (typeof input !== "string")
-    throw new Error(`${label}: string expected`);
+    throw new Error(`${label2}: string expected`);
   return true;
 }
 function anumber(n) {
@@ -1072,13 +1072,13 @@ function aArr(input) {
   if (!Array.isArray(input))
     throw new Error("array expected");
 }
-function astrArr(label, input) {
+function astrArr(label2, input) {
   if (!isArrayOf(true, input))
-    throw new Error(`${label}: array of strings expected`);
+    throw new Error(`${label2}: array of strings expected`);
 }
-function anumArr(label, input) {
+function anumArr(label2, input) {
   if (!isArrayOf(false, input))
-    throw new Error(`${label}: array of numbers expected`);
+    throw new Error(`${label2}: array of numbers expected`);
 }
 // @__NO_SIDE_EFFECTS__
 function chain(...args) {
@@ -1566,10 +1566,10 @@ function renderInline(text, keyPrefix = "i") {
       nodes.push(/* @__PURE__ */ React.createElement("strong", { key }, renderInline(token.slice(2, -2), key)));
     else if (token.startsWith("*")) nodes.push(/* @__PURE__ */ React.createElement("em", { key }, renderInline(token.slice(1, -1), key)));
     else if (token.startsWith("[")) {
-      const label = token.slice(1, token.indexOf("]("));
+      const label2 = token.slice(1, token.indexOf("]("));
       const href = token.slice(token.indexOf("](") + 2, -1);
       nodes.push(
-        SAFE_URL.test(href) ? /* @__PURE__ */ React.createElement("a", { key, href, target: "_blank", rel: "noreferrer", className: "dbx-link" }, label) : label
+        SAFE_URL.test(href) ? /* @__PURE__ */ React.createElement("a", { key, href, target: "_blank", rel: "noreferrer", className: "dbx-link" }, label2) : label2
       );
     } else
       nodes.push(
@@ -1776,6 +1776,181 @@ function filterFiltered(events, search) {
   });
 }
 
+// plugins/signals/src/posts.ts
+var TASK_LINE = /^📌 \*\*Task (\d+): (.+)\*\*\s*$/u;
+var REPLY_HERE = "Reply in this thread to work on it.";
+var NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
+var OPTIONS = /^Options: (.+)$/;
+var isTaskPost = (content) => TASK_LINE.test(content.split("\n", 1)[0] ?? "") && content.includes(REPLY_HERE);
+var splitOptions = (text) => text.split(" / ").map((item) => item.trim()).filter(Boolean);
+function parseTaskPost(content) {
+  if (!isTaskPost(content)) return void 0;
+  const lines = content.split("\n");
+  const head = TASK_LINE.exec(lines[0]);
+  const meta = {};
+  let mode;
+  let question;
+  let options = [];
+  let at = 1;
+  for (; at < lines.length; at++) {
+    const line2 = lines[at];
+    if (!line2.trim() || line2.startsWith("**Source**") || line2.startsWith(REPLY_HERE)) break;
+    const asked = /^⏸️ \*\*Needs input:\*\* (.+)$/u.exec(line2);
+    if (asked) {
+      question = asked[1].trim();
+      const listed = OPTIONS.exec(lines[at + 1] ?? "");
+      if (listed) options = splitOptions(listed[1]), at++;
+      continue;
+    }
+    const moded = /^Mode: (\w+)/.exec(line2);
+    if (moded) {
+      mode = moded[1];
+      continue;
+    }
+    for (const part of line2.split(" \xB7 ")) {
+      const pair = /^(Account|Workstream|Initiative|Rule): (.+)$/.exec(part.trim());
+      if (pair) meta[pair[1].toLowerCase()] = pair[2].trim();
+    }
+  }
+  const start = lines.findIndex((line2) => line2.startsWith("**Source**"));
+  const end = lines.findIndex((line2) => line2.startsWith(REPLY_HERE));
+  const title = head[2].trim();
+  const read = start >= 0 ? parseSource(lines.slice(start, end > start ? end : void 0)) : void 0;
+  const source = read && { ...read, facts: read.facts.filter((fact) => !title.toLowerCase().includes(fact.value.toLowerCase())) };
+  const after = end >= 0 ? lines.slice(end + 1).join("\n") : "";
+  return {
+    id: Number(head[1]),
+    title,
+    ...meta.account && { account: meta.account },
+    ...meta.workstream && { workstream: meta.workstream },
+    ...meta.initiative && { initiative: meta.initiative },
+    ...meta.rule && { rule: meta.rule },
+    ...mode && { mode },
+    ...question && { question },
+    options,
+    ...source && { source },
+    asksAgents: /nostr:npub1/.test(after)
+  };
+}
+var QUIET = /* @__PURE__ */ new Set(["channel_id", "context_before", "mimetype", "owners", "text", "from", "thread_ts", "ts", "message_ts", "status", "attendeecount", "recurringeventid", "id", "url", "link", "permalink", "user", "user_id"]);
+var personName = (text) => /^\s*"?([^"<]+?)"?\s*<[^>]+>/.exec(text)?.[1]?.trim() ?? text.trim();
+var label = (key) => {
+  const words = key.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_.-]+/g, " ").trim().toLowerCase();
+  return words ? words[0].toUpperCase() + words.slice(1) : key;
+};
+function detailPairs(text) {
+  return text.split(/;\s+(?=[A-Za-z_][\w.]*: )/).map((part) => /^([A-Za-z_][\w.]*): ([\s\S]*)$/.exec(part.trim())).filter((found) => Boolean(found)).map((found) => [found[1], found[2].trim()]);
+}
+function parseSource(lines) {
+  const first = /^\*\*Source\*\* \(([^)]+)\)(?::\s*(\S+))?/.exec(lines[0] ?? "");
+  if (!first) return void 0;
+  const field = (name) => lines.find((line2) => line2.startsWith(`${name}: `))?.slice(name.length + 2).trim();
+  const facts = [];
+  const attendeesAt = lines.findIndex((line2) => /^Attendees \(\d+\):/.test(line2));
+  if (attendeesAt >= 0) {
+    const count = Number(/^Attendees \((\d+)\)/.exec(lines[attendeesAt])[1]);
+    let customers = 0;
+    let customerWord;
+    for (const line2 of lines.slice(attendeesAt + 1)) {
+      if (!line2.startsWith("- ")) break;
+      const notes = /\(([^()]*)\)\s*$/.exec(line2)?.[1] ?? "";
+      const first2 = notes.split(",")[0].trim();
+      if (first2 && !/-domain address|organizer|accepted|declined|tentative/.test(first2)) customers++, customerWord ??= first2;
+    }
+    facts.push({ label: "Attendees", value: `${count}${customers ? ` \xB7 ${customers} ${customerWord}` : ""}` });
+  }
+  const detailsAt = lines.findIndex((line2) => line2.startsWith("Details: "));
+  const details = detailsAt >= 0 ? detailPairs(lines.slice(detailsAt).join("\n").slice("Details: ".length)) : [];
+  const detail = (key) => details.find(([name]) => name === key)?.[1];
+  const quote = detail("text") ?? detail("snippet");
+  const fromDetail = detail("from");
+  const fromLine = field("From");
+  const from = fromDetail && /</.test(fromDetail) ? personName(fromDetail) : fromLine && personName(fromLine);
+  const channel = detail("channel");
+  const whereLine = field("Where");
+  for (const [key, value] of details) {
+    if (facts.length >= 4) break;
+    if (QUIET.has(key.toLowerCase()) || key === "channel" || key === "snippet") continue;
+    if (!value || /^[[{]/.test(value) || value.length > 48 || /\n/.test(value) || value === "false" || value === "null") continue;
+    facts.push({ label: label(key), value });
+  }
+  const when = field("When");
+  return {
+    kind: first[1],
+    ...first[2] && { url: first[2] },
+    ...when && { when },
+    ...from && { from },
+    ...(channel || whereLine) && { where: channel ?? whereLine },
+    ...quote && { quote: quote.length > 400 ? `${quote.slice(0, 399).trimEnd()}\u2026` : quote },
+    facts
+  };
+}
+function sourceName(kind) {
+  const known = { slack: "Slack", gmail: "Gmail", google_calendar: "Calendar", google_drive: "Drive", jira: "Jira", atlassian: "Jira", agent: "Agent" };
+  if (known[kind]) return known[kind];
+  if (kind.startsWith("table.")) return label(kind.slice(6));
+  return label(kind);
+}
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function shortWhen(when, now = /* @__PURE__ */ new Date()) {
+  const zoned = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2}) \S+ \(([^)]+)\)/.exec(when);
+  if (zoned) return `${MONTHS[Number(zoned[2]) - 1]} ${Number(zoned[3])}, ${zoned[4]} ${zoned[5]}`;
+  const allDay = /^(\d{4})-(\d{2})-(\d{2}) \(all day\)/.exec(when);
+  if (allDay) return `${MONTHS[Number(allDay[2]) - 1]} ${Number(allDay[3])} (all day)`;
+  const at = /^\d{4}-\d{2}-\d{2}T/.test(when) ? new Date(when) : void 0;
+  if (!at || Number.isNaN(at.getTime())) return when.split(" \u2192 ")[0];
+  const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const sameDay = at.toDateString() === now.toDateString();
+  return sameDay ? `Today, ${time}` : `${MONTHS[at.getMonth()]} ${at.getDate()}, ${time}`;
+}
+function humanPart(content) {
+  const lines = content.split("\n");
+  const at = lines.findIndex((line2, n) => n > 0 && /^nostr:npub1/.test(line2.trim()));
+  const text = (at > 0 ? lines.slice(0, at) : lines).join("\n").trim();
+  return { text, forAgents: at > 0 || /\*\*For agents:/.test(content) };
+}
+function parseThreadPost(content) {
+  const lines = content.split("\n");
+  const first = lines[0] ?? "";
+  const asked = /^⏸️ \*\*Needs input\*\* \(asked by (.+?)\): (.+)$/u.exec(first);
+  if (asked) {
+    const listed = OPTIONS.exec(lines[1] ?? "");
+    return { kind: "question", by: asked[1].trim(), question: asked[2].trim(), options: listed ? splitOptions(listed[1]) : [] };
+  }
+  const done = /^✅ Done: (.+?)\.?(?: \(Set its status on the Tasks board if it isn't\.\))?$/u.exec(first);
+  if (done) return { kind: "done", reason: done[1].trim() };
+  if (first.startsWith("\u23F0 ")) return { kind: "nudge", text: first.slice(2).trim() };
+  const update = /^Update: (.+)$/.exec(first);
+  if (update) {
+    const link2 = /^\[(.+)\]\((\S+)\)$/.exec(update[1].trim());
+    const changes = lines.slice(1).map((line2) => /^- \*\*(.+?):\*\* (.*) → (.*)$/.exec(line2)).filter((found) => Boolean(found)).map((found) => ({ field: found[1], from: found[2], to: found[3] }));
+    return { kind: "update", title: link2 ? link2[1] : update[1].trim(), ...link2 && { url: link2[2] }, changes, forAgents: humanPart(content).forAgents };
+  }
+  const answered = /^(?:nostr:npub1\S+\s+)*(.+?) answered: (.+)$/.exec(first);
+  if (answered) {
+    const quoted = lines.find((line2) => line2.startsWith("> "))?.slice(2).trim();
+    return { kind: "answered", who: answered[1].trim(), answer: answered[2].trim(), ...quoted && { question: quoted }, forAgents: /^nostr:npub1/.test(first) };
+  }
+  const status2 = /^(.+?) set this to \*\*(\w[\w ]*)\*\*/.exec(first);
+  if (status2 && lines.length === 1) return { kind: "status", text: first };
+  if (first.startsWith("\u{1F464} ")) {
+    const part = humanPart(content);
+    return { kind: "assigned", text: part.text.slice(2).trim(), forAgents: part.forAgents };
+  }
+  const ask = /^((?:nostr:npub1\S+\s*)+)(.+?)(?::| asked you to work on this task)/.exec(first);
+  if (ask && /work on this task|no agent has worked on this task|you've been named|you've been added/.test(first)) {
+    const asker = /^(?:nostr:npub1\S+\s*)+(.+?) asked you to work on this task/.exec(first)?.[1];
+    return { kind: "asked", text: asker ? `${asker} asked agents to work on it` : "Agents were asked to work on it", forAgents: true };
+  }
+  return void 0;
+}
+var mentionedNpubs = (content) => [...new Set((content.match(NPUB) ?? []).map((found) => found.slice(6)))];
+var taskTarget = (channel, id) => `signals-task:${channel}:${id}`;
+function readTaskTarget(target) {
+  const found = /^signals-task:([^:\s]+):(\d+)$/.exec(target);
+  return found ? { channel: found[1], id: Number(found[2]) } : void 0;
+}
+
 // plugins/signals/src/board-panel.tsx
 var NO_RELAY = {};
 var readRelay = (relay) => {
@@ -1870,7 +2045,7 @@ var npubOf = (key) => {
     return key;
   }
 };
-var initials = (label) => label.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
+var initials = (label2) => label2.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("") || "?";
 var assigneeName = (assignee, profile) => assignee.kind === "you" ? "You" : assignee.kind === "unassigned" ? "Unassigned" : profile(assignee.key)?.name ?? assignee.label;
 var nameOf = (person, profile) => profile(person.key)?.name ?? person.label;
 function AssigneeMark(props) {
@@ -1888,8 +2063,8 @@ function StatusIcon(props) {
   const size = props.size ?? 13;
   const color = { open: "var(--dbx-tertiary)", in_progress: "var(--dbx-warning)", waiting: "var(--dbx-danger)", done: "var(--dbx-success)", dismissed: "var(--dbx-tertiary)" }[props.status] ?? "var(--dbx-tertiary)";
   const fill = props.status === "in_progress" ? `conic-gradient(${color} 0 50%, transparent 50% 100%)` : props.status === "done" ? color : "transparent";
-  const label = STATUS_GROUPS.find((group) => group.status === props.status)?.title ?? props.status;
-  return /* @__PURE__ */ React.createElement("span", { title: label, "aria-label": label, style: { width: size, height: size, flex: "none", boxSizing: "border-box", borderRadius: 999, border: `1.5px ${props.status === "waiting" ? "dotted" : "solid"} ${color}`, background: fill, display: "inline-flex", alignItems: "center", justifyContent: "center", color: "var(--dbx-surface)", fontSize: size * 0.6, lineHeight: 1 } }, props.status === "done" ? "\u2713" : props.status === "dismissed" ? /* @__PURE__ */ React.createElement("span", { style: { color, fontSize: size * 0.7 } }, "\xD7") : null);
+  const label2 = STATUS_GROUPS.find((group) => group.status === props.status)?.title ?? props.status;
+  return /* @__PURE__ */ React.createElement("span", { title: label2, "aria-label": label2, style: { width: size, height: size, flex: "none", boxSizing: "border-box", borderRadius: 999, border: `1.5px ${props.status === "waiting" ? "dotted" : "solid"} ${color}`, background: fill, display: "inline-flex", alignItems: "center", justifyContent: "center", color: "var(--dbx-surface)", fontSize: size * 0.6, lineHeight: 1 } }, props.status === "done" ? "\u2713" : props.status === "dismissed" ? /* @__PURE__ */ React.createElement("span", { style: { color, fontSize: size * 0.7 } }, "\xD7") : null);
 }
 function Chip(props) {
   const color = props.tone === "brand" ? "var(--dbx-lava-text)" : props.tone === "success" ? "var(--dbx-success)" : "var(--dbx-subtle)";
@@ -1926,7 +2101,7 @@ function Owners(props) {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState();
   const [picked, setPicked] = React.useState();
-  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  const closed2 = item.task.status === "done" || item.task.status === "dismissed";
   const owners2 = ownersOf(item);
   const helpers = removable(item).filter((person) => person.role !== "owner");
   const choices = memberChoices(props.members, props.boardAgents, owners2.map((owner) => owner.key), props.profile, props.viewer);
@@ -1951,8 +2126,8 @@ function Owners(props) {
     if (!owners2.length) void run({ assign: [asOwner(member)] });
     else setPicked(member);
   };
-  const row = (person, owner) => /* @__PURE__ */ React.createElement(Stack, { key: `${person.kind}:${person.key}`, direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: person.kind, key: person.key, label: person.label }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, nameOf(person, props.profile), !owner && /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, " \xB7 ", person.role)), !closed && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-input", disabled: busy, title: person.kind === "agent" ? "Take it off this task: it's told in the thread to stop" : "Take them off this task", "aria-label": `Take ${nameOf(person, props.profile)} off`, onClick: () => void run({ unassign: [off(person)] }), style: { width: "auto", padding: "0 6px", lineHeight: 1.4, cursor: "pointer" } }, "\xD7"));
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "OWNERS"), item.task.question && !closed && !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: "you" }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Waiting on your input")), owners2.length ? owners2.map((person) => row(person, true)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No one", helpers.length ? "; agents asked are below" : "", "."), helpers.length > 0 && helpers.map((person) => row(person, false)), !closed && !picked && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assign", disabled: busy || !choices.length, value: "", onChange: (event) => pick(event.target.value), style: { fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("option", { value: "" }, choices.length ? "Assign to\u2026" : "No channel members to assign"), choices.map((member) => /* @__PURE__ */ React.createElement("option", { key: member.key, value: member.key }, member.agent ? "\u{1F916} " : "", member.name))), picked && /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs" }, "Assign ", picked.name, ":"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, title: "Take the current owners off and assign them", onClick: () => void run({ assign: [asOwner(picked)], unassign: owners2.map(off) }) }, "Reassign"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, title: "Keep the current owners", onClick: () => void run({ assign: [asOwner(picked)] }) }, "Add"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => setPicked(void 0) }, "Cancel"))), busy && /* @__PURE__ */ React.createElement(Spinner, { size: 10 }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error));
+  const row = (person, owner) => /* @__PURE__ */ React.createElement(Stack, { key: `${person.kind}:${person.key}`, direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: person.kind, key: person.key, label: person.label }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, nameOf(person, props.profile), !owner && /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, " \xB7 ", person.role)), !closed2 && /* @__PURE__ */ React.createElement("button", { type: "button", className: "dbx-input", disabled: busy, title: person.kind === "agent" ? "Take it off this task: it's told in the thread to stop" : "Take them off this task", "aria-label": `Take ${nameOf(person, props.profile)} off`, onClick: () => void run({ unassign: [off(person)] }), style: { width: "auto", padding: "0 6px", lineHeight: 1.4, cursor: "pointer" } }, "\xD7"));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "OWNERS"), item.task.question && !closed2 && !props.compact && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(AssigneeMark, { assignee: { kind: "you" }, profile: props.profile }), /* @__PURE__ */ React.createElement(Text, { size: "sm" }, "Waiting on your input")), owners2.length ? owners2.map((person) => row(person, true)) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "No one", helpers.length ? "; agents asked are below" : "", "."), helpers.length > 0 && helpers.map((person) => row(person, false)), !closed2 && !picked && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Assign", disabled: busy || !choices.length, value: "", onChange: (event) => pick(event.target.value), style: { fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("option", { value: "" }, choices.length ? "Assign to\u2026" : "No channel members to assign"), choices.map((member) => /* @__PURE__ */ React.createElement("option", { key: member.key, value: member.key }, member.agent ? "\u{1F916} " : "", member.name))), picked && /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs" }, "Assign ", picked.name, ":"), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, title: "Take the current owners off and assign them", onClick: () => void run({ assign: [asOwner(picked)], unassign: owners2.map(off) }) }, "Reassign"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, title: "Keep the current owners", onClick: () => void run({ assign: [asOwner(picked)] }) }, "Add"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => setPicked(void 0) }, "Cancel"))), busy && /* @__PURE__ */ React.createElement(Spinner, { size: 10 }), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error));
 }
 function ProvideInput(props) {
   const { task } = props.task;
@@ -1994,9 +2169,9 @@ function TaskBody(props) {
       setBusy(false);
     }
   };
-  const closed = item.task.status === "done" || item.task.status === "dismissed";
+  const closed2 = item.task.status === "done" || item.task.status === "dismissed";
   const assets = item.artifacts.filter((artifact) => /^https?:/.test(artifact.url) && artifact.kind !== "workspace");
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && props.assigning && /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, ...props.assigning, onChange: props.onChange, compact: true }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 8, style: { paddingTop: 8 } }, item.task.question && !closed2 && /* @__PURE__ */ React.createElement(ProvideInput, { hub: props.hub, task: item, onDone: props.onChange }), !props.full && props.assigning && /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, ...props.assigning, onChange: props.onChange, compact: true }), !props.full && item.source?.title && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "From ", item.source.source, ": ", item.source.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, item.source.title) : item.source.title), !props.full && item.activity && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, item.activity.kind === "agent_reply" ? "Agent: " : "", item.activity.text.length > 280 ? `${item.activity.text.slice(0, 279)}\u2026` : item.activity.text, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", ago(item.activity.at * 1e3))), !props.full && assets.length > 0 && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true }, assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem" } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.kind))), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.open && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", title: "Its details, assets and thread", onClick: () => props.open(item) }, "Open"), /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: !item.thread, title: "Open its thread to steer the agents there", onClick: () => props.steer(item) }, "Steer"), !closed2 && /* @__PURE__ */ React.createElement(AddAgent, { hub: props.hub, task: item, onDone: props.onChange }), /* @__PURE__ */ React.createElement("select", { className: "dbx-input", "aria-label": "Status", disabled: busy, value: item.task.status, onChange: (event) => void setStatus(event.target.value), style: { width: "auto", fontSize: "0.75rem" } }, TASK_STATUSES.map((status2) => /* @__PURE__ */ React.createElement("option", { key: status2, value: status2 }, status2.replace("_", " ")))), !closed2 && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, onClick: () => void setStatus("dismissed") }, "Dismiss")));
 }
 function AssignButton(props) {
   const name = assigneeName(props.assignee, props.profile);
@@ -2132,7 +2307,7 @@ function TaskView(props) {
     if (seen.current !== void 0 && count > seen.current) onChange();
     seen.current = count;
   }, [count, thread.status]);
-  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.reading && /* @__PURE__ */ React.createElement(Spinner, { size: 10, label: "Reading the thread" }), thread.limited && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Only part of the thread can be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), " for the rest."), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, members, boardAgents: props.boardAgents, ...viewer && { viewer }, profile: who, onChange: props.onChange }), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center" }, props.back && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: props.back }, "\u2190 Board"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "#", item.task.id)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "flex-start" }, /* @__PURE__ */ React.createElement("span", { style: { paddingTop: 4 } }, /* @__PURE__ */ React.createElement(StatusIcon, { status: item.task.status, size: 15 })), /* @__PURE__ */ React.createElement(Text, { as: "h2", size: "xl", weight: 600, style: { overflowWrap: "anywhere" } }, item.task.title)), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 20, alignItems: "flex-start", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "2 1 360px", minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, /* @__PURE__ */ React.createElement(TaskBody, { hub: props.hub, item, steer: props.steer, onChange: props.onChange, full: true }), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Text, { size: "sm", weight: 600 }, "Activity"), !item.thread ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Not posted in Buzz yet.") : !thread.available ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "The thread can't be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), ".") : thread.status === "error" ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, thread.error ?? "Couldn't read the thread.") : thread.status !== "ready" && !count ? /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the thread" }) : /* @__PURE__ */ React.createElement(Stack, { gap: 14 }, thread.more && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: thread.more }, "Earlier comments"), thread.reading && /* @__PURE__ */ React.createElement(Spinner, { size: 10, label: "Reading the thread" }), thread.limited && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Only part of the thread can be read here. ", /* @__PURE__ */ React.createElement("a", { href: "#", onClick: (event) => (event.preventDefault(), props.steer(item)) }, "Open it in Buzz"), " for the rest."), thread.comments.map((comment) => /* @__PURE__ */ React.createElement(CommentItem, { key: comment.id, comment, profile: who })), /* @__PURE__ */ React.createElement("div", { ref: end })), item.thread && /* @__PURE__ */ React.createElement(ReplyBox, { assignee, profile: props.profile, ...thread.reply && { send: thread.reply }, steer: () => props.steer(item) }))))), /* @__PURE__ */ React.createElement("aside", { style: { flex: "1 1 220px", minWidth: 0, maxWidth: 340 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Owners, { hub: props.hub, item, members, boardAgents: props.boardAgents, ...viewer && { viewer }, profile: who, onChange: props.onChange }), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "DETAILS"), facts.map((fact) => /* @__PURE__ */ React.createElement("div", { key: fact.label, style: { display: "flex", gap: 8, fontSize: "0.75rem" } }, /* @__PURE__ */ React.createElement("span", { style: { flex: "0 0 84px", color: "var(--dbx-tertiary)" } }, fact.label), /* @__PURE__ */ React.createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" } }, fact.label === "Source" && item.source?.url ? /* @__PURE__ */ React.createElement("a", { href: item.source.url, onClick: link(item.source.url) }, fact.value) : fact.value)))), people.length > 0 && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "PEOPLE"), people.map((person) => /* @__PURE__ */ React.createElement(Text, { key: `${person.kind}:${person.key}`, size: "xs" }, person.label, " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", person.role)))), /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", weight: 600 }, "ASSETS"), !assets.length ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Nothing made for it yet.") : assets.map((artifact) => /* @__PURE__ */ React.createElement("a", { key: `${artifact.at}:${artifact.url}`, href: artifact.url, onClick: link(artifact.url), title: artifact.url, style: { fontSize: "0.75rem", overflowWrap: "anywhere", opacity: artifact.kind === "workspace" ? 0.65 : 1 } }, ASSET_ICON[artifact.kind] ?? "\u{1F517}", " ", artifact.title ?? artifact.url.replace(/^https?:\/\//, "").slice(0, 60), " ", /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "\xB7 ", artifact.kind))))))));
 }
 var VIEW_KEY = "signals.board.view";
 var savedView = () => {
@@ -2324,6 +2499,255 @@ function boardPage(ctx, service) {
       }
     );
   };
+}
+function taskPanel(ctx, live) {
+  return function TaskPanel({ target, context }) {
+    const at = readTaskTarget(target);
+    React.useSyncExternalStore(live.subscribe, live.snapshot);
+    const connection = useConnection(live.service);
+    const [hub2, setHub] = React.useState();
+    const [problem, setProblem] = React.useState();
+    const [attempt, retry] = React.useReducer((n) => n + 1, 0);
+    React.useEffect(() => {
+      if (connection.status !== "connected") return;
+      let current = true;
+      setProblem(void 0);
+      live.client().then(
+        (found) => current && (found ? setHub(found) : setProblem("There's no signals hub in this workspace.")),
+        (error) => current && setProblem(describeError(error))
+      );
+      return () => void (current = false);
+    }, [connection.status, attempt]);
+    const entry = at && connection.status === "connected" ? live.board(at.channel) : void 0;
+    const item = at ? entry?.board?.tasks.find((found) => found.task.id === at.id) : void 0;
+    ctx.panels.useTabTitle?.(at ? `Task ${at.id}` : "Task");
+    const agents = item ? [...new Set(item.people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
+    const profile = useProfiles(ctx, agents);
+    const steer = (found) => void (found.thread && context?.canOpen(found.thread) && context.open(found.thread));
+    let body;
+    if (!at) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, "This link doesn't name a task.");
+    else if (connection.status !== "connected") body = /* @__PURE__ */ React.createElement(Notice, { title: "Connect Databricks", action: /* @__PURE__ */ React.createElement(Button, { variant: "brand", onClick: () => live.service.openSettings() }, "Connect") }, "Tasks live in your team's signals hub, a Databricks App.");
+    else if (problem || entry?.error && !entry.board) body = /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't load the task", action: /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => (retry(), void live.load(at.channel)) }, "Try again") }, problem ?? describeError(entry.error));
+    else if (!hub2 || !entry?.board) body = /* @__PURE__ */ React.createElement(Spinner, { label: "Loading the task" });
+    else if (!item) body = /* @__PURE__ */ React.createElement(Notice, { title: `Task ${at.id} isn't on this channel's board` }, "Done and dismissed tasks leave the board after two weeks.");
+    else body = /* @__PURE__ */ React.createElement(TaskView, { ctx, hub: hub2, item, channel: at.channel, boardAgents: agents, profile, steer, onChange: () => void live.load(at.channel) });
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: "100%", width: "100%", height: "100%", overflow: "auto", boxSizing: "border-box" } }, /* @__PURE__ */ React.createElement("div", { style: { padding: 16, minWidth: 0, boxSizing: "border-box" } }, body));
+  };
+}
+
+// plugins/signals/src/live-tasks.ts
+var STALE_MS = 3e4;
+var LiveTasks = class {
+  constructor(service) {
+    this.service = service;
+  }
+  hub;
+  boards = /* @__PURE__ */ new Map();
+  listeners = /* @__PURE__ */ new Set();
+  version = 0;
+  /** Changes whenever a board is read, for useSyncExternalStore. */
+  snapshot = () => this.version;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    return () => void this.listeners.delete(listener);
+  };
+  notify() {
+    this.version++;
+    for (const listener of [...this.listeners]) listener();
+  }
+  /** Whether Databricks is connected, so the hub can be asked. */
+  connected() {
+    return this.service.snapshot().status === "connected";
+  }
+  /** The hub as the signed-in person, found once per workspace. */
+  client() {
+    const snapshot = this.service.snapshot();
+    if (snapshot.status !== "connected") return Promise.resolve(void 0);
+    const key = "profile" in snapshot ? snapshot.profile.host : "connected";
+    if (this.hub?.key !== key) {
+      const client = chosenHub(this.service).then((found) => found.app ? new HubClient(this.service.client(), found.app) : void 0).catch((error) => (this.hub = void 0, Promise.reject(error)));
+      this.hub = { key, client };
+    }
+    return this.hub.client;
+  }
+  /** A channel's board as last read, reading it (again) when it's missing or stale. */
+  board(channel) {
+    const entry = this.boards.get(channel) ?? {};
+    if (!this.boards.has(channel)) this.boards.set(channel, entry);
+    if (!entry.pending && this.connected() && (!entry.board || Date.now() - entry.board.at > STALE_MS) && !(entry.error && !entry.board && Date.now() - (entry.errorAt ?? 0) < STALE_MS)) void this.load(channel);
+    return entry;
+  }
+  /** The task as the hub has it now, if its channel's board was read. */
+  task(channel, id) {
+    return this.board(channel).board?.tasks.find((item) => item.task.id === id);
+  }
+  /** The task whose thread starts at `root`, if its channel's board was read. */
+  byRoot(channel, root) {
+    return this.board(channel).board?.tasks.find((item) => item.task.buzz_root === root);
+  }
+  /** Whether a channel's board is being read and none is shown yet. */
+  loading(channel) {
+    const entry = this.boards.get(channel);
+    return Boolean(entry?.pending && !entry.board);
+  }
+  /** Reads a channel's board now (after an action on one of its tasks, say). */
+  load(channel) {
+    const entry = this.boards.get(channel) ?? {};
+    this.boards.set(channel, entry);
+    if (entry.pending) return entry.pending;
+    entry.pending = (async () => {
+      try {
+        const hub2 = await this.client();
+        if (!hub2) return;
+        const read = await hub2.board(channel);
+        entry.board = { tasks: read.tasks, at: Date.now() };
+        entry.error = void 0;
+      } catch (error) {
+        entry.error = error instanceof Error ? error : new Error(String(error));
+        entry.errorAt = Date.now();
+      } finally {
+        entry.pending = void 0;
+        this.notify();
+      }
+    })();
+    this.notify();
+    return entry.pending;
+  }
+  /** Answers what a task asks, then reads its board again so every card shows the answer. */
+  async answer(channel, id, input) {
+    const hub2 = await this.client();
+    if (!hub2) throw new Error("There's no signals hub in your Databricks workspace.");
+    await hub2.updateTask({ id, input });
+    await this.load(channel);
+  }
+};
+
+// plugins/signals/src/post-cards.tsx
+var MODE_TITLE = { auto: "Auto: agents do it and report", draft: "Draft: agents prepare it, a person sends it", ask: "Ask: agents ask before doing anything", off: "Off: agents leave it alone" };
+var clamp = (lines) => ({ display: "-webkit-box", WebkitLineClamp: lines, WebkitBoxOrient: "vertical", overflow: "hidden" });
+var statusTitle = (status2) => STATUS_GROUPS.find((group) => group.status === status2)?.title ?? status2;
+var closed = (item) => item?.task.status === "done" || item?.task.status === "dismissed";
+function Chip2(props) {
+  const color = props.tone === "warning" ? "var(--dbx-warning)" : props.tone === "success" ? "var(--dbx-success)" : "var(--dbx-subtle)";
+  return /* @__PURE__ */ React.createElement("span", { title: props.title, style: { display: "inline-flex", alignItems: "center", padding: "0 6px", borderRadius: 4, border: "1px solid var(--dbx-border)", fontSize: "0.6875rem", lineHeight: "18px", color, whiteSpace: "nowrap", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" } }, props.children);
+}
+function useLiveTask(live, channel, by) {
+  React.useSyncExternalStore(live.subscribe, live.snapshot);
+  const connection = React.useSyncExternalStore(live.service.subscribe, live.service.snapshot);
+  if (connection.status !== "connected") return void 0;
+  return by.id !== void 0 ? live.task(channel, by.id) : by.root ? live.byRoot(channel, by.root) : void 0;
+}
+function FullPost(props) {
+  const HostMarkdown = props.ctx.conversation?.ui?.Markdown;
+  return /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid var(--dbx-border)", paddingTop: 8, overflowWrap: "anywhere" } }, HostMarkdown ? /* @__PURE__ */ React.createElement(HostMarkdown, { content: props.content }) : /* @__PURE__ */ React.createElement(Markdown, { source: withMentionNames(props.content, npubKey, (key) => props.profile(key)?.name), size: "sm" }));
+}
+function Answer(props) {
+  const { live, item } = props;
+  const [busy, setBusy] = React.useState();
+  const [error, setError] = React.useState();
+  const [other, setOther] = React.useState(false);
+  const [text, setText] = React.useState("");
+  const connected = live.connected();
+  const ready = connected && props.id !== void 0;
+  const waiting = item ? Boolean(item.task.question) && !closed(item) && item.task.question === props.question : void 0;
+  const send = async (answer) => {
+    if (!answer.trim() || busy || props.id === void 0) return;
+    setBusy(answer);
+    setError(void 0);
+    try {
+      await live.answer(props.channel, props.id, answer.trim());
+      setText("");
+      setOther(false);
+    } catch (problem) {
+      const message = describeError(problem);
+      setError(/isn't waiting on input/.test(message) ? "Someone already answered this." : message);
+      if (/isn't waiting on input/.test(message)) void live.load(props.channel);
+    } finally {
+      setBusy(void 0);
+    }
+  };
+  if (waiting === false)
+    return /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "baseline", wrap: true }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "success", weight: 600 }, "\u2713 Answered"), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { minWidth: 0, ...clamp(1) } }, props.question));
+  return /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "3px solid var(--dbx-warning)", paddingLeft: 10 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Text, { size: "xs", weight: 600, tone: "warning" }, "Needs your input"), /* @__PURE__ */ React.createElement(Text, { size: "sm", style: { overflowWrap: "anywhere" } }, props.question), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, wrap: true, align: "center" }, props.options.map((option) => /* @__PURE__ */ React.createElement(Button, { key: option, size: "sm", disabled: !ready || Boolean(busy), onClick: () => void send(option), title: `Answer \u201C${option}\u201D` }, busy === option ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, option)), !other && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", disabled: !ready || Boolean(busy), onClick: () => setOther(true) }, props.options.length ? "Other answer\u2026" : "Answer\u2026")), other && /* @__PURE__ */ React.createElement("form", { onSubmit: (event) => (event.preventDefault(), void send(text)), style: { display: "flex", gap: 6, flexWrap: "wrap", minWidth: 0 } }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      className: "dbx-input",
+      "aria-label": "Your answer",
+      placeholder: "Your answer",
+      autoFocus: true,
+      value: text,
+      onChange: (event) => setText(event.target.value),
+      onKeyDown: (event) => event.key === "Escape" && (event.preventDefault(), setOther(false)),
+      style: { flex: "1 1 200px", minWidth: 0 }
+    }
+  ), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", type: "submit", disabled: !text.trim() || Boolean(busy) }, busy && busy === text.trim() ? /* @__PURE__ */ React.createElement(Spinner, { size: 10 }) : null, "Send answer")), connected && props.id === void 0 && (live.loading(props.channel) ? /* @__PURE__ */ React.createElement(Spinner, { size: 10, label: "Loading the task" }) : /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "This task isn't on the signals hub you're connected to. Answer from its Tasks board.")), !connected && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle" }, "Connect Databricks to answer here.", " ", /* @__PURE__ */ React.createElement("a", { href: "#", className: "dbx-link", onClick: (event) => (event.preventDefault(), live.service.openSettings()) }, "Connect")), error && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "danger" }, error)));
+}
+function SourceLine(props) {
+  const { source } = props;
+  if (!source) return null;
+  const parts = [sourceName(source.kind), source.from, source.where && !/^https?:/.test(source.where) ? source.where : void 0, source.when && shortWhen(source.when)].filter(Boolean);
+  return /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { minWidth: 0, ...clamp(1) } }, /* @__PURE__ */ React.createElement("span", { title: parts.join(" \xB7 ") }, parts.join(" \xB7 ")));
+}
+function TaskPostCard(props) {
+  const { message, live } = props;
+  const post = React.useMemo(() => parseTaskPost(message.content), [message.content]);
+  const item = useLiveTask(live, message.channelId, { ...post && { id: post.id } });
+  const [full, setFull] = React.useState(false);
+  const mentioned = React.useMemo(() => mentionedNpubs(message.content).map(npubKey).filter((key) => Boolean(key)), [message.content]);
+  const assignee = item && assigneeOf(item);
+  const profile = useProfiles(props.ctx, [...mentioned, ...assignee && (assignee.kind === "agent" || assignee.kind === "person") ? [assignee.key] : []]);
+  if (!post) return null;
+  const target = taskTarget(message.channelId, post.id);
+  const question = item ? item.task.question && !closed(item) ? item.task.question : void 0 : post.question;
+  const options = item ? item.task.options ?? [] : post.options;
+  const status2 = item?.task.status;
+  const source = post.source;
+  const open = () => props.canOpen(target) && props.open(target) || props.openBoard(message.channelId);
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: "10px 12px", borderRadius: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true, style: { minWidth: 0 } }, status2 ? /* @__PURE__ */ React.createElement(StatusIcon, { status: status2 }) : /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "Task ", post.id), status2 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: status2 === "waiting" ? "warning" : status2 === "done" ? "success" : "subtle", weight: 500 }, statusTitle(status2)), post.workstream && /* @__PURE__ */ React.createElement(Chip2, null, post.workstream), post.initiative && /* @__PURE__ */ React.createElement(Chip2, null, post.initiative), post.mode && post.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip2, { title: MODE_TITLE[post.mode], ...post.mode === "auto" && { tone: "success" } }, post.mode)), assignee && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none", maxWidth: "40%" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, assignee.kind === "you" ? "Waiting on you" : assigneeName(assignee, profile)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { size: "md", weight: 600, style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: post.title }, post.title)), /* @__PURE__ */ React.createElement(SourceLine, { source })), source?.quote && /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(3) } }, source.quote)), source && source.facts.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 } }, source.facts.map((fact) => /* @__PURE__ */ React.createElement(Text, { key: fact.label, size: "xs", tone: "subtle", style: { whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, fact.label), " ", fact.value))), question && /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, id: post.id, question, options, ...item && { item } }), item?.activity && !question && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, item.activity.kind === "agent_reply" ? "Agent" : "Latest", " \xB7 ", ago(item.activity.at * 1e3), " \xB7 "), /* @__PURE__ */ React.createElement("span", { title: item.activity.text }, item.activity.text)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: open, title: "Its details, what's been made for it and its thread" }, "Open task"), source?.url && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => openExternal(source.url), title: source.url }, "View source \u2197"), /* @__PURE__ */ React.createElement("span", { style: { flex: "1 1 auto" } }), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setFull(!full), title: "The whole message, as agents read it" }, full ? "Hide full post" : "Full post")), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile }))));
+}
+var LINE_ICON = { update: "\u21BB", done: "\u2713", nudge: "\u23F1", answered: "\u21B3", status: "\u25CF", assigned: "\u{1F464}", asked: "\u2192" };
+function ThreadPostCard(props) {
+  const { message, live } = props;
+  const post = React.useMemo(() => parseThreadPost(message.content), [message.content]);
+  const item = useLiveTask(live, message.channelId, { ...message.threadRootId && { root: message.threadRootId } });
+  const id = item?.task.id;
+  const [full, setFull] = React.useState(false);
+  const mentioned = React.useMemo(() => mentionedNpubs(message.content).map(npubKey).filter((key) => Boolean(key)), [message.content]);
+  const profile = useProfiles(props.ctx, mentioned);
+  if (!post) return null;
+  const named = (text) => withMentionNames(text, npubKey, (key) => profile(key)?.name).replace(/\*\*/g, "");
+  if (post.kind === "question") {
+    const by = named(post.by);
+    return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, ...id !== void 0 && { id }, question: post.question, options: post.options, ...item && { item } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, "Asked by ", by)));
+  }
+  let body;
+  let forAgents = false;
+  switch (post.kind) {
+    case "update":
+      forAgents = post.forAgents;
+      body = /* @__PURE__ */ React.createElement(React.Fragment, null, post.url ? /* @__PURE__ */ React.createElement("a", { href: post.url, className: "dbx-link", title: post.url, onClick: (event) => (event.preventDefault(), openExternal(post.url)) }, post.title) : /* @__PURE__ */ React.createElement("span", null, post.title), post.changes.map((change) => /* @__PURE__ */ React.createElement(Chip2, { key: change.field, title: `${change.field}: ${change.from} \u2192 ${change.to}` }, change.field, " ", change.from === "(none)" ? "" : `${change.from} `, "\u2192 ", /* @__PURE__ */ React.createElement("b", { style: { marginLeft: 3 } }, change.to))));
+      break;
+    case "done":
+      body = /* @__PURE__ */ React.createElement("span", null, "Done: ", post.reason);
+      break;
+    case "nudge":
+      body = /* @__PURE__ */ React.createElement("span", null, post.text);
+      break;
+    case "answered":
+      forAgents = post.forAgents;
+      body = /* @__PURE__ */ React.createElement("span", null, named(post.who), " answered ", /* @__PURE__ */ React.createElement("b", null, named(post.answer)), post.question ? /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, " to \u201C", post.question.length > 80 ? `${post.question.slice(0, 79)}\u2026` : post.question, "\u201D") : null);
+      break;
+    case "status":
+    case "assigned":
+      forAgents = post.kind === "assigned" && post.forAgents;
+      body = /* @__PURE__ */ React.createElement("span", null, named(post.text));
+      break;
+    case "asked":
+      forAgents = true;
+      body = /* @__PURE__ */ React.createElement("span", null, post.text, mentioned.length ? `: ${mentioned.map((key) => profile(key)?.name ?? "an agent").join(", ")}` : "");
+      break;
+  }
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 6, fontSize: "0.75rem", color: "var(--dbx-subtle)", minWidth: 0 } }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { color: post.kind === "done" ? "var(--dbx-success)" : "var(--dbx-tertiary)", flex: "none" } }, LINE_ICON[post.kind]), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: 6, rowGap: 2, flex: "1 1 auto", minWidth: 0, overflowWrap: "anywhere" } }, body, forAgents && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFull(!full), "aria-expanded": full, style: { border: 0, background: "transparent", padding: 0, cursor: "pointer", color: "var(--dbx-tertiary)", fontSize: "0.75rem", textDecoration: "underline dotted" } }, full ? "Hide" : "For agents"))), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile })));
 }
 
 // plugins/signals/src/tools.ts
@@ -2559,7 +2983,7 @@ async function setUpPollerJob(client, onboarding, options = {}) {
 }
 
 // plugins/signals/src/index.tsx
-var inject = ["react", "settingsCards", "panels", "pages"];
+var inject = ["react", "settingsCards", "panels", "pages", "conversation"];
 var WORKSPACE_PREF = "signalsWorkspace";
 function HubWorkspace(props) {
   const [, setProfile] = usePreference(props.main, WORKSPACE_PREF);
@@ -2653,6 +3077,44 @@ function SignalsSettings(props) {
     }
   ), (hubs.data?.apps.length ?? 0) > 1 && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", value: app.name, onChange: (event) => setPicked(event.target.value), style: { maxWidth: 320 } }, hubs.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.name)))), /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Your sources", description: "Off until you turn them on. Turning one off stops it; Forget also deletes what the hub keeps from it (tasks others work on stay)." }), loaded.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), loaded.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't reach the hub" }, describeError(loaded.error)), hub2 && [...catalog, ...extra, { name: "agent", label: "Agents", description: "Events your agents send with signals_event." }].map((info) => /* @__PURE__ */ React.createElement(SourceRow, { key: info.name, service, hub: hub2, info, state: sources?.find((state) => state.source === info.name), onChange: setSources }))), hub2 && /* @__PURE__ */ React.createElement(PollerSetup, { hub: hub2, service }));
 }
+var HUB_AUTHORS_KEY = "signals.hubAuthors";
+function registerPosts(ctx, scope, databricks) {
+  const live = new LiveTasks(databricks);
+  const authors = /* @__PURE__ */ new Set();
+  try {
+    for (const key of JSON.parse(globalThis.localStorage?.getItem(HUB_AUTHORS_KEY) ?? "[]")) if (typeof key === "string") authors.add(key);
+  } catch {
+  }
+  const remember = (author) => {
+    if (authors.has(author)) return;
+    authors.add(author);
+    try {
+      globalThis.localStorage?.setItem(HUB_AUTHORS_KEY, JSON.stringify([...authors].slice(-20)));
+    } catch {
+    }
+  };
+  const openBoard = (channel) => {
+    const navigation = optionalService(ctx, "navigation");
+    void navigation?.open({ version: 1, kind: "page", pluginId: "bkvarda.databricks-signals", pageId: BOARD_PAGE, route: { version: 1, params: { channel } } });
+  };
+  scope.panels.register({ id: "task", title: "Task", matches: (target) => readTaskTarget(target) !== void 0, component: taskPanel(ctx, live) });
+  scope.conversation.registerMessage({
+    id: "task-post",
+    title: "Signals task",
+    matches: (message) => {
+      if (!isTaskPost(message.content)) return false;
+      remember(message.authorId);
+      return true;
+    },
+    component: (props) => /* @__PURE__ */ React.createElement(TaskPostCard, { ctx, live, message: props.message, canOpen: props.canOpen, open: props.open, openBoard })
+  });
+  scope.conversation.registerMessage({
+    id: "task-reply",
+    title: "Signals update",
+    matches: (message) => Boolean(message.threadRootId) && authors.has(message.authorId) && parseThreadPost(message.content) !== void 0,
+    component: (props) => /* @__PURE__ */ React.createElement(ThreadPostCard, { ctx, live, message: props.message })
+  });
+}
 function apply(ctx) {
   bindReact(ctx.react);
   const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, main) => {
@@ -2678,6 +3140,7 @@ function apply(ctx) {
       channelPlacement: "tab",
       component: boardPanel(ctx, databricks)
     });
+    registerPosts(ctx, scope, databricks);
     return { main, databricks, BoardPage: boardPage(ctx, databricks) };
   });
   ctx.pages.register({

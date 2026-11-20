@@ -328,11 +328,32 @@ export class Hub {
       const title = update.title && plainSlack(update.title);
       const text = `Update: ${update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event")}`;
       if (update.changes?.length) {
+        this.posted(update.task.id, text);
         await this.changed(update.task, text, update.changes, update.outgrown).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
         continue;
       }
+      // A source that saves an event again with nothing new to say (a calendar does, hourly) doesn't repeat the line.
+      if (this.repeats(update.task.id, text)) continue;
       await this.notifier.updated(update.task, text).catch((error: Error) => this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`));
     }
+  }
+
+  /** The last update line each task's thread got, and when, so the same line isn't posted again soon after. */
+  private readonly lastUpdates = new Map<number, Readonly<{ text: string; at: number }>>();
+
+  private posted(task: number, text: string) {
+    this.lastUpdates.delete(task);
+    this.lastUpdates.set(task, { text, at: Date.now() });
+    // The oldest go first; a task that's forgotten can repeat its line once.
+    if (this.lastUpdates.size > 5000) this.lastUpdates.delete(this.lastUpdates.keys().next().value!);
+  }
+
+  /** Whether `text` is the line this task's thread got last, within REPEAT_MS; otherwise it's noted as posted. */
+  private repeats(task: number, text: string): boolean {
+    const last = this.lastUpdates.get(task);
+    if (last?.text === text && Date.now() - last.at < REPEAT_MS) return true;
+    this.posted(task, text);
+    return false;
   }
 
   /**
@@ -867,6 +888,9 @@ export class Hub {
     return { posted, nudged, finished };
   }
 }
+
+/** How long the same update line isn't posted again in a task's thread. */
+const REPEAT_MS = 12 * 60 * 60 * 1000;
 
 /** What a task's thread is told when its rule finishes it. */
 export const doneMessage = (reason: string) => `✅ Done: ${reason}. (Set its status on the Tasks board if it isn't.)`;

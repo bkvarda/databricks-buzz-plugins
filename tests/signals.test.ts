@@ -273,6 +273,20 @@ describe("the hub API", () => {
     expect(((await call("GET", "/api/tasks", undefined, "alice@x.com", "open=1&account=Acme")).json as { tasks: unknown[] }).tasks).toHaveLength(1);
   });
 
+  it("doesn't repeat an update line when an event is saved again with nothing new", async () => {
+    await call("POST", "/api/sources", { source: "gmail", enabled: true });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "sam@acme.com", title: "Q", group_key: "t1" }] });
+    const again = (n: number, title = "Re: Q", url = "https://mail/2") => call("POST", "/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "sam@acme.com", title, url, group_key: "t1", payload: { snippet: `seen ${n}` } }] });
+    await again(1);
+    await again(2);
+    await again(3);
+    expect(posts.filter((post) => post.kind === "updated").map((post) => post.text)).toEqual(["Update: [Re: Q](https://mail/2)"]);
+    // Something new to say is posted.
+    await again(4, "Re: Q (new subject)");
+    expect(posts.at(-1)).toEqual({ kind: "updated", task: 1, text: "Update: [Re: Q (new subject)](https://mail/2)" });
+  });
+
   it("updates tasks with status, notes and artifacts", async () => {
     await call("POST", "/api/sources", { source: "gmail", enabled: true });
     await call("POST", "/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
