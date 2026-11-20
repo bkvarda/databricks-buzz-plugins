@@ -288,6 +288,52 @@ describe("rule categories", () => {
     expect(await store.task(tasks.open!.id)).toMatchObject({ rule_id: "resolved" });
   });
 
+  it("places a replayed update once, whichever post of it gets there first, and never over a newer version", async () => {
+    const rules = [
+      { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "investigating", group: "es", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "verified", group: "es", when: { "payload.status": ["Verified"] }, watch: ["payload.status"] },
+    ] satisfies readonly Rule[];
+    for (const scenario of ["duplicate", "newer"] as const) {
+      // conflict: a filing by hand before each refile write; pause: the next refile write waits until it's let go.
+      let stage: "open" | "conflict" | "pause" = "open";
+      let attempts = 0;
+      let reached!: () => void;
+      let release!: () => void;
+      const paused = new Promise<void>((resolve) => { reached = resolve; });
+      const resumed = new Promise<void>((resolve) => { release = resolve; });
+      const { store, post } = await prepare("capacity request: auto\nverified: auto\ninvestigating: off", rules, (text, values) => {
+        if (!text.includes("SET rule_id = $2") || stage === "open") return undefined;
+        if (stage === "pause") {
+          stage = "open";
+          reached();
+          return resumed;
+        }
+        attempts++;
+        return store.file(Number(values?.[0]), "bob@x.com", { workstream: attempts % 2 ? "incident" : "capacity request" }).then(() => undefined);
+      });
+      await post(ticket("ES-990", "Please increase TPM", { status: "Incoming" }));
+      const task = (await store.tasks({}))[0]!;
+      const older = ticket("ES-990", "Please increase TPM", { status: "Investigating" });
+      stage = "conflict";
+      expect((await post(older)).errors).toEqual([expect.objectContaining({ retry: true })]);
+      // A replay waits at its refile while another post gets there first: the same version again, or a newer one.
+      stage = "pause";
+      const replay = post(older);
+      await paused;
+      const second = await post(scenario === "duplicate" ? older : ticket("ES-990", "Please increase TPM", { status: "Verified" }));
+      expect(second.updated.map((one) => one.task.id)).toEqual([task.id]);
+      release();
+      // The replay finds the mark gone: it moves, attaches and reports nothing.
+      expect(await replay).toMatchObject({ updated: [], errors: [] });
+      const moves = (await store.detail(task.id))!.activities.filter((one) => one.kind === "rule");
+      expect({ task: await store.task(task.id), moves: moves.length }).toMatchObject({
+        task: scenario === "duplicate" ? { rule_id: "investigating", mode: "off", event_count: 2 } : { rule_id: "verified", mode: "auto", event_count: 2 },
+        moves: 1,
+      });
+    }
+  });
+
   it("opens a closed task again only while the team still works on its own category", async () => {
     const rules = [{ ...ESCALATIONS, group_by: "payload.case" }] satisfies readonly Rule[];
     const { store, post, prefer } = await prepare("escalation tracking: ask\ncapacity request: auto", rules);

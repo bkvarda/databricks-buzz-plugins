@@ -174,6 +174,12 @@ const now = () => Math.floor(Date.now() / 1000);
  */
 class RefileConflict extends Error {}
 
+/**
+ * A replay (see RefileConflict) whose mark is gone: another post of the same version placed it, or a newer version was saved
+ * (its own ingest places it). It stops, writing and reporting nothing more.
+ */
+class ReplayTaken extends Error {}
+
 /** A version to be placed again (see RefileConflict): as the ingest that stopped had it. */
 type PlacePending = { version: number; outcome: Exclude<Outcome, "skipped">; before?: EventInput; changes?: FieldChange[]; reopened: boolean };
 
@@ -592,6 +598,8 @@ export class SignalsStore {
       let resume: PlacePending | undefined;
       let pending: PlacePending | undefined;
       let pendingEvent: number | undefined;
+      // A replay that took its mark (see placedNow): a failure after that puts the mark back, so a post again finishes it.
+      let took = false;
       try {
         let state = consent.get(event.source);
         if (!state) consent.set(event.source, (state = await this.enabled(owner, event.source)));
@@ -618,7 +626,15 @@ export class SignalsStore {
         const recorded = resume ? { ...stored, outcome: resume.outcome, ...(resume.before ? { before: resume.before } : {}) } : stored;
         pendingEvent = recorded.id;
         pending = { version: recorded.version, outcome: recorded.outcome, ...(recorded.before && { before: recorded.before }), reopened: Boolean(resume?.reopened) };
-        const placedNow = () => (resume ? this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND (place_pending->>'version')::int = $2`, [recorded.id, recorded.version]) : Promise.resolve());
+        // A replay places and reports only while it holds the mark: the refile that moves the task takes it in the same statement
+        // (see refile's `owned`), or else this does, before its update is reported. One that finds it gone stops (ReplayTaken).
+        const owned = resume ? { event: recorded.id, version: recorded.version } : undefined;
+        const placedNow = async () => {
+          if (!resume || took) return;
+          const found = await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2 RETURNING 1`, [recorded.id, recorded.version]);
+          if (!found.rows.length) throw new ReplayTaken();
+          took = true;
+        };
         const replies = handledBy(config, event, owner);
         // About every account (a new feature announced): a candidate per opted-in account, then nothing else to do with it.
         // Its version is pending (fan_pending) until placed on every candidate: a failure asks for the post again, and posting it
@@ -700,7 +716,10 @@ export class SignalsStore {
           pending.changes = changes;
           // When a watched field changed and the event now matches another `task` rule of the group, that rule takes the task over, with its playbook.
           // (Only then: groups without watched fields keep their tasks on the rule that opened them, as before.)
-          if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) task = await this.refile(task, placed.rule, config);
+          if (changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task" && isOpen(task.status)) {
+            task = await this.refile(task, placed.rule, config, owned);
+            if (owned) took = true;
+          }
           // Still on its old rule, and that rule doesn't apply now (a case back to Open, say): its playbook would be the wrong one.
           // (Checked for every attached event, whatever its rules watch, changed or not: the last event of a post decides the briefing,
           // and one that changes nothing, a new title say, or that comes through a rule watching nothing, still leaves the task where
@@ -709,8 +728,9 @@ export class SignalsStore {
           if (own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
-        // (Resumed: it may have opened the task again the first time; this attach finds it attached and open.)
-        const reopened = (await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen })) || Boolean(resume?.reopened);
+        // (Resumed: it may have opened the task again the first time; this attach finds it attached and open. And only while it's
+        // the event's saved version: a newer one saved meanwhile is placed by its own ingest.)
+        const reopened = (await this.attachOnce(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen }, Boolean(resume))).reopened || Boolean(resume?.reopened);
         pending.reopened = reopened;
         // A meeting's notes: the account team's items get their own tasks, the rest a checklist on this one.
         let checklist: string | null | undefined;
@@ -724,7 +744,8 @@ export class SignalsStore {
         }
         // A done task isn't taken over above; once this event opened it again, the rule it now matches takes it, as for an open one.
         if (reopened && changes.length && placed.rule.id !== task.rule_id && placed.rule.action === "task") {
-          task = await this.refile(task, placed.rule, config);
+          task = await this.refile(task, placed.rule, config, took ? undefined : owned);
+          if (owned) took = true;
           outgrown = undefined;
         }
         if (placed.opened) {
@@ -750,8 +771,13 @@ export class SignalsStore {
       } catch (error) {
         // A refile that lost every write to filings by hand: the version is marked to be placed again, and the post is asked for
         // again (posted again, the same event takes that mark, above). Only while it's still the version saved: a newer one places itself.
-        const again = error instanceof RefileConflict && saved && !fanning && pending !== undefined
-          && (await this.q(`UPDATE $S.events SET place_pending = $3::jsonb WHERE id = $1 AND versions = $2 RETURNING 1`, [pendingEvent, pending.version, JSON.stringify(pending)]).then((found) => found.rows.length > 0, () => false));
+        // A replay another post or a newer version took over: nothing to report.
+        if (error instanceof ReplayTaken) continue;
+        // (A replay that took its mark and then failed puts back the one it took; one that didn't writes it only while it's still there,
+        // so a replay another post finished meanwhile isn't marked again.)
+        const mark = took ? resume : pending;
+        const again = (error instanceof RefileConflict || took) && saved && !fanning && mark !== undefined
+          && (await this.q(`UPDATE $S.events SET place_pending = $3::jsonb WHERE id = $1 AND versions = $2 AND ${took ? "place_pending IS NULL" : resume ? "place_pending IS NOT NULL" : "true"} RETURNING 1`, [pendingEvent, mark.version, JSON.stringify(mark)]).then((found) => found.rows.length > 0, () => false));
         result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning || again) && { retry: true }) });
         if (!saved || fanning || again) retried.add(event.source);
       } finally {
@@ -1358,8 +1384,10 @@ export class SignalsStore {
    * rule's categories keeps it; one under a category its old rule gave it (see Rule.categories) that the new rule doesn't offer
    * takes the new rule's workstream (none, if it names none). Either way, a task under a category takes the team's mode for it
    * under the new rule (its id first, so a rule turned off stays off); others keep their mode, as before.
+   * With `owned` (a replay, see RefileConflict): only while that event version's mark is there, taken in the same statement; once
+   * it's gone (another post of it placed it, or a newer version was saved), ReplayTaken.
    */
-  private async refile(read: Task, rule: Rule, config: SignalsConfig): Promise<Task> {
+  private async refile(read: Task, rule: Rule, config: SignalsConfig, owned?: Readonly<{ event: number; version: number }>): Promise<Task> {
     // Decided here from the task as read, and written only while the row still has that workstream (so a filing that lands
     // meanwhile is seen, and the mode follows the workstream the row has, normalized as categoryNamed does); if it changed,
     // read it again and decide again.
@@ -1373,16 +1401,21 @@ export class SignalsStore {
       const found = await this.q(
         // Filed by hand: the row's own marker, which file() saves with the workstream, or its history, for tasks filed before
         // the marker. A category of the new rule takes the team's mode for it there ($7), whoever filed it; a dropped one, the rule's.
-        `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS history)
+        // (A replay: the task row locked while it has that workstream, then the mark taken only then, and the move only with it.
+        // A second replay or a newer version's save waits on the event row and then finds the mark gone.)
+        `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS history)${owned ? `,
+         lk AS (SELECT id FROM $S.tasks WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text FOR UPDATE),
+         mk AS (UPDATE $S.events SET place_pending = NULL WHERE id = $9 AND versions = $10 AND (place_pending->>'version')::int = $10 AND EXISTS (SELECT 1 FROM lk) RETURNING 1)` : ""}
          UPDATE $S.tasks SET rule_id = $2,
            workstream = CASE WHEN d.history OR workstream_by IS NOT NULL THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
            mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT (d.history OR workstream_by IS NOT NULL) THEN $6 ELSE mode END, updated_at = $4
-         FROM d WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text
+         FROM d WHERE id = $1 AND workstream IS NOT DISTINCT FROM $8::text${owned ? " AND EXISTS (SELECT 1 FROM mk)" : ""}
          RETURNING $S.tasks.*, ($5::boolean AND NOT (d.history OR $S.tasks.workstream_by IS NOT NULL)) AS dropped`,
-        [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null],
+        [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null, task.workstream ?? null, ...(owned ? [owned.event, owned.version] : [])],
       );
       row = found.rows[0];
       if (row) break;
+      if (owned && !(await this.q(`SELECT 1 FROM $S.events WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2`, [owned.event, owned.version])).rows.length) throw new ReplayTaken();
       const again = await this.task(task.id);
       if (!again) return task;
       if (attempt >= 5) throw new RefileConflict(`task ${task.id}'s workstream kept changing while it moved to rule ${rule.id}`);
