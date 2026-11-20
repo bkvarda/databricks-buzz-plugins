@@ -90,10 +90,13 @@ describe("rule categories", () => {
     const store = new SignalsStore(pglite(), "signals_categories");
     await store.setup();
     await store.setSource("alice@x.com", "jira", true);
-    const config: SignalsConfig = { ...CONFIG, accounts: [{ name: "Acme", channel: "acme", preferences }], rules };
-    const post = (...events: ReturnType<typeof ticket>[]) => store.ingest("alice@x.com", events, config);
+    const config = (preferences: string): SignalsConfig => ({ ...CONFIG, accounts: [{ name: "Acme", channel: "acme", preferences }], rules });
+    let current = config(preferences);
+    const post = (...events: ReturnType<typeof ticket>[]) => store.ingest("alice@x.com", events, current);
     await post(ticket("seed", "seed"));
-    return { store, post };
+    /** The team changes its preferences. */
+    const prefer = (text: string) => void (current = config(text));
+    return { store, post, prefer };
   };
 
   it("opens a category the team kept on when the rule's own workstream is off, but not the fallback", async () => {
@@ -139,20 +142,45 @@ describe("rule categories", () => {
       { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
       { id: "resolved_work", group: "es", group_by: "external_id", action: "task", sources: ["jira"], when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
       { ...ESCALATIONS, id: "es_later", group: "es", when: { "payload.status": ["Waiting"] }, watch: ["payload.status"] },
+      { ...ESCALATIONS, id: "es_off", group: "es", when: { "payload.status": ["Blocked"] }, watch: ["payload.status"] },
+      { id: "case_follow", group: "es", group_by: "external_id", action: "task", sources: ["jira"], workstream: "case follow-up", when: { "payload.status": ["Pending"] }, watch: ["payload.status"] },
     ] satisfies readonly Rule[];
-    const { store, post } = await prepare("escalation tracking: ask\ncapacity request: auto\nresolved_work: draft", rules);
-    await post(ticket("refile", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("kept", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("hand", "Please increase TPM", { status: "Incoming" }));
+    const { store, post } = await prepare("escalation tracking: ask\ncapacity request: auto\nresolved_work: draft\nes_off: off", rules);
+    const tickets = ["refile", "kept", "hand", "offrule", "hand2"];
+    await post(...tickets.map((id) => ticket(id, "Please increase TPM for our endpoint", { status: "Incoming" })));
     const byKey = async (): Promise<Record<string, Awaited<ReturnType<SignalsStore["tasks"]>>[number]>> => Object.fromEntries((await store.tasks({})).map((task) => [task.group_key.split("|").pop(), task]));
-    expect(Object.values(await byKey()).map((task) => [task.workstream, task.mode])).toEqual([["capacity request", "auto"], ["capacity request", "auto"], ["capacity request", "auto"]]);
-    // Someone filed "hand" under capacity request themselves: that stays.
-    await store.file((await byKey()).hand!.id, "bob@x.com", { workstream: "capacity request" });
-    await post(ticket("refile", "Please increase TPM for our endpoint", { status: "Investigating" }), ticket("kept", "Please increase TPM for our endpoint", { status: "Waiting" }), ticket("hand", "Please increase TPM", { status: "Investigating" }));
+    expect(Object.values(await byKey()).map((task) => [task.workstream, task.mode])).toEqual(tickets.map(() => ["capacity request", "auto"]));
+    // Someone filed "hand" and "hand2" under capacity request themselves: that stays, whatever the new rule's workstream.
+    for (const id of ["hand", "hand2"]) await store.file((await byKey())[id]!.id, "bob@x.com", { workstream: "capacity request" });
+    const status = { refile: "Investigating", kept: "Waiting", hand: "Investigating", offrule: "Blocked", hand2: "Pending" } as Record<string, string>;
+    await post(...tickets.map((id) => ticket(id, "Please increase TPM for our endpoint", { status: status[id] })));
     const after = await byKey();
     // resolved_work has no workstream and no categories: the task is under none, in the team's mode for that rule.
     expect(after.refile).toMatchObject({ rule_id: "resolved_work", workstream: null, mode: "draft" });
     expect(after.kept).toMatchObject({ rule_id: "es_later", workstream: "capacity request", mode: "auto" });
     expect(after.hand).toMatchObject({ rule_id: "resolved_work", workstream: "capacity request", mode: "auto" });
+    expect(after.hand2).toMatchObject({ rule_id: "case_follow", workstream: "capacity request", mode: "auto" });
+    // es_off offers the same category, but the team turned that rule off: the task keeps its category, and is off with the rule.
+    expect(after.offrule).toMatchObject({ rule_id: "es_off", workstream: "capacity request", mode: "off" });
+    expect((await store.detail(after.offrule!.id))!.activities.map((one) => one.text)).toContain("Now under rule es_off: a new event matched it. Its mode is off now.");
     expect((await store.detail(after.refile!.id))!.activities.map((one) => one.text)).toContain("Now under rule resolved_work: a new event matched it. That rule has no capacity request category, so it's under no workstream now, in draft mode.");
+  });
+
+  it("opens a closed task again only while the team still works on its own category", async () => {
+    const rules = [{ ...ESCALATIONS, group_by: "payload.case" }] satisfies readonly Rule[];
+    const { store, post, prefer } = await prepare("escalation tracking: ask\ncapacity request: auto", rules);
+    store.categorizer = async () => NO_CATEGORY;
+    await post(ticket("e1", "Please increase TPM for our endpoint", { case: "c1" }), ticket("e2", "Please increase TPM", { case: "c2" }));
+    const [one, two] = (await store.tasks({})).sort((a, b) => a.id - b.id);
+    for (const task of [one!, two!]) await store.setStatus(task.id, "done", "bob@x.com");
+    // A new event in c1's group that no `when` places, while the rule's own workstream is still on: capacity request is off now.
+    prefer("escalation tracking: ask\ncapacity request: off");
+    await post(ticket("e3", "Any update?", { case: "c1" }));
+    expect(await store.task(one!.id)).toMatchObject({ status: "done", workstream: "capacity request" });
+    // With capacity request back on, c2's does open again.
+    prefer("escalation tracking: ask\ncapacity request: auto");
+    await post(ticket("e4", "Any update?", { case: "c2" }));
+    expect(await store.task(two!.id)).toMatchObject({ status: "open", workstream: "capacity request" });
   });
 
   it("asks the endpoint a choice question, and reads its answer", async () => {

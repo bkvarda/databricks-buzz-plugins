@@ -752,8 +752,11 @@ export class SignalsStore {
     if (decision.kind === "none") return undefined;
     const rule = decision.rule;
     const found = await this.taskByGroup(decision.group);
-    // A task already open is under its own category's mode, not under the model's possible pick (see Decision.byCategory).
-    const createFor = (task: Task) => decision.create && (!decision.byCategory || categoryModeFor(decision.account?.preferences, rule, categoryNamed(rule, task.workstream)?.workstream) !== "off");
+    // A task that's already there goes by the team's mode for its own workstream (its category, if it's one of the rule's), not
+    // by this event's `when` match or the model's possible pick: whether this event may open it again.
+    // (For a rule without categories, that's the rule's mode, as decide has it.)
+    const fresh = !(firstRun && config.first_run_seen !== false);
+    const createFor = (task: Task) => rule.action === "task" && fresh && categoryModeFor(decision.account?.preferences, rule, categoryNamed(rule, task.workstream)?.workstream) !== "off";
     if (found) {
       if (decision.same) await this.copyOf(decision.same, found.id);
       return { task: found, opened: false, create: createFor(found), rule };
@@ -1311,26 +1314,29 @@ export class SignalsStore {
 
   /**
    * Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule.
-   * A task under one of the new rule's categories keeps it. One under a category its old rule's model or `when` gave it (see
-   * Rule.categories) that the new rule doesn't offer takes the new rule's workstream (none, if it names none) and the team's
-   * mode for it, unless a person or agent filed it under that workstream themselves (a `workstream` activity).
+   * A task someone filed under a workstream themselves (a `workstream` activity) keeps it. Otherwise, one under one of the new
+   * rule's categories keeps it; one under a category its old rule gave it (see Rule.categories) that the new rule doesn't offer
+   * takes the new rule's workstream (none, if it names none). Either way, a task under a category takes the team's mode for it
+   * under the new rule (its id first, so a rule turned off stays off); others keep their mode, as before.
    */
   private async refile(task: Task, rule: Rule, config: SignalsConfig): Promise<Task> {
     const kept = categoryNamed(rule, task.workstream)?.workstream.trim();
     const before = config.rules.find((one) => one.id === task.rule_id);
     const automatic = !kept && Boolean(categoryNamed(before, task.workstream)) && task.workstream?.trim().toLowerCase() !== before?.workstream?.trim().toLowerCase();
-    const mode = modeFor(config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences, rule);
+    const preferences = config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences;
     const found = await this.q(
-      `WITH d AS (SELECT $5::boolean AND NOT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS dropped)
-       UPDATE $S.tasks SET rule_id = $2, workstream = CASE WHEN d.dropped THEN $3 ELSE COALESCE($3, workstream) END,
-         mode = CASE WHEN d.dropped THEN $6 ELSE mode END, updated_at = $4
-       FROM d WHERE id = $1 RETURNING $S.tasks.*, d.dropped`,
-      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, mode],
+      `WITH d AS (SELECT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream') AS manual)
+       UPDATE $S.tasks SET rule_id = $2,
+         workstream = CASE WHEN d.manual THEN workstream WHEN $5::boolean THEN $3 ELSE COALESCE($3, workstream) END,
+         mode = CASE WHEN $7::text IS NOT NULL THEN $7 WHEN $5::boolean AND NOT d.manual THEN $6 ELSE mode END, updated_at = $4
+       FROM d WHERE id = $1 RETURNING $S.tasks.*, ($5::boolean AND NOT d.manual) AS dropped`,
+      [task.id, rule.id, kept ?? rule.workstream ?? null, now(), automatic, modeFor(preferences, rule), kept ? categoryModeFor(preferences, rule, kept) : null],
     );
     const row = found.rows[0];
-    const dropped = row?.dropped === true;
-    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.${dropped ? ` That rule has no ${task.workstream} category, so it's ${row!.workstream ? `under ${row!.workstream as string}` : "under no workstream"} now, in ${mode} mode.` : ""}`);
-    return row ? toTask(row) : task;
+    const moved = row ? toTask(row) : task;
+    const why = row?.dropped === true ? ` That rule has no ${task.workstream} category, so it's ${moved.workstream ? `under ${moved.workstream}` : "under no workstream"} now, in ${moved.mode} mode.` : moved.mode !== task.mode ? ` Its mode is ${moved.mode} now.` : "";
+    await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.${why}`);
+    return moved;
   }
 
   /**
