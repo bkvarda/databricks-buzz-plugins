@@ -26,7 +26,7 @@
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
-import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
+import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -322,7 +322,14 @@ export class Hub {
       seen.add(task.id);
       await this.notifier.updated(task, doneMessage(reason)).catch((error: Error) => this.log(`couldn't post that task ${task.id} is done: ${error.message}`));
     }
-    for (const { task, by, title, url, agents, owner } of result.handled) {
+    // One notice per task, for its last closure in this post (the reply that answered the newest customer message),
+    // taking off every agent any of its closures removed.
+    const closures = new Map<number, Handled>();
+    for (const done of result.handled) {
+      const before = closures.get(done.task.id);
+      closures.set(done.task.id, { ...done, agents: [...new Set([...(before?.agents ?? []), ...done.agents])] });
+    }
+    for (const { task, by, title, url, agents, owner } of closures.values()) {
       if (!task.buzz_root || seen.has(task.id)) continue;
       seen.add(task.id);
       // A newer customer message later in the same post opened it again: one message says both, and no "Done".

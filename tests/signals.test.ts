@@ -1499,6 +1499,18 @@ describe("work someone on the team did themselves", () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]!.text).toContain("[Newer follow-up](https://mail/m7)");
     expect(posts[0]!.text).not.toContain("Delayed older one");
+    // A reply, a newer follow-up, then a last reply in one post: one Done, for the last reply, still taking the agent off.
+    await store.assign(task.id, "agent", agent, false);
+    posts.length = 0;
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m10", actor: "Alice <alice@x.com>", title: "First answer", group_key: "th1", url: "https://mail/m10", occurred_at: 1795000375 },
+      { source: "gmail", external_id: "m11", actor: "Ann <ann@globex.io>", title: "And this?", group_key: "th1", url: "https://mail/m11", occurred_at: 1795000380 },
+      { source: "gmail", external_id: "m12", actor: "Alice <alice@x.com>", title: "Last answer", group_key: "th1", url: "https://mail/m12", occurred_at: 1795000385 },
+    ] });
+    expect((await store.task(task.id))!.status).toBe("done");
+    expect(posts).toEqual([{ task: task.id, text: handledMessage("alice@x.com", "Last answer", "https://mail/m12", [agent]), agents: [agent] }]);
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m13", actor: "Ann <ann@globex.io>", title: "Thanks, one more", group_key: "th1", occurred_at: 1795000390 }] });
+    expect((await store.task(task.id))!.status).toBe("open");
     // In two posts, as before: "Done", then the update.
     await call("/api/events", { events: [{ source: "gmail", external_id: "m4", actor: "Alice <alice@x.com>", title: "Re: one more", group_key: "th1", occurred_at: 1795000400 }] });
     expect((await store.task(task.id))!.status).toBe("done");
