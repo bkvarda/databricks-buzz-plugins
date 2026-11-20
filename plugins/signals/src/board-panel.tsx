@@ -569,7 +569,7 @@ const lineText = (text: string, profile: (key: string) => Profile | undefined) =
 function RichText(props: { ctx: Context; text: string; profile(key: string): Profile | undefined }) {
   const HostMarkdown = (props.ctx as unknown as { conversation?: { ui?: { Markdown?: React.ComponentType<{ content: string; scale?: "message" | "document" }> } } }).conversation?.ui?.Markdown;
   const named = withMentionNames(props.text, npubKey, (key) => props.profile(key)?.name);
-  return <div style={{ overflowWrap: "anywhere", minWidth: 0 }}>{HostMarkdown ? <HostMarkdown content={named} /> : <Markdown source={named} size="sm" />}</div>;
+  return <div className="dbx-quiet-headings" style={{ overflowWrap: "anywhere", minWidth: 0 }}>{HostMarkdown ? <HostMarkdown content={named} /> : <Markdown source={named} size="sm" />}</div>;
 }
 
 /**
