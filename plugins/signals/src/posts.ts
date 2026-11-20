@@ -27,6 +27,8 @@ export type TaskSource = Readonly<{
   /** The source's name, like `slack`, `google_calendar` or `table.incident`. */
   kind: string;
   url?: string;
+  /** The source's own title, when the task's title says something else (the hub's `Title:` line right under **Source**). */
+  title?: string;
   when?: string;
   from?: string;
   where?: string;
@@ -167,9 +169,11 @@ function parseSource(lines: readonly string[]): TaskSource | undefined {
     facts.push({ label: label(key), value });
   }
   const when = field("When");
+  const title = lines[1]?.startsWith("Title: ") ? lines[1].slice(7).trim() : undefined;
   return {
     kind: first[1]!,
     ...(first[2] && { url: first[2] }),
+    ...(title && { title }),
     ...(when && { when }),
     ...(from && { from }),
     ...((channel || whereLine) && { where: channel ?? whereLine! }),

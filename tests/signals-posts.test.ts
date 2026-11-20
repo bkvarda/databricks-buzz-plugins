@@ -5,6 +5,8 @@ import { npubEncode } from "nostr-tools/nip19";
 import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage } from "../plugins/signals/app/hub";
 import type { Task } from "../plugins/signals/app/store";
 import { ago } from "../packages/core/src/ui/components";
+import { filedHint, filterTasks, openingTitle, postOrigin, taskFacts, taskOrigin, titleHint, workstreamHint } from "../plugins/signals/src/board-view";
+import type { BoardTask } from "../plugins/signals/src/client";
 import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
 
 const AGENT = "09fea0492c475c37e6e96b6e4e47a7b8f0670fd319c667b45ab8f49aa85602f2";
@@ -63,6 +65,82 @@ describe("task posts", () => {
   it("isn't fooled by other messages", () => {
     expect(isTaskPost("📌 **Task 3: something**\nno footer")).toBe(false);
     expect(parseTaskPost("hello")).toBeUndefined();
+  });
+});
+
+describe("short titles", () => {
+  const ES = "ES-2376026 For customer: [Block], workspace id: [2736046192934091] increase RPM/TPM rate limit for Gemini 4 Carbon";
+  it("reads the source's own title from the line under **Source**", () => {
+    const text = taskMessage(task({ title: "Capacity request: Gemini 4 Carbon in workspace 2736046192934091" }), { source: `**Source** (jira)\nTitle: ${ES}\nWhen: 2026-11-20T10:03:00Z\nDetails: status: To Do` });
+    const post = parseTaskPost(text)!;
+    expect(post.source).toMatchObject({ kind: "jira", title: ES, when: "2026-11-20T10:03:00Z" });
+    expect(parseTaskPost(taskMessage(task(), { source: "**Source** (jira)\nWhen: 2026-11-20T10:03:00Z" }))!.source?.title).toBeUndefined();
+  });
+
+  it("says what a short title left out about the source it opened from: its own title and ticket key", () => {
+    const jira = { source: "jira", external_id: "ES-2376026", title: ES };
+    expect(taskOrigin("Capacity request: Gemini 4 Carbon in workspace 2736046192934091", jira)).toEqual({ original: ES, ref: "ES-2376026" });
+    expect(titleHint("Capacity request: Gemini 4 Carbon", jira)).toBe(`Capacity request: Gemini 4 Carbon\nFrom Jira: ${ES}`);
+    // The key comes from a Jira link or an id that is one, not from how a title starts.
+    expect(taskOrigin("Capacity request: Neon", { source: "jira", external_id: "10233", url: "https://x.atlassian.net/browse/ES-2376508", title: "Neon quota" }).ref).toBe("ES-2376508");
+    expect(taskOrigin("Slack: QBR prep", { source: "slack", external_id: "1795.12", title: "QBR-2026 prep: who's coming?" })).toEqual({ original: "QBR-2026 prep: who's coming?" });
+    // A key the title already shows, as a whole word, isn't repeated; one that only starts the same is.
+    expect(taskOrigin("Incident ES-2373918 (Sev1): Model Serving", { source: "table.incident", external_id: "ES-2373918" })).toEqual({});
+    expect(taskOrigin("Follow up on ES-1234", { source: "jira", external_id: "ES-123" }).ref).toBe("ES-123");
+    // A template that keeps the source's title adds nothing.
+    expect(taskOrigin("Prep: Block  x Databricks sync", { source: "google_calendar", external_id: "ev1", title: "Block x Databricks sync" })).toEqual({});
+    expect(taskOrigin("Anything", undefined)).toEqual({});
+    expect(titleHint("Anything", undefined)).toBe("Anything");
+  });
+
+  it("finds a task by the ticket key it shows, even one only its Jira link has", () => {
+    const item = { task: { id: 7, title: "Capacity request: Neon", status: "open", mode: "draft" }, people: [], artifacts: [], source: { source: "table.fmapi_429", title: "429s", occurred_at: 1 }, origin: { source: "jira", external_id: "10233", url: "https://x.atlassian.net/browse/ES-2376508" } } as unknown as BoardTask;
+    expect(filterTasks([item], { search: "es-2376508" })).toHaveLength(1);
+    expect(filterTasks([item], { search: "es-999" })).toHaveLength(0);
+  });
+
+  it("describes a post's own source, and takes from the live task only what's about that same source", () => {
+    const alert = { source: "table.fmapi_429", external_id: "a1", title: "429s on databricks-gemini-4-carbon" };
+    const jira = { source: "jira", external_id: "ES-2376026", title: ES };
+    expect(postOrigin({ kind: "jira" }, jira)).toEqual({ source: "jira", external_id: "ES-2376026", title: ES });
+    // A live task that opened from another source (or another link) lends nothing.
+    expect(postOrigin({ kind: "jira" }, alert)).toEqual({ source: "jira" });
+    expect(postOrigin({ kind: "jira", url: "https://x/browse/ES-1" }, { ...jira, url: "https://x/browse/ES-2" })).toEqual({ source: "jira", url: "https://x/browse/ES-1" });
+    // The hub's Title: line wins over the live title.
+    expect(postOrigin({ kind: "jira", title: "From the post" }, jira)).toMatchObject({ title: "From the post", external_id: "ES-2376026" });
+    expect(postOrigin(undefined, jira)).toBeUndefined();
+  });
+
+  it("keeps the opening source's title for the full view after a grouped update", () => {
+    const origin = { source: "jira", external_id: "ES-2376026", title: ES, url: "https://x.atlassian.net/browse/ES-2376026" };
+    const task = { title: "Capacity request: Gemini 4 Carbon in workspace 2736046192934091" };
+    // A 429 alert grouped onto the task is its latest event; the Jira summary still shows.
+    expect(openingTitle({ task, source: { source: "table.fmapi_429", title: "429s on databricks-gemini-4-carbon" }, origin })).toEqual({ source: "jira", title: ES, url: origin.url });
+    // When the latest event is the one it opened from, its source line already says it.
+    expect(openingTitle({ task, source: { source: "jira", title: ES, url: origin.url }, origin })).toBeUndefined();
+    // Another ticket grouped on with the same summary links elsewhere: the opening ticket's link still shows.
+    expect(openingTitle({ task, source: { source: "jira", title: ES, url: "https://x.atlassian.net/browse/ES-820" }, origin })).toEqual({ source: "jira", title: ES, url: origin.url });
+    // Nothing hidden, or no origin (tasks opened before the hub kept it): nothing extra.
+    expect(openingTitle({ task: { title: `Prep: ${ES}` }, origin })).toBeUndefined();
+    expect(openingTitle({ task, source: { source: "jira", title: ES } })).toBeUndefined();
+    expect(openingTitle({ task, source: { source: "jira", title: ES }, origin: { source: "jira", external_id: "ES-1", title: ES } })).toBeUndefined();
+    expect(openingTitle({ task, origin: null })).toBeUndefined();
+  });
+
+  it("says how a task was filed under its workstream, only when a category picked it", () => {
+    expect(filedHint({ filed_by: "match" })).toBe("Matched a category rule");
+    expect(filedHint({ filed_by: "classifier", filed_score: 0.857 })).toBe("Picked by the classifier (86%)");
+    expect(filedHint({ filed_by: "classifier", filed_score: null })).toBe("Picked by the classifier");
+    // The rule alone, or a task filed before the hub kept this, says nothing.
+    expect(filedHint({ filed_by: "rule" })).toBeUndefined();
+    expect(filedHint({ filed_by: null })).toBeUndefined();
+    expect(filedHint({})).toBeUndefined();
+    expect(workstreamHint({ workstream: "capacity requests", filed_by: "match" })).toBe("capacity requests\nMatched a category rule");
+    expect(workstreamHint({ workstream: "escalation tracking", filed_by: "rule" })).toBe("escalation tracking");
+    expect(workstreamHint({ workstream: null, filed_by: "match" })).toBeUndefined();
+    const item = (fields: object) => ({ task: { id: 1, title: "t", status: "open", mode: "draft", workstream: "capacity requests", created_at: 1, last_event_at: 1, event_count: 1, ...fields }, people: [], artifacts: [] }) as unknown as BoardTask;
+    expect(taskFacts(item({ filed_by: "classifier", filed_score: 0.91 }), 10).find((fact) => fact.label === "Workstream")).toEqual({ label: "Workstream", value: "capacity requests", note: "Picked by the classifier (91%)" });
+    expect(taskFacts(item({ filed_by: null }), 10).find((fact) => fact.label === "Workstream")).toEqual({ label: "Workstream", value: "capacity requests" });
   });
 });
 

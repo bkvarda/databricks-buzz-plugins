@@ -9,7 +9,7 @@ import { React } from "@dbx/core/react";
 import { describeError } from "@dbx/core/service";
 import { ago, Button, DbxRoot, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { Markdown } from "@dbx/core/ui/markdown";
-import { assigneeOf, STATUS_GROUPS, withMentionNames } from "./board-view";
+import { assigneeOf, postOrigin, STATUS_GROUPS, taskOrigin, titleHint, withMentionNames, workstreamHint } from "./board-view";
 import { AssigneeMark, assigneeName, npubKey, type Profile, StatusIcon, useProfiles } from "./board-panel";
 import type { BoardTask } from "./client";
 import type { LiveTasks } from "./live-tasks";
@@ -130,10 +130,10 @@ function Answer(props: { live: LiveTasks; channel: string; id?: number; question
 }
 
 /** The line under a task's title: where it came from, who, where and when. */
-function SourceLine(props: { source: TaskPost["source"] }) {
+function SourceLine(props: { source: TaskPost["source"]; ticket?: string }) {
   const { source } = props;
   if (!source) return null;
-  const parts = [sourceName(source.kind), source.from, source.where && !/^https?:/.test(source.where) ? source.where : undefined, source.when && shortWhen(source.when)].filter(Boolean) as string[];
+  const parts = [props.ticket ? `${sourceName(source.kind)} ${props.ticket}` : sourceName(source.kind), source.from, source.where && !/^https?:/.test(source.where) ? source.where : undefined, source.when && shortWhen(source.when)].filter(Boolean) as string[];
   return (
     <Text size="xs" tone="tertiary" style={{ minWidth: 0, ...clamp(1) }}>
       <span title={parts.join(" · ")}>{parts.join(" · ")}</span>
@@ -157,6 +157,9 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
   const options = item ? (item.task.options ?? []) : post.options;
   const status = item?.task.status;
   const source = post.source;
+  // The source the task opened from, whose own title and key a short title or the rule's template may hide.
+  const origin = postOrigin(source, item?.origin);
+  const ticket = taskOrigin(post.title, origin).ref;
   const open = () => (props.canOpen(target) && props.open(target)) || props.openBoard(message.channelId);
   return (
     <DbxRoot style={{ minWidth: 0, maxWidth: 620 }}>
@@ -167,7 +170,7 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
               {status ? <StatusIcon status={status} /> : <span aria-hidden style={{ width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" }} />}
               <Text size="xs" tone="tertiary" mono>Task {post.id}</Text>
               {status && <Text size="xs" tone={status === "waiting" ? "warning" : status === "done" ? "success" : "subtle"} weight={500}>{statusTitle(status)}</Text>}
-              {post.workstream && <Chip>{post.workstream}</Chip>}
+              {post.workstream && <Chip title={item && item.task.workstream === post.workstream ? workstreamHint(item.task) : post.workstream}>{post.workstream}</Chip>}
               {post.initiative && <Chip>{post.initiative}</Chip>}
               {post.mode && post.mode !== "draft" && <Chip title={MODE_TITLE[post.mode]} {...(post.mode === "auto" && { tone: "success" as const })}>{post.mode}</Chip>}
             </Stack>
@@ -180,9 +183,9 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
           </Stack>
           <Stack gap={2}>
             <Text size="md" weight={600} style={{ overflowWrap: "anywhere", ...clamp(2) }}>
-              <span title={post.title}>{post.title}</span>
+              <span title={titleHint(post.title, origin)}>{post.title}</span>
             </Text>
-            <SourceLine source={source} />
+            <SourceLine source={source} {...(ticket && { ticket })} />
           </Stack>
           {source?.quote && (
             <div style={{ borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 }}>
