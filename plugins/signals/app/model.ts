@@ -959,6 +959,17 @@ export function idsByKind(accounts: readonly Readonly<{ ids?: AccountIds }>[]): 
   return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)).map(([kind, ids]) => [kind, [...ids].sort()]));
 }
 
+/** Every account's name and other names (each once, sorted): pollers read a notes doc only when its title names one. */
+export function accountNames(accounts: readonly Readonly<{ name: string; aliases?: readonly string[] }>[]): string[] {
+  return [...new Set(accounts.flatMap((account) => [account.name, ...(account.aliases ?? [])]).map((name) => name.trim()).filter(Boolean))].sort();
+}
+
+/**
+ * Payload fields a source fills only when it could read the item's details (a notes doc's `notes` and `meeting`):
+ * a later version of the same event without them keeps the earlier ones.
+ */
+export const KEPT_DETAILS = ["notes", "meeting"] as const;
+
 /** What a team registers for its account channel (the hub's accounts table). */
 export type AccountRecord = Readonly<{
   name: string;

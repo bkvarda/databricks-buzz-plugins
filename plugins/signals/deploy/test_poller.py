@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as dt
+import json
 import io
 import unittest
 
@@ -68,6 +69,258 @@ class Templates(unittest.TestCase):
         self.assertEqual(events[2]["payload"], {"attendees": None, "description": None})
         self.assertEqual([c[2] for c in ws.calls], ["calendar_event_list", "calendar_event_get", "calendar_event_get"])
 
+    def test_detail_only_for_items_its_when_matches_and_match_max_trims(self):
+        notes = "Intro\nSummary\nBilling pushed back.\nNext steps\n[Josh Herman] Visit Undisputed: in 2 days.\nDetails\nLong transcript text"
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "google_file_read":
+                    return {"metadata": {"title": "x"}, "content": notes}
+                return {"items": [{"id": "d1", "name": "Plan.xlsx"}, {"id": "d2", "name": "QBR - Notes by Gemini"}, {"id": "d3", "name": "Sync - Notes by Gemini"}]}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "google_drive_list_recent",
+                  "detail": {"tool": "google_file_read", "args": {"file_id": "{id}", "file_type": "doc"}, "when": {"name": "Notes by Gemini"}, "max": 1},
+                  "map": {"external_id": "id", "title": "name", "payload": {"notes": {"from": "content", "match": r"(?s)(Summary\n.*?)(?:\nDetails\n|$)", "max": 40}}}}
+        ws = Drive([])
+        events, _ = poller.poll_source(ws, source, None, None, NOW)
+        # Only notes docs are read, and `max` counts those: the spreadsheet isn't read and doesn't use up the one read.
+        self.assertEqual([c[3] for c in ws.calls if c[2] == "google_file_read"], [{"file_id": "d2", "file_type": "doc"}])
+        self.assertEqual(events[1]["payload"]["notes"], "Summary\nBilling pushed back.\nNext steps\n")
+        self.assertEqual(len(events[1]["payload"]["notes"]), 40)
+        self.assertEqual(events[0]["payload"], {"notes": None})
+        self.assertEqual(events[2]["payload"], {"notes": None})
+        self.assertFalse(poller.detail_applies({"when": {"name": "Gemini"}}, {"id": "x"}))
+        self.assertTrue(poller.detail_applies({}, {"id": "x"}))
+
+    def test_notes_docs_are_read_only_for_meetings_that_name_an_account(self):
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {"file_id": "{id}"}, "when": {"name": "Notes by Gemini"}, "named_in": "name"}, "map": {"external_id": "id", "title": "name", "payload": {"notes": {"from": "content", "match": "(Summary.*)"}}}}
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "read":
+                    return {"content": "Summary: secret"}
+                return {"items": [{"id": "h", "name": "Hiring sync - Notes by Gemini"}, {"id": "g", "name": "Globex Corp QBR - Notes by Gemini"}, {"id": "x", "name": "Globexx - Notes by Gemini"}]}
+
+        ws = Drive([])
+        events, _ = poller.poll_source(ws, source, None, None, NOW, names=["Globex"])
+        self.assertEqual([c[3]["file_id"] for c in ws.calls if c[2] == "read"], ["g"])
+        self.assertEqual([e["payload"]["notes"] for e in events], [None, "Summary: secret", None])
+        # No account names known (or none read): no doc is read.
+        ws = Drive([])
+        poller.poll_source(ws, source, None, None, NOW)
+        self.assertFalse([c for c in ws.calls if c[2] == "read"])
+        self.assertTrue(poller.names_one("QBR – GLOBEX/Initech notes", ["globex"]))
+        self.assertFalse(poller.names_one("Globexx", ["Globex"]))
+
+    def test_run_reads_account_names_for_named_in_sources(self):
+        class Hub(FakeWorkspace):
+            def hub(self, base, method, path, body=None):
+                if path == "/api/ids":
+                    self.calls.append(("hub", method, path, body))
+                    return {"ids": {}, "names": ["Globex"]}
+                return super().hub(base, method, path, body)
+
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                return {"content": "x"} if tool == "read" else {"items": [{"id": "g", "name": "Globex - Notes by Gemini"}]}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {}, "named_in": "name"}, "map": {"external_id": "id"}}
+        ws = Hub([{"source": "google_drive", "enabled": True}])
+        poller.run(ws, {"sources": [source]}, "https://hub", None, log=lambda _: None, now=NOW)
+        self.assertEqual([c[2] for c in ws.calls if c[0] == "mcp"], ["list", "read"])
+
+    def test_lakebase_ids_split_out_account_names(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, *a): pass
+            def fetchall(self): return [("_name", "Globex"), ("crm", "001")]
+
+        class Db:
+            def cursor(self): return Cursor()
+
+        inbox = poller.LakebaseInbox(None, {"schema": "signals_hub"}, connect=lambda: Db())
+        self.assertEqual(inbox.call("GET", "/api/ids"), {"ids": {"crm": ["001"]}, "names": ["Globex"]})
+
+    def test_read_cap_holds_the_cursor_so_later_docs_are_read_and_read_ones_arent_reposted(self):
+        docs = [{"id": f"d{n}", "name": f"Globex {n} - Notes by Gemini", "modifiedTime": f"2026-11-17T{n:02d}:00:00Z"} for n in range(1, 12)]
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "read":
+                    return {"content": f"Summary\nnotes of {args['file_id']}\nDetails\n"}
+                # The same one-day listing, newest first, on every poll.
+                return {"items": [{"id": "sheet", "name": "Plan", "modifiedTime": "2026-11-17T05:30:00Z"}] + list(reversed(docs))}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {"file_id": "{id}"}, "when": {"name": "Notes by Gemini"}, "named_in": "name", "after": "modifiedTime", "max": 10},
+                  "map": {"external_id": "{id}:{modifiedTime}", "title": "name", "payload": {"notes": {"from": "content", "match": "(?s)(Summary.*?)Details"}}}}
+        now = dt.datetime(2026, 11, 17, 12, 30, tzinfo=dt.timezone.utc)
+        ws = Drive([])
+        first, cursor = poller.poll_source(ws, source, None, None, now, names=["Globex"])
+        # The ten oldest are read; the eleventh isn't posted, and the cursor stops just before it.
+        self.assertEqual([c[3]["file_id"] for c in ws.calls if c[2] == "read"], [f"d{n}" for n in range(1, 11)])
+        self.assertEqual(sorted(e["external_id"] for e in first if e["payload"]["notes"]), sorted(f"d{n}:2026-11-17T{n:02d}:00:00Z" for n in range(1, 11)))
+        self.assertNotIn("d11:2026-11-17T11:00:00Z", [e["external_id"] for e in first])
+        self.assertIn("sheet:2026-11-17T05:30:00Z", [e["external_id"] for e in first])
+        self.assertLess(json.loads(cursor)["at"], "2026-11-17T11:00:00Z")
+        ws = Drive([])
+        second, cursor2 = poller.poll_source(ws, source, cursor, None, now, names=["Globex"])
+        # Only the eleventh is read and posted; the ten read before aren't posted again (no version without notes).
+        self.assertEqual([c[3]["file_id"] for c in ws.calls if c[2] == "read"], ["d11"])
+        self.assertEqual([e["external_id"] for e in second if e["payload"]["notes"] is not None], ["d11:2026-11-17T11:00:00Z"])
+        self.assertFalse([e for e in second if e["external_id"].startswith("d") and e["payload"]["notes"] is None])
+        self.assertEqual(json.loads(cursor2)["at"], poller.iso(now))
+        self.assertEqual(len(json.loads(cursor2)["read"]), 11)
+        # A third poll of the same listing reads and posts nothing more.
+        ws = Drive([])
+        third, _ = poller.poll_source(ws, source, cursor2, None, now, names=["Globex"])
+        self.assertFalse([c for c in ws.calls if c[2] == "read"])
+        self.assertEqual([e["external_id"] for e in third], ["sheet:2026-11-17T05:30:00Z"])
+
+    def test_a_failed_read_waits_for_the_next_poll(self):
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "read":
+                    raise RuntimeError("busy")
+                return {"items": [{"id": "d1", "name": "Globex - Notes by Gemini", "modifiedTime": "2026-11-17T09:00:00Z"}]}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {}, "named_in": "name", "after": "modifiedTime"}, "map": {"external_id": "id"}}
+        events, cursor = poller.poll_source(Drive([]), source, None, None, NOW, names=["Globex"])
+        self.assertEqual(events, [])
+        self.assertLess(json.loads(cursor)["at"], "2026-11-17T09:00:00Z")
+        self.assertEqual(json.loads(cursor)["read"], [])
+
+    def notes_drive(self, listings):
+        """A Drive whose listing is listings[n] on poll n (the last one after that)."""
+        polls = {"n": 0}
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "read":
+                    return {"content": f"Summary\nnotes of {args['file_id']}\nDetails\n"}
+                listing = listings[min(polls["n"], len(listings) - 1)]
+                polls["n"] += 1
+                return {"items": list(listing)}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {"file_id": "{id}"}, "when": {"name": "Notes by Gemini"}, "named_in": "name", "after": "modifiedTime", "max": 10},
+                  "map": {"external_id": "{id}:{modifiedTime}", "payload": {"notes": {"from": "content", "match": "(?s)(Summary.*?)Details"}}}}
+        return Drive([]), source
+
+    def test_read_cap_reaches_every_doc_in_a_burst_within_one_second(self):
+        for label, stamp in (("milliseconds apart", lambda n: f"2026-11-17T10:00:00.{n:03d}Z"), ("the same time", lambda n: "2026-11-17T10:00:00Z")):
+            docs = [{"id": f"d{n}", "name": f"Globex {n} - Notes by Gemini", "modifiedTime": stamp(n)} for n in range(1, 12)]
+            ws, source = self.notes_drive([list(reversed(docs))])
+            now = dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc)
+            cursor, posted = None, []
+            for _ in range(3):
+                events, cursor = poller.poll_source(ws, source, cursor, None, now, names=["Globex"])
+                posted += [e["external_id"].split(":")[0] for e in events]
+            self.assertEqual(sorted(posted), sorted(f"d{n}" for n in range(1, 12)), label)
+            self.assertEqual(sorted(c[3]["file_id"] for c in ws.calls if c[2] == "read"), sorted(f"d{n}" for n in range(1, 12)), label)
+
+    def test_a_doc_listed_late_with_an_older_time_is_still_read(self):
+        early = {"id": "d1", "name": "Globex QBR - Notes by Gemini", "modifiedTime": "2026-11-17T11:00:00Z"}
+        late = {"id": "d2", "name": "Globex sync - Notes by Gemini", "modifiedTime": "2026-11-17T11:58:00Z"}
+        ws, source = self.notes_drive([[early], [late, early]])
+        first, cursor = poller.poll_source(ws, source, None, None, dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc), names=["Globex"])
+        self.assertEqual([e["external_id"] for e in first], ["d1:2026-11-17T11:00:00Z"])
+        # d2 is first listed after the cursor passed its time: it's read, and d1 isn't posted again.
+        second, _ = poller.poll_source(ws, source, cursor, None, dt.datetime(2026, 11, 17, 12, 30, tzinfo=dt.timezone.utc), names=["Globex"])
+        self.assertEqual([e["external_id"] for e in second], ["d2:2026-11-17T11:58:00Z"])
+        self.assertTrue(second[0]["payload"]["notes"])
+
+    def test_a_new_version_of_a_doc_read_before_is_read_again(self):
+        v1 = {"id": "d1", "name": "Globex QBR - Notes by Gemini", "modifiedTime": "2026-11-17T11:00:00Z"}
+        v2 = {**v1, "modifiedTime": "2026-11-17T11:40:00Z"}
+        ws, source = self.notes_drive([[v1], [v2]])
+        _, cursor = poller.poll_source(ws, source, None, None, dt.datetime(2026, 11, 17, 11, 30, tzinfo=dt.timezone.utc), names=["Globex"])
+        second, _ = poller.poll_source(ws, source, cursor, None, dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc), names=["Globex"])
+        self.assertEqual([e["external_id"] for e in second], ["d1:2026-11-17T11:40:00Z"])
+
+    def test_failed_reads_count_against_the_cap_and_healthy_docs_still_get_a_turn(self):
+        docs = [{"id": f"d{n:02d}", "name": f"Globex {n} - Notes by Gemini", "modifiedTime": f"2026-11-17T10:{n:02d}:00Z"} for n in range(50)]
+        broken = {f"d{n:02d}" for n in range(15)}  # the 15 oldest always fail
+        outage = {"on": True}
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                if tool == "read":
+                    if outage["on"] or args["file_id"] in broken:
+                        raise RuntimeError("busy")
+                    return {"content": f"Summary\nnotes of {args['file_id']}\nDetails\n"}
+                return {"items": list(docs)}
+
+        _, source = self.notes_drive([])
+        now = dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc)
+        reads = lambda ws: [c[3]["file_id"] for c in ws.calls if c[2] == "read"]
+        # An outage of the detail service: 50 eligible docs, max 10, so 10 reads are tried, and none is posted.
+        ws = Drive([])
+        events, cursor = poller.poll_source(ws, source, None, None, now, names=["Globex"])
+        self.assertEqual(len(reads(ws)), 10)
+        self.assertEqual(events, [])
+        self.assertEqual(len(json.loads(cursor)["failed"]), 10)
+        # It recovers except for the 15 oldest: the 40 never tried go first, then the failed ones take turns.
+        outage["on"] = False
+        posted, tried = [], []
+        for _ in range(8):
+            ws = Drive([])
+            events, cursor = poller.poll_source(ws, source, cursor, None, now, names=["Globex"])
+            self.assertLessEqual(len(reads(ws)), 10)
+            tried += reads(ws)
+            posted += [e["external_id"].split(":")[0] for e in events]
+        self.assertEqual(sorted(posted), sorted(f"d{n:02d}" for n in range(15, 50)))
+        self.assertEqual(len(posted), len(set(posted)))
+        self.assertTrue(broken <= set(tried))  # every failing doc is retried, none is left behind
+        state = json.loads(cursor)
+        self.assertEqual(sorted(state["failed"]), sorted(poller.version_key(d, "modifiedTime") for d in docs if d["id"] in broken))
+        self.assertLess(state["at"], "2026-11-17T10:00:00Z")
+
+    def test_the_cursor_keeps_every_read_key_below_capacity(self):
+        docs = [{"id": f"d{n:02d}", "name": f"Globex {n} - Notes by Gemini", "modifiedTime": f"2026-11-17T10:{n % 60:02d}:{n // 60:02d}Z"} for n in range(80)]
+        ws, source = self.notes_drive([docs])
+        now = dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc)
+        cursor = None
+        for _ in range(8):
+            _, cursor = poller.poll_source(ws, source, cursor, None, now, names=["Globex"])
+        self.assertEqual(len(json.loads(cursor)["read"]), 80)
+        before = len([c for c in ws.calls if c[2] == "read"])
+        events, _ = poller.poll_source(ws, source, cursor, None, now, names=["Globex"])
+        self.assertEqual(len([c for c in ws.calls if c[2] == "read"]), before)  # nothing read again
+        self.assertEqual(events, [])
+
+    def test_an_old_plain_cursor_still_works(self):
+        doc = {"id": "d1", "name": "Globex QBR - Notes by Gemini", "modifiedTime": "2026-11-17T11:00:00Z"}
+        ws, source = self.notes_drive([[doc]])
+        events, cursor = poller.poll_source(ws, source, "2026-11-17T11:30:00Z", None, dt.datetime(2026, 11, 17, 12, 0, tzinfo=dt.timezone.utc), names=["Globex"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(json.loads(cursor)["at"], "2026-11-17T12:00:00Z")
+
+    def test_a_failed_account_lookup_holds_a_named_in_source(self):
+        class Hub(FakeWorkspace):
+            def hub(self, base, method, path, body=None):
+                if path == "/api/ids":
+                    raise RuntimeError("hub busy")
+                return super().hub(base, method, path, body)
+
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                return {"items": [{"id": "g", "name": "Globex - Notes by Gemini", "modifiedTime": "2026-11-17T09:00:00Z"}]}
+
+        source = {"name": "google_drive", "kind": "mcp", "tool": "list", "detail": {"tool": "read", "args": {}, "named_in": "name", "after": "modifiedTime"}, "map": {"external_id": "id"}}
+        ws = Hub([{"source": "google_drive", "enabled": True, "cursor": "2026-11-17T08:00:00Z"}])
+        summary = poller.run(ws, {"sources": [source]}, "https://hub", None, log=lambda _: None, now=NOW)
+        self.assertTrue(str(summary["google_drive"]).startswith("unavailable"))
+        self.assertFalse([c for c in ws.calls if c[0] == "mcp"])
+        posts = [c for c in ws.calls if c[0] == "hub" and c[1] == "POST"]
+        self.assertFalse([c for c in posts if c[2] == "/api/events"])
+        self.assertFalse([c for c in posts if c[2] == "/api/cursor" and "cursor" in (c[3] or {})])
+
     def test_to_event_maps_paths_templates_and_payload(self):
         item = {"id": 7, "subject": "Hi", "threadId": "t", "from": "a@b", "start": {"date": "2026-11-18"}}
         clock = {"now": NOW, "since": NOW}
@@ -129,6 +382,35 @@ class ExampleSources(unittest.TestCase):
         ws = FakeWorkspace([], mcp={"slack": {"results": results}})
         events, _ = poller.poll_source(ws, self.sources[name], None, None, NOW)
         return ws, events
+
+    def drive_notes(self, content, names=("Globex",)):
+        item = {"id": "d1", "name": "Globex QBR - 2026/11/17 - Notes by Gemini", "modifiedTime": "2026-11-17T10:00:00Z", "webViewLink": "https://docs/d1"}
+
+        class Drive(FakeWorkspace):
+            def mcp(self, service, tool, args):
+                self.calls.append(("mcp", service, tool, args))
+                return {"content": content} if tool == "google_file_read" else {"items": [item]}
+
+        ws = Drive([])
+        events, _ = poller.poll_source(ws, self.sources["google_drive"], None, None, NOW, names=list(names))
+        return ws, events
+
+    def test_google_drive_keeps_summary_and_next_steps_not_the_transcript(self):
+        doc = "Meeting Nov 17\nSummary\nBilling pushed back.\x0bMore.\nDecisions\nAligned\nNext steps\n[Ann] Send pricing.\n{heading}\nTRANSCRIPT-MARKER Ann said things\nhttps://calendar.google.com/calendar/event?eid=abc_1"
+        for heading in ("Details", "Details:", "Transcript", "Attachments"):
+            _, events = self.drive_notes(doc.format(heading=heading))
+            notes = events[0]["payload"]["notes"]
+            self.assertTrue(notes.startswith("Summary\nBilling pushed back."), heading)
+            self.assertIn("[Ann] Send pricing.", notes)
+            self.assertNotIn("TRANSCRIPT-MARKER", notes, heading)
+            self.assertEqual(events[0]["payload"]["meeting"], "https://calendar.google.com/calendar/event?eid=abc_1")
+        # No section after Next steps that it knows: no notes, rather than the transcript.
+        _, events = self.drive_notes(doc.format(heading="Notes from the call"))
+        self.assertIsNone(events[0]["payload"]["notes"])
+        # A meeting whose title names no account isn't read at all.
+        ws, events = self.drive_notes(doc.format(heading="Details"), names=("Initech",))
+        self.assertFalse([c for c in ws.calls if c[2] == "google_file_read"])
+        self.assertIsNone(events[0]["payload"]["notes"])
 
     def test_slack_sources_use_the_slack_service(self):
         for name in ("slack", "slack.sent"):

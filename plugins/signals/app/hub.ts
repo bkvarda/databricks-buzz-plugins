@@ -25,7 +25,7 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -120,7 +120,8 @@ export class Hub {
     const config = withAccounts((await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, await this.store.accounts());
     this.cached = { at: Date.now(), config };
     // Poller jobs that reach the hub through Lakebase read the ids from a table.
-    const ids = idsByKind(config.accounts ?? []);
+    // Account names go there as kind `_name` (an id kind starts with a letter), for pollers that read notes docs.
+    const ids = { ...idsByKind(config.accounts ?? []), _name: accountNames(config.accounts ?? []) };
     const text = JSON.stringify(ids);
     if (text !== this.publishedIds)
       await this.store.publishIds(ids).then(
@@ -214,8 +215,10 @@ export class Hub {
           return { json: await this.onboard(user, false) };
         case "POST /api/onboard":
           return { json: await this.onboard(user, true) };
-        case "GET /api/ids":
-          return { json: { ids: idsByKind((await this.config()).accounts ?? []) } };
+        case "GET /api/ids": {
+          const accounts = (await this.config()).accounts ?? [];
+          return { json: { ids: idsByKind(accounts), names: accountNames(accounts) } };
+        }
         case "GET /api/accounts":
           return { json: { accounts: await this.store.accounts() } };
         case "GET /api/account": {
@@ -1052,7 +1055,7 @@ function timeText(value: unknown): string | undefined {
 }
 
 
-const SHOWN = new Set(["start", "end", "attendees", "description", "location", "hangoutLink", "organizer"]);
+const SHOWN = new Set(["start", "end", "attendees", "description", "location", "hangoutLink", "organizer", "notes"]);
 const MAX_ATTENDEES = 30;
 
 /**
@@ -1083,6 +1086,8 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [],
   });
   if (attendees.length > MAX_ATTENDEES) who.push(`- …and ${attendees.length - MAX_ATTENDEES} more`);
   const description = typeof payload.description === "string" ? payload.description.replace(/<[^>]+>/g, " ").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim() : "";
+  // A notes doc's Summary and Next steps (the poller's `payload.notes`): what the follow-up is about. Vertical tabs are Docs' soft line breaks.
+  const notes = typeof payload.notes === "string" ? payload.notes.replace(/\v/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim() : "";
   const rest = Object.entries(payload).filter(([key, value]) => !SHOWN.has(key) && value !== null && value !== undefined && value !== "" && !(Array.isArray(value) && !value.length));
   const excerpt = rest.map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("; ");
   const place = [typeof payload.location === "string" && payload.location, typeof payload.hangoutLink === "string" && payload.hangoutLink].filter(Boolean).join(" · ");
@@ -1093,6 +1098,7 @@ export function eventDetails(event: EventInput, domains: readonly string[] = [],
     place && `Where: ${place}`,
     who.length ? `Attendees (${attendees.length}):\n${who.join("\n")}` : "",
     description && `Description:\n${clip(description, 1500)}`,
+    notes && `Meeting notes (summary and next steps):\n${clip(notes, 4000)}`,
     excerpt && `Details: ${clip(excerpt, 600)}`,
   ]
     .filter(Boolean)
