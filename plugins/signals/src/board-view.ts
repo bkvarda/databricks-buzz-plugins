@@ -17,6 +17,15 @@ export const STATUS_GROUPS = [
 ] as const;
 
 /**
+ * How much room a task's post takes in its channel: an open task is a full
+ * card; a done one keeps its card without the source's quote and details;
+ * a dismissed one folds to one quiet line, so nothing in the channel looks
+ * like it still needs doing.
+ */
+export type PostWeight = "full" | "quiet" | "folded";
+export const postWeight = (status: string | undefined): PostWeight => (status === "dismissed" ? "folded" : status === "done" ? "quiet" : "full");
+
+/**
  * Who a task is with, the one name its card shows: you, when it waits on a
  * person's input; otherwise its first owner (an agent or a person someone
  * assigned); otherwise the agent that replied in its thread, or the one

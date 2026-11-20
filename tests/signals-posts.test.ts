@@ -5,8 +5,9 @@ import { npubEncode } from "nostr-tools/nip19";
 import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage } from "../plugins/signals/app/hub";
 import type { Task } from "../plugins/signals/app/store";
 import { ago } from "../packages/core/src/ui/components";
-import { filedHint, filterTasks, openingTitle, postOrigin, taskFacts, taskOrigin, titleHint, workstreamHint } from "../plugins/signals/src/board-view";
+import { filedHint, filterTasks, openingTitle, postOrigin, postWeight, taskFacts, taskOrigin, titleHint, workstreamHint } from "../plugins/signals/src/board-view";
 import type { BoardTask } from "../plugins/signals/src/client";
+import { LiveTasks } from "../plugins/signals/src/live-tasks";
 import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
 
 const AGENT = "09fea0492c475c37e6e96b6e4e47a7b8f0670fd319c667b45ab8f49aa85602f2";
@@ -204,5 +205,39 @@ describe("helpers", () => {
   it("round-trips the task panel's target", () => {
     expect(readTaskTarget(taskTarget("cd524d72-32a3", 65))).toEqual({ channel: "cd524d72-32a3", id: 65 });
     expect(readTaskTarget("https://example.com")).toBeUndefined();
+  });
+});
+
+describe("closed tasks in the channel", () => {
+  it("folds a dismissed task to a line and quiets a done one", () => {
+    expect(postWeight("dismissed")).toBe("folded");
+    expect(postWeight("done")).toBe("quiet");
+    for (const status of ["open", "in_progress", "waiting", undefined]) expect(postWeight(status)).toBe("full");
+  });
+
+  it("looks up, once per channel, the status of a task that's left the board", async () => {
+    const service = { snapshot: () => ({ status: "connected" }), subscribe: () => () => {} };
+    const live = new LiveTasks(service as never);
+    const asked: unknown[] = [];
+    const board = { tasks: [{ task: { id: 1, status: "open" } }] };
+    const hub = {
+      board: async () => board,
+      tasks: async (filter: unknown) => (asked.push(filter), [{ id: 1, status: "open" }, { id: 7, status: "dismissed" }, { id: 8, status: "done" }]),
+    };
+    live.client = () => Promise.resolve(hub as never);
+    const changed = () => new Promise<void>((resolve) => { const stop = live.subscribe(() => (stop(), resolve())); });
+    expect(live.olderStatus("c", 7)).toBeUndefined();
+    await live.load("c");
+    // On the board: its own status is the card's, and nothing more is read.
+    expect(live.olderStatus("c", 1)).toBeUndefined();
+    expect(asked).toEqual([]);
+    const read = changed();
+    expect(live.olderStatus("c", 7)).toBeUndefined();
+    expect(live.olderStatus("c", 8)).toBeUndefined();
+    await read;
+    expect(live.olderStatus("c", 7)).toBe("dismissed");
+    expect(live.olderStatus("c", 8)).toBe("done");
+    expect(live.olderStatus("c", 99)).toBeUndefined();
+    expect(asked).toEqual([{ channel: "c", limit: 500 }]);
   });
 });
