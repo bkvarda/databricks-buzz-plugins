@@ -130,7 +130,7 @@ function AddAction(props: { onAdd(label: string, trigger: string): void; disable
   };
   return (
     <form ref={opener as never} onSubmit={(event) => (event.preventDefault(), add())} onKeyDown={(event) => event.key === "Escape" && (event.preventDefault(), event.stopPropagation(), setOpen(false))} style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-      <input ref={first} className="dbx-input" aria-label="What agents do" placeholder="What agents do, e.g. Loop in the CSM" maxLength={MAX_ACTION_LABEL} value={label} onChange={(event) => setLabel(event.target.value)} style={{ flex: "1 1 160px", minWidth: 0, fontSize: "0.75rem" }} />
+      <input ref={first} className="dbx-input" aria-label="What agents do" placeholder="What agents do, e.g. Loop in the CSM" maxLength={MAX_ACTION_LABEL} value={label} onChange={(event) => setLabel(event.target.value.replace(/—/g, "-")) /* the hub's posts set an action's reason after " — " */} style={{ flex: "1 1 160px", minWidth: 0, fontSize: "0.75rem" }} />
       <input className="dbx-input" aria-label="When" placeholder="When, e.g. the customer mentions renewal" maxLength={MAX_ACTION_TRIGGER} value={trigger} onChange={(event) => setTrigger(event.target.value)} style={{ flex: "2 1 220px", minWidth: 0, fontSize: "0.75rem" }} />
       <Button size="sm" type="submit" disabled={!label.trim() || !trigger.trim()}>Add action</Button>
       <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>

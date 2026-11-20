@@ -2,13 +2,14 @@
 // parser against the hub's own message builders and posts as they look live.
 import { describe, expect, it } from "vitest";
 import { npubEncode } from "nostr-tools/nip19";
-import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage } from "../plugins/signals/app/hub";
+import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage, triggeredMessage } from "../plugins/signals/app/hub";
+import { triggeredLines } from "../plugins/signals/app/model";
 import type { Task } from "../plugins/signals/app/store";
 import { ago } from "../packages/core/src/ui/components";
 import { filedHint, filterTasks, openingTitle, postOrigin, postWeight, taskFacts, taskOrigin, titleHint, workstreamHint } from "../plugins/signals/src/board-view";
 import type { BoardTask } from "../plugins/signals/src/client";
 import { LiveTasks } from "../plugins/signals/src/live-tasks";
-import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget } from "../plugins/signals/src/posts";
+import { detailPairs, isTaskPost, parseTaskPost, parseThreadPost, personName, plainLine, readTaskTarget, shortWhen, sourceName, taskTarget, untriggeredNote } from "../plugins/signals/src/posts";
 
 const AGENT = "09fea0492c475c37e6e96b6e4e47a7b8f0670fd319c667b45ab8f49aa85602f2";
 const task = (over: Partial<Task> = {}) => ({ id: 65, title: "Incident ES-2373918 (Sev1, Mitigated): Model Serving", account: "Block", workstream: "escalations", initiative: null, rule_id: "incidents", mode: "draft", question: null, options: null, channel: "c1", buzz_root: "r".repeat(64), status: "open", ...over }) as unknown as Task;
@@ -157,10 +158,10 @@ describe("thread posts", () => {
   });
 
   it("reads updates, with what changed and whether agents were asked", () => {
-    expect(parseThreadPost("Update: Case 01060787 (Normal): Open")).toEqual({ kind: "update", title: "Case 01060787 (Normal): Open", changes: [], forAgents: false });
+    expect(parseThreadPost("Update: Case 01060787 (Normal): Open")).toEqual({ kind: "update", title: "Case 01060787 (Normal): Open", changes: [], triggered: [], forAgents: false });
     expect(parseThreadPost("Update: [lucas/dbx buzz sync](https://calendar.example/e)")).toMatchObject({ kind: "update", title: "lucas/dbx buzz sync", url: "https://calendar.example/e" });
     const changed = changedMessage(task(), "Update: Case 01060787 (Normal): Open", [{ field: "es_status", from: "(none)", to: "Mitigated" }], [AGENT], "**For agents: Block**\nProfile: …");
-    expect(parseThreadPost(changed)).toEqual({ kind: "update", title: "Case 01060787 (Normal): Open", changes: [{ field: "es_status", from: "(none)", to: "Mitigated" }], forAgents: true });
+    expect(parseThreadPost(changed)).toEqual({ kind: "update", title: "Case 01060787 (Normal): Open", changes: [{ field: "es_status", from: "(none)", to: "Mitigated" }], triggered: [], forAgents: true });
   });
 
   it("leaves other replies alone", () => {
@@ -222,7 +223,7 @@ describe("closed tasks in the channel", () => {
     const board = { tasks: [{ task: { id: 1, status: "open" } }] };
     const hub = {
       board: async () => board,
-      tasks: async (filter: unknown) => (asked.push(filter), [{ id: 1, status: "open" }, { id: 7, status: "dismissed" }, { id: 8, status: "done" }]),
+      tasks: async (filter: unknown) => (asked.push(filter), [{ id: 1, status: "open" }, { id: 7, status: "dismissed" }, { id: 8, status: "done" }, { id: 9, status: "dismissed", triggers: { held: {}, dismissed: true } }, { id: 10, status: "dismissed", triggers: null }]),
     };
     live.client = () => Promise.resolve(hub as never);
     const changed = () => new Promise<void>((resolve) => { const stop = live.subscribe(() => (stop(), resolve())); });
@@ -238,6 +239,76 @@ describe("closed tasks in the channel", () => {
     expect(live.olderStatus("c", 7)).toBe("dismissed");
     expect(live.olderStatus("c", 8)).toBe("done");
     expect(live.olderStatus("c", 99)).toBeUndefined();
+    // Whether its workstream's defaults dismissed it, or a person did (a mark the hub clears on a person's dismissal).
+    expect(live.olderTask("c", 9)).toEqual({ status: "dismissed", byDefaults: true });
+    expect(live.olderTask("c", 10)).toEqual({ status: "dismissed", byDefaults: false });
+    expect(live.olderTask("c", 7)).toEqual({ status: "dismissed", byDefaults: false });
     expect(asked).toEqual([{ channel: "c", limit: 500 }]);
+  });
+});
+
+describe("default actions on the cards", () => {
+  const agent = "d64a4f5ad61d5a70d1b5c792edb862587a4b0ccac796eaf67f8bb04681a8b3ed";
+  const source = eventDetails({ source: "jira", external_id: "ES-1", occurred_at: 1795200000, title: "ES-1: more ITPM", url: "https://x/ES-1", actor: "Dana", payload: { status: "Open" } } as never);
+  const fired = [{ id: "draft-request", label: "Draft request", holds: true, why: "the customer asked for 4M ITPM: today — or sooner" }, { id: "work-it", label: "Work it", holds: true, why: "always" }];
+
+  it("reads what triggered as a task opened, or what happened when nothing did", () => {
+    const post = parseTaskPost(taskMessage(task(), { source, agents: [agent], note: triggeredLines(fired as never) }))!;
+    // The reason may have a colon or a dash of its own; only the first " — " splits.
+    expect(post.triggered).toEqual([{ label: "Draft request", why: "the customer asked for 4M ITPM: today — or sooner" }, { label: "Work it" }]);
+    // A label may have ": " (it can't have "—": readWorkstreamActions refuses it).
+    const colon = parseTaskPost(taskMessage(task(), { source, agents: [agent], note: triggeredLines([{ id: "escalate", label: "Escalate: production", held: true, why: "sev1: paging" }]) }))!;
+    expect(colon.triggered).toEqual([{ label: "Escalate: production", why: "sev1: paging" }]);
+    expect(post.untriggered).toBeUndefined();
+    expect(post.source?.facts.some((fact) => /Triggered/.test(fact.value))).toBe(false);
+    for (const note of ["No default action for capacity requests is triggered, so it's dismissed. It opens again if one is.", "No default action for capacity requests is triggered, so it's tracked with no agent asked."]) {
+      const quiet = parseTaskPost(taskMessage(task(), { source, note }))!;
+      expect(quiet.triggered).toEqual([]);
+      expect(quiet.untriggered).toBe(/dismissed\./.test(note) ? "dismissed" : "tracked");
+    }
+    // A task without default actions has neither.
+    expect(parseTaskPost(taskMessage(task(), { source }))).toMatchObject({ triggered: [] });
+    expect(parseTaskPost(taskMessage(task(), { source }))?.untriggered).toBeUndefined();
+  });
+
+  it("says nothing triggered only while that's still so, else as how it opened", () => {
+    const dismissed = { triggered: [], untriggered: "dismissed" as const };
+    const tracked = { triggered: [], untriggered: "tracked" as const };
+    // Only the hub, now, says it's still dismissed by its defaults.
+    expect(untriggeredNote(dismissed, { status: "dismissed", byDefaults: true })).toBe("dismissed");
+    // Anything else is how it opened: not known yet, open again, dismissed by a person since…
+    expect(untriggeredNote(dismissed)).toBe("opening");
+    expect(untriggeredNote(dismissed, { status: "open", byDefaults: false })).toBe("opening");
+    expect(untriggeredNote(dismissed, { status: "dismissed", byDefaults: false })).toBe("opening");
+    // …and tracked always is: an action may have fired, and asked an agent, since.
+    for (const status of ["open", "waiting", "in_progress", "done"]) expect(untriggeredNote(tracked, { status, byDefaults: false })).toBe("opening");
+    expect(untriggeredNote(tracked)).toBe("opening");
+    // The outcome is the hub's clause, whatever the workstream is called.
+    const named = parseTaskPost(taskMessage(task(), { source, note: "No default action for dismissed cases is triggered, so it's tracked with no agent asked." }))!;
+    expect(named.untriggered).toBe("tracked");
+    const named2 = parseTaskPost(taskMessage(task(), { source, note: "No default action for tracked work is triggered, so it's dismissed. It opens again if one is." }))!;
+    expect(named2.untriggered).toBe("dismissed");
+    // Something triggered, or the workstream has no default actions: nothing to say.
+    expect(untriggeredNote({ triggered: [{ label: "Draft request" }], untriggered: tracked.untriggered }, { status: "open", byDefaults: false })).toBeUndefined();
+    expect(untriggeredNote({ triggered: [] }, { status: "dismissed", byDefaults: false })).toBeUndefined();
+  });
+
+  it("reads what triggered on an update, with or without field changes", () => {
+    const text = `Update: [ES-1](https://x/ES-1)\n\n${triggeredLines(fired.slice(0, 1) as never)}`;
+    const plain = parseThreadPost(triggeredMessage(task(), text, [agent], "Account briefing", source));
+    expect(plain).toMatchObject({ kind: "update", title: "ES-1", triggered: [{ label: "Draft request" }], changes: [], forAgents: true });
+    const changed = parseThreadPost(changedMessage(task(), text, [{ field: "status", from: "Open", to: "In Progress" }], [agent]));
+    expect(changed).toMatchObject({ kind: "update", triggered: [{ label: "Draft request" }], changes: [{ field: "status", from: "Open", to: "In Progress" }] });
+    // Opened again by what it triggered: the same update, saying so.
+    const again = parseThreadPost(triggeredMessage(task(), `↩️ Open again: [ES-1](https://x/ES-1)\n\n${triggeredLines([{ id: "escalate", label: "Escalate: production", held: true, why: "sev1" }])}\n- **status:** Open → Reopened`, [agent], "Account briefing", source));
+    expect(again).toEqual({ kind: "update", title: "ES-1", url: "https://x/ES-1", triggered: [{ label: "Escalate: production", why: "sev1" }], changes: [{ field: "status", from: "Open", to: "Reopened" }], forAgents: true, reopened: true });
+    // With no agents asked, a meeting's checklist is still there to open (Details).
+    const listed = parseThreadPost(triggeredMessage(task(), `↩️ Open again: Weekly sync\n\n${triggeredLines([{ id: "follow-up", label: "Send follow-up", held: true, why: "new action items" }])}\n\n- [ ] Send the deck\n- [ ] Book the next sync`, []));
+    expect(listed).toMatchObject({ kind: "update", reopened: true, forAgents: false, more: true, triggered: [{ label: "Send follow-up" }] });
+    expect(again).not.toHaveProperty("more");
+    // A person's reopening (no actions with it) stays the hub's plain line.
+    expect(parseThreadPost("↩️ Open again: [ES-1](https://x/ES-1)\nNo one has it yet.")).toBeUndefined();
+    // An ordinary update has none.
+    expect(parseThreadPost("Update: [ES-1](https://x/ES-1)")).toMatchObject({ triggered: [] });
   });
 });
