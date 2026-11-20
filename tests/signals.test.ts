@@ -7,7 +7,7 @@ import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
-import { assigneeOf, memberChoices, ownersOf, removable, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
+import { assigneeOf, memberChoices, ownersOf, removable, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskActivity, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
 import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
 import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
@@ -1502,18 +1502,49 @@ describe("rules for every account", () => {
       expect(replyText("go on", [])).toBe("go on");
     });
 
-    it("lists a task's details", () => {
-      const facts = taskFacts(item(9, { account: "Globex", created_at: 1_700_000_000, last_event_at: 1_700_003_600, event_count: 3, initiative: "Q4" }));
-      expect(facts).toEqual([
-        { label: "Status", value: "Open" },
-        { label: "Mode", value: "draft" },
-        { label: "Workstream", value: "meeting prep" },
-        { label: "Initiative", value: "Q4" },
-        { label: "Account", value: "Globex" },
-        { label: "Source", value: "gmail: Pricing question" },
-        { label: "Opened", value: "2023-11-14 22:13 UTC" },
-        { label: "Last event", value: "2023-11-14 23:13 UTC (3 events)" },
+    it("lists a task's details, in the viewer's time with UTC on hover, and a meeting ahead as when it starts", () => {
+      const facts = taskFacts(item(9, { account: "Globex", created_at: 1_700_000_000, last_event_at: 1_700_003_600, event_count: 3, initiative: "Q4" }), 1_700_010_000);
+      expect(facts.map((fact) => fact.label)).toEqual(["Mode", "Workstream", "Initiative", "Account", "Opened", "Last event"]);
+      expect(facts[0]).toEqual({ label: "Mode", value: "Draft", title: "Agents prepare it, a person sends it" });
+      expect(facts[4]!.title).toBe("2023-11-14 22:13 UTC");
+      expect(facts[5]!.title).toBe("2023-11-14 23:13 UTC");
+      expect(facts[5]!.value).toMatch(/ · 3 events$/);
+      const ahead = taskFacts(item(9, { created_at: 1_700_000_000, last_event_at: 1_700_090_000, event_count: 3 }), 1_700_010_000);
+      expect(ahead.at(-1)).toMatchObject({ label: "Starts", title: "2023-11-15 23:13 UTC" });
+      expect(ahead.at(-1)!.value).not.toMatch(/events/);
+    });
+
+    it("reads a task's thread as activity: the hub's posts as lines, notes for agents as lines, long runs folded", () => {
+      const hub = "hub";
+      const post = "📌 **Task 9: Pricing question**\nAccount: Globex · Workstream: questions\nMode: draft (agents prepare it; a person sends it)\n\n**Source** (gmail): https://mail/x\nFrom: Ann <ann@globex.io>\n\nReply in this thread to work on it.";
+      const comment = (id: string, author: string, text: string, agents = false) => ({ id, author, at: id.charCodeAt(0), text, agents, pending: false, failed: false });
+      const thread = [
+        comment("a", hub, post),
+        comment("b", agent, "Draft ready"),
+        comment("c", hub, "alice@x.com set this to **in_progress**"),
+        comment("d", agent, "Update: [the doc](https://x)"),
+        comment("e", scout, "checking", true),
+        comment("f", hub, "👤 alice@x.com assigned this to nostr:npub1x."),
+        comment("g", hub, "Update: [Pricing](https://mail/x)"),
+        comment("h", hub, "✅ Done: replied. (Set its status on the Tasks board if it isn't.)"),
+        comment("i", hub, "an unknown hub post"),
+      ];
+      const entries = taskActivity(thread);
+      expect(entries.map((entry) => (entry.kind === "lines" ? `lines:${entry.lines.map((line) => line.comment.id).join("")}` : `${entry.kind}:${entry.comment.id}`))).toEqual([
+        "opened:a",
+        "comment:b",
+        "event:c",
+        // An agent's own "Update:" stays a comment: only the hub's posts are lines.
+        "comment:d",
+        // Four lines in a row fold into one entry.
+        "lines:efgh",
+        "comment:i",
       ]);
+      const opened = entries[0]!;
+      expect(opened.kind === "opened" && opened.post.source?.from).toBe("Ann");
+      // Without a task post first, nothing is read as the hub's.
+      expect(taskActivity(thread.slice(1)).every((entry) => entry.kind !== "event" && entry.kind !== "opened")).toBe(true);
+      expect(taskActivity([])).toEqual([]);
     });
   });
 });
