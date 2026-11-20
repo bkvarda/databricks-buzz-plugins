@@ -1,0 +1,54 @@
+// Synthetic drafts: an internal link is fine in Internal notes and flagged in
+// the Customer draft, and an unmarked draft is checked whole.
+import { describe, expect, it } from "vitest";
+import { disclosureCheck, draftSections, internalHits } from "../plugins/signals/app/disclosure";
+
+const customer = (body: string) => `## Customer draft\nHi Ann,\n\n${body}\n\nThanks,\nSam`;
+const internal = (body: string) => `## Internal notes\n${body}`;
+
+const INTERNAL_LINKS: [string, string][] = [
+  ["go link", "See go/roadmaptool for the date."],
+  ["Jira or Confluence", "Tracked in https://databricks.atlassian.net/browse/ES-1234567."],
+  ["internal ticket", "Root cause is in ES-2331845."],
+  ["Brickroad", "There's already brickroad:issue/11732 for this."],
+  ["Buzz link", "Discussed in buzz://message?channel=c1&id=abc."],
+  ["Slack link", "Per https://databricks.slack.com/archives/C01/p1700000000."],
+  ["Google Drive", "The FAQ is at https://drive.google.com/file/d/1bXh/view."],
+  ["workspace link", "Repro in https://fevm-buzz-lakebase-lab.cloud.databricks.com/jobs/1."],
+  ["internal date", "Eng availability is 2027-02-15."],
+];
+
+describe("disclosure check", () => {
+  it.each(INTERNAL_LINKS)("flags a %s in the customer draft", (kind, line) => {
+    const { hits, marked } = disclosureCheck(`${customer(line)}\n\n${internal("Nothing here.")}`);
+    expect(marked).toBe(true);
+    expect(hits.map((hit) => hit.kind)).toContain(kind);
+  });
+
+  it.each(INTERNAL_LINKS)("allows a %s in internal notes", (_kind, line) => {
+    expect(disclosureCheck(`${customer("Managed Iceberg tables follow the open Iceberg spec: https://docs.databricks.com/aws/en/iceberg/")}\n\n${internal(line)}`).hits).toEqual([]);
+  });
+
+  it("checks a draft with no headings as customer-facing", () => {
+    expect(disclosureCheck("Hi Ann, see go/roadmaptool.")).toEqual({ hits: [{ kind: "go link", text: "go/roadmaptool" }], marked: false });
+  });
+
+  it("goes back to customer text after internal notes when another customer heading follows", () => {
+    const text = `${internal("ES-1234567")}\n\n**Customer reply:**\nSee INC-6588.`;
+    expect(draftSections(text)).toEqual({ customer: "See INC-6588.", internal: "ES-1234567", marked: true });
+    expect(disclosureCheck(text).hits.map((hit) => hit.text)).toEqual(["INC-6588"]);
+  });
+
+  it("reads common heading shapes", () => {
+    for (const heading of ["# Customer draft", "### Draft email to the customer", "**Customer-facing reply**", "Customer draft:", "📧 Email draft"])
+      expect(draftSections(`${heading}\nhello\n## Internal notes\nES-1234567`)).toMatchObject({ customer: "hello", marked: true });
+  });
+
+  it("doesn't take a heading inside a code block", () => {
+    expect(draftSections("## Customer draft\n```\n## Internal notes\n```\nES-1234567").customer).toContain("ES-1234567");
+  });
+
+  it("leaves public Databricks docs alone", () => {
+    expect(internalHits("https://docs.databricks.com/aws/en/iceberg/ and https://www.databricks.com/product/roadmap")).toEqual([]);
+  });
+});
