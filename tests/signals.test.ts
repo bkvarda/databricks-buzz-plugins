@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, agentsFor, DEFAULT_SOURCES, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
@@ -1192,6 +1192,13 @@ describe("work someone on the team did themselves", () => {
     ],
   };
 
+  it("offers the sent sources on their own in Settings, each with its sign-in service", () => {
+    const sources = new Map(DEFAULT_SOURCES.map((info) => [info.name, info]));
+    expect(sources.get("gmail")).toMatchObject({ service: "gmail", description: "Mail in your inbox." });
+    expect(sources.get("gmail.sent")).toMatchObject({ service: "gmail" });
+    expect(sources.get("slack.sent")).toMatchObject({ service: "slack" });
+  });
+
   it("finds the tasks an owner's own event handles, only for by_owner rules", () => {
     const reply: EventInput = { source: "gmail", external_id: "m2", actor: "Alice <Alice@x.com>", group_key: "th1" };
     expect(decide(config, reply, { firstRun: false, owner: "alice@x.com" })).toMatchObject({ kind: "none" });
@@ -1261,7 +1268,95 @@ describe("work someone on the team did themselves", () => {
     await call("/api/events", { events: [{ source: "slack.sent", external_id: "s3", actor: "bob@x.com", title: "Looking now, it's back", group_key: "1795000000" }] }, "bob@x.com");
     expect((await store.task(slack!.id))!.status).toBe("done");
     expect((await store.people([slack!.id])).get(slack!.id)!.map((person) => person.key)).toEqual(["carol@x.com"]);
-    expect(posts.at(-1)).toEqual({ task: slack!.id, text: handledMessage("bob@x.com", "Looking now, it's back"), agents: [] });
+    expect(posts.at(-1)).toEqual({ task: slack!.id, text: handledMessage("bob@x.com", "Looking now, it's back", undefined, [], "carol@x.com"), agents: [] });
+    expect(posts.at(-1)!.text).toContain("It stays with **carol@x.com**");
+  });
+
+  it("closes a task whose team reply came in before the customer's message, and never posts it", async () => {
+    const { store, call } = await setup("signals_handled_early");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "r1", actor: "alice@x.com", title: "Re: Pricing?", group_key: "th1", occurred_at: 1795001100 }] });
+    expect(await store.tasks({})).toHaveLength(0);
+    const opened = await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?", group_key: "th1", occurred_at: 1795001000 }] });
+    expect(opened.json).toMatchObject({ created: [] });
+    const [task] = await store.tasks({});
+    expect(task).toMatchObject({ status: "done", buzz_root: null, event_count: 2 });
+    expect((await store.people([task!.id])).get(task!.id)!.map((person) => person.key)).toEqual(["alice@x.com"]);
+  });
+
+  it("decides by event time: an older team reply doesn't close a newer customer message, or reopen for an older one", async () => {
+    const { store, call } = await setup("signals_handled_order");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?", group_key: "th1", occurred_at: 1795001000 }] });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "ann@globex.io", title: "Also SSO?", group_key: "th1", occurred_at: 1795002000 }] });
+    const [task] = await store.tasks({});
+    // Alice's reply to the first message, delivered late: the follow-up still needs an answer.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "r1", actor: "alice@x.com", title: "Re: Pricing?", group_key: "th1", occurred_at: 1795001500 }] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+    // Her reply to both: done. Then the customer's earlier message, delivered late: still done.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "r2", actor: "alice@x.com", title: "Re: Also SSO?", group_key: "th1", occurred_at: 1795002500 }] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m0", actor: "ann@globex.io", title: "Hello?", group_key: "th1", occurred_at: 1795000500 }] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    // A newer one opens it again.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m3", actor: "ann@globex.io", title: "Thanks, one more", group_key: "th1", occurred_at: 1795003000 }] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
+
+  it("finishes a closure a failed write cut short when the reply comes again, and tells the agents once", async () => {
+    let fail = 0;
+    const db = pglite();
+    const flaky: Db = { query: async (text, values) => (fail > 0 && /INSERT INTO \S+\.activities/.test(text) && fail-- ? Promise.reject(new Error("connection reset")) : db.query(text, values)) };
+    const store = new SignalsStore(flaky, "signals_handled_retry");
+    await store.setup();
+    const posts: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(store, { opened: async (task) => `root-${task.id}`, updated: async (task, text, agents = []) => void posts.push({ task: task.id, text, agents }) }, { defaultConfig: config });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    await call("/api/sources", { source: "gmail", enabled: true });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?", group_key: "th1" }] });
+    const [task] = await store.tasks({});
+    await store.assign(task!.id, "agent", agent, false);
+    posts.length = 0;
+
+    const reply = { source: "gmail", external_id: "r1", actor: "alice@x.com", title: "Re: Pricing?", group_key: "th1", url: "https://mail/th1" };
+    fail = 1;
+    const first = await call("/api/events", { events: [reply] });
+    expect((first.json as { errors: unknown[] }).errors).toHaveLength(1);
+    expect((await store.task(task!.id))!.status).toBe("open");
+    expect((await store.people([task!.id])).get(task!.id)!.map((person) => person.key)).toEqual([agent]);
+    expect(posts).toHaveLength(0);
+
+    // The poller sends it again (its cursor didn't move): same content, and the closure finishes.
+    await call("/api/events", { events: [reply] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    const detail = (await store.detail(task!.id))!;
+    expect(detail.activities.filter((item) => item.kind === "handled")).toHaveLength(1);
+    expect(detail.artifacts).toHaveLength(1);
+    expect(posts).toEqual([{ task: task!.id, text: handledMessage("alice@x.com", "Re: Pricing?", "https://mail/th1", [agent]), agents: [agent] }]);
+    await call("/api/events", { events: [reply] });
+    expect(posts).toHaveLength(1);
+  });
+
+  it("makes the responder the owner when only an agent owned it", async () => {
+    const { store, posts, call } = await setup("signals_handled_agent_owner");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Pricing?", group_key: "th1" }] });
+    const [task] = await store.tasks({});
+    await store.assign(task!.id, "agent", agent, true);
+    await call("/api/events", { events: [{ source: "gmail", external_id: "r1", actor: "alice@x.com", title: "Re: Pricing?", group_key: "th1" }] });
+    expect(await store.task(task!.id)).toMatchObject({ status: "done" });
+    expect((await store.people([task!.id])).get(task!.id)).toEqual([expect.objectContaining({ kind: "person", key: "alice@x.com", assigned_at: expect.any(Number) })]);
+    expect(posts.at(-1)!.text).toContain("It's theirs now");
+  });
+
+  it("keeps Slack threads apart by channel and root, and a reply permalink finds its root's task", async () => {
+    const { store, call } = await setup("signals_handled_slack_keys");
+    // As the example slack sources map them: channel:root thread_ts.
+    await call("/api/events", { events: [{ source: "slack", external_id: "https://x.slack.com/archives/C1/p1795000000123456", actor: "ann@globex.io", title: "Is ingest down?", group_key: "C1:1795000000.123456", occurred_at: "1795000000.123456" }] });
+    await call("/api/events", { events: [{ source: "slack", external_id: "https://x.slack.com/archives/C2/p1795000000999999", actor: "ann@globex.io", title: "Other channel", group_key: "C2:1795000000.999999", occurred_at: "1795000000.999999" }] });
+    const [one, two] = (await store.tasks({ open: true })).sort((a, b) => a.id - b.id);
+    expect([one!.group_key, two!.group_key]).toEqual(["slack|C1:1795000000.123456", "slack|C2:1795000000.999999"]);
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "https://x.slack.com/archives/C1/p1795000300654321", actor: "alice@x.com", title: "Looking", group_key: "C1:1795000000.123456", occurred_at: "1795000300.654321" }] });
+    expect((await store.task(one!.id))!.status).toBe("done");
+    expect((await store.task(two!.id))!.status).toBe("open");
   });
 
   it("closes nothing for a rule without by_owner", async () => {

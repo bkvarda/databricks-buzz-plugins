@@ -279,10 +279,12 @@ export type SourceInfo = Readonly<{
 
 export const DEFAULT_SOURCES: readonly SourceInfo[] = [
   { name: "gmail", label: "Gmail", service: "gmail", description: "Mail in your inbox." },
+  { name: "gmail.sent", label: "Gmail (sent)", service: "gmail", description: "Mail you sent, so a reply you send in a task's thread closes it." },
   { name: "google_calendar", label: "Google Calendar", service: "google_calendar", description: "Your meetings in the next week." },
   { name: "google_drive", label: "Google Drive", service: "google_drive", description: "Docs changed recently." },
   { name: "jira", label: "Jira", service: "atlassian", description: "Issues you're assigned, reported or watching." },
   { name: "slack", label: "Slack", service: "slack", description: "Messages that mention you." },
+  { name: "slack.sent", label: "Slack (sent)", service: "slack", description: "Messages you sent, so a reply you send in a task's thread closes it." },
 ];
 
 export type SignalsConfig = Readonly<{

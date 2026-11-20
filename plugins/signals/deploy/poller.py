@@ -70,7 +70,8 @@ group_key, occurred_at, and payload (a list of fields, "*" for the whole item,
 or an object of specs). A spec is a path ("fields.summary"), a template
 ("{key}: {fields.summary}"), or {"from": <spec>, "match": <regex>}, which takes
 the regex's first group (case-insensitive) and is left out without a match:
-{"from": "title", "match": "workspace (\\d+)"}.
+{"from": "title", "match": "workspace (\\d+)"}. `match` can be a list of regexes,
+tried in order, and `"replace": "\\1:\\2"` builds the value from the groups.
 """
 
 from __future__ import annotations
@@ -154,15 +155,25 @@ def fill(template: Any, item: Any, clock: dict[str, dt.datetime]) -> Any:
     return re.sub(r"\{([A-Za-z0-9_.+-]+)\}", lambda m: "" if one(m.group(1)) is None else str(one(m.group(1))), template)
 
 
-def extract(found: Any, pattern: str) -> Any:
-    """The first capture group of `pattern` in `found` (or the whole match), case-insensitive; None without a match."""
+def extract(found: Any, pattern: str | list[str], replace: str | None = None) -> Any:
+    """The first capture group of `pattern` in `found` (or the whole match), case-insensitive; None without a match.
+
+    `pattern` can be a list, tried in order (the first that matches wins). With
+    `replace`, the result is that template with the match's groups in it
+    (`\\1:\\2`), for a value made of several parts.
+    """
     if found in (None, ""):
         return None
-    match = re.search(pattern, found if isinstance(found, str) else json.dumps(found, default=str), re.I)
-    if not match:
-        return None
-    groups = [group for group in match.groups() if group is not None]
-    return (groups[0] if groups else match.group(0)).strip()
+    text = found if isinstance(found, str) else json.dumps(found, default=str)
+    for one in [pattern] if isinstance(pattern, str) else pattern:
+        match = re.search(one, text, re.I)
+        if not match:
+            continue
+        if replace is not None:
+            return match.expand(replace).strip()
+        groups = [group for group in match.groups() if group is not None]
+        return (groups[0] if groups else match.group(0)).strip()
+    return None
 
 
 _FIELD = re.compile(r"^([A-Z][A-Za-z_ ]{0,30}):[ \t]?(.*)$")
@@ -198,7 +209,7 @@ def to_event(source: str, item: dict, mapping: dict, clock: dict[str, dt.datetim
 
     def value(spec: Any) -> Any:
         if isinstance(spec, dict) and "match" in spec:
-            return extract(value(spec.get("from", "")), spec["match"])
+            return extract(value(spec.get("from", "")), spec["match"], spec.get("replace"))
         if isinstance(spec, str) and "{" not in spec:
             return get_path(item, spec)  # a plain path
         return fill(spec, item, clock)

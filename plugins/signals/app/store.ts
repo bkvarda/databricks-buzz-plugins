@@ -67,6 +67,12 @@ export type Series = Readonly<{
 /** Someone on a task. `assigned_at`: when a person (or an agent) made them its owner, as against an agent asked to help. */
 export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number; assigned_at?: number }>;
 
+/** A task someone on the team handled: who, their reply, the agents taken off it, and `owner` when a person other than them still owns it. */
+export type Handled = { task: Task; by: string; title?: string; url?: string; agents: string[]; owner?: string };
+
+/** A reply someone on the team sent in a group's thread, as recorded. */
+export type Reply = Readonly<{ group: string; event: number; owner: string; source: string; title: string | null; url: string | null; at: number }>;
+
 export type Outcome = "new" | "changed" | "same" | "skipped";
 /** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
 export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
@@ -93,7 +99,7 @@ export type IngestResult = Readonly<{
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
   /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
-  handled: { task: Task; by: string; title?: string; url?: string; agents: string[] }[];
+  handled: Handled[];
   firstRun: boolean;
 }>;
 
@@ -184,6 +190,12 @@ export class SignalsStore {
     // Owners someone chose (assigned_at), and who was taken off (removed_at): kept, so nothing puts them back but assigning them again.
     await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS assigned_at bigint`);
     await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS removed_at bigint`);
+    // Replies someone on the team sent in a group's thread (done_when.by_owner), kept until they're decided:
+    // applied_at once checked against the task (closed_task when they closed it). One with no task yet waits for the task to open.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.replies (
+      group_key text NOT NULL, event_id bigint NOT NULL, owner text NOT NULL, source text NOT NULL, title text, url text,
+      at bigint NOT NULL, seen_at bigint NOT NULL, applied_at bigint, closed_task bigint, PRIMARY KEY (group_key, event_id))`);
+    await this.q(`CREATE INDEX IF NOT EXISTS replies_event ON $S.replies (event_id) WHERE applied_at IS NULL`);
     await this.setupInbox();
   }
 
@@ -357,7 +369,15 @@ export class SignalsStore {
         if (state.firstRun) counts.firstRun = true;
         const recorded = await this.record(owner, event);
         counts[recorded.outcome]++;
-        if (recorded.outcome === "same") continue;
+        const replies = handledBy(config, event, owner);
+        if (recorded.outcome === "same") {
+          // Seen before, but a closure it started may not have finished (a write failed): finish it.
+          if (replies.length) {
+            for (const { group } of replies) await this.recordReply(group, recorded.id, owner, event, true);
+            for (const reply of await this.pendingReplies({ event: recorded.id })) await this.applyReply(reply, result);
+          }
+          continue;
+        }
         const placed = await this.place(owner, event, recorded, config, state.firstRun, classifier, () => counts.filtered++);
         // An event can finish a task even when its rule no longer matches it (a resolved ticket).
         let finishedHere = false;
@@ -372,18 +392,17 @@ export class SignalsStore {
           if (done && !(placed?.opened && task.id === placed.task.id)) result.finished.push({ task: done, reason });
         }
         // Someone on the team did the work themselves (their reply in the thread): done, theirs, and its agents off it.
-        for (const { group } of handledBy(config, event, owner)) {
-          const task = placed?.task.group_key === group ? placed.task : await this.taskByGroup(group);
-          if (!task || !isOpen(task.status) || (task.series && task.asked_by === SERIES_ASKER)) continue;
-          await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
-          const done = await this.handled(task.id, owner, event);
-          if (task.id === placed?.task.id) finishedHere = true;
-          if (done) result.handled.push(done);
+        // (Recorded first, so a reply that comes before the customer's message, or a closure a failed write cut short, is still decided.)
+        for (const { group } of replies) {
+          const reply = await this.recordReply(group, recorded.id, owner, event);
+          const done = await this.applyReply(reply, result);
+          if (done && done.task.id === placed?.task.id) finishedHere = true;
         }
         if (!placed || finishedHere) continue;
         let task = placed.task;
         if (placed.opened) opened.add(task.id);
-        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true })) {
+        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true }) && !(await this.answeredAfter(task.id, toSeconds(event.occurred_at)))) {
+          // (Not for a message older than the team's reply that closed it: that reply answered it.)
           // (A finished task stays done when a late event for it is itself past done, like a meeting's notes after it ended.)
           await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
         }
@@ -402,6 +421,15 @@ export class SignalsStore {
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
         await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
+        if (placed.opened) {
+          // Someone on the team already replied in its thread (their reply came in first): done, and never posted.
+          let closed = false;
+          for (const reply of await this.pendingReplies({ group: task.group_key })) if (await this.applyReply(reply)) closed = true;
+          if (closed) {
+            opened.delete(task.id);
+            continue;
+          }
+        }
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
         if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
@@ -822,22 +850,88 @@ export class SignalsStore {
     return out;
   }
 
+  /** Records a reply someone on the team sent in a group's thread (once; it waits there until it's decided). */
+  private async recordReply(group: string, event: number, owner: string, input: EventInput, keep = false): Promise<Reply> {
+    const title = input.title ? plainSlack(input.title).replace(/\s+/g, " ").trim().slice(0, 200) : null;
+    const occurred = toSeconds(input.occurred_at);
+    const at = Number.isNaN(occurred) ? now() : occurred;
+    await this.q(
+      `INSERT INTO $S.replies (group_key, event_id, owner, source, title, url, at, seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (group_key, event_id) DO ${keep ? "NOTHING" : "UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url, at = EXCLUDED.at"}`,
+      [group, event, owner.toLowerCase(), input.source, title, input.url ?? null, at, now()],
+    );
+    return { group, event, owner: owner.toLowerCase(), source: input.source, title, url: input.url ?? null, at };
+  }
+
+  /** Replies not decided yet: one event's, or one group's. */
+  private async pendingReplies(where: { event: number } | { group: string }): Promise<Reply[]> {
+    const found = "event" in where
+      ? await this.q(`SELECT * FROM $S.replies WHERE event_id = $1 AND applied_at IS NULL ORDER BY at`, [where.event])
+      : await this.q(`SELECT * FROM $S.replies WHERE group_key = $1 AND applied_at IS NULL ORDER BY at`, [where.group]);
+    return found.rows.map((row) => ({ group: String(row.group_key), event: Number(row.event_id), owner: String(row.owner), source: String(row.source), title: (row.title as string | null) ?? null, url: (row.url as string | null) ?? null, at: Number(row.at) }));
+  }
+
+  /** Whether a team reply that closed the task came at or after `at` (so a customer message from then needs nothing more). */
+  private async answeredAfter(task: number, at: number): Promise<boolean> {
+    if (Number.isNaN(at)) return false;
+    const found = await this.q(`SELECT 1 FROM $S.replies WHERE closed_task = $1 AND at >= $2 LIMIT 1`, [task, at]);
+    return found.rows.length > 0;
+  }
+
+  /** Decides a recorded reply against its group's task, if it has one yet (adding the closure to `result`). */
+  private async applyReply(reply: Reply, result?: IngestResult): Promise<Handled | undefined> {
+    const task = await this.taskByGroup(reply.group);
+    if (!task) return undefined;
+    await this.attach(task.id, reply.event, 1, reply.at);
+    const done = await this.handled(task.id, reply);
+    if (done && result) result.handled.push(done);
+    return done;
+  }
+
   /**
-   * Marks a task done because `by` (a person's email) did the work, as
-   * `event` shows: records what they did, makes them its owner when it has
-   * none, and takes its agents off it. Undefined if it's gone.
+   * Marks a task done because someone on the team did the work, as their
+   * reply shows, when it's open and the reply is no older than the customer's
+   * latest message on it: records what they did, makes them its owner unless
+   * a person still owns it, and takes its agents off it. All in one statement,
+   * so it all happens or none does, and only the call that closes it gets a
+   * result (and tells the agents to stop). The reply is marked decided either way.
    */
-  async handled(id: number, by: string, event: EventInput): Promise<{ task: Task; by: string; title?: string; url?: string; agents: string[] } | undefined> {
-    const people = (await this.people([id])).get(id) ?? [];
-    const title = event.title ? plainSlack(event.title).replace(/\s+/g, " ").trim().slice(0, 200) : undefined;
-    await this.activity(id, by, "handled", `${by} handled it themselves (${event.source})${title ? `: ${title}` : ""}${event.url ? ` ${event.url}` : ""}`);
-    if (event.url) await this.artifact(id, by, "reply", event.url, `${by}'s reply`);
-    if (!people.some((person) => person.assigned_at)) await this.assign(id, "person", by.toLowerCase(), true);
-    const agents = people.filter((person) => person.kind === "agent").map((person) => person.key);
-    for (const agent of agents) await this.unassign(id, agent, "agent");
-    await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL WHERE id = $1`, [id]);
-    const task = await this.setStatus(id, "done", by, `handled by ${by}`);
-    return task && { task, by, ...(title && { title }), ...(event.url && { url: event.url }), agents };
+  async handled(id: number, reply: Reply): Promise<Handled | undefined> {
+    const at = now();
+    const what = `${reply.owner} handled it themselves (${reply.source})${reply.title ? `: ${reply.title}` : ""}${reply.url ? ` ${reply.url}` : ""}`.slice(0, 4000);
+    const found = await this.q<{ task: unknown; agents: unknown; owners: unknown }>(
+      `WITH latest AS (
+         SELECT max(e.occurred_at) AS at FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+         WHERE te.task_id = $1 AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)),
+       t AS (
+         UPDATE $S.tasks SET status = 'done', question = NULL, options = NULL, asked_by = NULL, updated_at = $3
+         WHERE id = $1 AND status NOT IN ('done', 'dismissed') AND NOT (series IS NOT NULL AND asked_by IS NOT DISTINCT FROM $9::text)
+           AND $4::bigint >= COALESCE((SELECT at FROM latest), 0)
+         RETURNING *),
+       mark AS (UPDATE $S.replies SET applied_at = $3, closed_task = (SELECT id FROM t) WHERE group_key = $2 AND event_id = $5 RETURNING 1),
+       owners AS (SELECT key FROM $S.task_people WHERE task_id = $1 AND kind = 'person' AND assigned_at IS NOT NULL AND removed_at IS NULL AND key <> $6),
+       agents AS (
+         UPDATE $S.task_people SET removed_at = $3, assigned_at = NULL
+         WHERE task_id = $1 AND kind = 'agent' AND removed_at IS NULL AND EXISTS (SELECT 1 FROM t) RETURNING key),
+       responder AS (
+         INSERT INTO $S.task_people (task_id, kind, key, at, assigned_at)
+         SELECT $1, 'person', $6, $3, $3 WHERE EXISTS (SELECT 1 FROM t) AND NOT EXISTS (SELECT 1 FROM owners)
+         ON CONFLICT (task_id, kind, key) DO UPDATE SET removed_at = NULL, assigned_at = COALESCE($S.task_people.assigned_at, EXCLUDED.assigned_at)
+         RETURNING key),
+       acts AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text)
+         SELECT $1, $3, $6, v.kind, v.text FROM t, (VALUES (1, 'handled', $7::text), (2, 'status', $8::text)) AS v(n, kind, text) ORDER BY v.n RETURNING 1),
+       art AS (INSERT INTO $S.artifacts (task_id, at, actor, kind, url, title) SELECT $1, $3, $6, 'reply', $10::text, $11::text FROM t WHERE $10::text IS NOT NULL RETURNING 1)
+       SELECT (SELECT row_to_json(t) FROM t) AS task, ARRAY(SELECT key FROM agents ORDER BY key) AS agents, ARRAY(SELECT key FROM owners ORDER BY key) AS owners,
+         (SELECT count(*) FROM mark) + (SELECT count(*) FROM responder) + (SELECT count(*) FROM acts) + (SELECT count(*) FROM art) AS writes`,
+      [id, reply.group, at, reply.at, reply.event, reply.owner, what, `done: handled by ${reply.owner}`, SERIES_ASKER, reply.url, `${reply.owner}'s reply`],
+    );
+    const row = found.rows[0];
+    const raw = typeof row?.task === "string" ? (JSON.parse(row.task) as Row) : (row?.task as Row | null | undefined);
+    if (!raw) return undefined;
+    const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : typeof value === "string" ? value.replace(/^\{|\}$/g, "").split(",").filter(Boolean) : []);
+    const owners = list(row!.owners);
+    return { task: toTask(raw), by: reply.owner, ...(reply.title && { title: reply.title }), ...(reply.url && { url: reply.url }), agents: list(row!.agents), ...(owners[0] && { owner: owners[0] }) };
   }
 
   /** Marks a task done by its rule (not a person), clearing any question; undefined if it's gone. */
