@@ -324,7 +324,7 @@ export function apply(ctx: Context) {
       matches: () => false,
       channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
       channelPlacement: "side",
-      component: accountPanel(databricks),
+      component: accountPanel(ctx, databricks),
     });
     scope.panels.register({
       id: "board",

@@ -124,7 +124,7 @@ export function useProfiles(ctx: Context, keys: readonly string[]) {
 const NO_MEMBERS: readonly string[] = [];
 
 /** A channel's members, from its relay-signed roster (empty until the host has read it). */
-function useMembers(ctx: Context, channel: string | undefined): readonly string[] {
+export function useMembers(ctx: Context, channel: string | undefined): readonly string[] {
   const channels = useRelay(ctx).session?.channels;
   const [, bump] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => (channels?.subscribeList ? channels.subscribeList(bump) : undefined), [channels]);
