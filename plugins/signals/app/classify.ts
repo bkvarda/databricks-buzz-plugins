@@ -4,7 +4,7 @@
 // of yes (answers.<name>.noul). The hub calls it as its service principal,
 // only for an event a rule matched that would open a new task.
 import { type Classify, classifyQuestions, classifyState, type EventInput } from "./model";
-import type { Classifier } from "./store";
+import type { Categorizer, Classifier } from "./store";
 
 export const DEFAULT_CLASSIFIER_ENDPOINT = "databricks-openjev-qwen35-4b";
 
@@ -30,6 +30,31 @@ export function jevClassifier(call: Call, endpoint = DEFAULT_CLASSIFIER_ENDPOINT
       return score;
     } catch (error) {
       log?.(`classifier ${endpoint} failed for ${event.source} ${event.external_id}: ${(error as Error).message}`);
+      return undefined;
+    }
+  };
+}
+
+/** The workstream a classifier's choice answer picked (`answers.category.choice`), or undefined. */
+export function answerChoice(answer: unknown): string | undefined {
+  const found = (answer as { answers?: { category?: { choice?: unknown; confidence?: unknown } } } | undefined)?.answers?.category;
+  return typeof found?.choice === "string" && found.choice.trim() ? found.choice : undefined;
+}
+
+/**
+ * A categorizer that asks the same serving endpoint a choice question: which
+ * of the rule's categories the event is. Errors and odd answers give
+ * undefined, so the task keeps its rule's workstream; `log` hears why.
+ */
+export function jevCategorizer(call: Call, endpoint = DEFAULT_CLASSIFIER_ENDPOINT, log?: (line: string) => void): Categorizer {
+  return async (event: EventInput, choices: Readonly<Record<string, string>>) => {
+    try {
+      const answer = await call(`/serving-endpoints/${encodeURIComponent(endpoint)}/invocations`, { method: "POST", body: { state: classifyState(event), questions: { category: { type: "choice", instructions: "Which kind of work is this event?", criteria: choices } } } });
+      const choice = answerChoice(answer);
+      if (choice === undefined) log?.(`categorizer ${endpoint} gave no choice for ${event.source} ${event.external_id}`);
+      return choice;
+    } catch (error) {
+      log?.(`categorizer ${endpoint} failed for ${event.source} ${event.external_id}: ${(error as Error).message}`);
       return undefined;
     }
   };
