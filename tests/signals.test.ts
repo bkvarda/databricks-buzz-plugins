@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, agentsFor, DEFAULT_SOURCES, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
@@ -1192,6 +1192,14 @@ describe("work someone on the team did themselves", () => {
     ],
   };
 
+  it("reads a Slack thread's key from a permalink", () => {
+    expect(slackThreadKey("https://x.slack.com/archives/C1/p1795000000123456")).toBe("C1:1795000000.123456");
+    expect(slackThreadKey("https://x.slack.com/archives/C1/p1795000300654321?thread_ts=1795000000.123456&cid=C1")).toBe("C1:1795000000.123456");
+    expect(slackThreadKey("https://x.slack.com/archives/C1/p1795000300654321?cid=C1&thread_ts=1795000000.123456")).toBe("C1:1795000000.123456");
+    expect(slackThreadKey("https://mail/th1")).toBeUndefined();
+    expect(slackThreadKey(undefined)).toBeUndefined();
+  });
+
   it("offers the sent sources on their own in Settings, each with its sign-in service", () => {
     const sources = new Map(DEFAULT_SOURCES.map((info) => [info.name, info]));
     expect(sources.get("gmail")).toMatchObject({ service: "gmail", description: "Mail in your inbox." });
@@ -1357,6 +1365,61 @@ describe("work someone on the team did themselves", () => {
     await call("/api/events", { events: [{ source: "slack.sent", external_id: "https://x.slack.com/archives/C1/p1795000300654321", actor: "alice@x.com", title: "Looking", group_key: "C1:1795000000.123456", occurred_at: "1795000300.654321" }] });
     expect((await store.task(one!.id))!.status).toBe("done");
     expect((await store.task(two!.id))!.status).toBe("open");
+  });
+
+  describe("Slack tasks keyed the old way (the root's second)", () => {
+    const link = (channel: string, ts: string, root?: string) => `https://x.slack.com/archives/${channel}/p${ts.replace(".", "")}${root ? `?thread_ts=${root}&cid=${channel}` : ""}`;
+    // As the earlier example source sent them: group_key the 10-digit second, url the permalink.
+    const legacy = (id: string, channel: string, ts: string, root?: string) => ({ source: "slack", external_id: link(channel, ts), url: link(channel, ts, root), actor: "ann@globex.io", title: `msg ${id}`, group_key: (root ?? ts).slice(0, 10), occurred_at: ts });
+    const current = (source: string, channel: string, ts: string, root: string, actor = "ann@globex.io") => ({ source, external_id: link(channel, ts), url: link(channel, ts, root === ts ? undefined : root), actor, title: `${source} ${ts}`, group_key: `${channel}:${root}`, occurred_at: ts });
+
+    it("a customer's new message in the thread joins the old task, and a team reply closes it", async () => {
+      const { store, call } = await setup("signals_legacy_both");
+      await call("/api/events", { events: [legacy("1", "C1", "1795000000.123456")] });
+      const [task] = await store.tasks({});
+      expect(task!.group_key).toBe("slack|1795000000");
+      // The customer writes again in that thread, now keyed the new way: no second task.
+      await call("/api/events", { events: [current("slack", "C1", "1795000100.000001", "1795000000.123456")] });
+      expect(await store.tasks({})).toHaveLength(1);
+      expect((await store.task(task!.id))!.event_count).toBe(2);
+      // Alice replies in it: the old task closes.
+      await call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
+      expect((await store.task(task!.id))!.status).toBe("done");
+      expect(await store.tasks({})).toHaveLength(1);
+    });
+
+    it("a team reply first, then the customer: both on the old task (from a reply's permalink)", async () => {
+      const { store, call } = await setup("signals_legacy_reply_first");
+      // The old task was opened by a reply in the thread: its permalink names the root.
+      await call("/api/events", { events: [legacy("1", "C1", "1795000050.000009", "1795000000.123456")] });
+      const [task] = await store.tasks({});
+      await call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
+      expect((await store.task(task!.id))!.status).toBe("done");
+      await call("/api/events", { events: [current("slack", "C1", "1795000300.000003", "1795000000.123456")] });
+      expect(await store.tasks({})).toHaveLength(1);
+      expect((await store.task(task!.id))!.status).toBe("open");
+    });
+
+    it("keeps two threads that started in the same second apart, and leaves an old task that mixed them alone", async () => {
+      const { store, call } = await setup("signals_legacy_same_second");
+      await call("/api/events", { events: [legacy("1", "C1", "1795000000.123456")] });
+      const [old] = await store.tasks({});
+      // Another thread, same second (another channel, then the same channel): its own task; the old one is untouched.
+      await call("/api/events", { events: [current("slack", "C2", "1795000000.999999", "1795000000.999999")] });
+      await call("/api/events", { events: [current("slack.sent", "C1", "1795000400.000001", "1795000000.000001", "alice@x.com")] });
+      await call("/api/events", { events: [current("slack", "C1", "1795000500.000001", "1795000000.000001")] });
+      const tasks = (await store.tasks({})).sort((a, b) => a.id - b.id);
+      expect(tasks.map((task) => task.group_key)).toEqual(["slack|1795000000", "slack|C2:1795000000.999999", "slack|C1:1795000000.000001"]);
+      expect((await store.task(old!.id))!).toMatchObject({ status: "open", event_count: 1 });
+
+      // An old task that already holds both threads of a second (the bug this fixes): neither new key takes it.
+      const mixed = await setup("signals_legacy_mixed");
+      await mixed.call("/api/events", { events: [legacy("1", "C1", "1795000000.123456"), legacy("2", "C1", "1795000000.000001")] });
+      const [both] = await mixed.store.tasks({});
+      expect(both!.event_count).toBe(2);
+      await mixed.call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
+      expect((await mixed.store.task(both!.id))!.status).toBe("open");
+    });
   });
 
   it("closes nothing for a rule without by_owner", async () => {

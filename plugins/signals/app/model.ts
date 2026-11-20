@@ -513,6 +513,20 @@ export function handledBy(config: SignalsConfig, event: EventInput, owner: strin
   return config.rules.flatMap((rule) => (rule.action === "task" && rule.done_when?.by_owner && sourceMatches(rule.sources, event.source) ? [{ rule, group: groupKey(rule, event) }] : []));
 }
 
+/**
+ * A Slack thread's key, `C123:1795000000.123456` (its channel and root
+ * message's full ts), from a message's permalink: a reply's carries the root
+ * as `thread_ts=`, a root's is its own `/p…`. As the example Slack sources key
+ * threads. Undefined for anything else.
+ */
+export function slackThreadKey(permalink: string | null | undefined): string | undefined {
+  if (!permalink) return undefined;
+  const reply = /\/archives\/([A-Z0-9]+)\/p\d+\?(?:[^\s)#]*&)?thread_ts=(\d+)\.(\d+)/i.exec(permalink);
+  if (reply) return `${reply[1]}:${reply[2]}.${reply[3]}`;
+  const root = /\/archives\/([A-Z0-9]+)\/p(\d{10})(\d{6})(?![\d])/i.exec(permalink);
+  return root ? `${root[1]}:${root[2]}.${root[3]}` : undefined;
+}
+
 /** A rule's done_when with the config's done_idle_days filled in. */
 export function doneWhenOf(config: SignalsConfig, rule: Rule): DoneWhen | undefined {
   if (!config.done_idle_days || rule.done_when?.idle_days) return rule.done_when;

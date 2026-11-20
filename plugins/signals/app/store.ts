@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { slackThreadKey, type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -548,6 +548,34 @@ export class SignalsStore {
   async taskByGroup(group: string): Promise<Task | undefined> {
     const found = await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [group]);
     if (found.rows[0]) return toTask(found.rows[0]);
+    const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
+    if (linked.rows[0]) return toTask(linked.rows[0]);
+    return this.legacySlackTask(group);
+  }
+
+  /**
+   * A Slack task from before threads were keyed by channel and full root ts
+   * (`rule|1795000000`, the root's second): for a new key (`rule|C1:1795000000.123456`),
+   * the old task of that second, when every Slack message on it has a
+   * permalink that names this thread. It's linked to the new key, so a
+   * customer's message and a team reply in the thread both find it. Left
+   * alone when any message on it names another thread or none (two threads
+   * in one second, a message without a permalink): it can't tell them apart.
+   */
+  private async legacySlackTask(group: string): Promise<Task | undefined> {
+    const key = /^(.*)\|([A-Z0-9]+):(\d{10})\.(\d{6})$/i.exec(group);
+    if (!key) return undefined;
+    const old = await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [`${key[1]}|${key[3]}`]);
+    if (!old.rows[0]) return undefined;
+    const task = toTask(old.rows[0]);
+    const messages = await this.q<{ url: unknown; external_id: unknown }>(
+      `SELECT DISTINCT e.url, e.external_id FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id WHERE te.task_id = $1 AND (e.source = 'slack' OR e.source LIKE 'slack.%')`,
+      [task.id],
+    );
+    if (!messages.rows.length) return undefined;
+    const threads = new Set(messages.rows.map((row) => slackThreadKey(typeof row.url === "string" ? row.url : undefined) ?? slackThreadKey(String(row.external_id)) ?? ""));
+    if (threads.size !== 1 || !threads.has(`${key[2]}:${key[3]}.${key[4]}`)) return undefined;
+    await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [group, task.id, now()]);
     const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
     return linked.rows[0] ? toTask(linked.rows[0]) : undefined;
   }
