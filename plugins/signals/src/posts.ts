@@ -7,6 +7,9 @@
 /** A fact the card shows about the source, like "21 attendees · 5 customer". */
 export type Fact = Readonly<{ label: string; value: string }>;
 
+/** A default action the hub found triggered (its `**Triggered:**` line): the action, and the model's reason. */
+export type Triggered = Readonly<{ label: string; why?: string }>;
+
 export type TaskPost = Readonly<{
   id: number;
   title: string;
@@ -21,6 +24,10 @@ export type TaskPost = Readonly<{
   source?: TaskSource;
   /** Whether the post asks agents to work on it (it mentions them). */
   asksAgents: boolean;
+  /** The workstream's default actions that triggered as it opened. */
+  triggered: readonly Triggered[];
+  /** When the workstream has default actions and none triggered: what the hub did then (left it tracked, or dismissed it). */
+  untriggered?: "dismissed" | "tracked";
 }>;
 
 export type TaskSource = Readonly<{
@@ -39,7 +46,7 @@ export type TaskSource = Readonly<{
 
 export type ThreadPost =
   | Readonly<{ kind: "question"; question: string; options: readonly string[]; by: string }>
-  | Readonly<{ kind: "update"; title: string; url?: string; changes: readonly Readonly<{ field: string; from: string; to: string }>[]; forAgents: boolean }>
+  | Readonly<{ kind: "update"; title: string; url?: string; changes: readonly Readonly<{ field: string; from: string; to: string }>[]; triggered: readonly Triggered[]; forAgents: boolean; more?: true; reopened?: true }>
   | Readonly<{ kind: "done"; reason: string }>
   | Readonly<{ kind: "nudge"; text: string }>
   | Readonly<{ kind: "answered"; who: string; answer: string; question?: string; forAgents: boolean }>
@@ -53,6 +60,37 @@ const NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
 /** A person named in a text: a nostr: mention, or the hub's agent:/person: actor. */
 const NAMED = /(?:nostr|agent|person):(npub1[02-9ac-hj-np-z]{58})/g;
 const OPTIONS = /^Options: (.+)$/;
+const CHANGE = /^- \*\*(.+?):\*\* (.*) → (.*)$/;
+const TRIGGERED = /^\*\*Triggered:\*\* (.+)$/;
+// The hub's two outcomes (hub.ts), matched from the end, so a workstream named "dismissed cases" can't change which.
+const UNTRIGGERED = /^No default action for .+ is triggered, so it's (?:(dismissed)\. It opens again if one is|(tracked) with no agent asked)\.$/;
+
+/**
+ * The `**Triggered:** <action> — <why>` lines among a post's lines (model.ts
+ * triggeredLines). An action's label can't contain "—", so the first " — "
+ * ends it; the reason may have anything.
+ */
+const triggeredIn = (lines: readonly string[]): Triggered[] =>
+  lines.flatMap((line) => {
+    const found = TRIGGERED.exec(line.trim());
+    if (!found) return [];
+    const at = found[1]!.indexOf(" — ");
+    return [at < 0 ? { label: found[1]!.trim() } : { label: found[1]!.slice(0, at).trim(), why: found[1]!.slice(at + 3).trim() }];
+  });
+
+/**
+ * What a task card says about a post's "No default action … is triggered"
+ * note. `dismissed`: the hub says now that its workstream's defaults
+ * dismissed it (triggers.dismissed), so the card says so. `opening`:
+ * anything else (tracked, open again, closed by a person, or not known):
+ * the post is a snapshot, so the card says it as how the task opened.
+ * Undefined: nothing to say.
+ */
+export type UntriggeredNote = "dismissed" | "opening";
+export function untriggeredNote(post: Pick<TaskPost, "triggered" | "untriggered">, now?: Readonly<{ status: string; byDefaults: boolean }>): UntriggeredNote | undefined {
+  if (!post.untriggered || post.triggered.length) return undefined;
+  return now?.status === "dismissed" && now.byDefaults ? "dismissed" : "opening";
+}
 
 /** Whether a message is a task the hub posted: its first line and the line every task post has. */
 export const isTaskPost = (content: string) => TASK_LINE.test(content.split("\n", 1)[0] ?? "") && content.includes(REPLY_HERE);
@@ -96,6 +134,10 @@ export function parseTaskPost(content: string): TaskPost | undefined {
   // A fact the title already says (a meeting's summary, say) isn't repeated under it.
   const source = read && { ...read, facts: read.facts.filter((fact) => !title.toLowerCase().includes(fact.value.toLowerCase())) };
   const after = end >= 0 ? lines.slice(end + 1).join("\n") : "";
+  // What the default actions found sits after the source, before "Reply in this thread".
+  const middle = lines.slice(at, end >= 0 ? end : undefined);
+  const outcome = middle.map((line) => UNTRIGGERED.exec(line.trim())).find(Boolean);
+  const untriggered = outcome ? (outcome[1] ? "dismissed" : "tracked") : undefined;
   return {
     id: Number(head[1]),
     title,
@@ -108,6 +150,8 @@ export function parseTaskPost(content: string): TaskPost | undefined {
     options,
     ...(source && { source }),
     asksAgents: /nostr:npub1/.test(after),
+    triggered: triggeredIn(middle),
+    ...(untriggered && { untriggered }),
   };
 }
 
@@ -229,11 +273,16 @@ export function parseThreadPost(content: string): ThreadPost | undefined {
   const done = /^✅ Done: (.+?)\.?(?: \(Set its status on the Tasks board if it isn't\.\))?$/u.exec(first);
   if (done) return { kind: "done", reason: done[1]!.trim() };
   if (first.startsWith("⏰ ")) return { kind: "nudge", text: first.slice(2).trim() };
-  const update = /^Update: (.+)$/.exec(first);
+  // An update, or (when actions it triggered opened the task again) its "↩️ Open again" with them.
+  const update = /^Update: (.+)$/.exec(first) ?? (TRIGGERED.test((lines[2] ?? "").trim()) ? /^↩️ Open again: (.+)$/u.exec(first) : null);
   if (update) {
     const link = /^\[(.+)\]\((\S+)\)$/.exec(update[1]!.trim());
-    const changes = lines.slice(1).map((line) => /^- \*\*(.+?):\*\* (.*) → (.*)$/.exec(line)).filter((found): found is RegExpExecArray => Boolean(found)).map((found) => ({ field: found[1]!, from: found[2]!, to: found[3]! }));
-    return { kind: "update", title: link ? link[1]! : update[1]!.trim(), ...(link && { url: link[2]! }), changes, forAgents: humanPart(content).forAgents };
+    const changes = lines.slice(1).map((line) => CHANGE.exec(line)).filter((found): found is RegExpExecArray => Boolean(found)).map((found) => ({ field: found[1]!, from: found[2]!, to: found[3]! }));
+    const human = humanPart(content);
+    const shown = human.text.split("\n");
+    // Anything people read that the line doesn't show (a meeting's checklist, say): the card offers the message.
+    const more = shown.slice(1).some((line) => line.trim() && !TRIGGERED.test(line.trim()) && !CHANGE.test(line));
+    return { kind: "update", title: link ? link[1]! : update[1]!.trim(), ...(link && { url: link[2]! }), changes, triggered: triggeredIn(shown), forAgents: human.forAgents, ...(more && { more: true as const }), ...(!first.startsWith("Update:") && { reopened: true as const }) };
   }
   // "nostr:npub… Brandon answered: X\n\n> the question\n\nPlease go on…"
   const answered = /^(?:nostr:npub1\S+\s+)*(.+?) answered: (.+)$/.exec(first);

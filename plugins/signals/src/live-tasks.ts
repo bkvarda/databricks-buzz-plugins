@@ -11,7 +11,9 @@ const STALE_MS = 30_000;
 
 type Board = Readonly<{ tasks: readonly BoardTask[]; at: number }>;
 /** errorAt: when a read last failed, so a hub that's down isn't asked on every render. */
-type Entry = { board?: Board; error?: Error; errorAt?: number; pending?: Promise<void>; older?: ReadonlyMap<number, string>; olderPending?: boolean };
+/** A task off its channel's board, as the hub's task list has it: `byDefaults`, dismissed by its workstream's Otherwise (nothing triggered), not by a person. */
+export type OlderTask = Readonly<{ status: string; byDefaults: boolean }>;
+type Entry = { board?: Board; error?: Error; errorAt?: number; pending?: Promise<void>; older?: ReadonlyMap<number, OlderTask>; olderPending?: boolean };
 
 /** How many of a channel's tasks are read to find the status of one that's left its board. */
 const OLDER_LIMIT = 500;
@@ -76,6 +78,16 @@ export class LiveTasks {
    * or when the hub doesn't have it.
    */
   olderStatus(channel: string, id: number): string | undefined {
+    return this.olderTask(channel, id)?.status;
+  }
+
+  /**
+   * A task that isn't on its channel's board (it closed before the board's
+   * window): its status, and whether its workstream's defaults dismissed it
+   * (not a person). Read once per channel; undefined until it's known, or
+   * when the hub doesn't have it.
+   */
+  olderTask(channel: string, id: number): OlderTask | undefined {
     const entry = this.board(channel);
     if (!entry.board || entry.board.tasks.some((item) => item.task.id === id)) return undefined;
     if (entry.older) return entry.older.get(id);
@@ -85,7 +97,7 @@ export class LiveTasks {
         try {
           const hub = await this.client();
           const tasks = hub ? await hub.tasks({ channel, limit: OLDER_LIMIT }) : [];
-          entry.older = new Map(tasks.map((task) => [task.id, task.status]));
+          entry.older = new Map(tasks.map((task) => [task.id, { status: task.status, byDefaults: task.status === "dismissed" && Boolean(task.triggers?.dismissed) }]));
         } catch {
           // Unknown: the post keeps its full card. Not asked again until the page reloads.
           entry.older = new Map();

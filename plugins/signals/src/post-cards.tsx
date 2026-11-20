@@ -15,7 +15,7 @@ import { assigneeOf, postOrigin, postWeight, STATUS_GROUPS, taskOrigin, titleHin
 import { AssigneeMark, assigneeName, npubKey, type Profile, StatusIcon, useProfiles } from "./board-panel";
 import type { BoardTask } from "./client";
 import type { LiveTasks } from "./live-tasks";
-import { mentionedNpubs, parseTaskPost, parseThreadPost, plainLine, shortWhen, sourceName, type TaskPost, taskTarget, type ThreadPost } from "./posts";
+import { mentionedNpubs, parseTaskPost, parseThreadPost, plainLine, shortWhen, sourceName, type TaskPost, taskTarget, type ThreadPost, type Triggered, type UntriggeredNote, untriggeredNote } from "./posts";
 
 /** What a message renderer gets from the host (ChannelMessage, the parts used here). */
 export type PostMessage = Readonly<{ id: string; channelId: string; authorId: string; content: string; createdAt: number; threadRootId?: string }>;
@@ -148,7 +148,7 @@ function SourceLine(props: { source: TaskPost["source"]; ticket?: string }) {
  * card. Muted like the board's Dismissed group, so the channel's open work
  * stands out.
  */
-function FoldedTask(props: { id: number; title: string; onShow(): void; focus?: boolean }) {
+function FoldedTask(props: { id: number; title: string; onShow(): void; focus?: boolean; untriggered?: boolean }) {
   const button = React.useRef<HTMLButtonElement>(null);
   // Back from Fold: the keyboard stays where it was.
   React.useEffect(() => void (props.focus && button.current?.focus()), []);
@@ -159,16 +159,43 @@ function FoldedTask(props: { id: number; title: string; onShow(): void; focus?: 
         type="button"
         onClick={props.onShow}
         aria-expanded={false}
-        title={`Task ${props.id} was dismissed: ${props.title}. Show its card.`}
+        title={`Task ${props.id} was dismissed${props.untriggered ? " because none of its workstream's default actions triggered" : ""}: ${props.title}. Show its card.`}
         style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, margin: 0, padding: "2px 0", border: 0, borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--dbx-tertiary)", fontFamily: "inherit", fontSize: "0.75rem", lineHeight: "18px", textAlign: "left" }}
       >
         <StatusIcon status="dismissed" size={11} />
-        <span style={{ flex: "none" }}>Dismissed</span>
+        <span style={{ flex: "none" }}>{props.untriggered ? "Not triggered" : "Dismissed"}</span>
         <span aria-hidden style={{ flex: "none" }}>·</span>
         <span style={{ flex: "0 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{props.title}</span>
         <span style={{ flex: "none", marginLeft: "auto", paddingLeft: 8, textDecoration: "underline dotted" }}>Show</span>
       </button>
     </DbxRoot>
+  );
+}
+
+/** What a workstream's default actions found: each that triggered, with why; or, quietly, that none did (now, or when it opened). */
+function TriggeredLines(props: { triggered: readonly Triggered[]; note?: UntriggeredNote | undefined; dismissing?: boolean | undefined }) {
+  if (!props.triggered.length)
+    return props.note ? (
+      <Text size="xs" tone="tertiary" style={{ overflowWrap: "anywhere" }}>
+        {props.note === "dismissed"
+          ? "Nothing triggered, so it was dismissed. It opens again if something does."
+          : props.dismissing
+              ? "When it opened, nothing triggered, so it was dismissed then."
+              : "When it opened, nothing triggered, so no agent was asked then."}
+      </Text>
+    ) : null;
+  return (
+    <Stack gap={2}>
+      {props.triggered.map((item) => (
+        <Text key={item.label} size="xs" tone="subtle" style={{ overflowWrap: "anywhere", ...clamp(2) }}>
+          <span title={item.why ? `${item.label} — ${item.why}` : item.label}>
+            <span style={{ color: "var(--dbx-tertiary)" }}>Triggered · </span>
+            <span style={{ fontWeight: 600 }}>{item.label}</span>
+            {item.why ? ` — ${item.why}` : ""}
+          </span>
+        </Text>
+      ))}
+    </Stack>
   );
 }
 
@@ -198,8 +225,9 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
   const target = taskTarget(message.channelId, post.id);
 
   const options = item ? (item.task.options ?? []) : post.options;
-  // A task that closed before the board's window isn't on it: its status is looked up on its own.
-  const status = item?.task.status ?? live.olderStatus(message.channelId, post.id);
+  // A task that closed before the board's window isn't on it: it's looked up on its own.
+  const older = item ? undefined : live.olderTask(message.channelId, post.id);
+  const status = item?.task.status ?? older?.status;
   const weight = postWeight(status);
   // A closed task asks nothing, even when its post did (and the board no longer has it).
   const question = item ? (item.task.question && !closed(item) ? item.task.question : undefined) : weight === "full" ? post.question : undefined;
@@ -210,7 +238,12 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
   const origin = postOrigin(source, item?.origin);
   const ticket = taskOrigin(post.title, origin).ref;
   const open = () => (props.canOpen(target) && props.open(target)) || props.openBoard(message.channelId);
-  if (weight === "folded" && !unfolded) return <FoldedTask id={post.id} title={post.title} focus={moved.current === "show"} onShow={() => ((moved.current = "fold"), setUnfolded(true))} />;
+  // Whether its workstream's defaults dismissed it (nothing triggered), not a person, as the hub has it now;
+  // and what the post's "nothing triggered" note still means: so now, or only when it opened.
+  const now = item ? { status: item.task.status, byDefaults: item.task.status === "dismissed" && Boolean(item.task.triggers?.dismissed) } : older;
+  const note = untriggeredNote(post, now);
+  const untriggered = Boolean(now?.byDefaults);
+  if (weight === "folded" && !unfolded) return <FoldedTask id={post.id} title={post.title} untriggered={untriggered} focus={moved.current === "show"} onShow={() => ((moved.current = "fold"), setUnfolded(true))} />;
   return (
     <DbxRoot style={{ minWidth: 0, maxWidth: 620 }}>
       <div ref={card} className="dbx-card" style={{ padding: "10px 12px", borderRadius: 8, minWidth: 0 }}>
@@ -251,6 +284,7 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
               ))}
             </div>
           )}
+          {details && <TriggeredLines triggered={post.triggered} note={note} dismissing={post.untriggered === "dismissed"} />}
           {question && <Answer live={live} channel={message.channelId} id={post.id} question={question} options={options} {...(item && { item })} />}
           {item?.activity && !question && (
             <Text size="xs" tone="subtle" style={{ overflowWrap: "anywhere", ...clamp(2) }}>
@@ -302,11 +336,15 @@ export function ThreadPostCard(props: { ctx: Context; live: LiveTasks; message: 
   }
   let body: React.ReactNode;
   let forAgents = false;
+  // More in the message than its line shows, for people (a meeting's checklist): offered as Details.
+  let more = false;
   switch (post.kind) {
     case "update":
       forAgents = post.forAgents;
+      more = Boolean(post.more);
       body = (
         <>
+          {post.reopened && <span>Open again:</span>}
           {post.url ? <a href={post.url} className="dbx-link" title={post.url} onClick={(event) => (event.preventDefault(), openExternal(post.url!))}>{post.title}</a> : <span>{post.title}</span>}
           {post.changes.map((change) => (
             <Chip key={change.field} title={`${change.field}: ${change.from} → ${change.to}`}>{change.field} {change.from === "(none)" ? "" : `${change.from} `}→ <b style={{ marginLeft: 3 }}>{change.to}</b></Chip>
@@ -338,17 +376,22 @@ export function ThreadPostCard(props: { ctx: Context; live: LiveTasks; message: 
     <DbxRoot style={{ minWidth: 0 }}>
       <Stack gap={6}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 6, fontSize: "0.75rem", color: "var(--dbx-subtle)", minWidth: 0 }}>
-          <span aria-hidden style={{ color: post.kind === "done" ? "var(--dbx-success)" : "var(--dbx-tertiary)", flex: "none" }}>{LINE_ICON[post.kind]}</span>
+          <span aria-hidden style={{ color: post.kind === "done" ? "var(--dbx-success)" : "var(--dbx-tertiary)", flex: "none" }}>{post.kind === "update" && post.reopened ? "↩" : LINE_ICON[post.kind]}</span>
           {/* The icon stays beside the text when a narrow column wraps it. */}
           <span style={{ display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: 6, rowGap: 2, flex: "1 1 auto", minWidth: 0, overflowWrap: "anywhere" }}>
             {body}
-            {forAgents && (
+            {(forAgents || more) && (
               <button type="button" onClick={() => setFull(!full)} aria-expanded={full} style={{ border: 0, background: "transparent", padding: 0, cursor: "pointer", color: "var(--dbx-tertiary)", fontSize: "0.75rem", textDecoration: "underline dotted" }}>
-                {full ? "Hide" : "For agents"}
+                {full ? "Hide" : more ? "Details" : "For agents"}
               </button>
             )}
           </span>
         </div>
+        {post.kind === "update" && post.triggered.length > 0 && (
+          <div style={{ paddingLeft: 18, minWidth: 0 }}>
+            <TriggeredLines triggered={post.triggered} />
+          </div>
+        )}
         {full && <FullPost ctx={props.ctx} content={message.content} profile={profile} />}
       </Stack>
     </DbxRoot>

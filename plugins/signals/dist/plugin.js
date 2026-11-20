@@ -1691,6 +1691,19 @@ var REPLY_HERE = "Reply in this thread to work on it.";
 var NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
 var NAMED = /(?:nostr|agent|person):(npub1[02-9ac-hj-np-z]{58})/g;
 var OPTIONS = /^Options: (.+)$/;
+var CHANGE = /^- \*\*(.+?):\*\* (.*) → (.*)$/;
+var TRIGGERED = /^\*\*Triggered:\*\* (.+)$/;
+var UNTRIGGERED = /^No default action for .+ is triggered, so it's (?:(dismissed)\. It opens again if one is|(tracked) with no agent asked)\.$/;
+var triggeredIn = (lines) => lines.flatMap((line2) => {
+  const found = TRIGGERED.exec(line2.trim());
+  if (!found) return [];
+  const at = found[1].indexOf(" \u2014 ");
+  return [at < 0 ? { label: found[1].trim() } : { label: found[1].slice(0, at).trim(), why: found[1].slice(at + 3).trim() }];
+});
+function untriggeredNote(post, now) {
+  if (!post.untriggered || post.triggered.length) return void 0;
+  return now?.status === "dismissed" && now.byDefaults ? "dismissed" : "opening";
+}
 var isTaskPost = (content) => TASK_LINE.test(content.split("\n", 1)[0] ?? "") && content.includes(REPLY_HERE);
 var splitOptions = (text) => text.split(" / ").map((item) => item.trim()).filter(Boolean);
 function parseTaskPost(content) {
@@ -1728,6 +1741,9 @@ function parseTaskPost(content) {
   const read = start >= 0 ? parseSource(lines.slice(start, end > start ? end : void 0)) : void 0;
   const source = read && { ...read, facts: read.facts.filter((fact) => !title.toLowerCase().includes(fact.value.toLowerCase())) };
   const after = end >= 0 ? lines.slice(end + 1).join("\n") : "";
+  const middle = lines.slice(at, end >= 0 ? end : void 0);
+  const outcome = middle.map((line2) => UNTRIGGERED.exec(line2.trim())).find(Boolean);
+  const untriggered = outcome ? outcome[1] ? "dismissed" : "tracked" : void 0;
   return {
     id: Number(head[1]),
     title,
@@ -1739,7 +1755,9 @@ function parseTaskPost(content) {
     ...question && { question },
     options,
     ...source && { source },
-    asksAgents: /nostr:npub1/.test(after)
+    asksAgents: /nostr:npub1/.test(after),
+    triggered: triggeredIn(middle),
+    ...untriggered && { untriggered }
   };
 }
 var QUIET = /* @__PURE__ */ new Set(["channel_id", "context_before", "mimetype", "owners", "text", "from", "thread_ts", "ts", "message_ts", "status", "attendeecount", "recurringeventid", "id", "url", "link", "permalink", "user", "user_id"]);
@@ -1832,11 +1850,14 @@ function parseThreadPost(content) {
   const done = /^✅ Done: (.+?)\.?(?: \(Set its status on the Tasks board if it isn't\.\))?$/u.exec(first);
   if (done) return { kind: "done", reason: done[1].trim() };
   if (first.startsWith("\u23F0 ")) return { kind: "nudge", text: first.slice(2).trim() };
-  const update = /^Update: (.+)$/.exec(first);
+  const update = /^Update: (.+)$/.exec(first) ?? (TRIGGERED.test((lines[2] ?? "").trim()) ? /^↩️ Open again: (.+)$/u.exec(first) : null);
   if (update) {
     const link2 = /^\[(.+)\]\((\S+)\)$/.exec(update[1].trim());
-    const changes = lines.slice(1).map((line2) => /^- \*\*(.+?):\*\* (.*) → (.*)$/.exec(line2)).filter((found) => Boolean(found)).map((found) => ({ field: found[1], from: found[2], to: found[3] }));
-    return { kind: "update", title: link2 ? link2[1] : update[1].trim(), ...link2 && { url: link2[2] }, changes, forAgents: humanPart(content).forAgents };
+    const changes = lines.slice(1).map((line2) => CHANGE.exec(line2)).filter((found) => Boolean(found)).map((found) => ({ field: found[1], from: found[2], to: found[3] }));
+    const human = humanPart(content);
+    const shown = human.text.split("\n");
+    const more = shown.slice(1).some((line2) => line2.trim() && !TRIGGERED.test(line2.trim()) && !CHANGE.test(line2));
+    return { kind: "update", title: link2 ? link2[1] : update[1].trim(), ...link2 && { url: link2[2] }, changes, triggered: triggeredIn(shown), forAgents: human.forAgents, ...more && { more: true }, ...!first.startsWith("Update:") && { reopened: true } };
   }
   const answered = /^(?:nostr:npub1\S+\s+)*(.+?) answered: (.+)$/.exec(first);
   if (answered) {
@@ -2918,7 +2939,7 @@ function AddAction(props) {
     setTrigger("");
     setOpen(false);
   };
-  return /* @__PURE__ */ React.createElement("form", { ref: opener, onSubmit: (event) => (event.preventDefault(), add()), onKeyDown: (event) => event.key === "Escape" && (event.preventDefault(), event.stopPropagation(), setOpen(false)), style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement("input", { ref: first, className: "dbx-input", "aria-label": "What agents do", placeholder: "What agents do, e.g. Loop in the CSM", maxLength: MAX_ACTION_LABEL, value: label2, onChange: (event) => setLabel(event.target.value), style: { flex: "1 1 160px", minWidth: 0, fontSize: "0.75rem" } }), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", "aria-label": "When", placeholder: "When, e.g. the customer mentions renewal", maxLength: MAX_ACTION_TRIGGER, value: trigger, onChange: (event) => setTrigger(event.target.value), style: { flex: "2 1 220px", minWidth: 0, fontSize: "0.75rem" } }), /* @__PURE__ */ React.createElement(Button, { size: "sm", type: "submit", disabled: !label2.trim() || !trigger.trim() }, "Add action"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setOpen(false) }, "Cancel"));
+  return /* @__PURE__ */ React.createElement("form", { ref: opener, onSubmit: (event) => (event.preventDefault(), add()), onKeyDown: (event) => event.key === "Escape" && (event.preventDefault(), event.stopPropagation(), setOpen(false)), style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement("input", { ref: first, className: "dbx-input", "aria-label": "What agents do", placeholder: "What agents do, e.g. Loop in the CSM", maxLength: MAX_ACTION_LABEL, value: label2, onChange: (event) => setLabel(event.target.value.replace(/—/g, "-")), style: { flex: "1 1 160px", minWidth: 0, fontSize: "0.75rem" } }), /* @__PURE__ */ React.createElement("input", { className: "dbx-input", "aria-label": "When", placeholder: "When, e.g. the customer mentions renewal", maxLength: MAX_ACTION_TRIGGER, value: trigger, onChange: (event) => setTrigger(event.target.value), style: { flex: "2 1 220px", minWidth: 0, fontSize: "0.75rem" } }), /* @__PURE__ */ React.createElement(Button, { size: "sm", type: "submit", disabled: !label2.trim() || !trigger.trim() }, "Add action"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setOpen(false) }, "Cancel"));
 }
 function Actions(props) {
   const { name, value } = props;
@@ -3182,6 +3203,15 @@ var LiveTasks = class {
    * or when the hub doesn't have it.
    */
   olderStatus(channel, id) {
+    return this.olderTask(channel, id)?.status;
+  }
+  /**
+   * A task that isn't on its channel's board (it closed before the board's
+   * window): its status, and whether its workstream's defaults dismissed it
+   * (not a person). Read once per channel; undefined until it's known, or
+   * when the hub doesn't have it.
+   */
+  olderTask(channel, id) {
     const entry = this.board(channel);
     if (!entry.board || entry.board.tasks.some((item) => item.task.id === id)) return void 0;
     if (entry.older) return entry.older.get(id);
@@ -3191,7 +3221,7 @@ var LiveTasks = class {
         try {
           const hub2 = await this.client();
           const tasks = hub2 ? await hub2.tasks({ channel, limit: OLDER_LIMIT }) : [];
-          entry.older = new Map(tasks.map((task) => [task.id, task.status]));
+          entry.older = new Map(tasks.map((task) => [task.id, { status: task.status, byDefaults: task.status === "dismissed" && Boolean(task.triggers?.dismissed) }]));
         } catch {
           entry.older = /* @__PURE__ */ new Map();
         } finally {
@@ -3320,15 +3350,20 @@ function FoldedTask(props) {
       type: "button",
       onClick: props.onShow,
       "aria-expanded": false,
-      title: `Task ${props.id} was dismissed: ${props.title}. Show its card.`,
+      title: `Task ${props.id} was dismissed${props.untriggered ? " because none of its workstream's default actions triggered" : ""}: ${props.title}. Show its card.`,
       style: { display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, margin: 0, padding: "2px 0", border: 0, borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--dbx-tertiary)", fontFamily: "inherit", fontSize: "0.75rem", lineHeight: "18px", textAlign: "left" }
     },
     /* @__PURE__ */ React.createElement(StatusIcon, { status: "dismissed", size: 11 }),
-    /* @__PURE__ */ React.createElement("span", { style: { flex: "none" } }, "Dismissed"),
+    /* @__PURE__ */ React.createElement("span", { style: { flex: "none" } }, props.untriggered ? "Not triggered" : "Dismissed"),
     /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { flex: "none" } }, "\xB7"),
     /* @__PURE__ */ React.createElement("span", { style: { flex: "0 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.title),
     /* @__PURE__ */ React.createElement("span", { style: { flex: "none", marginLeft: "auto", paddingLeft: 8, textDecoration: "underline dotted" } }, "Show")
   ));
+}
+function TriggeredLines(props) {
+  if (!props.triggered.length)
+    return props.note ? /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { overflowWrap: "anywhere" } }, props.note === "dismissed" ? "Nothing triggered, so it was dismissed. It opens again if something does." : props.dismissing ? "When it opened, nothing triggered, so it was dismissed then." : "When it opened, nothing triggered, so no agent was asked then.") : null;
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, props.triggered.map((item) => /* @__PURE__ */ React.createElement(Text, { key: item.label, size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: item.why ? `${item.label} \u2014 ${item.why}` : item.label }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, "Triggered \xB7 "), /* @__PURE__ */ React.createElement("span", { style: { fontWeight: 600 } }, item.label), item.why ? ` \u2014 ${item.why}` : ""))));
 }
 function TaskPostCard(props) {
   const { message, live } = props;
@@ -3351,7 +3386,8 @@ ${latest}`).map(npubKey).filter((key) => Boolean(key)), [message.content, latest
   if (!post) return null;
   const target = taskTarget(message.channelId, post.id);
   const options = item ? item.task.options ?? [] : post.options;
-  const status2 = item?.task.status ?? live.olderStatus(message.channelId, post.id);
+  const older = item ? void 0 : live.olderTask(message.channelId, post.id);
+  const status2 = item?.task.status ?? older?.status;
   const weight = postWeight(status2);
   const question = item ? item.task.question && !closed(item) ? item.task.question : void 0 : weight === "full" ? post.question : void 0;
   const details = weight === "full" || weight === "folded" && unfolded;
@@ -3359,8 +3395,11 @@ ${latest}`).map(npubKey).filter((key) => Boolean(key)), [message.content, latest
   const origin = postOrigin(source, item?.origin);
   const ticket = taskOrigin(post.title, origin).ref;
   const open = () => props.canOpen(target) && props.open(target) || props.openBoard(message.channelId);
-  if (weight === "folded" && !unfolded) return /* @__PURE__ */ React.createElement(FoldedTask, { id: post.id, title: post.title, focus: moved.current === "show", onShow: () => (moved.current = "fold", setUnfolded(true)) });
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement("div", { ref: card, className: "dbx-card", style: { padding: "10px 12px", borderRadius: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true, style: { minWidth: 0 } }, status2 ? /* @__PURE__ */ React.createElement(StatusIcon, { status: status2 }) : /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "Task ", post.id), status2 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: status2 === "waiting" ? "warning" : status2 === "done" ? "success" : "subtle", weight: 500 }, statusTitle(status2)), post.workstream && /* @__PURE__ */ React.createElement(Chip2, { title: item && item.task.workstream === post.workstream ? workstreamHint(item.task) : post.workstream }, post.workstream), post.initiative && /* @__PURE__ */ React.createElement(Chip2, null, post.initiative), post.mode && post.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip2, { title: MODE_TITLE[post.mode], ...post.mode === "auto" && { tone: "success" } }, post.mode)), assignee && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none", maxWidth: "40%" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, assignee.kind === "you" ? "Waiting on you" : assigneeName(assignee, profile)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { size: "md", weight: 600, style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: titleHint(post.title, origin) }, post.title)), /* @__PURE__ */ React.createElement(SourceLine, { source, ...ticket && { ticket } })), source?.quote && details && /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(3) } }, source.quote)), source && source.facts.length > 0 && details && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 } }, source.facts.map((fact) => /* @__PURE__ */ React.createElement(Text, { key: fact.label, size: "xs", tone: "subtle", style: { whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, fact.label), " ", fact.value))), question && /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, id: post.id, question, options, ...item && { item } }), item?.activity && !question && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, item.activity.kind === "agent_reply" ? "Agent" : "Latest", " \xB7 ", ago(item.activity.at * 1e3), " \xB7 "), (() => {
+  const now = item ? { status: item.task.status, byDefaults: item.task.status === "dismissed" && Boolean(item.task.triggers?.dismissed) } : older;
+  const note = untriggeredNote(post, now);
+  const untriggered = Boolean(now?.byDefaults);
+  if (weight === "folded" && !unfolded) return /* @__PURE__ */ React.createElement(FoldedTask, { id: post.id, title: post.title, untriggered, focus: moved.current === "show", onShow: () => (moved.current = "fold", setUnfolded(true)) });
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement("div", { ref: card, className: "dbx-card", style: { padding: "10px 12px", borderRadius: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true, style: { minWidth: 0 } }, status2 ? /* @__PURE__ */ React.createElement(StatusIcon, { status: status2 }) : /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "Task ", post.id), status2 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: status2 === "waiting" ? "warning" : status2 === "done" ? "success" : "subtle", weight: 500 }, statusTitle(status2)), post.workstream && /* @__PURE__ */ React.createElement(Chip2, { title: item && item.task.workstream === post.workstream ? workstreamHint(item.task) : post.workstream }, post.workstream), post.initiative && /* @__PURE__ */ React.createElement(Chip2, null, post.initiative), post.mode && post.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip2, { title: MODE_TITLE[post.mode], ...post.mode === "auto" && { tone: "success" } }, post.mode)), assignee && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none", maxWidth: "40%" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, assignee.kind === "you" ? "Waiting on you" : assigneeName(assignee, profile)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { size: "md", weight: 600, style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: titleHint(post.title, origin) }, post.title)), /* @__PURE__ */ React.createElement(SourceLine, { source, ...ticket && { ticket } })), source?.quote && details && /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(3) } }, source.quote)), source && source.facts.length > 0 && details && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 } }, source.facts.map((fact) => /* @__PURE__ */ React.createElement(Text, { key: fact.label, size: "xs", tone: "subtle", style: { whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, fact.label), " ", fact.value))), details && /* @__PURE__ */ React.createElement(TriggeredLines, { triggered: post.triggered, note, dismissing: post.untriggered === "dismissed" }), question && /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, id: post.id, question, options, ...item && { item } }), item?.activity && !question && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, item.activity.kind === "agent_reply" ? "Agent" : "Latest", " \xB7 ", ago(item.activity.at * 1e3), " \xB7 "), (() => {
     const line2 = plainLine(item.activity.text, (npub) => profile(npubKey(npub) ?? "")?.name);
     return /* @__PURE__ */ React.createElement("span", { title: line2 }, line2);
   })()), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: weight === "full" ? "primary" : "default", onClick: open, title: "Its details, what's been made for it and its thread" }, "Open task"), source?.url && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => openExternal(source.url), title: source.url }, "View source \u2197"), /* @__PURE__ */ React.createElement("span", { style: { flex: "1 1 auto" } }), weight === "folded" && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", "aria-label": "Fold", onClick: () => (moved.current = "show", setUnfolded(false), setFull(false)), title: "Back to one line: it was dismissed, so there's nothing to do" }, "Fold"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setFull(!full), title: "The whole message, as agents read it" }, full ? "Hide full post" : "Full post")), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile }))));
@@ -3382,10 +3421,12 @@ function ThreadPostCard(props) {
   }
   let body;
   let forAgents = false;
+  let more = false;
   switch (post.kind) {
     case "update":
       forAgents = post.forAgents;
-      body = /* @__PURE__ */ React.createElement(React.Fragment, null, post.url ? /* @__PURE__ */ React.createElement("a", { href: post.url, className: "dbx-link", title: post.url, onClick: (event) => (event.preventDefault(), openExternal(post.url)) }, post.title) : /* @__PURE__ */ React.createElement("span", null, post.title), post.changes.map((change) => /* @__PURE__ */ React.createElement(Chip2, { key: change.field, title: `${change.field}: ${change.from} \u2192 ${change.to}` }, change.field, " ", change.from === "(none)" ? "" : `${change.from} `, "\u2192 ", /* @__PURE__ */ React.createElement("b", { style: { marginLeft: 3 } }, change.to))));
+      more = Boolean(post.more);
+      body = /* @__PURE__ */ React.createElement(React.Fragment, null, post.reopened && /* @__PURE__ */ React.createElement("span", null, "Open again:"), post.url ? /* @__PURE__ */ React.createElement("a", { href: post.url, className: "dbx-link", title: post.url, onClick: (event) => (event.preventDefault(), openExternal(post.url)) }, post.title) : /* @__PURE__ */ React.createElement("span", null, post.title), post.changes.map((change) => /* @__PURE__ */ React.createElement(Chip2, { key: change.field, title: `${change.field}: ${change.from} \u2192 ${change.to}` }, change.field, " ", change.from === "(none)" ? "" : `${change.from} `, "\u2192 ", /* @__PURE__ */ React.createElement("b", { style: { marginLeft: 3 } }, change.to))));
       break;
     case "done":
       body = /* @__PURE__ */ React.createElement("span", null, "Done: ", post.reason);
@@ -3407,7 +3448,7 @@ function ThreadPostCard(props) {
       body = /* @__PURE__ */ React.createElement("span", null, post.text, mentioned.length ? `: ${mentioned.map((key) => profile(key)?.name ?? "an agent").join(", ")}` : "");
       break;
   }
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 6, fontSize: "0.75rem", color: "var(--dbx-subtle)", minWidth: 0 } }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { color: post.kind === "done" ? "var(--dbx-success)" : "var(--dbx-tertiary)", flex: "none" } }, LINE_ICON[post.kind]), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: 6, rowGap: 2, flex: "1 1 auto", minWidth: 0, overflowWrap: "anywhere" } }, body, forAgents && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFull(!full), "aria-expanded": full, style: { border: 0, background: "transparent", padding: 0, cursor: "pointer", color: "var(--dbx-tertiary)", fontSize: "0.75rem", textDecoration: "underline dotted" } }, full ? "Hide" : "For agents"))), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile })));
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 6, fontSize: "0.75rem", color: "var(--dbx-subtle)", minWidth: 0 } }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { color: post.kind === "done" ? "var(--dbx-success)" : "var(--dbx-tertiary)", flex: "none" } }, post.kind === "update" && post.reopened ? "\u21A9" : LINE_ICON[post.kind]), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: 6, rowGap: 2, flex: "1 1 auto", minWidth: 0, overflowWrap: "anywhere" } }, body, (forAgents || more) && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFull(!full), "aria-expanded": full, style: { border: 0, background: "transparent", padding: 0, cursor: "pointer", color: "var(--dbx-tertiary)", fontSize: "0.75rem", textDecoration: "underline dotted" } }, full ? "Hide" : more ? "Details" : "For agents"))), post.kind === "update" && post.triggered.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { paddingLeft: 18, minWidth: 0 } }, /* @__PURE__ */ React.createElement(TriggeredLines, { triggered: post.triggered })), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile })));
 }
 
 // plugins/signals/src/tools.ts
