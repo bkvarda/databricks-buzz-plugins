@@ -2,8 +2,8 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { accountRule, agentsFor, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -1071,7 +1071,9 @@ describe("the board page's route", () => {
 
 describe("tasks that finish themselves", () => {
   it("checks done_when", () => {
-    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: {} }] })).toEqual(["rules[0].done_when needs when, after or idle_days"]);
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: {} }] })).toEqual(["rules[0].done_when needs when, after, idle_days or by_owner"]);
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: { by_owner: "yes" } }] })).toEqual(["rules[0].done_when.by_owner is true or false"]);
+    expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: { by_owner: true } }] })).toEqual([]);
     expect(configProblems({ version: 1, rules: [{ id: "a", action: "task", done_when: { after: "", idle_days: 0, when: { x: "(" } } }] })).toEqual([
       "rules[0].done_when.when.x isn't a valid regular expression",
       "rules[0].done_when.after is an event field holding a time, like payload.end",
@@ -1176,6 +1178,97 @@ describe("tasks that finish themselves", () => {
     expect((await store.task(mailA!.id))!.status).toBe("done");
     expect(posts.at(-1)!.text).toBe(doneMessage("nothing new in 14 days"));
     expect((await store.task(mailB!.id))!.status).toBe("waiting");
+  });
+});
+
+describe("work someone on the team did themselves", () => {
+  const config: SignalsConfig = {
+    version: 1,
+    default_channel: "triage",
+    rules: [
+      { id: "mail", sources: ["gmail"], customer_actor: "@globex\\.io$", action: "task", title: "Reply: {title}", group_by: "group_key", done_when: { by_owner: true } },
+      { id: "slack", sources: ["slack", "slack.sent"], customer_actor: "@globex\\.io$", skip_own: true, action: "task", group_by: "group_key", done_when: { by_owner: true } },
+      { id: "tickets", sources: ["jira"], action: "task", group_by: "external_id" },
+    ],
+  };
+
+  it("finds the tasks an owner's own event handles, only for by_owner rules", () => {
+    const reply: EventInput = { source: "gmail", external_id: "m2", actor: "Alice <Alice@x.com>", group_key: "th1" };
+    expect(decide(config, reply, { firstRun: false, owner: "alice@x.com" })).toMatchObject({ kind: "none" });
+    expect(handledBy(config, reply, "alice@x.com").map((found) => found.group)).toEqual(["mail|th1"]);
+    expect(handledBy(config, reply, "bob@x.com")).toEqual([]);
+    expect(handledBy(config, reply, undefined)).toEqual([]);
+    expect(handledBy(config, { source: "slack.sent", external_id: "s", actor: "alice@x.com", group_key: "1795000000" }, "alice@x.com").map((found) => found.group)).toEqual(["slack|1795000000"]);
+    expect(handledBy(config, { source: "jira", external_id: "T-1", actor: "alice@x.com" }, "alice@x.com")).toEqual([]);
+  });
+
+  const setup = async (schema: string) => {
+    const store = new SignalsStore(pglite(), schema);
+    await store.setup();
+    const posts: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(store, { opened: async (task) => `root-${task.id}`, updated: async (task, text, agents = []) => void posts.push({ task: task.id, text, agents }) }, { defaultConfig: config });
+    const call = (path: string, body: unknown, user = "alice@x.com") => hub.handle({ method: "POST", path, query: new URLSearchParams(), user, body: async () => JSON.stringify(body) });
+    for (const user of ["alice@x.com", "bob@x.com"])
+      for (const source of ["gmail", "slack", "slack.sent", "jira"]) {
+        await call("/api/sources", { source, enabled: true }, user);
+        await call("/api/events", { events: [{ source, external_id: "seed" }] }, user);
+      }
+    return { store, hub, posts, call };
+  };
+  const agent = "ab".repeat(32);
+
+  it("closes the task when the owner replies in its thread: theirs, recorded, agents off, and a customer reply opens it again", async () => {
+    const { store, posts, call } = await setup("signals_handled");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "th1" }] });
+    const task = (await store.tasks({ open: true }))[0]!;
+    await store.assign(task.id, "agent", agent, false);
+    await store.setQuestion(task.id, "agent", { question: "Which plan?", options: [], by: agent });
+    posts.length = 0;
+
+    const reply = await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "Alice <alice@x.com>", title: "Re: Pricing?", group_key: "th1", url: "https://mail/th1" }] });
+    expect(reply.json).toMatchObject({ created: [], updated: [] });
+    expect(await store.task(task.id)).toMatchObject({ status: "done", question: null, event_count: 2 });
+    const people = (await store.people([task.id])).get(task.id)!;
+    expect(people).toEqual([expect.objectContaining({ kind: "person", key: "alice@x.com", assigned_at: expect.any(Number) })]);
+    const detail = (await store.detail(task.id))!;
+    expect(detail.activities.map((item) => item.text)).toEqual(expect.arrayContaining(["alice@x.com handled it themselves (gmail): Re: Pricing? https://mail/th1", "done: handled by alice@x.com"]));
+    expect(detail.artifacts).toEqual([expect.objectContaining({ actor: "alice@x.com", url: "https://mail/th1" })]);
+    expect(posts).toEqual([{ task: task.id, text: handledMessage("alice@x.com", "Re: Pricing?", "https://mail/th1", [agent]), agents: [agent] }]);
+    expect(posts[0]!.text).toContain("you're off this task");
+
+    // Seen again: nothing more. The customer writes again: open again, still Alice's.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "Alice <alice@x.com>", title: "Re: Pricing? (edited)", group_key: "th1" }] });
+    expect(posts).toHaveLength(1);
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m3", actor: "Ann <ann@globex.io>", title: "Re: Pricing?", group_key: "th1" }] });
+    expect(await store.task(task.id)).toMatchObject({ status: "open" });
+    expect((await store.people([task.id])).get(task.id)!.map((person) => person.key)).toEqual(["alice@x.com"]);
+  });
+
+  it("keeps an owner someone chose, closes from a Slack reply, and leaves other people's and other threads' events alone", async () => {
+    const { store, posts, call } = await setup("signals_handled_slack");
+    await call("/api/events", { events: [{ source: "slack", external_id: "s1", actor: "ann@globex.io", title: "Is ingest down?", group_key: "1795000000" }] });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", title: "Other", group_key: "th9" }] });
+    const [slack, mail] = (await store.tasks({ open: true })).sort((a, b) => a.id - b.id);
+    await store.assign(slack!.id, "person", "carol@x.com", true);
+
+    // Bob's reply in another thread, and Alice's mail in another thread: nothing.
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "s2", actor: "alice@x.com", title: "unrelated", group_key: "1795009999" }] });
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m2", actor: "bob@x.com", title: "Re: Other", group_key: "th1" }] }, "bob@x.com");
+    expect((await store.task(slack!.id))!.status).toBe("open");
+    expect((await store.task(mail!.id))!.status).toBe("open");
+
+    // Bob replies in the Slack thread, seen by his own slack.sent source: done, still Carol's.
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "s3", actor: "bob@x.com", title: "Looking now, it's back", group_key: "1795000000" }] }, "bob@x.com");
+    expect((await store.task(slack!.id))!.status).toBe("done");
+    expect((await store.people([slack!.id])).get(slack!.id)!.map((person) => person.key)).toEqual(["carol@x.com"]);
+    expect(posts.at(-1)).toEqual({ task: slack!.id, text: handledMessage("bob@x.com", "Looking now, it's back"), agents: [] });
+  });
+
+  it("closes nothing for a rule without by_owner", async () => {
+    const { store, call } = await setup("signals_handled_off");
+    await call("/api/events", { events: [{ source: "jira", external_id: "T-1", actor: "ann@globex.io" }] });
+    await call("/api/events", { events: [{ source: "jira", external_id: "T-1", actor: "alice@x.com", title: "changed" }] });
+    expect((await store.tasks({ open: true }))).toHaveLength(1);
   });
 });
 

@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -92,6 +92,8 @@ export type IngestResult = Readonly<{
   updated: { task: Task; title?: string; url?: string; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
+  /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
+  handled: { task: Task; by: string; title?: string; url?: string; agents: string[] }[];
   firstRun: boolean;
 }>;
 
@@ -339,7 +341,7 @@ export class SignalsStore {
    * are skipped (that's the opt-in). Returns what changed, for Buzz.
    */
   async ingest(owner: string, events: readonly EventInput[], config: SignalsConfig, classifier?: Classifier): Promise<IngestResult> {
-    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], firstRun: false };
+    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], handled: [], firstRun: false };
     const counts = result as { -readonly [K in keyof IngestResult]: IngestResult[K] };
     const consent = new Map<string, { enabled: boolean; firstRun: boolean }>();
     const touched = new Map<number, Task>();
@@ -368,6 +370,15 @@ export class SignalsStore {
           if (task.id === placed?.task.id) finishedHere = true;
           // A task its own first event finishes (a ticket already resolved) is never posted.
           if (done && !(placed?.opened && task.id === placed.task.id)) result.finished.push({ task: done, reason });
+        }
+        // Someone on the team did the work themselves (their reply in the thread): done, theirs, and its agents off it.
+        for (const { group } of handledBy(config, event, owner)) {
+          const task = placed?.task.group_key === group ? placed.task : await this.taskByGroup(group);
+          if (!task || !isOpen(task.status) || (task.series && task.asked_by === SERIES_ASKER)) continue;
+          await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
+          const done = await this.handled(task.id, owner, event);
+          if (task.id === placed?.task.id) finishedHere = true;
+          if (done) result.handled.push(done);
         }
         if (!placed || finishedHere) continue;
         let task = placed.task;
@@ -809,6 +820,24 @@ export class SignalsStore {
       if (reason) out.push({ task: toTask(row), reason });
     }
     return out;
+  }
+
+  /**
+   * Marks a task done because `by` (a person's email) did the work, as
+   * `event` shows: records what they did, makes them its owner when it has
+   * none, and takes its agents off it. Undefined if it's gone.
+   */
+  async handled(id: number, by: string, event: EventInput): Promise<{ task: Task; by: string; title?: string; url?: string; agents: string[] } | undefined> {
+    const people = (await this.people([id])).get(id) ?? [];
+    const title = event.title ? plainSlack(event.title).replace(/\s+/g, " ").trim().slice(0, 200) : undefined;
+    await this.activity(id, by, "handled", `${by} handled it themselves (${event.source})${title ? `: ${title}` : ""}${event.url ? ` ${event.url}` : ""}`);
+    if (event.url) await this.artifact(id, by, "reply", event.url, `${by}'s reply`);
+    if (!people.some((person) => person.assigned_at)) await this.assign(id, "person", by.toLowerCase(), true);
+    const agents = people.filter((person) => person.kind === "agent").map((person) => person.key);
+    for (const agent of agents) await this.unassign(id, agent, "agent");
+    await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL WHERE id = $1`, [id]);
+    const task = await this.setStatus(id, "done", by, `handled by ${by}`);
+    return task && { task, by, ...(title && { title }), ...(event.url && { url: event.url }), agents };
   }
 
   /** Marks a task done by its rule (not a person), clearing any question; undefined if it's gone. */

@@ -232,6 +232,10 @@ export function classifyQuestions(classify: Classify): Record<string, { type: "n
  *   calendar `{dateTime}` / `{date}`), like a meeting's `payload.end`; done
  *   once it has passed by `grace_hours` (default 0). Checked by the sweep.
  * - `idle_days`: nothing new on the task (no event, no activity) for this many days. Checked by the sweep.
+ * - `by_owner`: someone on the team did the work: an event of the task's group
+ *   whose `actor` is the person whose source sent it (their reply in the
+ *   thread, mail they sent). Checked as each event comes in. They become the
+ *   task's owner, and agents on it are taken off.
  *
  * Tasks still asking the team about a recurring series are left open.
  */
@@ -240,6 +244,7 @@ export type DoneWhen = Readonly<{
   after?: string;
   grace_hours?: number;
   idle_days?: number;
+  by_owner?: boolean;
   /** What the thread is told; `{field}` takes an event field. A default says why. */
   note?: string;
 }>;
@@ -423,10 +428,11 @@ export function configProblems(raw: unknown): string[] {
 }
 
 function doneWhenProblems(raw: unknown, where: string): string[] {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [`${where} is an object with when, after or idle_days`];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [`${where} is an object with when, after, idle_days or by_owner`];
   const done = raw as Record<string, unknown>;
   const problems: string[] = [];
-  if (done.when === undefined && done.after === undefined && done.idle_days === undefined) problems.push(`${where} needs when, after or idle_days`);
+  if (done.when === undefined && done.after === undefined && done.idle_days === undefined && done.by_owner === undefined) problems.push(`${where} needs when, after, idle_days or by_owner`);
+  if (done.by_owner !== undefined && typeof done.by_owner !== "boolean") problems.push(`${where}.by_owner is true or false`);
   if (done.when !== undefined) {
     if (!done.when || typeof done.when !== "object" || Array.isArray(done.when)) problems.push(`${where}.when is an object`);
     else
@@ -492,6 +498,17 @@ export function finishes(config: SignalsConfig, event: EventInput): { rule: Rule
   return config.rules.flatMap((rule) =>
     rule.action === "task" && rule.done_when?.when && Object.keys(rule.done_when.when).length && sourceMatches(rule.sources, event.source) && matches(rule.done_when.when, event) ? [{ rule, group: groupKey(rule, event) }] : [],
   );
+}
+
+/**
+ * The tasks an event shows someone on the team handled: for each rule with
+ * `done_when.by_owner` (and whose sources it's from), when the event's actor
+ * is `owner`, the person whose source sent it, that rule's group for it. The
+ * rule itself needn't match (it may skip your own messages).
+ */
+export function handledBy(config: SignalsConfig, event: EventInput, owner: string | undefined): { rule: Rule; group: string }[] {
+  if (!owner || emailOf(event.actor) !== owner.toLowerCase()) return [];
+  return config.rules.flatMap((rule) => (rule.action === "task" && rule.done_when?.by_owner && sourceMatches(rule.sources, event.source) ? [{ rule, group: groupKey(rule, event) }] : []));
 }
 
 /** A rule's done_when with the config's done_idle_days filled in. */

@@ -322,6 +322,11 @@ export class Hub {
       seen.add(task.id);
       await this.notifier.updated(task, doneMessage(reason)).catch((error: Error) => this.log(`couldn't post that task ${task.id} is done: ${error.message}`));
     }
+    for (const { task, by, title, url, agents } of result.handled) {
+      if (!task.buzz_root || seen.has(task.id)) continue;
+      seen.add(task.id);
+      await this.notifier.updated(task, handledMessage(by, title, url, agents), agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
+    }
     for (const update of result.updated) {
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
       seen.add(update.task.id);
@@ -894,6 +899,17 @@ const REPEAT_MS = 12 * 60 * 60 * 1000;
 
 /** What a task's thread is told when its rule finishes it. */
 export const doneMessage = (reason: string) => `✅ Done: ${reason}. (Set its status on the Tasks board if it isn't.)`;
+
+/** What a task's thread is told when someone on the team did the work themselves; its agents (taken off it) are told to stop. */
+export function handledMessage(by: string, title?: string, url?: string, agents: readonly string[] = []): string {
+  const what = url ? `[${title ?? "their reply"}](${url})` : title ? `"${title}"` : "";
+  return [
+    `✅ Done: **${by}** handled this${what ? `: ${what}` : ""}. It's theirs now; a new message from the customer opens it again.`,
+    agents.length ? `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you're off this task: stop working on it, and don't post more here unless someone asks you.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
 
 /** A task as its Buzz message shows it. */
 /** An account as the API gives it: with its preferences read, so the UI and agents see what took. */
