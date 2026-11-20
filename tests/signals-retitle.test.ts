@@ -141,6 +141,19 @@ describe("retitle", () => {
     expect((await store.task(ids["ES-1"]!))!).toMatchObject({ rule_id: "es-tickets", title: CAP_TITLE });
   });
 
+  it("leaves a title with Slack mentions that's unchanged as stored (shown with plain names)", async () => {
+    const { store, call } = await setup();
+    const same = new Hub(store, undefined, { admins: ["admin@x.com"], defaultConfig: BEFORE });
+    await call(same, "/api/events", { events: [ticket("ES-9", "Ping <@U029YEWF7V2|Brandon Kvarda> about <#C1|ops>")] });
+    const task = (await store.tasks({})).find((one) => one.group_key.endsWith("ES-9"))!;
+    expect(task.title).toBe("Ping @Brandon Kvarda about #ops");
+    const result = (await call(same, "/api/retitle", { dry_run: true, ids: [task.id] })).json as { changed: unknown[]; unchanged: number };
+    expect(result).toMatchObject({ changed: [], unchanged: 1 });
+    const applied = (await call(same, "/api/retitle", { dry_run: false, ids: [task.id] })).json as { changed: unknown[] };
+    expect(applied.changed).toEqual([]);
+    expect((await store.detail(task.id))!.activities.map((a) => a.kind)).toEqual(["opened"]);
+  });
+
   it("looks up an old-keyed Slack task without linking it", async () => {
     const store = new SignalsStore(new PGlite(), "signals_retitle_slack");
     await store.setup();

@@ -1554,14 +1554,16 @@ export class SignalsStore {
       const short = rule.summarize_title && !category?.title ? await this.shortened(event) : undefined;
       // (Shortened before, and the titler can't now: it keeps the short title it has.)
       const keep = rule.summarize_title && !category?.title && !short && Boolean(task.source_title);
-      const title = keep ? task.title : taskTitle(rule, event, category, short);
+      // (Compared and checked as stored: toTask shows a Slack title's mentions as plain names, a title as stored never has.)
+      const stored = String(row.title);
+      const title = keep ? stored : taskTitle(rule, event, category, short);
       const source_title = keep ? (task.source_title ?? undefined) : sourceTitle(event, title);
-      if (title === task.title && rule.id === task.rule_id && workstream === task.workstream && mode === task.mode) { result.unchanged++; continue; }
-      const change: RetitleChange = { id: task.id, title, was: task.title, rule: rule.id, was_rule: task.rule_id, workstream, was_workstream: task.workstream, mode, was_mode: task.mode,
+      if (title === stored && rule.id === task.rule_id && workstream === task.workstream && mode === task.mode) { result.unchanged++; continue; }
+      const change: RetitleChange = { id: task.id, title: plainSlack(title), was: task.title, rule: rule.id, was_rule: task.rule_id, workstream, was_workstream: task.workstream, mode, was_mode: task.mode,
         ...(source_title && { source_title }), filed_by: byHand ? (task.filed_by ?? null) : filed.by, applied: false };
       if (options.dryRun) { result.changed.push(change); continue; }
       const moves = [rule.id !== task.rule_id && `rule ${task.rule_id} → ${rule.id}`, workstream !== task.workstream && `workstream ${task.workstream ?? "none"} → ${workstream ?? "none"}`, mode !== task.mode && `mode ${task.mode} → ${mode}`].filter(Boolean);
-      const text = `Retitled by ${actor}${title !== task.title ? `: was "${clip(task.title, 300)}"` : ""}${moves.length ? ` (${moves.join(", ")})` : ""}.`;
+      const text = `Retitled by ${actor}${title !== stored ? `: was "${clip(task.title, 300)}"` : ""}${moves.length ? ` (${moves.join(", ")})` : ""}.`;
       // Only while it reads as it did (a filing, a move or a retitle meanwhile is left as it is), and, for a task this read as not
       // filed by hand, still isn't; and while its event is at the version read (a newer one, withdrawn say, is that version's to place).
       // The new group is claimed first, as a link to it in group_links, the table every alias writer inserts into: the task row
@@ -1591,7 +1593,7 @@ export class SignalsStore {
            a AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $12, $18, 'retitle', $19 FROM u RETURNING 1)
            SELECT * FROM u`,
           [task.id, title, source_title ?? null, rule.id, workstream, mode, byHand, filed.by, filed.score ?? null, Number(row.ev_id), event.title ?? null, now(),
-            task.title, task.rule_id, task.workstream, task.mode, decision.group, actor, text.slice(0, 4000), task.group_key, Number(row.ev_versions)],
+            stored, task.rule_id, task.workstream, task.mode, decision.group, actor, text.slice(0, 4000), task.group_key, Number(row.ev_versions)],
         );
       } catch (error) {
         if ((error as { code?: unknown }).code !== "23505") throw error;
