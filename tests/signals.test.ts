@@ -731,6 +731,8 @@ describe("account channels", () => {
     // Assign an agent: mentioned and asked to work on it, with the briefing, and logged.
     const assigned = await call("/api/task", { id: 1, assign: [npubEncode(scout)], note: "Scout has the deck" });
     expect(assigned.json).toMatchObject({ activities: expect.arrayContaining([expect.objectContaining({ kind: "assigned", text: expect.stringContaining("Scout has the deck") })]) });
+    // The log names them as a mention, so every surface and agents reading the API see who it is.
+    expect(assigned.json).toMatchObject({ activities: expect.arrayContaining([expect.objectContaining({ kind: "assigned", text: `Assigned nostr:${npubEncode(scout)}: Scout has the deck` })]) });
     expect(replies.at(-1)!.agents).toEqual([scout]);
     expect(replies.at(-1)!.text).toContain(`assigned this to nostr:${npubEncode(scout)}`);
     expect(replies.at(-1)!.text).toContain("post a draft in this thread");

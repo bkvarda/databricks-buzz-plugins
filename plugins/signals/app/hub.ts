@@ -540,7 +540,7 @@ export class Hub {
         const why = handOffReason(agentListFor(account, task).key, fellBack(task));
         await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels), why), asked);
         await this.store.addPeople(task.id, asked.map((key) => ({ kind: "agent", key })));
-        await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `agent:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
+        await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
         woken.push(task.id);
       } catch (error) {
         this.log(`couldn't ask agents to work on task ${task.id}: ${(error as Error).message}`);
@@ -583,7 +583,7 @@ export class Hub {
       await this.notifier.updated(task, askMessage(task, keys, user, note, account && briefing(account, labels, task), event && eventDetails(event, account?.domains ?? [], labels)), keys);
       // Asking an agent taken off it puts it back.
       for (const key of keys) await this.store.assign(id, "agent", key, false);
-      await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `agent:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
+      await this.store.activity(id, user, "agents_asked", `Asked ${keys.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it${note ? `: ${note}` : ""}`);
     }
     if (input.assign !== undefined || input.unassign !== undefined) {
       const assign = input.assign === undefined ? [] : readOwners(input.assign);
@@ -638,7 +638,7 @@ export class Hub {
     const on = assign.filter((owner) => !people.some((person) => person.key === owner.key && person.assigned_at));
     for (const owner of on) await this.store.assign(task.id, owner.kind, owner.key, true);
     if (!off.length && !on.length) return task;
-    const said = (owner: Owner) => (owner.kind === "agent" ? `agent:${npub(owner.key)}` : HEX64.test(owner.key) ? `person:${npub(owner.key)}` : owner.key);
+    const said = (owner: Owner) => (owner.kind === "agent" || HEX64.test(owner.key) ? `nostr:${npub(owner.key)}` : owner.key);
     if (off.length) await this.store.activity(task.id, user, "unassigned", `Took ${off.map(said).join(", ")} off it`);
     if (on.length) await this.store.activity(task.id, user, "assigned", `Assigned ${on.map(said).join(", ")}${note ? `: ${note}` : ""}`);
     const updated = (await this.store.task(task.id))!;
