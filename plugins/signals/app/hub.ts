@@ -27,6 +27,7 @@
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
 import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
+import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -955,6 +956,7 @@ export class Hub {
         // Links in the reply (a doc, a PR, a workspace, an app) become the task's assets, each once.
         const have = new Set((await this.store.detail(task.id))?.artifacts.map((item) => item.url) ?? []);
         for (const link of replyLinks(reply.content)) if (!have.has(link.url)) await this.store.artifact(task.id, actor, link.kind, link.url, link.title);
+        if (task.mode === "draft") await this.warnDisclosure(task, agent, reply);
         await this.store.replied(task.id, agent, reply.created_at);
         // Agents without the Signals tools ask for input by marking a line in their reply.
         const ask = !question ? markedQuestion(reply.content) : undefined;
@@ -976,6 +978,22 @@ export class Hub {
       }
     }
     return { recorded };
+  }
+
+  /**
+   * Advisory only: records the disclosure check's result for an inline draft
+   * (unchecked, clean or warned), once per reply. When the customer part has
+   * internal-looking links or ids, the warning activity is saved with the
+   * result, and the run that saved them says so in the task's thread, mentioning the agent: the
+   * kinds only, never the flagged text. It never changes the task's status.
+   */
+  private async warnDisclosure(task: Task, agent: string, reply: ThreadReply): Promise<void> {
+    const result = disclosureCheck(reply.content);
+    const kinds = result.status === "warned" ? result.kinds : [];
+    const warning = kinds.length ? { actor: `agent:${npub(agent)}`, text: `The customer draft in reply ${reply.id} has internal-looking content: ${kinds.join(", ")}` } : undefined;
+    // The result and its warning activity are saved together; only the run that saved them posts.
+    if (!(await this.store.disclosureChecked(task.id, reply.id, result.status, kinds, warning)) || !warning) return;
+    if (this.notifier && task.buzz_root) await this.notifier.updated(task, disclosureMessage(kinds, agent), [agent]).catch(() => {});
   }
 
   /** Finishes meeting notes' action items a failed write cut short, finishes tasks by their rules' done_when, posts tasks that aren't in Buzz yet, and nudges stale ones. Run every few minutes. */
@@ -1082,7 +1100,7 @@ const MODE_TEXT = { auto: "Mode: auto (agents do it and report)", draft: "Mode: 
 /** What the account's agents are asked to do with a new task, by its mode. */
 const AGENT_ASK = {
   auto: "please work on this now: follow the team's guidance below, do the work and report it in this thread.",
-  draft: "please prepare this: follow the team's guidance below and post a draft in this thread (a reply, a doc) for a person to send. Don't send anything yourself.",
+  draft: "please prepare this: follow the team's guidance below and post a draft in this thread (a reply, a doc) for a person to send. Don't send anything yourself. " + DRAFT_FORMAT,
 } as const;
 const AGENT_RECORD = "Your first reply in this thread is recorded on the task. If you have the Signals tools, signals_account gives the full account and signals_task_update records more. If you need a person's input to go on, ask with signals_task_update (question, options), or start a line of your reply with \"Needs input:\" and the question, optionally followed by a line \"Options: A / B / C\".";
 
@@ -1363,6 +1381,11 @@ export function markedQuestion(text: string): { question: string; options: strin
     return typeof read === "string" ? undefined : read;
   }
   return undefined;
+}
+
+/** The thread reply when a draft's customer part looks like it has internal content: the kinds only, never the text. */
+export function disclosureMessage(kinds: readonly string[], agent: string): string {
+  return `⚠️ nostr:${npub(agent)} the customer draft has internal-looking content (${kinds.join(", ")}). Please check it and move anything internal under "Internal notes" before anyone sends it. This is a warning only; the task isn't on hold.`;
 }
 
 /** The thread reply when a task goes on hold for input. */

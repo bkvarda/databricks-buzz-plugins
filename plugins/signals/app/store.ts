@@ -287,6 +287,8 @@ export class SignalsStore {
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.activities (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, text text NOT NULL)`);
     await this.q(`CREATE INDEX IF NOT EXISTS activities_task ON $S.activities (task_id, at)`);
+    // The disclosure check's result for each agent reply it looked at, once per reply.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.disclosure_checks (task_id bigint NOT NULL, reply_id text NOT NULL, status text NOT NULL, kinds text[] NOT NULL DEFAULT '{}', at bigint NOT NULL, PRIMARY KEY (task_id, reply_id))`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.artifacts (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, url text NOT NULL, title text)`);
     // Who works on a task: agents asked to (and when each first replied), and people who changed it.
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_people (
@@ -1267,6 +1269,31 @@ export class SignalsStore {
 
   async activity(task: number, actor: string, kind: string, text: string): Promise<void> {
     await this.q(`INSERT INTO $S.activities (task_id, at, actor, kind, text) VALUES ($1, $2, $3, $4, $5)`, [task, now(), actor, kind, text.slice(0, 4000)]);
+  }
+
+  /**
+   * Records the disclosure check's result for a reply and, for a warning, its
+   * activity on the task, in one statement: both are saved or neither is, so a
+   * failed write leaves the reply to be checked again. True only for the call
+   * that recorded it first, so overlapping collectors warn once.
+   */
+  async disclosureChecked(task: number, reply: string, status: string, kinds: readonly string[] = [], warning?: { actor: string; text: string }): Promise<boolean> {
+    const inserted = await this.q(
+      `WITH checked AS (
+         INSERT INTO $S.disclosure_checks (task_id, reply_id, status, kinds, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING task_id, at
+       ), warned AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT task_id, at, $6, 'disclosure_warning', $7 FROM checked WHERE $7::text IS NOT NULL RETURNING id
+       )
+       SELECT task_id FROM checked`,
+      [task, reply, status, [...kinds], now(), warning?.actor ?? "", warning?.text.slice(0, 4000) ?? null],
+    );
+    return inserted.rows.length > 0;
+  }
+
+  /** The disclosure check's results on a task, oldest first. */
+  async disclosureChecks(task: number): Promise<{ reply_id: string; status: string; kinds: string[]; at: number }[]> {
+    const found = await this.q(`SELECT reply_id, status, kinds, at FROM $S.disclosure_checks WHERE task_id = $1 ORDER BY at, reply_id`, [task]);
+    return found.rows.map((row) => ({ reply_id: String(row.reply_id), status: String(row.status), kinds: (row.kinds as string[]) ?? [], at: Number(row.at) }));
   }
 
   async artifact(task: number, actor: string, kind: string, url: string, title?: string): Promise<void> {

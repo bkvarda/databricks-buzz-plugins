@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, mergedChanges, reopenedMessage, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, mergedChanges, reopenedMessage, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn, disclosureMessage } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -2547,5 +2547,134 @@ describe("watched fields, rule outgrown", () => {
     await call("/api/events", { events: [kase("Awaiting Confirmation", "Resolved")] });
     expect(await store.task(1)).toMatchObject({ rule_id: "case-es-open" });
     expect(replies.at(-1)!.text).not.toContain("no longer applies");
+  });
+});
+
+describe("disclosure warning", () => {
+  // Synthetic drafts: the same internal link under Customer draft warns once; under Internal notes it passes.
+  const LINK = "go/roadmaptool";
+  const drafts = {
+    customer: `## Customer draft\nHi Ann, the date is on ${LINK}.\n\n## Internal notes\nNothing.`,
+    internal: `## Customer draft\nHi Ann, see https://docs.databricks.com/aws/en/iceberg/.\n\n## Internal notes\nDate from ${LINK}.`,
+  };
+  const setup = async (schema: string, mode: string) => {
+    const db = pglite();
+    const store = new SignalsStore(db, schema);
+    await store.setup();
+    const posts: { task: number; text: string; agents: readonly string[] }[] = [];
+    const hub = new Hub(store, { opened: async (task) => "e".repeat(63) + task.id, updated: async (task, text, agents = []) => void posts.push({ task: task.id, text, agents }) }, { defaultConfig: { version: 1, rules: [{ id: "meetings", sources: ["google_calendar"], action: "task", workstream: "meeting prep", group_by: "external_id" }] } });
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const agent = "ab".repeat(32);
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], agents: [agent], preferences: `meeting prep: ${mode}` });
+    await call("/api/sources", { source: "google_calendar", enabled: true });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "google_calendar", external_id: "c1", actor: "ann@globex.io", title: "QBR" }] });
+    posts.length = 0;
+    const reply = (content: string, id = "r1") => [{ id, pubkey: agent, content, created_at: 2, tags: [["e", "e".repeat(63) + "1", "", "reply"]] }];
+    const warnings = async () => (await store.detail(1))!.activities.filter((item) => item.kind === "disclosure_warning");
+    const results = async () => (await store.disclosureChecks(1)).map(({ reply_id, status, kinds }) => ({ reply_id, status, kinds }));
+    const again = async () => {
+      // As if the task waited on the agent again, so collect() reads the same reply a second time.
+      await db.query(`UPDATE ${schema}.tasks SET agent_reply = NULL WHERE id = 1`);
+      await db.query(`UPDATE ${schema}.task_people SET replied_at = NULL WHERE task_id = 1`);
+    };
+    return { db, store, hub, posts, agent, reply, warnings, results, again };
+  };
+
+  it("warns once about an internal link under Customer draft, by kind only", async () => {
+    const { hub, posts, agent, reply, warnings, results, again } = await setup("signals_disclose_c", "draft");
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
+    expect(await warnings()).toHaveLength(1);
+    expect((await warnings())[0]!.text).toBe("The customer draft in reply r1 has internal-looking content: go link");
+    expect(posts).toEqual([{ task: 1, text: disclosureMessage(["go link"], agent), agents: [agent] }]);
+    // Neither the result, the activity nor the thread post repeats the flagged text.
+    expect(JSON.stringify([await results(), await warnings(), posts])).not.toContain(LINK);
+    // Advisory: the task isn't put on hold.
+    expect((await hub.store.task(1))).toMatchObject({ status: "in_progress", question: null });
+
+    // Collecting the same reply again adds nothing: normally (it's recorded) and forced (read again).
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 0 });
+    await again();
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 1 });
+    expect(await results()).toHaveLength(1);
+    expect(await warnings()).toHaveLength(1);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("warns once when two collections overlap", async () => {
+    const { hub, posts, reply, warnings, results } = await setup("signals_disclose_race", "draft");
+    // Both runs read the reply before either records it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let fetched = 0;
+    const fetch = async () => {
+      fetched += 1;
+      if (fetched === 2) release();
+      await gate;
+      return reply(drafts.customer);
+    };
+    await Promise.all([hub.collect(fetch), hub.collect(fetch)]);
+    expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
+    expect(await warnings()).toHaveLength(1);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("saves the result and the warning together, so a failed write is retried and warns once", async () => {
+    const { db, hub, posts, reply, warnings, results } = await setup("signals_disclose_retry", "draft");
+    // The warning's activity write fails once, inside the same statement as the result.
+    await db.query(`ALTER TABLE signals_disclose_retry.activities ADD CONSTRAINT fail_once CHECK (kind <> 'disclosure_warning')`);
+    await expect(hub.collect(async () => reply(drafts.customer))).rejects.toThrow();
+    expect(await results()).toEqual([]);
+    expect(await warnings()).toEqual([]);
+    expect(posts).toEqual([]);
+    await db.query(`ALTER TABLE signals_disclose_retry.activities DROP CONSTRAINT fail_once`);
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
+    expect(await warnings()).toHaveLength(1);
+    expect(posts).toHaveLength(1);
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 0 });
+    expect(await warnings()).toHaveLength(1);
+  });
+
+  it("records clean for the same link under Internal notes", async () => {
+    const { hub, posts, reply, warnings, results } = await setup("signals_disclose_i", "draft");
+    expect(await hub.collect(async () => reply(drafts.internal))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "clean", kinds: [] }]);
+    expect(await warnings()).toEqual([]);
+    expect(posts).toEqual([]);
+  });
+
+  it.each([
+    ["no draft headings", `Hi Ann, the date is on ${LINK}.`],
+    ["only Internal notes", `## Internal notes\nDate from ${LINK}.`],
+    ["an empty Customer draft", `## Customer draft\n\n## Internal notes\nDate from ${LINK}.`],
+  ])("records unchecked for a reply with %s", async (_case, content) => {
+    const { hub, posts, reply, warnings, results } = await setup("signals_disclose_u", "draft");
+    expect(await hub.collect(async () => reply(content))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "unchecked", kinds: [] }]);
+    expect(await warnings()).toEqual([]);
+    expect(posts).toEqual([]);
+  });
+
+  it("warns about an internal link under a Sources subheading of the customer draft", async () => {
+    const { hub, posts, reply, results } = await setup("signals_disclose_s", "draft");
+    expect(await hub.collect(async () => reply("## Customer draft\nHi Ann, here's the plan.\n\n### Sources\n- go/example"))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([{ reply_id: "r1", status: "warned", kinds: ["go link"] }]);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("checks only draft-mode tasks", async () => {
+    const { hub, posts, reply, warnings, results } = await setup("signals_disclose_a", "auto");
+    expect(await hub.collect(async () => reply(drafts.customer))).toEqual({ recorded: 1 });
+    expect(await results()).toEqual([]);
+    expect(await warnings()).toEqual([]);
+    expect(posts).toEqual([]);
+  });
+
+  it("asks draft-mode agents to mark the two parts", async () => {
+    const { store } = await setup("signals_disclose_f", "draft");
+    expect((await store.task(1))?.mode).toBe("draft");
+    expect(taskMessage((await store.task(1))!, { agents: ["ab".repeat(32)] })).toContain('under a heading "Customer draft"');
   });
 });
