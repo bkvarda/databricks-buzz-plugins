@@ -179,6 +179,18 @@ export type Rule = Readonly<{
    */
   action_items?: Readonly<{ workstream?: string; meetings?: string }>;
   /**
+   * The event is a meeting's notes whose `payload.meeting` link names a
+   * calendar event (from `source`, default google_calendar): when rule
+   * `rule` (the meeting's prep, say) has a task for that event, the notes go
+   * on it instead of opening their own task. That task moves to this rule
+   * (its workstream, playbook and the team's mode for it), the notes' later
+   * versions go there too, and its agents are asked to go on. Notes that
+   * name no meeting, or a meeting with no such task (or one still asking
+   * about its series), open their own task as before. Only where this rule
+   * would open one (not on a first run, not with its work turned off).
+   */
+  meeting_task?: Readonly<{ rule: string; source?: string }>;
+  /**
    * `accounts`: the event is about every account, not one (a new feature or
    * a preview announced to the field): it opens a candidate task for each
    * account whose team opted in to the rule's workstream (see fanOut), one
@@ -428,12 +440,20 @@ export function configProblems(raw: unknown): string[] {
         problems.push(`${where}.action_items is {workstream?, meetings?}, like {"workstream": "meeting action items"}`);
       else if (rule.action !== "task") problems.push(`${where}.action_items needs action task`);
     }
+    if (rule.meeting_task !== undefined) {
+      const m = rule.meeting_task as Record<string, unknown>;
+      if (!m || typeof m !== "object" || Array.isArray(m) || Object.keys(m).some((key) => key !== "rule" && key !== "source") || typeof m.rule !== "string" || !m.rule.trim() || (m.source !== undefined && (typeof m.source !== "string" || !m.source.trim())))
+        problems.push(`${where}.meeting_task is {rule, source?}, like {"rule": "customer-meetings"}`);
+      else if (rule.action !== "task") problems.push(`${where}.meeting_task needs action task`);
+      else if (m.rule === rule.id) problems.push(`${where}.meeting_task names another rule, the one whose task the meeting has`);
+      else if (!(config.rules as Record<string, unknown>[]).some((other) => other && typeof other === "object" && other.id === m.rule && other.action === "task")) problems.push(`${where}.meeting_task.rule ${m.rule} isn't a task rule here`);
+    }
     if (rule.fan_out !== undefined) {
       if (rule.fan_out !== "accounts") problems.push(`${where}.fan_out is "accounts"`);
       else if (rule.action !== "task") problems.push(`${where}.fan_out needs action task`);
       else
         // (classify: not supported on fan-out yet, so a rule with one is refused rather than its question skipped.)
-        for (const key of ["account", "series", "same_as", "action_items", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify"] as const)
+        for (const key of ["account", "series", "same_as", "action_items", "meeting_task", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify"] as const)
           if (rule[key] !== undefined) problems.push(`${where}.fan_out is about every account, so it takes no ${key}`);
     }
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);

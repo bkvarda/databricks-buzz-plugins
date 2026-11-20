@@ -26,7 +26,7 @@
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
 import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts } from "./model";
-import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
+import type { Classifier, Handled, IngestResult, JoinClaim, SignalsStore, Task, TaskPerson } from "./store";
 import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -320,9 +320,36 @@ export class Hub {
     };
   }
 
-  /** Posts new tasks to Buzz and their updates in the task's thread. Failures leave the task for `retry`. */
+  /**
+   * Posts new tasks to Buzz and their updates in the task's thread. Failures leave the task for `retry`. A meeting's
+   * notes' move of its prep task (an update's `joined`) is marked reported once its update is posted, or needs none
+   * (no thread to post in); when it can't be (a read or the post failed), it's left for the next sweep to report.
+   */
   private async announce(result: IngestResult) {
-    if (!this.notifier) return;
+    const joins = new Map(result.updated.flatMap((update) => (update.joined ? [[update.joined.claim, update.joined] as const] : [])));
+    try {
+      await this.announceAll(result, joins);
+    } finally {
+      if (joins.size) await this.store.releaseJoins([...joins.values()]).catch((error: Error) => this.log(`couldn't leave moves ${[...joins.values()].map((one) => one.event).join(", ")} for the sweep: ${error.message}`));
+    }
+  }
+
+  /**
+   * Done with these moves (see announce): their marks cleared, so no sweep reports them again. (A failure to clear
+   * them is logged, not thrown, so the post's other updates still go out; the sweep may then report them again.)
+   */
+  private async reported(joins: Map<string, JoinClaim>, updates: IngestResult["updated"]) {
+    const done = updates.flatMap((update) => (update.joined && joins.has(update.joined.claim) ? [update.joined] : []));
+    if (!done.length) return;
+    for (const one of done) joins.delete(one.claim);
+    await this.store.reportedJoins(done).catch((error: Error) => this.log(`couldn't mark moves ${done.map((one) => one.event).join(", ")} reported: ${error.message}`));
+  }
+
+  private async announceAll(result: IngestResult, joins: Map<string, JoinClaim>) {
+    if (!this.notifier) {
+      await this.reported(joins, result.updated);
+      return;
+    }
     for (const task of result.created) await this.post(task);
     // A task never posted (a reply closed it before it was) that a customer message opened again: post it now.
     for (const id of new Set(result.updated.filter((update) => update.reopened && !update.task.buzz_root).map((update) => update.task.id))) {
@@ -358,7 +385,11 @@ export class Hub {
     for (const update of result.updated) byTask.set(update.task.id, [...(byTask.get(update.task.id) ?? []), update]);
     for (const updates of byTask.values()) {
       const update = [...updates].reverse().find((one) => one.reopened) ?? updates[0]!;
-      if (!update.task.buzz_root || seen.has(update.task.id)) continue;
+      if (!update.task.buzz_root || seen.has(update.task.id)) {
+        // No thread yet (its post briefs the agents it has then), or its closure was posted: no handoff to post.
+        await this.reported(joins, updates);
+        continue;
+      }
       seen.add(update.task.id);
       const title = update.title && plainSlack(update.title);
       const what = update.url ? `[${title ?? "new event"}](${update.url})` : (title ?? "a new event");
@@ -372,7 +403,7 @@ export class Hub {
       // A meeting's notes changed: the follow-up's checklist as the new version has it.
       // (The last update of the post that changed it, when the task still has that: null says the notes list no items now.)
       const checklist = [...updates].reverse().find((one) => one.checklist !== undefined)?.checklist;
-      if (checklist !== undefined && (final.checklist ?? null) === checklist) text += checklist ? `\n\n${checklist}` : "\n\nThe notes list no action items now, so the checklist is cleared.";
+      const listed = checklist !== undefined && (final.checklist ?? null) === checklist ? (checklist ? `\n\n${checklist}` : "\n\nThe notes list no action items now, so the checklist is cleared.") : "";
       if (update.reopened) {
         // It was done: say it's open again and who has it, not just that something came in.
         const on = (await this.store.people([update.task.id])).get(update.task.id) ?? [];
@@ -380,19 +411,36 @@ export class Hub {
         text = reopenedMessage(what, people, on.some((person) => person.kind === "agent"));
       }
       if (changes.length) {
-        // The changes go the usual way (the diff, the agents asked again, a `changed` activity), under this line.
-        this.posted(update.task.id, text);
-        await this.changed(final, text, changes, outgrown).catch((error: Error) => this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`));
+        // The changes go the usual way (the diff, the agents asked again, a `changed` activity), under this line,
+        // and the checklist under them (notes that just came to their meeting's prep task, which may have been done).
+        this.posted(update.task.id, text + listed);
+        const sent = await this.changed(final, text, changes, outgrown, listed.trim(), updates.find((one) => one.joined)?.joined).then(
+          () => true,
+          (error: Error) => (this.log(`couldn't post a change to task ${update.task.id}: ${error.message}`), false),
+        );
+        if (sent) await this.reported(joins, updates);
         continue;
       }
+      text += listed;
       if (update.reopened) {
         this.posted(update.task.id, text);
-        await this.notifier.updated(final, text).catch((error: Error) => this.log(`couldn't post that task ${update.task.id} is open again: ${error.message}`));
+        const sent = await this.notifier.updated(final, text).then(
+          () => true,
+          (error: Error) => (this.log(`couldn't post that task ${update.task.id} is open again: ${error.message}`), false),
+        );
+        if (sent) await this.reported(joins, updates);
         continue;
       }
       // A source that saves an event again with nothing new to say (a calendar does, hourly) doesn't repeat the line.
-      if (this.repeats(update.task.id, text)) continue;
-      await this.notifier.updated(update.task, text).catch((error: Error) => this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`));
+      if (this.repeats(update.task.id, text)) {
+        await this.reported(joins, updates);
+        continue;
+      }
+      const sent = await this.notifier.updated(update.task, text).then(
+        () => true,
+        (error: Error) => (this.log(`couldn't post an update to task ${update.task.id}: ${error.message}`), false),
+      );
+      if (sent) await this.reported(joins, updates);
     }
   }
 
@@ -417,19 +465,40 @@ export class Hub {
   /**
    * A watched field changed: says what changed, and asks the task's agents to
    * go on with the playbook of the rule it's under now. Tasks in ask or off
-   * mode, or no agent on, only get the line.
+   * mode, or no agent on, only get the line. `joined`: a meeting's notes just
+   * moved its prep task to their rule (meeting_task), a handoff: the agents
+   * asked are the ones the account names for where it is now (its rule or
+   * workstream, as a new task's are), added to it, not the ones it had for its
+   * old workstream; never one someone took off it. A task someone chose people
+   * for (an owner or an agent assigned) keeps those: its agents are asked.
+   * (`joined` is the move's claim: its `changed` activity is recorded once
+   * for the move, however many posts of the handoff it takes and whatever
+   * each one's changes say.)
    */
-  private async changed(task: Task, update: string, changes: readonly FieldChange[], outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>) {
+  private async changed(task: Task, update: string, changes: readonly FieldChange[], outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, checklist?: string, joined?: JoinClaim) {
     const people = (await this.store.people([task.id])).get(task.id) ?? [];
-    const agents = task.mode === "auto" || task.mode === "draft" ? [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
-    const account = agents.length && task.account ? await this.store.account({ name: task.account }) : undefined;
+    const working = task.mode === "auto" || task.mode === "draft";
+    let agents = working ? [...new Set(people.filter((person) => person.kind === "agent").map((person) => person.key))] : [];
+    let added: string[] = [];
+    const routing = joined && working && task.account && !people.some((person) => person.assigned_at) ? await this.store.account({ name: task.account }) : undefined;
+    if (routing && routing.channel === task.channel) {
+      const gone = (await this.store.removed([task.id])).get(task.id);
+      agents = agentsFor(routing, task).filter((key) => !gone?.has(key));
+      added = agents.filter((key) => !people.some((person) => person.kind === "agent" && person.key === key));
+    }
+    const account = agents.length && task.account ? (routing ?? (await this.store.account({ name: task.account }))) : undefined;
     const labels = labelsOf(await this.config());
+    if (added.length) {
+      await this.store.addPeople(task.id, added.map((key) => ({ kind: "agent", key })));
+      await this.store.activity(task.id, "hub", "agents_asked", `Asked ${added.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it (${task.workstream ?? task.rule_id} now)`);
+    }
     if (agents.length) await this.store.askAgain(task.id, agents);
-    await this.store.activity(task.id, "hub", "changed", changes.map(changeLine).join("; "));
+    // (A handoff's once: a retried post of it, its first having failed after this, doesn't record it again.)
+    await this.store.activity(task.id, "hub", "changed", changes.map(changeLine).join("; "), joined && `move:${joined.event}:${joined.at}`);
     // A rule that no longer applies gives no playbook of its own: the workstream's, if any.
     const playbookTask = outgrown ? { rule_id: "", workstream: task.workstream } : task;
     const event = agents.length ? await this.store.latestEvent(task.id) : undefined;
-    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels)), agents);
+    await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels), checklist), agents);
   }
 
   /**
@@ -1008,7 +1077,8 @@ export class Hub {
     if (resumed) await this.announce({ received: 0, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: pending.created, updated: pending.updated, finished: [], handled: [], firstRun: false });
     // Finished tasks first, so they aren't posted or nudged.
     for (const { task, reason } of await this.store.finishable(await this.config(), at)) {
-      const done = await this.store.finish(task.id, reason);
+      // (As it was judged: one that moved or got an event since is left for the next sweep.)
+      const done = await this.store.finish(task.id, reason, task);
       if (!done) continue;
       finished++;
       if (this.notifier && done.buzz_root) await this.notifier.updated(done, doneMessage(reason)).catch(() => {});
@@ -1407,10 +1477,11 @@ export function answerMessage(task: Task, user: string, text: string, agents: re
 const changeLine = (change: FieldChange) => `${change.field}: ${change.from} → ${change.to}`;
 
 /** The thread's line when a watched field changes, asking the agents on it (if any) to go on. */
-export function changedMessage(task: Task, update: string, changes: readonly FieldChange[], agents: readonly string[], account?: string, outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, source?: string): string {
+export function changedMessage(task: Task, update: string, changes: readonly FieldChange[], agents: readonly string[], account?: string, outgrown?: Readonly<{ rule: string; values: readonly { field: string; value: string }[] }>, source?: string, checklist?: string): string {
   const mode = task.mode === "auto" ? "auto" : "draft";
   return [
     `${update}\n${changes.map((change) => `- **${change.field}:** ${change.from} → ${change.to}`).join("\n")}`,
+    checklist ? `\n${checklist}` : "",
     outgrown ? `\nThe rule this task is under (${outgrown.rule}) no longer applies, and no other rule for this kind of work does, so its playbook isn't given.${outgrown.values.length ? ` Now: ${outgrown.values.map((item) => `${item.field} ${item.value}`).join(", ")}.` : ""} Go by the source as it is now${source && agents.length ? " (below)" : ""}.` : "",
     agents.length ? `\n${agents.map((key) => `nostr:${npub(key)}`).join(" ")} this changed since you last looked: ${AGENT_ASK[mode]} Your next reply in this thread is recorded on the task.` : "",
     agents.length && source ? `\n${source}` : "",

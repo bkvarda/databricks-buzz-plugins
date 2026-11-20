@@ -414,3 +414,69 @@ describe.skipIf(!URL)("signals on PostgreSQL: fan-out", () => {
     expect((await store.tasks({})).map((task) => task.event_count)).toEqual([2, 2]);
   });
 });
+
+describe.skipIf(!URL)("signals on PostgreSQL: meeting notes on the meeting's prep task", () => {
+  const pool = new pg.Pool({ connectionString: URL, max: 10 });
+  afterAll(() => pool.end());
+  let fail: string | undefined;
+  const db: Db = {
+    query: async (text, values) => {
+      if (fail && text.includes(fail)) {
+        fail = undefined;
+        throw new Error("write failed");
+      }
+      return { rows: (await pool.query(text, values)).rows };
+    },
+  };
+  const config: SignalsConfig = {
+    version: 1,
+    rules: [
+      { id: "customer-meetings", sources: ["google_calendar"], customer_attendees: true, action: "task", title: "Prep: {title}", workstream: "meeting prep" },
+      { id: "meeting-notes", sources: ["google_drive"], when: { title: "Notes by Gemini" }, account_named_in: "title", action: "task", title: "Follow up: {title}", workstream: "meeting follow-up", group_by: "group_key", meeting_task: { rule: "customer-meetings" } },
+    ],
+    accounts: [{ name: "Globex", channel: "globex", domains: ["globex.io"] }],
+  };
+
+  it("finishes one failed move from the sweep and an identical repost at once without a deadlock", async () => {
+    const schema = "signals_pg_meeting_task";
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const store = new SignalsStore(db, schema);
+    await store.setup();
+    for (const source of ["google_drive", "google_calendar"]) {
+      await store.setSource("alice@x.com", source, true);
+      await store.ingest("alice@x.com", [{ source, external_id: `seed-${source}` }], config);
+    }
+    await store.ingest("alice@x.com", [{ source: "google_calendar", external_id: "evt1", title: "Globex QBR", payload: { attendees: [{ email: "alice@x.com" }, { email: "jane@globex.io" }] } }], config);
+    const [prep] = await store.tasks({});
+    expect(prep).toMatchObject({ rule_id: "customer-meetings" });
+    const meeting = `https://calendar.google.com/calendar/event?eid=${Buffer.from("evt1 alice@x.com").toString("base64url")}`;
+    const doc = { source: "google_drive", external_id: "d1:v1", group_key: "d1", title: "Globex QBR - Notes by Gemini", occurred_at: "2026-11-17T11:05:00Z", payload: { notes: "Next steps\nDetails", meeting } };
+    // The move's statement fails once the notes are saved.
+    fail = "SET join_pending = $8";
+    expect((await store.ingest("alice@x.com", [doc], config)).errors).toHaveLength(1);
+    const holder = await pool.connect();
+    try {
+      // Holds the prep task's row, so the sweep's retry and the repost's both reach the move's statement before either can
+      // finish it (one at the task's update, the other behind it).
+      await holder.query("BEGIN");
+      await holder.query(`SELECT 1 FROM ${schema}.tasks WHERE id = $1 FOR UPDATE`, [prep!.id]);
+      const sweep = store.pendingItems(config);
+      const repost = store.ingest("alice@x.com", [doc], config);
+      for (let i = 0; ; i++) {
+        const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO ${schema}.group_links%'`);
+        if (found.rows[0].n >= 2) break;
+        if (i > 200) throw new Error("the moves never waited: " + JSON.stringify((await pool.query(`SELECT wait_event_type, left(query, 300) AS q FROM pg_stat_activity WHERE state <> 'idle' AND pid <> pg_backend_pid()`)).rows));
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      await holder.query("COMMIT");
+      const [swept, reposted] = await Promise.all([sweep, repost]);
+      expect(swept.errors).toEqual([]);
+      expect(reposted.errors).toEqual([]);
+      // Moved once, with both events, and taken to report by one of them.
+      expect([...swept.updated, ...reposted.updated].filter((update) => update.joined)).toHaveLength(1);
+    } finally {
+      holder.release();
+    }
+    expect(await store.task(prep!.id)).toMatchObject({ rule_id: "meeting-notes", workstream: "meeting follow-up", event_count: 2 });
+  });
+});
