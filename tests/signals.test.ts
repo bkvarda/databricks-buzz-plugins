@@ -1528,6 +1528,39 @@ describe("work someone on the team did themselves", () => {
     expect((await store.task(task!.id))!.status).toBe("open");
   });
 
+  it("doesn't save a reply whose event Forget deleted before it was saved", async () => {
+    const pg = new PGlite();
+    let paused: (() => Promise<void>) | undefined;
+    const db: Db = {
+      query: async (text, values) => {
+        // Forget runs after the sent event is written, before its reply is saved.
+        if (paused && text.includes(".replies (group_key")) {
+          const run = paused;
+          paused = undefined;
+          await run();
+        }
+        return { rows: (await pg.query(text, values)).rows as never[] };
+      },
+    };
+    const store = new SignalsStore(db, "signals_handled_forget_early");
+    await store.setup();
+    for (const source of ["gmail", "slack", "slack.sent"]) {
+      await store.setSource("alice@x.com", source, true);
+      await store.ingest("alice@x.com", [{ source, external_id: "seed" }], config);
+    }
+    await store.ingest("alice@x.com", [{ source: "slack", external_id: "c1", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000100.000000" }], config);
+    const [task] = await store.tasks({});
+    paused = () => store.setSource("alice@x.com", "slack.sent", false, undefined, true);
+    const result = await store.ingest("alice@x.com", [{ source: "slack.sent", external_id: "s1", actor: "alice@x.com", group_key: "C1:1795000000.000001", occurred_at: "1795000200.000000" }], config);
+    expect(paused).toBeUndefined();
+    expect(result.handled).toEqual([]);
+    expect((await store.task(task!.id))!.status).toBe("open");
+    expect((await pg.query("SELECT count(*)::int AS n FROM signals_handled_forget_early.replies")).rows).toEqual([{ n: 0 }]);
+    // Later customer messages still find it open, and nothing the forgotten reply left closes it.
+    await store.ingest("alice@x.com", [{ source: "slack", external_id: "c2", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000150.000000" }], config);
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
+
   it("orders an event saved before the upgrade by its own permalink's ts, not the root's", async () => {
     const { store, call } = await setup("signals_handled_upgrade_us");
     const root = "1795001000.000001";

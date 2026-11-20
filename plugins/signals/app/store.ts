@@ -314,9 +314,10 @@ export class SignalsStore {
       [owner, source, enabled, scope === undefined ? null : JSON.stringify(scope), enabled ? now() : null],
     );
     if (!enabled && forget) {
-      // Its replies too, decided or not: a forgotten reply mustn't close (or keep closed) anything.
-      await this.q(`DELETE FROM $S.replies WHERE (owner = lower($1) AND source = $2) OR event_id IN (SELECT id FROM $S.events WHERE owner = $1 AND source = $2)`, [owner, source]);
+      // Events first, then their replies, decided or not: a forgotten reply mustn't close (or keep closed) anything.
+      // A reply is saved only while its event is there (recordReply), so one saved during this is caught by the second delete.
       await this.q(`DELETE FROM $S.events WHERE owner = $1 AND source = $2`, [owner, source]);
+      await this.q(`DELETE FROM $S.replies WHERE owner = lower($1) AND source = $2`, [owner, source]);
     }
   }
 
@@ -417,6 +418,7 @@ export class SignalsStore {
         // (Recorded first, so a reply that comes before the customer's message, or a closure a failed write cut short, is still decided.)
         for (const { group } of replies) {
           const reply = await this.recordReply(group, recorded.id, owner, event);
+          if (!reply) continue;
           const done = await this.applyReply(reply, result);
           if (done && done.task.id === placed?.task.id) finishedHere = true;
         }
@@ -913,18 +915,28 @@ export class SignalsStore {
     return out;
   }
 
-  /** Records a reply someone on the team sent in a group's thread (once; it waits there until it's decided). */
-  private async recordReply(group: string, event: number, owner: string, input: EventInput, keep = false): Promise<Reply> {
+  /**
+   * Records a reply someone on the team sent in a group's thread (once; it
+   * waits there until it's decided), only while its event is still saved:
+   * undefined when Forget deleted it meanwhile.
+   */
+  private async recordReply(group: string, event: number, owner: string, input: EventInput, keep = false): Promise<Reply | undefined> {
     const title = input.title ? plainSlack(input.title).replace(/\s+/g, " ").trim().slice(0, 200) : null;
     const occurred = toSeconds(input.occurred_at);
     const at = Number.isNaN(occurred) ? now() : occurred;
     const precise = toMicros(input.occurred_at);
     const micros = Number.isNaN(precise) ? at * 1_000_000 : precise;
-    await this.q(
-      `INSERT INTO $S.replies (group_key, event_id, owner, source, title, url, at, seen_at, at_us) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::bigint)
-       ON CONFLICT (group_key, event_id) DO ${keep ? "NOTHING" : "UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url, at = EXCLUDED.at, at_us = EXCLUDED.at_us"}`,
+    // (The event's key-share lock holds Forget's delete of it until this commits; then Forget's delete of replies sees this row.)
+    const saved = await this.q<{ kept: unknown }>(
+      `WITH ev AS (SELECT id FROM $S.events WHERE id = $2 FOR KEY SHARE),
+       ins AS (
+         INSERT INTO $S.replies (group_key, event_id, owner, source, title, url, at, seen_at, at_us)
+         SELECT $1, ev.id, $3, $4, $5, $6, $7, $8, $9::bigint FROM ev
+         ON CONFLICT (group_key, event_id) DO ${keep ? "NOTHING" : "UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url, at = EXCLUDED.at, at_us = EXCLUDED.at_us"} RETURNING 1)
+       SELECT EXISTS (SELECT 1 FROM ev) AS kept, (SELECT count(*) FROM ins) AS n`,
       [group, event, owner.toLowerCase(), input.source, title, input.url ?? null, at, now(), String(micros)],
     );
+    if (!saved.rows[0]?.kept) return undefined;
     return { group, event, owner: owner.toLowerCase(), source: input.source, title, url: input.url ?? null, at, micros };
   }
 
@@ -973,8 +985,11 @@ export class SignalsStore {
   async handled(id: number, reply: Reply): Promise<Handled | undefined> {
     const at = now();
     const what = `${reply.owner} handled it themselves (${reply.source})${reply.title ? `: ${reply.title}` : ""}${reply.url ? ` ${reply.url}` : ""}`.slice(0, 4000);
+    // The reply's row lock comes first, and for update: a second decision of the same reply waits for this one, then finds the task done,
+    // instead of both holding a share lock and deadlocking at `mark`. Forget's delete waits too, or wins and this closes nothing.
     const found = await this.q<{ task: unknown; agents: unknown; owners: unknown }>(
-      `WITH kept AS (SELECT 1 FROM $S.replies WHERE group_key = $2 AND event_id = $5 FOR SHARE),
+      // (Its event too: Forget deletes events before replies, so a reply whose event is gone is one being forgotten.)
+      `WITH kept AS (SELECT 1 FROM $S.replies r JOIN $S.events e ON e.id = r.event_id WHERE r.group_key = $2 AND r.event_id = $5 FOR NO KEY UPDATE OF r FOR KEY SHARE OF e),
        latest AS (
          SELECT max(${EVENT_MICROS}) AS at FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
          WHERE te.task_id = $1 AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)),
