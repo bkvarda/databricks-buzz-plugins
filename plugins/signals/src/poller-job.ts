@@ -32,16 +32,42 @@ export function pollerJobSettings(onboarding: Onboarding) {
     max_concurrent_runs: 1,
     schedule: { quartz_cron_expression: POLLER_SCHEDULE, timezone_id: "UTC", pause_status: "UNPAUSED" },
     tasks: [{ task_key: "poll", environment_key: "poller", spark_python_task: { python_file: `${onboarding.folder}/poller.py`, parameters: [...onboarding.args], source: "WORKSPACE" } }],
-    environments: [{ environment_key: "poller", spec: { client: "2", dependencies: ["psycopg[binary]"] } }],
+    environments: [{ environment_key: "poller", spec: { client: "3", dependencies: ["databricks-sdk>=0.40", "psycopg[binary]>=3.1"] } }],
   };
+}
+
+/** Points an existing job's poller task (or a new one, if it has none) at poller.py, and gives it the poller's environment. */
+async function updatePollerTask(client: DatabricksClient, jobId: number, settings: ReturnType<typeof pollerJobSettings>, signal?: AbortSignal) {
+  const job = await client.get<{ settings?: { tasks?: { task_key: string; spark_python_task?: { python_file?: string } }[]; environments?: { environment_key: string }[] } }>("/api/2.2/jobs/get", { query: { job_id: jobId }, ...(signal && { signal }) });
+  const ours = settings.tasks[0]!;
+  const task = job.settings?.tasks?.find((t) => t.spark_python_task?.python_file?.endsWith("/signals-poller/poller.py"));
+  const tasks = (job.settings?.tasks ?? []).filter((t) => t !== task).concat({ ...ours, task_key: task?.task_key ?? ours.task_key });
+  const environments = (job.settings?.environments ?? []).filter((e) => e.environment_key !== ours.environment_key).concat(settings.environments);
+  await client.post("/api/2.2/jobs/update", { job_id: jobId, new_settings: { tasks, environments } }, { ...(signal && { signal }) });
 }
 
 export type PollerJob = Readonly<{ jobId: number; created: boolean; keptSources: boolean }>;
 
-/** The person's poller job, by its name, if they have one. */
+type ListedJob = { job_id: number; creator_user_name?: string; settings?: { name?: string; tasks?: { spark_python_task?: { python_file?: string } }[] } };
+
+/**
+ * The person's poller job, if they have one: theirs, and named "Signals poller
+ * (<email>)" or running poller.py from their folder (a job they made by hand).
+ */
 export async function findPollerJob(client: DatabricksClient, user: string, signal?: AbortSignal): Promise<number | undefined> {
-  const reply = await client.get<{ jobs?: { job_id: number; creator_user_name?: string }[] }>("/api/2.2/jobs/list", { query: { name: pollerJobName(user), limit: 25 }, ...(signal && { signal }) });
-  return reply.jobs?.find((job) => !job.creator_user_name || job.creator_user_name.toLowerCase() === user.toLowerCase())?.job_id;
+  const script = `/Workspace/Users/${user}/signals-poller/poller.py`.toLowerCase();
+  const runsPoller = (job: ListedJob) => job.settings?.tasks?.some((task) => [script, script.replace(/^\/workspace/, "")].includes((task.spark_python_task?.python_file ?? "").toLowerCase()));
+  const mine = (job: ListedJob) => !job.creator_user_name || job.creator_user_name.toLowerCase() === user.toLowerCase();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const reply = await client.get<{ jobs?: ListedJob[]; next_page_token?: string }>("/api/2.2/jobs/list", { query: { expand_tasks: true, limit: 100, ...(pageToken && { page_token: pageToken }) }, ...(signal && { signal }) });
+    const jobs = (reply.jobs ?? []).filter(mine);
+    const found = jobs.find((job) => job.settings?.name === pollerJobName(user)) ?? jobs.find(runsPoller);
+    if (found) return found.job_id;
+    if (!reply.next_page_token) return undefined;
+    pageToken = reply.next_page_token;
+  }
+  return undefined;
 }
 
 /**
@@ -62,7 +88,8 @@ export async function setUpPollerJob(client: DatabricksClient, onboarding: Onboa
   const settings = pollerJobSettings(onboarding);
   const existing = await findPollerJob(client, onboarding.user, signal);
   let jobId = existing;
-  if (existing) await client.post("/api/2.2/jobs/reset", { job_id: existing, new_settings: settings }, { ...(signal && { signal }) });
+  // An existing job keeps its name, schedule and settings; only its poller task is brought up to date.
+  if (existing) await updatePollerTask(client, existing, settings, signal);
   else jobId = (await client.post<{ job_id: number }>("/api/2.2/jobs/create", settings, { ...(signal && { signal }) })).job_id;
   await client.post("/api/2.2/jobs/run-now", { job_id: jobId }, { ...(signal && { signal }) });
   return { jobId: jobId!, created: !existing, keptSources: hadSources };

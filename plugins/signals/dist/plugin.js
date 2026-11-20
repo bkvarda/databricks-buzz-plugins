@@ -2513,12 +2513,31 @@ function pollerJobSettings(onboarding) {
     max_concurrent_runs: 1,
     schedule: { quartz_cron_expression: POLLER_SCHEDULE, timezone_id: "UTC", pause_status: "UNPAUSED" },
     tasks: [{ task_key: "poll", environment_key: "poller", spark_python_task: { python_file: `${onboarding.folder}/poller.py`, parameters: [...onboarding.args], source: "WORKSPACE" } }],
-    environments: [{ environment_key: "poller", spec: { client: "2", dependencies: ["psycopg[binary]"] } }]
+    environments: [{ environment_key: "poller", spec: { client: "3", dependencies: ["databricks-sdk>=0.40", "psycopg[binary]>=3.1"] } }]
   };
 }
+async function updatePollerTask(client, jobId, settings, signal) {
+  const job = await client.get("/api/2.2/jobs/get", { query: { job_id: jobId }, ...signal && { signal } });
+  const ours = settings.tasks[0];
+  const task = job.settings?.tasks?.find((t) => t.spark_python_task?.python_file?.endsWith("/signals-poller/poller.py"));
+  const tasks = (job.settings?.tasks ?? []).filter((t) => t !== task).concat({ ...ours, task_key: task?.task_key ?? ours.task_key });
+  const environments = (job.settings?.environments ?? []).filter((e) => e.environment_key !== ours.environment_key).concat(settings.environments);
+  await client.post("/api/2.2/jobs/update", { job_id: jobId, new_settings: { tasks, environments } }, { ...signal && { signal } });
+}
 async function findPollerJob(client, user, signal) {
-  const reply = await client.get("/api/2.2/jobs/list", { query: { name: pollerJobName(user), limit: 25 }, ...signal && { signal } });
-  return reply.jobs?.find((job) => !job.creator_user_name || job.creator_user_name.toLowerCase() === user.toLowerCase())?.job_id;
+  const script = `/Workspace/Users/${user}/signals-poller/poller.py`.toLowerCase();
+  const runsPoller = (job) => job.settings?.tasks?.some((task) => [script, script.replace(/^\/workspace/, "")].includes((task.spark_python_task?.python_file ?? "").toLowerCase()));
+  const mine = (job) => !job.creator_user_name || job.creator_user_name.toLowerCase() === user.toLowerCase();
+  let pageToken;
+  for (let page = 0; page < 20; page++) {
+    const reply = await client.get("/api/2.2/jobs/list", { query: { expand_tasks: true, limit: 100, ...pageToken && { page_token: pageToken } }, ...signal && { signal } });
+    const jobs = (reply.jobs ?? []).filter(mine);
+    const found = jobs.find((job) => job.settings?.name === pollerJobName(user)) ?? jobs.find(runsPoller);
+    if (found) return found.job_id;
+    if (!reply.next_page_token) return void 0;
+    pageToken = reply.next_page_token;
+  }
+  return void 0;
 }
 async function setUpPollerJob(client, onboarding, options = {}) {
   const { signal } = options;
@@ -2533,7 +2552,7 @@ async function setUpPollerJob(client, onboarding, options = {}) {
   const settings = pollerJobSettings(onboarding);
   const existing = await findPollerJob(client, onboarding.user, signal);
   let jobId = existing;
-  if (existing) await client.post("/api/2.2/jobs/reset", { job_id: existing, new_settings: settings }, { ...signal && { signal } });
+  if (existing) await updatePollerTask(client, existing, settings, signal);
   else jobId = (await client.post("/api/2.2/jobs/create", settings, { ...signal && { signal } })).job_id;
   await client.post("/api/2.2/jobs/run-now", { job_id: jobId }, { ...signal && { signal } });
   return { jobId, created: !existing, keptSources: hadSources };
