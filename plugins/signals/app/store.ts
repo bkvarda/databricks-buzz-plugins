@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -47,6 +47,9 @@ export type Task = Readonly<{
   series?: string | null;
   /** For a meeting's follow-up (a rule's `action_items`): the notes' items that aren't the account team's own tasks, as a checklist, and the tasks the team's items opened. */
   checklist?: string | null;
+  /** For a fan-out candidate (a rule's `fan_out`): what was decided about it for its account, and who decided. */
+  verdict?: Verdict | null;
+  verdict_by?: string | null;
 }>;
 
 /** A recurring series and what the team said about it. */
@@ -207,6 +210,10 @@ export class SignalsStore {
     // Recurring series (a rule's `series`): asked once, and the answer kept.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS series text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS checklist text`);
+    // A fan-out candidate's verdict (see Rule.fan_out): set by an agent or a person, never by an event coming in.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict_by text`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS verdict_at bigint`);
     // The newest notes revision (microseconds) whose action items the follow-up took: an older one read late changes nothing.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS items_us bigint`);
     // The event version whose action items are being written, until all are: one a failed write cut short is finished by the sweep (or a repost).
@@ -219,6 +226,10 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS placing_at bigint`);
     // Whether the pending version came in on its source's first run: the sweep places it as that ingest would have.
     await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS items_first_run boolean`);
+    // A fan-out event's version not yet placed on every candidate (set with the version, cleared once it is), and whether it came
+    // in on its source's first run: posting it again finishes that version as its first ingest would have, and changes nothing else.
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS fan_pending int`);
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS fan_first_run boolean`);
     // A notes document's newest revision saved (microseconds), by source and group: raised as each is recorded, so placing an older
     // one can lock it and see a newer one being saved (see LATEST_REVISION).
     await this.q(`CREATE TABLE IF NOT EXISTS $S.revisions (source text NOT NULL, group_key text NOT NULL, latest_us bigint NOT NULL, PRIMARY KEY (source, group_key))`);
@@ -440,20 +451,21 @@ export class SignalsStore {
    * write (items_pending) in the same statement, so the sweep finishes them
    * even when a later write of this post fails and the post is acknowledged.
    */
-  async record(owner: string, given: EventInput, items = false, firstRun = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number }> {
+  async record(owner: string, given: EventInput, items = false, firstRun = false, fan = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number; fanPending?: { version: number; firstRun: boolean } }> {
     const event = await this.keepDetails(owner, given);
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
     const micros = toMicros(event.occurred_at);
-    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun];
+    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun, fan];
     // xmax = 0 only for a row this statement inserted.
-    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown }>(
+    const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown; fan_pending: unknown; fan_first_run: unknown }>(
       `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3),
        doc AS (INSERT INTO $S.revisions (source, group_key, latest_us) SELECT $2, $11, $13::bigint WHERE $14 AND $11::text IS NOT NULL AND $13::bigint IS NOT NULL
          ON CONFLICT (source, group_key) DO UPDATE SET latest_us = GREATEST($S.revisions.latest_us, excluded.latest_us) RETURNING 1)
-       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us, items_pending, placing_at, items_first_run)
-       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint, CASE WHEN $14 THEN 1 END, CASE WHEN $14 THEN $6::bigint END, CASE WHEN $14 THEN $15::boolean END)
+       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us, items_pending, placing_at, items_first_run, fan_pending, fan_first_run)
+       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint, CASE WHEN $14 THEN 1 END, CASE WHEN $14 THEN $6::bigint END, CASE WHEN $14 THEN $15::boolean END,
+         CASE WHEN $16 THEN 1 END, CASE WHEN $16 THEN $15::boolean END)
        ON CONFLICT (owner, source, external_id) DO UPDATE SET
          last_seen = excluded.last_seen,
          content_hash = excluded.content_hash,
@@ -464,8 +476,10 @@ export class SignalsStore {
          items_pending = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN $S.events.versions + 1 ELSE $S.events.items_pending END,
          items_tried = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN NULL ELSE $S.events.items_tried END,
          placing_at = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.placing_at ELSE $S.events.placing_at END,
-         items_first_run = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.items_first_run ELSE $S.events.items_first_run END
-       RETURNING id, versions, task_id, items_pending,
+         items_first_run = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.items_first_run ELSE $S.events.items_first_run END,
+         fan_pending = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $S.events.versions + 1 ELSE $S.events.fan_pending END,
+         fan_first_run = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $15::boolean ELSE $S.events.fan_first_run END
+       RETURNING id, versions, task_id, items_pending, fan_pending, fan_first_run,
          (SELECT row_to_json(previous) FROM previous) AS before,
          NOT EXISTS (SELECT 1 FROM previous) AS inserted,
          COALESCE((SELECT content_hash FROM previous) <> $4, false) AS changed`,
@@ -475,7 +489,7 @@ export class SignalsStore {
     // The event as it was before this version (pg gives row_to_json as an object, PGlite may give text).
     const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
     const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
-    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }) };
+    return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }), ...(num(row.fan_pending) !== null && { fanPending: { version: num(row.fan_pending)!, firstRun: row.fan_first_run === true } }) };
   }
 
   /**
@@ -511,6 +525,7 @@ export class SignalsStore {
       // Saved: an error after that needn't be posted again (a notes event's items_pending has the sweep finish it;
       // reposting a saved event changes nothing). Before that, the post is handled again (see Hub.drain).
       let saved = false;
+      let fanning = false;
       let placing: number | undefined;
       let placingVersion: number | undefined;
       try {
@@ -524,7 +539,8 @@ export class SignalsStore {
         // A meeting's notes a rule with action_items may take: marked pending as it's recorded, with whether it's a first run,
         // so the sweep places it as this ingest would (a first run opens tasks only with first_run_seen false; otherwise
         // placing it finds nothing to do and clears the marker).
-        const recorded = await this.record(owner, event, config.rules.some((rule) => rule.action_items && ruleApplies(config, rule, event, owner)), state.firstRun);
+        const fan = fanOut(config, event, { firstRun: state.firstRun, owner });
+        const recorded = await this.record(owner, event, config.rules.some((rule) => rule.action_items && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
         counts[recorded.outcome]++;
         saved = true;
         if (recorded.outcome !== "same" && recorded.itemsPending !== undefined) {
@@ -532,6 +548,21 @@ export class SignalsStore {
           placingVersion = recorded.version;
         }
         const replies = handledBy(config, event, owner);
+        // About every account (a new feature announced): a candidate per opted-in account, then nothing else to do with it.
+        // Its version is pending (fan_pending) until placed on every candidate: a failure asks for the post again, and posting it
+        // again places that version as its first ingest would have (the same first-run decision). Seen before and placed: nothing.
+        if (fan) {
+          const pending = recorded.fanPending;
+          if (!pending || pending.version !== recorded.version) continue;
+          fanning = true;
+          const decisions = pending.firstRun === state.firstRun ? fan.decisions : fanOut(config, event, { firstRun: pending.firstRun, owner })!.decisions;
+          await this.fanOutPlace(owner, event, recorded, decisions, opened, (task) => {
+            touched.set(task.id, task);
+            result.updated.push({ task, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }) });
+          });
+          await this.q(`UPDATE $S.events SET fan_pending = NULL WHERE id = $1 AND fan_pending = $2`, [recorded.id, recorded.version]);
+          continue;
+        }
         if (recorded.outcome === "same") {
           // Seen before, but a closure it started may not have finished (a write failed): finish it.
           if (replies.length) {
@@ -624,8 +655,8 @@ export class SignalsStore {
         touched.set(fresh.id, fresh);
         if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }) });
       } catch (error) {
-        result.errors.push({ index, error: (error as Error).message, ...(!saved && { retry: true }) });
-        if (!saved) retried.add(event.source);
+        result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning) && { retry: true }) });
+        if (!saved || fanning) retried.add(event.source);
       } finally {
         // Done placing it (or failed to): the sweep may finish it now.
         // (Only its own lease: a newer version recorded since holds the lease for its own ingest, still placing it.)
@@ -673,6 +704,82 @@ export class SignalsStore {
     const placed = await this.placeNew(owner, event, recorded, decision, classifier, filtered);
     if (placed && decision.same) await this.copyOf(decision.same, placed.task.id);
     return placed;
+  }
+
+  /**
+   * An event a `fan_out` rule takes, on each opted-in account's candidate:
+   * opened with its event and activity in one statement, or found by its
+   * group and the event attached (never opening a finished one again). A
+   * candidate's verdict is left as it is. Idempotent, so posting the event
+   * again finishes what a failed write cut short: each candidate it opens is
+   * added to `opened` as it's opened (posted once, by the ingest that opened
+   * it), and each open, unjudged one this version is attached to is passed to
+   * `updated` as it's attached, by the ingest whose write attached it (so an
+   * update is reported once, and kept when a later account's write fails).
+   */
+  private async fanOutPlace(owner: string, event: EventInput, recorded: { id: number; version: number }, decisions: readonly Extract<Decision, { kind: "task" }>[], opened: Set<number>, updated: (task: Task) => void): Promise<void> {
+    const occurred = toSeconds(event.occurred_at);
+    for (const decision of decisions) {
+      let task = await this.taskByGroup(decision.group);
+      if (!task) {
+        if (!decision.create) continue;
+        const at = now();
+        // One statement: the candidate, its event and its activity are all written or none is. A run placing the same
+        // announcement at the same time inserts nothing, and finds the one it committed (read again below).
+        const inserted = await this.q(
+          `WITH ins AS (
+             INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, event_count, latest_event)
+             -- Only while this is the event's saved version (locked, as in attach): a superseded ingest opens nothing.
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, 1, $11 WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $11 AND versions = $12 FOR SHARE)
+             ON CONFLICT (group_key) DO NOTHING RETURNING *),
+           te AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT id, $11, $12, $9 FROM ins RETURNING 1),
+           act AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $9, 'signals', 'opened', $13 FROM ins RETURNING 1)
+           SELECT * FROM ins`,
+          [decision.rule.id, decision.group, decision.title, decision.account?.name ?? null, decision.channel ?? null, decision.rule.workstream ?? null, decision.mode, owner, at, Number.isNaN(occurred) ? at : occurred, recorded.id, recorded.version,
+            `Opened by rule ${decision.rule.id}, for ${decision.account?.name ?? "this account"}.`],
+        );
+        if (inserted.rows[0]) {
+          opened.add(Number(inserted.rows[0].id));
+          continue;
+        }
+        task = await this.taskByGroup(decision.group);
+        if (!task) continue;
+      }
+      // Attached by this write (not already on it, from this ingest or one at the same time, and still the saved version):
+      // reported here, once, as the write left it.
+      const fresh = (await this.attachOnce(task.id, recorded.id, recorded.version, occurred, undefined, true)).attached;
+      if (fresh && isOpen(fresh.status) && !fresh.verdict && !opened.has(fresh.id)) updated(fresh);
+    }
+  }
+
+  /**
+   * Records a fan-out candidate's verdict, with why (see Rule.fan_out), in one
+   * statement with its activity: `disqualified` also marks an open one done
+   * (its question off, and that activity too); the others leave its status.
+   * Events that come in later never change it; only another verdict does.
+   */
+  async setVerdict(id: number, verdict: Verdict, actor: string, note?: string): Promise<Task | undefined> {
+    if (!VERDICTS.includes(verdict)) throw new Error(`verdict must be one of ${VERDICTS.join(", ")}`);
+    const done = note ? `Disqualified: ${note}` : "Disqualified.";
+    const found = await this.q(
+      `WITH old AS (SELECT id, status FROM $S.tasks WHERE id = $1 FOR UPDATE),
+       closes AS (SELECT id FROM old WHERE $2 = 'disqualified' AND status NOT IN ('done', 'dismissed')),
+       t AS (
+         UPDATE $S.tasks SET verdict = $2, verdict_by = $3, verdict_at = $4, updated_at = $4,
+           status = CASE WHEN EXISTS (SELECT 1 FROM closes) THEN 'done' ELSE status END,
+           question = CASE WHEN EXISTS (SELECT 1 FROM closes) THEN NULL ELSE question END,
+           options = CASE WHEN EXISTS (SELECT 1 FROM closes) THEN NULL ELSE options END,
+           asked_by = CASE WHEN EXISTS (SELECT 1 FROM closes) THEN NULL ELSE asked_by END
+         WHERE id = (SELECT id FROM old) RETURNING *),
+       act AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text)
+         SELECT id, $4, $3, 'verdict', $5 FROM t
+         UNION ALL SELECT id, $4, 'signals', 'status', $6 FROM closes WHERE EXISTS (SELECT 1 FROM t)
+         RETURNING 1)
+       SELECT * FROM t`,
+      [id, verdict, actor, now(), (note ? `${verdict}: ${note}` : verdict).slice(0, 4000), `done: ${done}`.slice(0, 4000)],
+    );
+    return found.rows[0] ? toTask(found.rows[0]) : undefined;
   }
 
   /** Records that a copy key's thing is on a task (the first task it was on keeps it). */
@@ -968,10 +1075,25 @@ export class SignalsStore {
    * it. Returns whether it reopened the task.
    */
   private async attach(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>): Promise<boolean> {
+    return (await this.attachOnce(task, event, version, at, customer)).reopened;
+  }
+
+  /**
+   * attach, also giving the task as this call left it when this call attached
+   * the event (undefined: that version was on the task already, or with
+   * `current`, it's no longer the event's saved version: a newer edit is
+   * saved, and its ingest places it). In one statement, so a read after it
+   * failing can't lose what it did.
+   */
+  private async attachOnce(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>, current = false): Promise<{ reopened: boolean; attached?: Task }> {
     const micros = customer && !Number.isNaN(customer.micros) ? String(customer.micros) : null;
-    const found = await this.q<{ reopened: unknown }>(
+    const found = await this.q<{ reopened: unknown; task: unknown }>(
       `WITH lk AS (SELECT id, status, answered_us FROM $S.tasks WHERE id = $1 FOR UPDATE),
-       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $2) ON CONFLICT DO NOTHING RETURNING task_id),
+       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk
+         -- (With current: only while $3 is the event's saved version, so an edit being saved waits for this, or this sees it.
+         -- Locked as ev below updates it, not FOR SHARE first: two of these on the event, for two tasks, would each hold a
+         -- share lock and wait for the other's to update it, a deadlock.)
+         WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $2${current ? " AND versions = $3 FOR NO KEY UPDATE" : ""}) ON CONFLICT DO NOTHING RETURNING task_id),
        ev AS (UPDATE $S.events SET task_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM ins) RETURNING 1),
        -- (Only while the event is saved: Forget's delete of it waits for this, or wins and this changes nothing on the task.)
        cust AS (SELECT $6::bigint AS us WHERE $6::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM ev) AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)),
@@ -984,19 +1106,28 @@ export class SignalsStore {
            AND (SELECT us FROM cust) > COALESCE((SELECT us FROM answered), -1) AS reopen
          FROM lk WHERE EXISTS (SELECT 1 FROM ev)),
        t AS (
-         UPDATE $S.tasks SET event_count = event_count + 1, latest_event = $2, last_event_at = GREATEST(last_event_at, $4), updated_at = $5,
+         -- The latest event is the newest by when it happened (one older that comes in late is kept in its history, not made latest).
+         UPDATE $S.tasks SET event_count = event_count + 1,
+           -- (By microsecond, as saved: two reminders in the same second are told apart.)
+           latest_event = CASE WHEN latest_event IS NULL OR latest_event = $2
+             OR (SELECT ${EVENT_MICROS} FROM $S.events e WHERE e.id = $2) >= COALESCE((SELECT ${EVENT_MICROS} FROM $S.events e WHERE e.id = $S.tasks.latest_event), -1)
+             THEN $2 ELSE latest_event END,
+           last_event_at = GREATEST(last_event_at, $4), updated_at = $5,
            customer_us = GREATEST(customer_us, (SELECT us FROM cust)),
            status = CASE WHEN (SELECT reopen FROM dec) THEN 'open' ELSE status END
          WHERE id = $1 AND EXISTS (SELECT 1 FROM dec)
-         RETURNING 1),
+         RETURNING *),
        again AS (
          INSERT INTO $S.activities (task_id, at, actor, kind, text)
          SELECT $1, $5, 'signals', 'status', 'open: Opened again: a new event came in.' FROM dec WHERE dec.reopen AND EXISTS (SELECT 1 FROM t)
          RETURNING 1)
-       SELECT EXISTS (SELECT 1 FROM again) AS reopened, (SELECT count(*) FROM ev) AS n`,
+       SELECT EXISTS (SELECT 1 FROM again) AS reopened, (SELECT row_to_json(t) FROM t) AS task`,
       [task, event, version, Number.isNaN(at) ? now() : at, now(), micros, customer?.reopen ?? false],
     );
-    return Boolean(found.rows[0]?.reopened);
+    // (pg gives row_to_json as an object, PGlite may give text.)
+    const raw = found.rows[0]?.task;
+    const row = typeof raw === "string" ? (JSON.parse(raw) as Row) : (raw as Row | null | undefined);
+    return { reopened: Boolean(found.rows[0]?.reopened), ...(row && { attached: toTask(row) }) };
   }
 
   /**
@@ -1103,7 +1234,9 @@ export class SignalsStore {
   async detail(id: number) {
     const task = await this.task(id);
     if (!task) return undefined;
-    const events = await this.q(`SELECT e.id, e.source, e.external_id, e.title, e.url, e.actor, e.occurred_at, e.versions, e.owner FROM $S.events e WHERE e.task_id = $1 ORDER BY e.occurred_at DESC LIMIT 100`, [id]);
+    const events = await this.q(`SELECT e.id, e.source, e.external_id, e.title, e.url, e.actor, e.occurred_at, e.versions, e.owner FROM $S.events e
+       -- (An event on several tasks, an announcement on each account's candidate, has the last as its task_id: task_events has them all.)
+       WHERE e.task_id = $1 OR e.id IN (SELECT event_id FROM $S.task_events WHERE task_id = $1) ORDER BY e.occurred_at DESC LIMIT 100`, [id]);
     const activities = await this.q(`SELECT at, actor, kind, text FROM $S.activities WHERE task_id = $1 ORDER BY at, id`, [id]);
     const artifacts = await this.q(`SELECT at, actor, kind, url, title FROM $S.artifacts WHERE task_id = $1 ORDER BY at, id`, [id]);
     const shown = (row: Row): Row => ({ ...numbers(row), ...(typeof row.title === "string" && { title: plainSlack(row.title) }), ...(typeof row.text === "string" && { text: plainSlack(row.text) }) });
@@ -1672,6 +1805,8 @@ function toTask(row: Row): Task {
     asked_by: (row.asked_by as string | null) ?? null,
     series: (row.series as string | null) ?? null,
     checklist: (row.checklist as string | null) ?? null,
+    verdict: VERDICTS.includes(row.verdict as Verdict) ? (row.verdict as Verdict) : null,
+    verdict_by: (row.verdict_by as string | null) ?? null,
   };
 }
 
