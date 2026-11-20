@@ -226,7 +226,33 @@ export type Rule = Readonly<{
    * on, with the playbook of the rule that now applies.
    */
   watch?: readonly string[];
+  /**
+   * Finer kinds of this rule's work, each its own workstream (with its own
+   * playbook, agents and the team's mode for it): a task opens under the
+   * first category whose `when` matches the event; else, when some have an
+   * `about` (what that kind of work is), the classifier model picks the one
+   * that fits (see Categorizer); else it opens under the rule's `workstream`.
+   * Decided once, when the task opens.
+   */
+  categories?: readonly Category[];
 }>;
+
+/** One kind of a rule's work (see Rule.categories). */
+export type Category = Readonly<{ workstream: string; when?: Readonly<Record<string, Condition>>; about?: string }>;
+export const MAX_CATEGORIES = 20;
+
+/** The first of a rule's categories whose `when` matches the event. */
+export function categoryByWhen(rule: Pick<Rule, "categories">, event: EventInput): Category | undefined {
+  return rule.categories?.find((category) => category.when && Object.keys(category.when).length && matches(category.when, event));
+}
+
+/** The choices to put to the classifier for a rule's categories with an `about`: workstream → what it is, and NO_CATEGORY. */
+export const NO_CATEGORY = "none of these";
+export function categoryChoices(rule: Pick<Rule, "categories" | "workstream">): Record<string, string> | undefined {
+  const about = (rule.categories ?? []).filter((category) => category.about?.trim() && category.workstream.trim().toLowerCase() !== NO_CATEGORY);
+  if (!about.length) return undefined;
+  return { ...Object.fromEntries(about.map((category) => [category.workstream.trim(), category.about!.trim()])), [NO_CATEGORY]: `None of these fits${rule.workstream ? ` (it stays ${rule.workstream})` : ""}` };
+}
 
 /** A watched field's change between a task's previous event and its new one. */
 export type FieldChange = Readonly<{ field: string; from: string; to: string }>;
@@ -453,9 +479,11 @@ export function configProblems(raw: unknown): string[] {
       else if (rule.action !== "task") problems.push(`${where}.fan_out needs action task`);
       else
         // (classify: not supported on fan-out yet, so a rule with one is refused rather than its question skipped.)
-        for (const key of ["account", "series", "same_as", "action_items", "meeting_task", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify"] as const)
+        for (const key of ["account", "series", "same_as", "action_items", "meeting_task", "account_named_in", "customer_actor", "customer_attendees", "known_account", "classify", "categories"] as const)
           if (rule[key] !== undefined) problems.push(`${where}.fan_out is about every account, so it takes no ${key}`);
     }
+    if (rule.categories !== undefined) problems.push(...categoryProblems(rule, where));
+    if (rule.categories !== undefined && rule.meeting_task !== undefined) problems.push(`${where}.categories and meeting_task don't go together (a moved task keeps the rule's workstream)`);
     if (rule.watch !== undefined && !(Array.isArray(rule.watch) && rule.watch.length && rule.watch.length <= 20 && rule.watch.every((item) => typeof item === "string" && item))) problems.push(`${where}.watch is a list of up to 20 event fields, like payload.status`);
     if (rule.classify !== undefined) {
       const c = rule.classify as Record<string, unknown>;
@@ -839,7 +867,9 @@ export const seriesQuestion = (title: string) => `"${title}" is part of a recurr
 
 export type Decision =
   | Readonly<{ kind: "none"; reason: string }>
-  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string; same?: string }>;
+  | Readonly<{ kind: "task"; rule: Rule; group: string; title: string; account?: AccountRule; channel?: string; create: boolean; mode: Mode; series?: string; same?: string;
+      /** The workstream a new task opens under: a category's (see Rule.categories) or the rule's. `category`: one of its categories' `when` chose it. */
+      workstream?: string; category?: boolean }>;
 
 /**
  * What to do with an event that is new or changed. `firstRun` is a source's
@@ -855,13 +885,15 @@ export function decide(config: SignalsConfig, event: EventInput, options: Readon
   const channel = account?.channel ?? config.default_channel;
   const group = groupKey(rule, event);
   const title = (rule.title ? fill(rule.title, event) : event.title || `${event.source} ${event.external_id}`).trim().slice(0, 500);
-  const mode = modeFor(account?.preferences, rule);
+  const category = categoryByWhen(rule, event);
+  const workstream = category?.workstream ?? rule.workstream;
+  const mode = categoryModeFor(account?.preferences, rule, category?.workstream);
   // On a first run, existing things are seen; only updates to tasks that already exist go through.
   // A team that turned a kind of work off still gets updates on tasks already open.
   const create = rule.action === "task" && mode !== "off" && !(options.firstRun && config.first_run_seen !== false);
   const series = seriesKey(rule, event, account);
   const same = sameKey(rule, event);
-  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }) };
+  return { kind: "task", rule, group, title, ...(account && { account }), ...(channel && { channel }), create, mode, ...(series && { series }), ...(same && { same }), ...(workstream && { workstream }), ...(category && { category: true }) };
 }
 
 /**
@@ -966,6 +998,13 @@ function preferencesOf(text: string | undefined): Preferences {
   return found;
 }
 
+/** A rule's mode for a task in one of its categories: its id, then the category's workstream, then the rule's (as modeFor). */
+export function categoryModeFor(preferences: string | undefined, rule: Pick<Rule, "id" | "workstream">, category: string | undefined): Mode {
+  if (!category) return modeFor(preferences, rule);
+  const { modes } = preferencesOf(preferences);
+  return modes[rule.id.toLowerCase()] ?? modes[category.trim().toLowerCase()] ?? modeFor(preferences, rule);
+}
+
 /** A rule's mode under a team's preferences: its id, then its workstream, then `everything`. */
 export function modeFor(preferences: string | undefined, rule: Pick<Rule, "id" | "workstream">): Mode {
   const { modes } = preferencesOf(preferences);
@@ -1012,7 +1051,7 @@ export function agentListFor(account: Pick<AccountRecord, "agents" | "workstream
 
 /** The workstreams a config's rules file tasks under, in rule order. */
 export function workstreamsOf(config: SignalsConfig | undefined): string[] {
-  return [...new Set((config?.rules ?? []).map((rule) => rule.workstream?.trim()).filter((name): name is string => Boolean(name)))];
+  return [...new Set((config?.rules ?? []).flatMap((rule) => [rule.workstream, ...(rule.categories ?? []).map((category) => category.workstream)]).map((name) => name?.trim()).filter((name): name is string => Boolean(name)))];
 }
 
 /**
@@ -1117,3 +1156,35 @@ export function withAccounts(config: SignalsConfig, records: readonly AccountRec
 export const TASK_STATUSES = ["open", "in_progress", "waiting", "done", "dismissed"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export const isOpen = (status: string) => status !== "done" && status !== "dismissed";
+
+function categoryProblems(rule: Pick<Rule, "action" | "categories"> | Record<string, unknown>, where: string): string[] {
+  const list = rule.categories as unknown;
+  if (!Array.isArray(list) || !list.length || list.length > MAX_CATEGORIES) return [`${where}.categories is a list of 1 to ${MAX_CATEGORIES} {workstream, when?, about?}`];
+  if (rule.action !== "task") return [`${where}.categories needs action task`];
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  list.forEach((item: Record<string, unknown>, i) => {
+    const at = `${where}.categories[${i}]`;
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).some((key) => !["workstream", "when", "about"].includes(key))) return void problems.push(`${at} is {workstream, when?, about?}`);
+    const name = typeof item.workstream === "string" ? item.workstream.trim().toLowerCase() : "";
+    if (!name) problems.push(`${at}.workstream is the workstream its tasks open under, like "capacity request"`);
+    else if (name === NO_CATEGORY) problems.push(`${at}.workstream can't be "${NO_CATEGORY}"`);
+    else if (seen.has(name)) problems.push(`${at}.workstream ${item.workstream} is used twice`);
+    else seen.add(name);
+    if (item.about !== undefined && (typeof item.about !== "string" || !item.about.trim() || item.about.length > 300)) problems.push(`${at}.about says what this kind of work is, in up to 300 characters`);
+    if (item.when === undefined) {
+      if (item.about === undefined) problems.push(`${at} needs a when or an about`);
+    } else if (!item.when || typeof item.when !== "object" || Array.isArray(item.when) || !Object.keys(item.when).length) problems.push(`${at}.when is an object of conditions`);
+    else
+      for (const [field, condition] of Object.entries(item.when as Record<string, unknown>)) {
+        if (typeof condition === "string") {
+          try {
+            new RegExp(condition, "i");
+          } catch {
+            problems.push(`${at}.when.${field} isn't a valid regular expression`);
+          }
+        } else if (!Array.isArray(condition)) problems.push(`${at}.when.${field} is a pattern or a list of values`);
+      }
+  });
+  return problems;
+}

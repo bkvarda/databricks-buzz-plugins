@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryChoices, categoryModeFor, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -125,6 +125,14 @@ function resumedUpdate(resumed: Resumed) {
 /** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
 export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
 
+/**
+ * Picks one of a rule's categories for an event (see Rule.categories):
+ * `choices` is workstream → what that work is, plus NO_CATEGORY. Gives the
+ * chosen workstream, or undefined when it can't tell (the task keeps the
+ * rule's workstream).
+ */
+export type Categorizer = (event: EventInput, choices: Readonly<Record<string, string>>) => Promise<string | undefined>;
+
 /** An event a classifier filtered out, as the hub lists them. */
 export type FilteredEvent = Readonly<{ id: number; owner: string; source: string; external_id: string; title?: string; url?: string; actor?: string; account?: string; occurred_at: number; rule: string; score: number; filtered_at: number; channel?: string;
   /** The rule's classify question and the score it needed (the hub adds them from its config). */
@@ -177,6 +185,9 @@ export class SignalsStore {
   ) {
     if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error(`Bad schema name ${schema}`);
   }
+
+  /** Picks a new task's category when none of its rule's categories' `when` matched (see Rule.categories); the hub sets it. */
+  categorizer?: Categorizer;
 
   private q<T extends Row = Row>(text: string, values: unknown[] = []) {
     return this.db.query<T>(text.replaceAll("$S.", `${this.schema}.`), values);
@@ -990,6 +1001,15 @@ export class SignalsStore {
     return true;
   }
 
+  /** The category the categorizer picks for an event its rule's categories' `when` didn't place, if it picks one of them. */
+  private async category(event: EventInput, rule: Rule): Promise<string | undefined> {
+    const choices = categoryChoices(rule);
+    if (!choices || !this.categorizer) return undefined;
+    const picked = await this.categorizer(event, choices).catch(() => undefined);
+    const key = picked?.trim().toLowerCase();
+    return rule.categories?.find((category) => category.about?.trim() && category.workstream.trim().toLowerCase() === key)?.workstream.trim();
+  }
+
   private async placeNew(owner: string, event: EventInput, recorded: { id: number; version?: number }, decision: Extract<Decision, { kind: "task" }>, classifier?: Classifier, filtered?: () => void): Promise<{ task: Task; opened: boolean; create: boolean; rule: Rule } | undefined> {
     const rule = decision.rule;
     if (!(await this.classified(event, recorded, decision, classifier, filtered))) return undefined;
@@ -999,7 +1019,18 @@ export class SignalsStore {
     // revision of the same document saved under its own id (see LATEST_REVISION), as for meeting_task's notes.
     // (So for a rule with meeting_task: an older revision whose move the newest one's decision stopped opens no follow-up instead.)
     const latest = (rule.classify || rule.action_items || rule.meeting_task) && recorded.version !== undefined ? { event: recorded.id, version: recorded.version, revisions: Boolean(rule.action_items || rule.meeting_task) } : undefined;
-    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream: decision.rule.workstream, mode: decision.mode, by: owner, at: toSeconds(event.occurred_at), latest };
+    // Its category (see Rule.categories): one whose `when` matched (decide), or the one the model picks, with the team's mode for it.
+    let { workstream, mode } = { workstream: decision.workstream ?? rule.workstream, mode: decision.mode };
+    if (!decision.category) {
+      const picked = await this.category(event, rule);
+      if (picked) {
+        workstream = picked;
+        mode = categoryModeFor(decision.account?.preferences, rule, picked);
+        // The team turned that kind of work off: no task, as for a rule whose work is off.
+        if (mode === "off") return undefined;
+      }
+    }
+    const input = { rule: decision.rule.id, group: decision.group, title: decision.title, account: decision.account?.name, channel: decision.channel, workstream, mode, by: owner, at: toSeconds(event.occurred_at), latest };
     const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
       const opened = await this.openTask(task);
       return opened && { task: opened, opened: true, create: true, rule };
@@ -1277,7 +1308,9 @@ export class SignalsStore {
 
   /** Moves a task to another rule of its group (its workstream too, when that rule names one), as a later event matched that rule. */
   private async refile(task: Task, rule: Rule): Promise<Task> {
-    const found = await this.q(`UPDATE $S.tasks SET rule_id = $2, workstream = COALESCE($3, workstream), updated_at = $4 WHERE id = $1 RETURNING *`, [task.id, rule.id, rule.workstream ?? null, now()]);
+    // A task already under one of the new rule's categories keeps it.
+    const kept = rule.categories?.find((category) => category.workstream.trim().toLowerCase() === task.workstream?.trim().toLowerCase())?.workstream.trim();
+    const found = await this.q(`UPDATE $S.tasks SET rule_id = $2, workstream = COALESCE($3, workstream), updated_at = $4 WHERE id = $1 RETURNING *`, [task.id, rule.id, kept ?? rule.workstream ?? null, now()]);
     await this.activity(task.id, "signals", "rule", `Now under rule ${rule.id}: a new event matched it.`);
     return found.rows[0] ? toTask(found.rows[0]) : task;
   }
