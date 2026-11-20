@@ -1369,8 +1369,8 @@ describe("work someone on the team did themselves", () => {
 
   describe("Slack tasks keyed the old way (the root's second)", () => {
     const link = (channel: string, ts: string, root?: string) => `https://x.slack.com/archives/${channel}/p${ts.replace(".", "")}${root ? `?thread_ts=${root}&cid=${channel}` : ""}`;
-    // As the earlier example source sent them: group_key the 10-digit second, url the permalink.
-    const legacy = (id: string, channel: string, ts: string, root?: string) => ({ source: "slack", external_id: link(channel, ts), url: link(channel, ts, root), actor: "ann@globex.io", title: `msg ${id}`, group_key: (root ?? ts).slice(0, 10), occurred_at: ts });
+    // As the earlier example source sent them: group_key the old regex's first match (`/p…` comes first, so a reply's own second), url the permalink.
+    const legacy = (id: string, channel: string, ts: string, root?: string) => ({ source: "slack", external_id: link(channel, ts), url: link(channel, ts, root), actor: "ann@globex.io", title: `msg ${id}`, group_key: /thread_ts=(\d{10})|\/p(\d{10})/.exec(link(channel, ts, root))!.slice(1).find(Boolean)!, occurred_at: ts });
     const current = (source: string, channel: string, ts: string, root: string, actor = "ann@globex.io") => ({ source, external_id: link(channel, ts), url: link(channel, ts, root === ts ? undefined : root), actor, title: `${source} ${ts}`, group_key: `${channel}:${root}`, occurred_at: ts });
 
     it("a customer's new message in the thread joins the old task, and a team reply closes it", async () => {
@@ -1400,6 +1400,26 @@ describe("work someone on the team did themselves", () => {
       expect((await store.task(task!.id))!.status).toBe("open");
     });
 
+    it("finds an old task keyed by the reply's own second that opened it, from the root its permalink names", async () => {
+      const { store, call } = await setup("signals_legacy_reply_second");
+      await call("/api/events", { events: [legacy("1", "C1", "1795000050.000009", "1795000000.123456")] });
+      const [task] = await store.tasks({});
+      expect(task!.group_key).toBe("slack|1795000050");
+      await call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
+      expect((await store.task(task!.id))!.status).toBe("done");
+      await call("/api/events", { events: [current("slack", "C1", "1795000300.000003", "1795000000.123456")] });
+      expect(await store.tasks({})).toHaveLength(1);
+      expect((await store.task(task!.id))!).toMatchObject({ status: "open", event_count: 3 });
+    });
+
+    it("leaves alone a thread two old tasks both hold", async () => {
+      const { store, call } = await setup("signals_legacy_two_old");
+      await call("/api/events", { events: [legacy("1", "C1", "1795000050.000009", "1795000000.123456"), legacy("2", "C1", "1795000070.000001", "1795000000.123456")] });
+      expect(await store.tasks({})).toHaveLength(2);
+      await call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
+      expect((await store.tasks({})).every((task) => task.status === "open")).toBe(true);
+    });
+
     it("keeps two threads that started in the same second apart, and leaves an old task that mixed them alone", async () => {
       const { store, call } = await setup("signals_legacy_same_second");
       await call("/api/events", { events: [legacy("1", "C1", "1795000000.123456")] });
@@ -1420,6 +1440,48 @@ describe("work someone on the team did themselves", () => {
       await mixed.call("/api/events", { events: [current("slack.sent", "C1", "1795000200.000002", "1795000000.123456", "alice@x.com")] });
       expect((await mixed.store.task(both!.id))!.status).toBe("open");
     });
+  });
+
+  it("orders a team reply and a customer message in the same second by Slack's ts", async () => {
+    const { store, call } = await setup("signals_handled_subsecond");
+    const msg = (source: string, ts: string, actor: string) => ({ source, external_id: `https://x.slack.com/archives/C1/p${ts.replace(".", "")}`, actor, title: ts, group_key: "C1:1795001000.000001", occurred_at: ts });
+    await call("/api/events", { events: [msg("slack", "1795001030.900000", "ann@globex.io")] });
+    const [task] = await store.tasks({});
+    // Delivered after the customer's message, but sent 0.8 s before it: it didn't answer it.
+    await call("/api/events", { events: [msg("slack.sent", "1795001030.100000", "alice@x.com")] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+    // A later reply in the same second does close it, and a customer message just before that reply doesn't reopen it.
+    await call("/api/events", { events: [msg("slack.sent", "1795001030.950000", "alice@x.com")] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    await call("/api/events", { events: [msg("slack", "1795001030.920000", "ann@globex.io")] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+    await call("/api/events", { events: [msg("slack", "1795001030.960000", "ann@globex.io")] });
+    expect((await store.task(task!.id))!.status).toBe("open");
+  });
+
+  it("keeps the closure when the same reply is decided twice (overlapping deliveries)", async () => {
+    const { store, call } = await setup("signals_handled_overlap");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "ann@globex.io", group_key: "th1", occurred_at: 1795000100 }] });
+    const [task] = await store.tasks({});
+    const sent = { source: "gmail", external_id: "m2", actor: "alice@x.com", group_key: "th1", occurred_at: 1795000200 };
+    // Two deliveries at once, then the other one's handled() again after the first closed it (the overlap's last step).
+    await Promise.all([call("/api/events", { events: [sent] }), call("/api/events", { events: [sent] })]);
+    expect((await store.task(task!.id))!.status).toBe("done");
+    const reply = { group: "mail|th1", event: Number((await store.detail(task!.id))!.events.find((event) => event.external_id === "m2")!.id), owner: "alice@x.com", source: "gmail", title: null, url: null, at: 1795000200, micros: 1795000200_000000 };
+    expect(await store.handled(task!.id, reply)).toBeUndefined();
+    // A late customer message older than the reply: the reply answered it, so it stays done.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m0", actor: "ann@globex.io", group_key: "th1", occurred_at: 1795000150 }] });
+    expect((await store.task(task!.id))!.status).toBe("done");
+  });
+
+  it("forgets a source's replies with its events, pending ones too", async () => {
+    const { store, call } = await setup("signals_handled_forget");
+    // Alice's reply comes in before the customer's message: it waits for the task.
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "s2", actor: "alice@x.com", group_key: "C1:1795000000.000001", occurred_at: "1795000200.000000" }] });
+    await call("/api/sources", { source: "slack.sent", enabled: false, forget: true });
+    await call("/api/events", { events: [{ source: "slack", external_id: "s1", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000100.000000" }] });
+    const [task] = await store.tasks({});
+    expect(task!.status).toBe("open");
   });
 
   it("closes nothing for a rule without by_owner", async () => {

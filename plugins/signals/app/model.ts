@@ -63,6 +63,24 @@ export function toSeconds(value: string | number | undefined): number {
   return Number.isNaN(ms) ? Number.NaN : Math.floor(ms / 1000);
 }
 
+/**
+ * The same moment as `toSeconds`, in whole microseconds, keeping what a
+ * decimal string carries exactly (Slack's `1795001030.900000`) rather than
+ * through a float. NaN when it can't be read.
+ */
+export function toMicros(value: string | number | undefined): number {
+  if (value === undefined) return Date.now() * 1000;
+  if (typeof value === "number") return value > 1e12 ? Math.floor(value) * 1000 : Math.round(value * 1e6);
+  const decimal = /^(\d+)(?:\.(\d+))?$/.exec(value);
+  if (decimal) {
+    const whole = Number(decimal[1]);
+    if (whole > 1e12) return Math.floor(Number(value)) * 1000;
+    return whole * 1_000_000 + Number((decimal[2] ?? "").slice(0, 6).padEnd(6, "0"));
+  }
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? Number.NaN : ms * 1000;
+}
+
 /** JSON with sorted keys, so the same content always hashes the same. */
 export function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
