@@ -1465,6 +1465,9 @@ dialog.dbx-modal::backdrop { background: rgba(0, 0, 0, 0.35); }
 [data-dbx] .dbx-md code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.92em; background: var(--dbx-inset); padding: 1px 4px; border-radius: 4px; }
 [data-dbx] .dbx-md pre { background: var(--dbx-inset); padding: 10px 12px; border-radius: var(--dbx-radius); overflow: auto; }
 [data-dbx] .dbx-md pre code { background: none; padding: 0; }
+/* Markdown inside a card, the host's included: headings no bigger than bold body text. */
+[data-dbx] .dbx-quiet-headings :is(h1, h2, h3, h4, h5, h6) { font-size: 1em !important; line-height: inherit !important; font-weight: 600 !important; letter-spacing: normal !important; margin: 12px 0 4px !important; padding: 0 !important; border: 0 !important; }
+[data-dbx] .dbx-quiet-headings :is(h1, h2, h3, h4, h5, h6):first-child { margin-top: 0 !important; }
 @keyframes dbx-spin { to { transform: rotate(360deg); } }
 @keyframes dbx-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { [data-dbx] * { animation-duration: 0s !important; transition: none !important; } }

@@ -261,6 +261,9 @@ dialog.dbx-modal::backdrop { background: rgba(0, 0, 0, 0.35); }
 [data-dbx] .dbx-md code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.92em; background: var(--dbx-inset); padding: 1px 4px; border-radius: 4px; }
 [data-dbx] .dbx-md pre { background: var(--dbx-inset); padding: 10px 12px; border-radius: var(--dbx-radius); overflow: auto; }
 [data-dbx] .dbx-md pre code { background: none; padding: 0; }
+/* Markdown inside a card, the host's included: headings no bigger than bold body text. */
+[data-dbx] .dbx-quiet-headings :is(h1, h2, h3, h4, h5, h6) { font-size: 1em !important; line-height: inherit !important; font-weight: 600 !important; letter-spacing: normal !important; margin: 12px 0 4px !important; padding: 0 !important; border: 0 !important; }
+[data-dbx] .dbx-quiet-headings :is(h1, h2, h3, h4, h5, h6):first-child { margin-top: 0 !important; }
 @keyframes dbx-spin { to { transform: rotate(360deg); } }
 @keyframes dbx-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { [data-dbx] * { animation-duration: 0s !important; transition: none !important; } }
@@ -2290,7 +2293,7 @@ var lineText = (text, profile) => shortEmails(plainLine(text, (npub) => profile(
 function RichText(props) {
   const HostMarkdown = props.ctx.conversation?.ui?.Markdown;
   const named = withMentionNames(props.text, npubKey, (key) => props.profile(key)?.name);
-  return /* @__PURE__ */ React.createElement("div", { style: { overflowWrap: "anywhere", minWidth: 0 } }, HostMarkdown ? /* @__PURE__ */ React.createElement(HostMarkdown, { content: named }) : /* @__PURE__ */ React.createElement(Markdown, { source: named, size: "sm" }));
+  return /* @__PURE__ */ React.createElement("div", { className: "dbx-quiet-headings", style: { overflowWrap: "anywhere", minWidth: 0 } }, HostMarkdown ? /* @__PURE__ */ React.createElement(HostMarkdown, { content: named }) : /* @__PURE__ */ React.createElement(Markdown, { source: named, size: "sm" }));
 }
 function Step(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: "none", width: 24, display: "flex", flexDirection: "column", alignItems: "center" } }, props.mark, !props.last && /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { flex: "1 1 auto", width: 1, minHeight: 8, marginTop: 4, background: "var(--dbx-border)" } })), /* @__PURE__ */ React.createElement("div", { style: { flex: "1 1 auto", minWidth: 0, paddingBottom: props.last ? 0 : 14 } }, props.children));
