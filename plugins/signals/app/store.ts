@@ -320,8 +320,15 @@ export class SignalsStore {
     if (!enabled && forget) {
       // Events first, then their replies, decided or not: a forgotten reply mustn't close (or keep closed) anything.
       // A reply is saved only while its event is there (recordReply), so one saved during this is caught by the second delete.
-      await this.q(`DELETE FROM $S.events WHERE owner = $1 AND source = $2`, [owner, source]);
-      await this.q(`DELETE FROM $S.replies WHERE owner = lower($1) AND source = $2`, [owner, source]);
+      // (An event being attached holds its row: the delete waits for it, then returns the task it went to.)
+      const events = await this.q<{ task: unknown }>(
+        `WITH del AS (DELETE FROM $S.events WHERE owner = $1 AND source = $2 RETURNING id, task_id)
+         SELECT task_id AS task FROM del WHERE task_id IS NOT NULL UNION SELECT te.task_id FROM $S.task_events te WHERE te.event_id IN (SELECT id FROM del)`,
+        [owner, source],
+      );
+      const replies = await this.q<{ task: unknown }>(`DELETE FROM $S.replies WHERE owner = lower($1) AND source = $2 RETURNING closed_task AS task`, [owner, source]);
+      const tasks = [...new Set([...events.rows, ...replies.rows].map((row) => row.task).filter((task) => task !== null && task !== undefined).map(String))];
+      if (tasks.length) await this.retime(tasks);
     }
   }
 
@@ -576,9 +583,10 @@ export class SignalsStore {
     const micros = customer && !Number.isNaN(customer.micros) ? String(customer.micros) : null;
     const found = await this.q<{ reopened: unknown }>(
       `WITH lk AS (SELECT id, status, answered_us FROM $S.tasks WHERE id = $1 FOR UPDATE),
-       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk ON CONFLICT DO NOTHING RETURNING task_id),
+       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $2) ON CONFLICT DO NOTHING RETURNING task_id),
        ev AS (UPDATE $S.events SET task_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM ins) RETURNING 1),
-       cust AS (SELECT $6::bigint AS us WHERE $6::bigint IS NOT NULL AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)),
+       -- (Only while the event is saved: Forget's delete of it waits for this, or wins and this changes nothing on the task.)
+       cust AS (SELECT $6::bigint AS us WHERE $6::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM ev) AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)),
        -- (For a task closed before answered_us was kept: its decided replies as this statement sees them.)
        answered AS (
          SELECT COALESCE((SELECT answered_us FROM lk), (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
@@ -586,7 +594,7 @@ export class SignalsStore {
        dec AS (
          SELECT $7::boolean AND lk.status IN ('done', 'dismissed') AND (SELECT us FROM cust) IS NOT NULL
            AND (SELECT us FROM cust) > COALESCE((SELECT us FROM answered), -1) AS reopen
-         FROM lk WHERE EXISTS (SELECT 1 FROM ins)),
+         FROM lk WHERE EXISTS (SELECT 1 FROM ev)),
        t AS (
          UPDATE $S.tasks SET event_count = event_count + 1, latest_event = $2, last_event_at = GREATEST(last_event_at, $4), updated_at = $5,
            customer_us = GREATEST(customer_us, (SELECT us FROM cust)),
@@ -601,6 +609,30 @@ export class SignalsStore {
       [task, event, version, Number.isNaN(at) ? now() : at, now(), micros, customer?.reopen ?? false],
     );
     return Boolean(found.rows[0]?.reopened);
+  }
+
+  /**
+   * Works out tasks' newest customer message and newest decided team reply
+   * again from the rows left (after Forget deleted some). Attaching and
+   * deciding only ever raise them, under the task's row lock: when one of
+   * them raised a task's value while this waited for that lock (after this
+   * statement's snapshot), its value is kept too.
+   */
+  private async retime(tasks: readonly string[]): Promise<void> {
+    await this.q(
+      `UPDATE $S.tasks t SET
+         customer_us = CASE WHEN t.customer_us IS DISTINCT FROM s.customer_was THEN GREATEST(s.customer, t.customer_us) ELSE s.customer END,
+         answered_us = CASE WHEN t.answered_us IS DISTINCT FROM s.answered_was THEN GREATEST(s.answered, t.answered_us) ELSE s.answered END
+       FROM (
+         SELECT x.id, x.customer_us AS customer_was, x.answered_us AS answered_was,
+           (SELECT max(${EVENT_MICROS}) FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+             WHERE te.task_id = x.id AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)) AS customer,
+           (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
+             AND (r.closed_task = x.id OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = x.id AND te.event_id = r.event_id))) AS answered
+         FROM $S.tasks x WHERE x.id = ANY($1::bigint[])) s
+       WHERE t.id = s.id`,
+      [tasks],
+    );
   }
 
   /** The task a group's events go to: the one it opened, or the one it joined as a copy of another person's. */

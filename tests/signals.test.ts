@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
-import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
+import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
@@ -1472,6 +1472,51 @@ describe("work someone on the team did themselves", () => {
     // A late customer message older than the reply: the reply answered it, so it stays done.
     await call("/api/events", { events: [{ source: "gmail", external_id: "m0", actor: "ann@globex.io", group_key: "th1", occurred_at: 1795000150 }] });
     expect((await store.task(task!.id))!.status).toBe("done");
+  });
+
+  it("posts one message, not a stale stop notice, when a reply and a newer customer message come in one post", async () => {
+    const { store, posts, call } = await setup("signals_handled_batch");
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m1", actor: "Ann <ann@globex.io>", title: "Pricing?", group_key: "th1", occurred_at: 1795000100 }] });
+    const task = (await store.tasks({ open: true }))[0]!;
+    await store.assign(task.id, "agent", agent, false);
+    posts.length = 0;
+    await call("/api/events", { events: [
+      { source: "gmail", external_id: "m2", actor: "Alice <alice@x.com>", title: "Re: Pricing?", group_key: "th1", url: "https://mail/m2", occurred_at: 1795000200 },
+      { source: "gmail", external_id: "m3", actor: "Ann <ann@globex.io>", title: "One more thing", group_key: "th1", url: "https://mail/m3", occurred_at: 1795000300 },
+    ] });
+    expect((await store.task(task.id))!.status).toBe("open");
+    expect(posts).toEqual([{ task: task.id, text: handledThenReopened("alice@x.com", "Re: Pricing?", "https://mail/m2", [agent], undefined, { title: "One more thing", url: "https://mail/m3" }), agents: [agent] }]);
+    expect(posts[0]!.text).not.toContain("Done");
+    expect(posts[0]!.text).toContain("[One more thing](https://mail/m3)");
+    // In two posts, as before: "Done", then the update.
+    await call("/api/events", { events: [{ source: "gmail", external_id: "m4", actor: "Alice <alice@x.com>", title: "Re: one more", group_key: "th1", occurred_at: 1795000400 }] });
+    expect((await store.task(task.id))!.status).toBe("done");
+    expect(posts.at(-1)!.text).toContain("✅ Done");
+  });
+
+  it("forgets what a forgotten source's messages said about a task's times", async () => {
+    const { store, call } = await setup("signals_handled_forget_times");
+    // A sent reply at t+300 closes it; forgotten, a customer message at t+200 opens it again.
+    await call("/api/events", { events: [{ source: "slack", external_id: "c1", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000100.000000" }] });
+    const task = (await store.tasks({}))[0]!;
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "s1", actor: "alice@x.com", group_key: "C1:1795000000.000001", occurred_at: "1795000300.000000" }] });
+    expect((await store.task(task.id))!.status).toBe("done");
+    await call("/api/sources", { source: "slack.sent", enabled: false, forget: true });
+    await call("/api/events", { events: [{ source: "slack", external_id: "c2", actor: "ann@globex.io", group_key: "C1:1795000000.000001", occurred_at: "1795000200.000000" }] });
+    expect((await store.task(task.id))!.status).toBe("open");
+
+    // A forgotten customer message at t+300 (Bob's copy of the thread) doesn't keep a reply at t+200 from closing it:
+    // its only message left is Alice's at t+100.
+    const group = "C2:1795000000.000002";
+    await call("/api/events", { events: [{ source: "slack", external_id: "d1", actor: "ann@globex.io", group_key: group, occurred_at: "1795000100.000000" }] });
+    const other = (await store.taskByGroup(`slack|${group}`))!;
+    await call("/api/events", { events: [{ source: "slack", external_id: "d3", actor: "ann@globex.io", group_key: group, occurred_at: "1795000300.000000" }] }, "bob@x.com");
+    expect((await store.task(other.id))!.event_count).toBe(2);
+    await call("/api/sources", { source: "slack", enabled: false, forget: true }, "bob@x.com");
+    await call("/api/sources", { source: "slack.sent", enabled: true });
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "seed2" }] });
+    await call("/api/events", { events: [{ source: "slack.sent", external_id: "s2", actor: "alice@x.com", group_key: group, occurred_at: "1795000200.000000" }] });
+    expect((await store.task(other.id))!.status).toBe("done");
   });
 
   it("forgets a source's replies with its events, pending ones too", async () => {

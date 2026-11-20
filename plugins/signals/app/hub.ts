@@ -25,7 +25,7 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
 import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
@@ -325,7 +325,11 @@ export class Hub {
     for (const { task, by, title, url, agents, owner } of result.handled) {
       if (!task.buzz_root || seen.has(task.id)) continue;
       seen.add(task.id);
-      await this.notifier.updated(task, handledMessage(by, title, url, agents, owner), agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
+      // A newer customer message later in the same post opened it again: one message says both, and no "Done".
+      const now = await this.store.task(task.id);
+      const later = now && isOpen(now.status) ? [...result.updated].reverse().find((update) => update.task.id === task.id) : undefined;
+      const text = now && isOpen(now.status) ? handledThenReopened(by, title, url, agents, owner, later && { title: later.title && plainSlack(later.title), url: later.url }) : handledMessage(by, title, url, agents, owner);
+      await this.notifier.updated(now ?? task, text, agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
     }
     for (const update of result.updated) {
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
@@ -907,6 +911,23 @@ export function handledMessage(by: string, title?: string, url?: string, agents:
   return [
     `✅ Done: **${by}** handled this${what ? `: ${what}` : ""}. ${whose}; a new message from the customer opens it again.`,
     agents.length ? `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you're off this task: stop working on it, and don't post more here unless someone asks you.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Someone on the team handled a task, and a newer message from the customer
+ * (in the same post) opened it again: it's still theirs, and the agents taken
+ * off it stay off (as when the message comes later), with nothing saying it's done.
+ */
+export function handledThenReopened(by: string, title?: string, url?: string, agents: readonly string[] = [], owner?: string, next?: Readonly<{ title?: string; url?: string }>): string {
+  const what = url ? `[${title ?? "their reply"}](${url})` : title ? `"${title}"` : "";
+  const message = next?.url ? `[${next.title ?? "a new message"}](${next.url})` : next?.title ? `"${next.title}"` : "a new message";
+  const who = owner && owner !== by ? owner : by;
+  return [
+    `↩️ **${by}** replied${what ? `: ${what}` : ""}, then the customer wrote again: ${message}. It's open, with **${who}**.`,
+    agents.length ? `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you're off this task: **${who}** has it. Don't post more here unless someone asks you.` : "",
   ]
     .filter(Boolean)
     .join("\n");

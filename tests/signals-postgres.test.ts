@@ -32,6 +32,13 @@ describe.skipIf(!URL)("signals on PostgreSQL: overlapping reply decisions", () =
     const reply = { group: "mail|th1", event: sent.id, owner: "alice@x.com", source: "gmail", title: null, url: null, at: 1795000200, micros: 1795000200_000000 };
     return { store, task: task!, reply };
   };
+  const waitFor = async (sql: string, n: number) => {
+    for (let i = 0; i < 200; i++) {
+      if ((await pool.query(sql)).rows[0].n === n) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`never got ${n}: ${sql}`);
+  };
   const waiting = async (count: number) => {
     for (let i = 0; i < 200; i++) {
       const found = await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%handled it themselves%' OR (wait_event_type = 'Lock' AND query LIKE '%WITH kept AS%')`);
@@ -68,10 +75,13 @@ describe.skipIf(!URL)("signals on PostgreSQL: overlapping reply decisions", () =
     try {
       await holder.query("BEGIN");
       await holder.query(`SELECT 1 FROM signals_pg_forget.tasks WHERE id = $1 FOR UPDATE`, [task.id]);
-      await store.setSource("alice@x.com", "gmail", false, undefined, true);
+      // Forget deletes the events and replies, then waits on the task row too, to work out its times again.
+      const forgot = store.setSource("alice@x.com", "gmail", false, undefined, true);
+      await waitFor(`SELECT count(*)::int AS n FROM signals_pg_forget.replies`, 0);
       const decided = store.handled(task.id, reply);
       await holder.query("COMMIT");
       expect(await decided).toBeUndefined();
+      await forgot;
     } finally {
       holder.release();
     }
