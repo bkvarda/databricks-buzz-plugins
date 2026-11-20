@@ -7,11 +7,11 @@ import type { DatabricksApp } from "@dbx/core/api/apps";
 import { bindReact, React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
-import { ago, Badge, Button, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
+import { ago, Badge, Button, CodeView, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { WorkspaceField } from "@dbx/core/ui/workspace";
 import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choice";
 import type { SourceInfo } from "../app/model";
-import { chosenHub, HUB_PREFERENCE, HubClient, type SignIn, signInPath, signInState, type SourceState } from "./client";
+import { chosenHub, HUB_PREFERENCE, HubClient, lakebaseSnippet, type Onboarding, type SignIn, signInPath, signInState, type SourceState } from "./client";
 import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
 import { BOARD_PAGE, boardPage, boardPanel, validBoardRoute } from "./board-panel";
 import { signalsTools } from "./tools";
@@ -95,6 +95,67 @@ function SourceRow(props: { service: DatabricksService; hub: HubClient; info: So
   );
 }
 
+// Your poller job logs in to the hub's database as your own Postgres role; this
+// says whether you have one, makes it when the hub can, and gives the settings.
+function PollerSetup(props: { hub: HubClient }) {
+  const { hub } = props;
+  const looked = useAsync(async (signal) => hub.onboarding(signal), [hub]);
+  const [state, setState] = React.useState<Onboarding>();
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string>();
+  React.useEffect(() => setState(looked.data), [looked.data]);
+  const create = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      setState(await hub.createRole());
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const snippet = state && lakebaseSnippet(state);
+  return (
+    <Stack gap={10}>
+      <SectionHeader title="Your poller" description="A job that runs as you reads the sources you turn on and writes what it finds to the hub's database, as your own database role." />
+      {looked.loading && <Spinner size={12} />}
+      {looked.error && <Notice tone="danger" title="Couldn't check your poller setup">{describeError(looked.error)}</Notice>}
+      {state && (
+        <div className="dbx-card" style={{ padding: 12 }}>
+          <Stack gap={8}>
+            <Stack direction="row" align="center" justify="space-between" gap={10}>
+              <Stack direction="row" gap={6} align="center">
+                <Text weight={500}>Database role</Text>
+                {state.role === "waiting" ? <Badge tone="warning">Not set up</Badge> : <Badge tone="success">{state.role === "created" ? "Created" : "Ready"}</Badge>}
+              </Stack>
+              {state.role === "waiting" && (
+                <Button size="sm" variant="brand" disabled={busy} onClick={() => void create()}>
+                  {busy ? <Spinner size={12} /> : null}Create my role
+                </Button>
+              )}
+            </Stack>
+            <Text tone="subtle" size="sm">{state.role === "waiting" ? (state.waiting?.reason ?? "You don't have a role in the hub's database yet.") : `${state.user} can write to the hub's inbox.`}</Text>
+            {state.role === "waiting" && state.waiting?.command && (
+              <Stack gap={4}>
+                <Text tone="tertiary" size="xs">If the hub can't create it, someone with Can Manage on the database project can run:</Text>
+                <CodeView code={state.waiting.command} language="bash" copy />
+              </Stack>
+            )}
+            {error && <Text tone="danger" size="sm">{error}</Text>}
+          </Stack>
+        </div>
+      )}
+      {state && snippet && (
+        <Stack gap={4}>
+          <Text tone="subtle" size="sm">Add this to your poller's sources.json, and run it with <code>{state.args.join(" ")}</code>:</Text>
+          <CodeView code={snippet} language="json" copy />
+        </Stack>
+      )}
+    </Stack>
+  );
+}
+
 function SignalsSettings(props: { service: DatabricksService }) {
   const { service } = props;
   const snapshot = useConnection(service);
@@ -141,6 +202,7 @@ function SignalsSettings(props: { service: DatabricksService }) {
           <SourceRow key={info.name} service={service} hub={hub} info={info} state={sources?.find((state) => state.source === info.name)} onChange={setSources} />
         ))}
       </Stack>
+      {hub && <PollerSetup hub={hub} />}
     </Stack>
   );
 }

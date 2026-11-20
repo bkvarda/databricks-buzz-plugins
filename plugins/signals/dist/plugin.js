@@ -483,6 +483,44 @@ function Field(props) {
 function SectionHeader(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500 }, props.title), props.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.description)), props.action);
 }
+function CopyButton(props) {
+  const [copied, setCopied] = React.useState(false);
+  return /* @__PURE__ */ React.createElement(
+    Button,
+    {
+      size: "sm",
+      variant: "ghost",
+      onClick: () => {
+        void navigator.clipboard?.writeText(props.text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
+      }
+    },
+    copied ? "Copied" : props.label ?? "Copy"
+  );
+}
+function CodeView(props) {
+  return /* @__PURE__ */ React.createElement("div", { style: { position: "relative" } }, /* @__PURE__ */ React.createElement(
+    "pre",
+    {
+      className: "dbx-mono",
+      style: {
+        margin: 0,
+        padding: "10px 12px",
+        background: "var(--dbx-inset)",
+        border: "1px solid var(--dbx-border)",
+        borderRadius: "var(--dbx-radius)",
+        fontSize: "0.75rem",
+        lineHeight: 1.5,
+        overflow: "auto",
+        maxHeight: props.maxHeight ?? 260,
+        whiteSpace: "pre"
+      }
+    },
+    /* @__PURE__ */ React.createElement("code", null, props.code)
+  ), props.copy !== false && /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", top: 4, right: 4 } }, /* @__PURE__ */ React.createElement(CopyButton, { text: props.code })));
+}
 function Disclosure(props) {
   return /* @__PURE__ */ React.createElement("details", { open: props.defaultOpen }, /* @__PURE__ */ React.createElement("summary", { style: { cursor: "pointer", fontSize: "0.75rem", color: "var(--dbx-subtle)", userSelect: "none" } }, props.summary), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8 } }, props.children));
 }
@@ -876,6 +914,14 @@ var HubClient = class {
   filtered(channel, signal) {
     return this.call("GET", "/api/filtered", { query: { channel, days: 14, limit: 100 }, ...signal && { signal } }).then((reply) => reply.events);
   }
+  /** Your poller's setup: your database role, and the settings for your sources.json and job. */
+  onboarding(signal) {
+    return this.call("GET", "/api/onboard", { ...signal && { signal } });
+  }
+  /** Creates your database role if the hub can. */
+  createRole() {
+    return this.call("POST", "/api/onboard");
+  }
   events(events) {
     return this.call("POST", "/api/events", { body: { events } });
   }
@@ -906,6 +952,7 @@ function rpcSignIn(status2, body) {
     return "unknown";
   }
 }
+var lakebaseSnippet = (onboarding) => onboarding.lakebase ? JSON.stringify({ lakebase: onboarding.lakebase }, null, 2) : void 0;
 var signInPath = (service) => `/explore/mcp-services/system/ai/${service}`;
 
 // node_modules/@noble/hashes/utils.js
@@ -2453,6 +2500,27 @@ function SourceRow(props) {
   const loginUrl = info.service ? service.workspaceUrl(signInPath(info.service)) : void 0;
   return /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 10 }, /* @__PURE__ */ React.createElement(Stack, { gap: 2, style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, info.label), on ? /* @__PURE__ */ React.createElement(Badge, { tone: "success" }, "On") : /* @__PURE__ */ React.createElement(Badge, null, "Off"), signIn.data === "needed" && /* @__PURE__ */ React.createElement(Badge, { tone: "warning" }, "Not signed in"), signIn.loading && info.service && /* @__PURE__ */ React.createElement(Spinner, { size: 10 })), info.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, info.description), on && /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, state?.last_post_at ? `Last read ${ago(state.last_post_at * 1e3)} (${state.last_count ?? 0} items)` : "Not read yet: your poller job reads it on its next run."), on && state?.last_error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "xs" }, state.last_error)), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none" } }, signIn.data === "needed" && loginUrl && /* @__PURE__ */ React.createElement(Button, { size: "sm", onClick: () => openExternal(loginUrl) }, "Sign in"), on ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: busy, onClick: () => void toggle(false) }, "Turn off"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "danger", disabled: busy, title: "Turn it off and delete what the hub keeps from it", onClick: () => void toggle(false, true) }, "Forget")) : /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy || signIn.data === "needed", onClick: () => void toggle(true) }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Turn on"))), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error)));
 }
+function PollerSetup(props) {
+  const { hub: hub2 } = props;
+  const looked = useAsync(async (signal) => hub2.onboarding(signal), [hub2]);
+  const [state, setState] = React.useState();
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState();
+  React.useEffect(() => setState(looked.data), [looked.data]);
+  const create = async () => {
+    setBusy(true);
+    setError(void 0);
+    try {
+      setState(await hub2.createRole());
+    } catch (problem) {
+      setError(describeError(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const snippet = state && lakebaseSnippet(state);
+  return /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Your poller", description: "A job that runs as you reads the sources you turn on and writes what it finds to the hub's database, as your own database role." }), looked.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), looked.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't check your poller setup" }, describeError(looked.error)), state && /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", align: "center", justify: "space-between", gap: 10 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center" }, /* @__PURE__ */ React.createElement(Text, { weight: 500 }, "Database role"), state.role === "waiting" ? /* @__PURE__ */ React.createElement(Badge, { tone: "warning" }, "Not set up") : /* @__PURE__ */ React.createElement(Badge, { tone: "success" }, state.role === "created" ? "Created" : "Ready")), state.role === "waiting" && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "brand", disabled: busy, onClick: () => void create() }, busy ? /* @__PURE__ */ React.createElement(Spinner, { size: 12 }) : null, "Create my role")), /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, state.role === "waiting" ? state.waiting?.reason ?? "You don't have a role in the hub's database yet." : `${state.user} can write to the hub's inbox.`), state.role === "waiting" && state.waiting?.command && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { tone: "tertiary", size: "xs" }, "If the hub can't create it, someone with Can Manage on the database project can run:"), /* @__PURE__ */ React.createElement(CodeView, { code: state.waiting.command, language: "bash", copy: true })), error && /* @__PURE__ */ React.createElement(Text, { tone: "danger", size: "sm" }, error))), state && snippet && /* @__PURE__ */ React.createElement(Stack, { gap: 4 }, /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm" }, "Add this to your poller's sources.json, and run it with ", /* @__PURE__ */ React.createElement("code", null, state.args.join(" ")), ":"), /* @__PURE__ */ React.createElement(CodeView, { code: snippet, language: "json", copy: true })));
+}
 function SignalsSettings(props) {
   const { service } = props;
   const snapshot = useConnection(service);
@@ -2478,7 +2546,7 @@ function SignalsSettings(props) {
       title: "Hub",
       description: /* @__PURE__ */ React.createElement(React.Fragment, null, "Tasks are kept in ", /* @__PURE__ */ React.createElement("b", null, app.name), app.url ? "" : " (not running)", ". Your sources are read by a job that runs as you, so the hub only gets what you can read, and only from sources you turn on.")
     }
-  ), (hubs.data?.apps.length ?? 0) > 1 && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", value: app.name, onChange: (event) => setPicked(event.target.value), style: { maxWidth: 320 } }, hubs.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.name)))), /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Your sources", description: "Off until you turn them on. Turning one off stops it; Forget also deletes what the hub keeps from it (tasks others work on stay)." }), loaded.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), loaded.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't reach the hub" }, describeError(loaded.error)), hub2 && [...catalog, ...extra, { name: "agent", label: "Agents", description: "Events your agents send with signals_event." }].map((info) => /* @__PURE__ */ React.createElement(SourceRow, { key: info.name, service, hub: hub2, info, state: sources?.find((state) => state.source === info.name), onChange: setSources }))));
+  ), (hubs.data?.apps.length ?? 0) > 1 && /* @__PURE__ */ React.createElement("select", { className: "dbx-input", value: app.name, onChange: (event) => setPicked(event.target.value), style: { maxWidth: 320 } }, hubs.data.apps.map((found) => /* @__PURE__ */ React.createElement("option", { key: found.name, value: found.name }, found.name)))), /* @__PURE__ */ React.createElement(Stack, { gap: 10 }, /* @__PURE__ */ React.createElement(SectionHeader, { title: "Your sources", description: "Off until you turn them on. Turning one off stops it; Forget also deletes what the hub keeps from it (tasks others work on stay)." }), loaded.loading && /* @__PURE__ */ React.createElement(Spinner, { size: 12 }), loaded.error && /* @__PURE__ */ React.createElement(Notice, { tone: "danger", title: "Couldn't reach the hub" }, describeError(loaded.error)), hub2 && [...catalog, ...extra, { name: "agent", label: "Agents", description: "Events your agents send with signals_event." }].map((info) => /* @__PURE__ */ React.createElement(SourceRow, { key: info.name, service, hub: hub2, info, state: sources?.find((state) => state.source === info.name), onChange: setSources }))), hub2 && /* @__PURE__ */ React.createElement(PollerSetup, { hub: hub2 }));
 }
 function apply(ctx) {
   bindReact(ctx.react);
