@@ -204,11 +204,11 @@ export function replyTemplate(input: Readonly<{ conversation: Conversation; cont
 }
 
 /** The agent's kind 0 profile, attested by its owner. */
-export function profileTemplate(input: Readonly<{ name: string; picture?: string; about?: string; authTag: readonly string[] }>): EventTemplate {
+export function profileTemplate(input: Readonly<{ name: string; picture?: string; about?: string; authTag: readonly string[]; tags?: readonly string[][] }>): EventTemplate {
   return {
     kind: 0,
     created_at: Math.floor(Date.now() / 1000),
     content: JSON.stringify({ name: input.name, display_name: input.name, bot: true, ...(input.picture && { picture: input.picture }), ...(input.about && { about: input.about }) }),
-    tags: [[...input.authTag]],
+    tags: [...(input.tags ?? []).map((tag) => [...tag]), [...input.authTag]],
   };
 }

@@ -56,3 +56,14 @@ export function CustomKindIcon({ size = 20 }: IconProps) {
     </>,
   );
 }
+
+/** Slack bridge: two speech bubbles, one each way. */
+export function SlackKindIcon({ size = 20 }: IconProps) {
+  return svg(
+    size,
+    <>
+      <path fill={LAVA} d="M3 4.5A2.5 2.5 0 0 1 5.5 2h7A2.5 2.5 0 0 1 15 4.5v4A2.5 2.5 0 0 1 12.5 11H8l-3.2 2.6c-.33.27-.8.03-.8-.39V11a2.5 2.5 0 0 1-1-2Z" />
+      <path fill={LAVA} opacity={0.65} d="M21 12.5A2.5 2.5 0 0 0 18.5 10H17v.5a4.5 4.5 0 0 1-4.5 4.5H10v.5a2.5 2.5 0 0 0 2.5 2.5H16l3.2 2.6c.33.27.8.03.8-.39V18a2.5 2.5 0 0 0 1-2Z" />
+    </>,
+  );
+}

@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ToolChoice } from "../src/capabilities";
 import type { Permissions, RemoteHarness } from "../src/remote";
+import type { SlackConversation } from "../src/slack";
 
 export const AGENT_DIR = process.env.BUZZ_AGENT_DIR ?? join(homedir(), ".buzz", "agent");
 const RUN_DIR = process.env.BUZZ_AGENT_RUN_DIR ?? (process.env.BUZZ_AGENT_DIR ? join(AGENT_DIR, "run") : "/tmp/buzz-agent");
@@ -31,6 +32,8 @@ export const paths = {
   /** Touched by the owner's Buzz while it's open, so a sleeping agent stays awake. */
   awake: join(AGENT_DIR, "awake"),
   runs: join(AGENT_DIR, "runs"),
+  /** A Slack bridge's channels and what it has posted and sent. */
+  slack: join(AGENT_DIR, "slack.json"),
 };
 
 export type Availability = "always" | "sleep";
@@ -44,8 +47,10 @@ export type RunnerConfig = Readonly<{
   authTag: string[];
   name: string;
   picture?: string;
-  /** "genie": Genie One or a Genie agent answers; "sandbox": a coding harness does; "omnigent": an Omnigent agent does, in Omnigent sessions. */
-  kind: "genie" | "sandbox" | "omnigent";
+  /** "genie": Genie One or a Genie agent answers; "sandbox": a coding harness does; "omnigent": an Omnigent agent does, in Omnigent sessions; "slack": it bridges Slack conversations (./slack-bridge.ts). */
+  kind: "genie" | "sandbox" | "omnigent" | "slack";
+  /** A Slack bridge's conversations. */
+  slack?: Readonly<{ conversations: readonly SlackConversation[] }>;
   /** The Omnigent agent's name (e.g. "claude-native-ui") and what it's called. */
   omnigentAgent?: string;
   omnigentLabel?: string;
@@ -109,6 +114,7 @@ export function writeJson(path: string, value: unknown, mode = 0o600) {
   chmodSync(path, mode);
 }
 
+export const readJsonFile = readJson;
 export const readConfig = () => readJson<RunnerConfig | undefined>(paths.config, undefined);
 export const readState = (): RunnerState => ({ sessions: {}, since: 0, handled: [], ...readJson<Partial<RunnerState>>(paths.state, {}) });
 export const writeState = (state: RunnerState) => writeJson(paths.state, { ...state, handled: state.handled.slice(-500) });
