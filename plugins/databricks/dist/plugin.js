@@ -872,11 +872,20 @@ var Connection = class {
     const generation = ++this.generation;
     this.target = profile;
     this.set({ status: "connecting", profile });
+    const token = async (tokenOptions) => {
+      try {
+        return (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken;
+      } catch (error) {
+        if (!(error instanceof SignInRequiredError)) throw error;
+        this.expired(generation, profile);
+        throw new SignInRequiredError(`Your sign-in to ${new URL(profile.host).hostname} has expired. Sign in again where this workspace is chosen (Settings \u2192 Databricks, or an agent's Workspace field).`);
+      }
+    };
     const client = new DatabricksClient({
       host: profile.host,
       ...profile.workspaceId && { workspaceId: profile.workspaceId },
       transport: this.transport,
-      token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken
+      token
     });
     try {
       const response = await client.request("/api/2.0/preview/scim/v2/Me", {
@@ -890,12 +899,7 @@ var Connection = class {
         throw new Error(`Databricks returned HTTP ${response.status}`);
       const me = JSON.parse(response.body);
       const workspaceId = response.headers["x-databricks-org-id"] ?? profile.workspaceId;
-      const routed = workspaceId && workspaceId !== profile.workspaceId ? new DatabricksClient({
-        host: profile.host,
-        workspaceId,
-        transport: this.transport,
-        token: async (tokenOptions) => (await this.cli.token({ profile: profile.name }, tokenOptions)).accessToken
-      }) : client;
+      const routed = workspaceId && workspaceId !== profile.workspaceId ? new DatabricksClient({ host: profile.host, workspaceId, transport: this.transport, token }) : client;
       this.current = { profile, client: routed };
       this.storage.set(SELECTION_KEY, JSON.stringify({ profile: profile.name }));
       this.set({
@@ -925,6 +929,15 @@ var Connection = class {
       });
     }
   }
+  /**
+   * A connected workspace whose CLI sign-in can no longer be refreshed (the
+   * refresh token expired or was revoked): show it as expired, so every view
+   * of this connection offers "Sign in again" instead of saying it's signed in.
+   */
+  expired(generation, profile) {
+    if (generation !== this.generation || this.state.status !== "connected") return;
+    this.set({ status: "error", profile, profiles: this.workspaceProfiles(), message: "Your Databricks sign-in has expired.", needsSignIn: true });
+  }
   async reloadProfiles() {
     this.profiles = await this.cli.profiles();
   }
@@ -953,7 +966,7 @@ var Connection = class {
 var NotConnectedError = class extends Error {
   constructor(snapshot) {
     super(
-      snapshot.status === "cli-missing" ? "Databricks isn't set up yet: install the Databricks CLI in Settings \u2192 Databricks." : snapshot.status === "error" && snapshot.needsSignIn ? "The Databricks sign-in expired. Sign in again in Settings \u2192 Databricks." : "Not connected to Databricks. Connect in Settings \u2192 Databricks."
+      snapshot.status === "cli-missing" ? "Databricks isn't set up yet: install the Databricks CLI in Settings \u2192 Databricks." : snapshot.status === "error" && snapshot.needsSignIn ? `Your sign-in to ${new URL(snapshot.profile.host).hostname} has expired. Sign in again where this workspace is chosen (Settings \u2192 Databricks, or an agent's Workspace field).` : "Not connected to Databricks. Connect in Settings \u2192 Databricks."
     );
     this.snapshot = snapshot;
     this.name = "NotConnectedError";

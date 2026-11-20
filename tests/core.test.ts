@@ -160,6 +160,36 @@ describe("CLI sign-in errors", () => {
   });
 });
 
+describe("a sign-in that expires while connected", () => {
+  it("shows the connection as expired, so it offers Sign in again, and signs in again to the same profile", async () => {
+    let expired = false;
+    const { host, calls } = scriptedHost({
+      "cli-profiles": () => PROFILES,
+      // A token that's already due for refresh, until the refresh token is gone too.
+      "cli-token": () => (expired ? EXPIRED : { code: 0, stdout: JSON.stringify({ access_token: "t", expires_in: 1 }) }),
+      "cli-login": () => {
+        expired = false;
+        return { code: 0 };
+      },
+    });
+    const storage = new Map<string, string>();
+    const connection = new Connection(host, { get: (key) => storage.get(key) ?? null, set: (key, value) => (value === null ? storage.delete(key) : storage.set(key, value)) }, async (request): Promise<{ status: number; headers: Record<string, string>; body: string }> =>
+      request.url.includes("/scim/v2/Me")
+        ? { status: 200, headers: {}, body: JSON.stringify({ userName: "me@example.com" }) }
+        : { status: 200, headers: { "content-type": "application/json" }, body: "{}" },
+    );
+    await connection.useProfile("ws");
+    expect(connection.snapshot()).toMatchObject({ status: "connected", user: { userName: "me@example.com" } });
+    const client = connection.client()!;
+    expired = true;
+    await expect(client.get("/api/2.1/unity-catalog/model-services")).rejects.toThrow(/sign-in to ws\.cloud\.databricks\.com has expired/);
+    expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true, profile: { name: "ws" } });
+    await connection.reauthenticate();
+    expect(calls.filter((call) => call.id === "cli-login").at(-1)?.args).toEqual(["--profile", "ws", "--host", "https://ws.cloud.databricks.com"]);
+    expect(connection.snapshot()).toMatchObject({ status: "connected" });
+  });
+});
+
 describe("results", () => {
   const statement = {
     manifest: { schema: { columns: [{ name: "day", type_text: "DATE" }, { name: "orders", type_text: "BIGINT" }] }, total_row_count: 3 },
