@@ -564,13 +564,13 @@ function SectionHeader(props) {
   return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { as: "h3", size: "md", weight: 500 }, props.title), props.description && /* @__PURE__ */ React.createElement(Text, { tone: "subtle", size: "sm", as: "div" }, props.description)), props.action);
 }
 function ago(ms, now = Date.now()) {
-  const s = Math.max(0, Math.round((now - ms) / 1e3));
+  const diff = Math.round((now - ms) / 1e3);
+  const s = Math.abs(diff);
   if (s < 45) return "just now";
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
   const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
+  const span = m < 60 ? `${m}m` : h < 24 ? `${h}h` : `${Math.round(h / 24)}d`;
+  return diff < 0 ? `in ${span}` : `${span} ago`;
 }
 
 // packages/core/src/suite.tsx
