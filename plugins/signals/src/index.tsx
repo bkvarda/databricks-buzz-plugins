@@ -148,7 +148,7 @@ function PollerSetup(props: { hub: HubClient }) {
       )}
       {state && snippet && (
         <Stack gap={4}>
-          <Text tone="subtle" size="sm">Add this to your poller's sources.json, and run it with <code>{state.args.join(" ")}</code>:</Text>
+          <Text tone="subtle" size="sm">Add this to <code>{state.folder}/sources.json</code>, and have your job run <code>{state.folder}/poller.py</code> with <code>{state.args.join(" ")}</code>:</Text>
           <CodeView code={snippet} language="json" copy />
         </Stack>
       )}

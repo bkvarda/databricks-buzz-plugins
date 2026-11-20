@@ -1000,7 +1000,7 @@ describe("onboarding a poller", () => {
 
     // No role yet: GET only looks, and says what someone who can should run.
     const looked = (await call("GET", "Ann@x.com")).json as Onboarding;
-    expect(looked).toMatchObject({ user: "ann@x.com", role: "waiting", lakebase: { ...lakebase, schema: "signals_onboard" }, args: ["--config", "sources.json", "--lakebase"] });
+    expect(looked).toMatchObject({ user: "ann@x.com", role: "waiting", lakebase: { ...lakebase, schema: "signals_onboard" }, args: ["--config", "/Workspace/Users/ann@x.com/signals-poller/sources.json", "--lakebase"], folder: "/Workspace/Users/ann@x.com/signals-poller" });
     expect(looked.waiting?.command).toBe(`databricks postgres create-role projects/p1/branches/production --json '{"spec":{"identity_type":"USER","postgres_role":"ann@x.com","auth_method":"LAKEBASE_OAUTH_V1"}}'`);
 
     // Without databricks_create_role (the extension isn't installed), POST says why and still gives the command.
@@ -1017,7 +1017,7 @@ describe("onboarding a poller", () => {
 
     // A hub that doesn't know its database still answers, without the settings or the command.
     const bare = (await new Hub(store).handle({ method: "GET", path: "/api/onboard", query: new URLSearchParams(), user: "bo@x.com", body: async () => "" })).json as Onboarding;
-    expect(bare).toEqual({ user: "bo@x.com", role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet." }, args: ["--config", "sources.json", "--lakebase"] });
+    expect(bare).toEqual({ user: "bo@x.com", role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet." }, folder: "/Workspace/Users/bo@x.com/signals-poller", args: ["--config", "/Workspace/Users/bo@x.com/signals-poller/sources.json", "--lakebase"] });
     // It needs to know who's asking.
     expect((await hub.handle({ method: "GET", path: "/api/onboard", query: new URLSearchParams(), body: async () => "" })).status).toBe(401);
   });
@@ -1026,8 +1026,8 @@ describe("onboarding a poller", () => {
 describe("the poller setup card", () => {
   it("gives the lakebase block for sources.json, or nothing when the hub doesn't know its database", () => {
     const lakebase = { endpoint: "projects/p/branches/b/endpoints/e", host: "h", database: "databricks_postgres", schema: "signals_x" };
-    expect(JSON.parse(lakebaseSnippet({ user: "a@x.com", role: "ready", lakebase, args: [] })!)).toEqual({ lakebase });
-    expect(lakebaseSnippet({ user: "a@x.com", role: "waiting", args: [] })).toBeUndefined();
+    expect(JSON.parse(lakebaseSnippet({ user: "a@x.com", role: "ready", lakebase, folder: "/f", args: [] })!)).toEqual({ lakebase });
+    expect(lakebaseSnippet({ user: "a@x.com", role: "waiting", folder: "/f", args: [] })).toBeUndefined();
   });
 });
 

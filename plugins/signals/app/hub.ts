@@ -75,6 +75,9 @@ export type HubOptions = Readonly<{
   log?(line: string): void;
 }>;
 
+/** Where a person's poller.py and sources.json live in the workspace. */
+export const pollerFolder = (user: string) => `/Workspace/Users/${user}/signals-poller`;
+
 /** The hub's database, as a person's poller job reaches it (sources.json's `lakebase`). */
 export type LakebaseInfo = Readonly<{ endpoint: string; host: string; database: string; port?: number }>;
 
@@ -87,6 +90,9 @@ export type Onboarding = Readonly<{
   /** sources.json's `lakebase`, or undefined when the hub doesn't know its database. */
   lakebase?: Readonly<{ endpoint: string; host: string; database: string; port?: number; schema: string }>;
   /** The poller's arguments, for its job. */
+  /** The workspace folder the person's poller.py and sources.json go in. */
+  folder: string;
+  /** The job's arguments, with sources.json's full workspace path (a job's working directory isn't the folder). */
   args: readonly string[];
 }>;
 
@@ -251,19 +257,20 @@ export class Hub {
   private async onboard(user: string, create: boolean): Promise<Onboarding> {
     const info = this.options.lakebase;
     const lakebase = info && { ...info, schema: this.store.schema };
-    const args = ["--config", "sources.json", "--lakebase"];
-    if (await this.store.hasRole(user)) return { user, role: "ready", ...(lakebase && { lakebase }), args };
+    const folder = pollerFolder(user);
+    const args = ["--config", `${folder}/sources.json`, "--lakebase"];
+    if (await this.store.hasRole(user)) return { user, role: "ready", ...(lakebase && { lakebase }), folder, args };
     const branch = info?.endpoint.split("/").slice(0, 4).join("/");
     const command = branch && /^projects\/[^/]+\/branches\/[^/]+$/.test(branch) ? `databricks postgres create-role ${branch} --json '${JSON.stringify({ spec: { identity_type: "USER", postgres_role: user, auth_method: "LAKEBASE_OAUTH_V1" } })}'` : undefined;
-    if (!create) return { user, role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet.", ...(command && { command }) }, ...(lakebase && { lakebase }), args };
+    if (!create) return { user, role: "waiting", waiting: { reason: "You don't have a role in the hub's database yet.", ...(command && { command }) }, ...(lakebase && { lakebase }), folder, args };
     try {
       await this.store.createRole(user);
       this.log(`created a database role for ${user}`);
-      return { user, role: "created", ...(lakebase && { lakebase }), args };
+      return { user, role: "created", ...(lakebase && { lakebase }), folder, args };
     } catch (error) {
       const reason = `The hub couldn't create your role in its database: ${(error as Error).message}`;
       this.log(`couldn't create a database role for ${user}: ${(error as Error).message}`);
-      return { user, role: "waiting", waiting: { reason, ...(command && { command }) }, ...(lakebase && { lakebase }), args };
+      return { user, role: "waiting", waiting: { reason, ...(command && { command }) }, ...(lakebase && { lakebase }), folder, args };
     }
   }
 
