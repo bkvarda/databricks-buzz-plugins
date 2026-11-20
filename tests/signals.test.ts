@@ -335,7 +335,7 @@ describe("account channels", () => {
   });
 
   it("turns registered accounts into accounts the rules find, ahead of the config's own", () => {
-    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], ids: {}, preferences: "questions: auto", profile: "", agents: [], playbooks: {}, workstream_agents: {}, updated_by: null, updated_at: null };
+    const record = { name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk", "bad domain"], ids: {}, preferences: "questions: auto", profile: "", agents: [], playbooks: {}, workstream_agents: {}, workstream_actions: {}, updated_by: null, updated_at: null };
     expect(accountRule(record)).toEqual({ name: "Acme", channel: "acme-2", aliases: ["ACME Corp"], domains: ["acme.com", "acme.co.uk"], preferences: "questions: auto" });
     const merged = withAccounts(config, [record]);
     expect(merged.accounts?.map((account) => account.channel)).toEqual(["acme-2"]);
@@ -1887,7 +1887,7 @@ describe("account ids", () => {
 
 describe("rules for every account", () => {
   const example = JSON.parse(readFileSync(new URL("../plugins/signals/deploy/signals.config.json", import.meta.url), "utf8")) as SignalsConfig;
-  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, ids: {}, preferences: "", profile: "", agents: [], playbooks: {}, workstream_agents: {}, updated_by: null, updated_at: null });
+  const record = (name: string, channel: string, domains: string[], aliases: string[] = []) => ({ name, channel, aliases, domains, ids: {}, preferences: "", profile: "", agents: [], playbooks: {}, workstream_agents: {}, workstream_actions: {}, updated_by: null, updated_at: null });
   const accounts = [record("Globex", "globex", ["globex.io"], ["Globex Corp"]), record("Initech", "initech", ["initech.com"])];
   const config = withAccounts(example, accounts);
 

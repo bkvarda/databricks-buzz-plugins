@@ -1094,6 +1094,164 @@ export function playbookFor(playbooks: Readonly<Record<string, string>> | undefi
 }
 
 /**
+ * What a workstream's agents do by default (Set up account): the actions the
+ * team ticked, each with a one-line trigger, and what happens to a task when
+ * none of them holds. A task's new versions are checked against every ticked
+ * action; each one whose trigger holds is done (several may be), under the
+ * workstream's mode. `always`: done on every task, without asking the model.
+ * A workstream with no row keeps working as before: its agents work every task.
+ */
+export type WorkstreamAction = Readonly<{ id: string; label: string; trigger: string; always?: true }>;
+export type Otherwise = "track" | "dismiss";
+export type WorkstreamActionsRow = Readonly<{ watch: readonly WorkstreamAction[]; otherwise: Otherwise }>;
+export type WorkstreamActions = Readonly<Record<string, WorkstreamActionsRow>>;
+
+export const MAX_ACTIONS = 8;
+export const MAX_ACTION_LABEL = 60;
+export const MAX_ACTION_TRIGGER = 300;
+export const OTHERWISE: readonly Otherwise[] = ["track", "dismiss"];
+const ACTION_ID = /^[a-z0-9-]{1,40}$/;
+
+/** `workstream_actions` as sent to POST /api/account, checked: the rows by workstream (or rule id), or what's wrong. */
+export function readWorkstreamActions(raw: unknown): WorkstreamActions | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "workstream_actions maps a workstream (or rule id) to {watch, otherwise}.";
+  const out: Record<string, WorkstreamActionsRow> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const name = key.trim();
+    if (!name || name.length > 80) return "A workstream is 1-80 characters.";
+    if (Object.keys(out).some((other) => other.toLowerCase() === name.toLowerCase())) return `${name} is named twice.`;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return `The ${name} actions are {watch, otherwise}.`;
+    const { watch, otherwise } = value as { watch?: unknown; otherwise?: unknown };
+    if (!OTHERWISE.includes(otherwise as Otherwise)) return `The ${name} otherwise is ${OTHERWISE.join(" or ")}.`;
+    if (watch !== undefined && !Array.isArray(watch)) return `The ${name} watch is a list of actions.`;
+    const actions: WorkstreamAction[] = [];
+    for (const item of (watch as unknown[] | undefined) ?? []) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return `A ${name} action is {id, label, trigger}.`;
+      const { id, label, trigger, always } = item as Record<string, unknown>;
+      if (typeof id !== "string" || !ACTION_ID.test(id)) return `A ${name} action's id is 1-40 lowercase letters, digits and dashes.`;
+      if (actions.some((other) => other.id === id)) return `${name} has the action ${id} twice.`;
+      if (typeof label !== "string" || !label.trim() || label.trim().length > MAX_ACTION_LABEL) return `The ${name} action ${id} needs a label of 1-${MAX_ACTION_LABEL} characters.`;
+      if (always !== undefined && always !== true && always !== false) return `The ${name} action ${id}: always is true or left out.`;
+      if (trigger !== undefined && typeof trigger !== "string") return `The ${name} action ${id}: trigger must be text.`;
+      const text = typeof trigger === "string" ? trigger.trim() : "";
+      if (text.length > MAX_ACTION_TRIGGER) return `The ${name} action ${id}: the trigger is at most ${MAX_ACTION_TRIGGER} characters.`;
+      // An action that's not always done needs a trigger to check.
+      if (always !== true && !text) return `The ${name} action ${id} needs a trigger (or always: true).`;
+      actions.push({ id, label: label.trim(), trigger: text, ...(always === true && { always: true }) });
+    }
+    if (actions.length > MAX_ACTIONS) return `${name} has more than ${MAX_ACTIONS} actions.`;
+    out[name] = { watch: actions, otherwise: otherwise as Otherwise };
+  }
+  if (Object.keys(out).length > MAX_PLAYBOOKS) return `An account sets actions for at most ${MAX_PLAYBOOKS} workstreams.`;
+  return out;
+}
+
+/** The actions row a task goes by: the one for its rule id, then for its workstream (any case), as playbooks are found; none means agents work every task. */
+export function actionsFor(rows: WorkstreamActions | undefined, task: Readonly<{ rule_id?: string; workstream?: string | null }>): { key: string; row: WorkstreamActionsRow } | undefined {
+  const entries = Object.entries(rows ?? {});
+  for (const wanted of [task.rule_id, task.workstream ?? undefined]) {
+    const lower = wanted?.trim().toLowerCase();
+    const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
+    if (found) return { key: found[0], row: found[1] };
+  }
+  return undefined;
+}
+
+/** A catalog action: as stored, and whether setup ticks it to start with. */
+export type CatalogAction = WorkstreamAction & Readonly<{ recommended: boolean }>;
+export type CatalogEntry = Readonly<{ workstream: string; aliases: readonly string[]; otherwise: Otherwise; actions: readonly CatalogAction[] }>;
+
+/**
+ * The built-in actions for the workstreams account teams usually have
+ * (from Genie's sets, buzz-factory 2026-11-20), that setup offers for a
+ * workstream it matches by name or alias. `recommended` ones start ticked.
+ */
+export const DEFAULT_WORKSTREAM_ACTIONS: readonly CatalogEntry[] = [
+  {
+    workstream: "support cases",
+    aliases: ["support", "support tracking", "cases"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "work-it", label: "Work it", trigger: "", always: true, recommended: false },
+      { id: "escalate-if-needed", label: "Escalate if needed", trigger: "Poor sentiment, no case update for 2 business days, open past SLA, priority raised, or a Sev1 production outage", recommended: true },
+      { id: "confirm-workaround", label: "Confirm workaround", trigger: "The linked ES moves to Mitigated or Resolved, or the case is waiting on the customer's confirmation", recommended: true },
+      { id: "engage-engineering", label: "Engage engineering", trigger: "The case is about a Private Preview or Beta product, which engineering supports directly", recommended: true },
+    ],
+  },
+  {
+    workstream: "capacity requests",
+    aliases: ["capacity", "es-capacity-requests", "capacity request", "quota requests"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "draft-request", label: "Draft request", trigger: "A third-party model hits a page-level 429 alert, or the customer asks for more, and no open request already covers it", recommended: true },
+      { id: "nudge-request", label: "Nudge request", trigger: "The open request is unassigned for 48h or past its SLA", recommended: true },
+      { id: "customer-update", label: "Customer update", trigger: "The request is granted, denied or changed", recommended: true },
+    ],
+  },
+  {
+    workstream: "escalations",
+    aliases: ["incidents", "escalations and incidents", "escalations & incidents"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "brief-account-team", label: "Brief account team", trigger: "The incident affects this account's workspaces, or an escalation (ER) is opened on the account", recommended: true },
+      { id: "customer-holding-note", label: "Customer holding note", trigger: "Sev0 or Sev1 impact on the account, and approved status or RCA text exists", recommended: true },
+      { id: "request-confidence-call", label: "Request confidence call", trigger: "A Sev0 or Sev1 that repeats a past incident, or the customer or an exec asks for a call", recommended: true },
+    ],
+  },
+  {
+    workstream: "tickets",
+    aliases: ["escalation tracking", "es tickets", "jira", "es-tickets"],
+    otherwise: "track",
+    actions: [
+      { id: "nudge", label: "Nudge", trigger: "Unassigned past SLA, or no update for 5 business days", recommended: true },
+      { id: "close-out", label: "Close out", trigger: "The status moves to Mitigated or Resolved", recommended: true },
+      { id: "customer-update", label: "Customer update", trigger: "A material change: assigned, fix scheduled, or workaround available", recommended: false },
+    ],
+  },
+  {
+    workstream: "questions",
+    aliases: ["customer slack questions", "customer questions", "slack questions"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "draft-answer", label: "Draft answer", trigger: "A customer question with no Databricks reply after 4 business hours, or someone asks the agent directly", recommended: true },
+      { id: "route-to-support", label: "Route to support case", trigger: "A break-fix report: a production error, an outage or a failing job", recommended: true },
+      { id: "route-to-ae", label: "Route to AE", trigger: "Pricing, contract or other commercial questions", recommended: true },
+    ],
+  },
+  {
+    workstream: "meeting prep",
+    aliases: ["meetings", "prep"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "prep-brief", label: "Prep brief", trigger: "An external meeting with the account in the next 24h", recommended: true },
+      { id: "brief-and-deck", label: "Brief + deck", trigger: "A QBR or exec meeting, or the account has an open escalation", recommended: true },
+    ],
+  },
+  {
+    workstream: "meeting follow-up",
+    aliases: ["meeting follow-up and action items", "meeting action items", "follow-up", "meeting notes"],
+    otherwise: "dismiss",
+    actions: [
+      { id: "draft-recap", label: "Draft recap + actions", trigger: "Notes exist for an external meeting, and the notes are about this account", recommended: true },
+      { id: "salesforce-updates", label: "Salesforce updates", trigger: "The notes include stage, date, next-step, competitor or contact changes", recommended: true },
+      { id: "create-action-tasks", label: "Create action tasks", trigger: "The notes assign a Databricks owner with a due date", recommended: false },
+    ],
+  },
+];
+
+/** The catalog entry for a workstream (or rule id): by its name or an alias, any case. */
+export function catalogFor(workstream: string | null | undefined): CatalogEntry | undefined {
+  const lower = workstream?.trim().toLowerCase();
+  if (!lower) return undefined;
+  return DEFAULT_WORKSTREAM_ACTIONS.find((entry) => entry.workstream === lower || entry.aliases.includes(lower));
+}
+
+/** A catalog entry as the row setup fills in: its recommended actions ticked, without `recommended`. */
+export function recommendedRow(entry: CatalogEntry): WorkstreamActionsRow {
+  return { watch: entry.actions.filter((action) => action.recommended).map(({ recommended: _, ...action }) => action), otherwise: entry.otherwise };
+}
+
+/**
  * The agents that work on a task: the ones the team named for its rule id,
  * then for its workstream (any case), as playbooks are found; otherwise the
  * account's agents.
@@ -1189,6 +1347,8 @@ export type AccountRecord = Readonly<{
   playbooks: Readonly<Record<string, string>>;
   /** Agents for one kind of work: workstream (or rule id) → hex pubkeys, in place of `agents` for its tasks. */
   workstream_agents: Readonly<Record<string, readonly string[]>>;
+  /** What each workstream's (or rule id's) agents do by default, and what happens when nothing triggers (see WorkstreamActions). */
+  workstream_actions: WorkstreamActions;
   updated_by: string | null;
   updated_at: number | null;
 }>;
