@@ -1,7 +1,9 @@
 // Tasks as the hub has them now, for the cards on the hub's posts. A channel
 // can show dozens of task posts at once, so each channel's board is read once
 // and shared by every card in it, again after `STALE_MS`, and at once after
-// an action on one of its tasks.
+// an action on one of its tasks. A post whose task closed before the board's
+// window (two weeks) is looked up once among the channel's recent tasks, so
+// an old dismissed task still folds away.
 import type { DatabricksService } from "@dbx/core/service";
 import { type BoardTask, chosenHub, HubClient } from "./client";
 
@@ -9,7 +11,10 @@ const STALE_MS = 30_000;
 
 type Board = Readonly<{ tasks: readonly BoardTask[]; at: number }>;
 /** errorAt: when a read last failed, so a hub that's down isn't asked on every render. */
-type Entry = { board?: Board; error?: Error; errorAt?: number; pending?: Promise<void> };
+type Entry = { board?: Board; error?: Error; errorAt?: number; pending?: Promise<void>; older?: ReadonlyMap<number, string>; olderPending?: boolean };
+
+/** How many of a channel's tasks are read to find the status of one that's left its board. */
+const OLDER_LIMIT = 500;
 
 export class LiveTasks {
   private hub?: Readonly<{ key: string; client: Promise<HubClient | undefined> }>;
@@ -63,6 +68,34 @@ export class LiveTasks {
   /** The task as the hub has it now, if its channel's board was read. */
   task(channel: string, id: number): BoardTask | undefined {
     return this.board(channel).board?.tasks.find((item) => item.task.id === id);
+  }
+
+  /**
+   * The status of a task that isn't on its channel's board (it closed before
+   * the board's window), read once per channel; undefined until it's known,
+   * or when the hub doesn't have it.
+   */
+  olderStatus(channel: string, id: number): string | undefined {
+    const entry = this.board(channel);
+    if (!entry.board || entry.board.tasks.some((item) => item.task.id === id)) return undefined;
+    if (entry.older) return entry.older.get(id);
+    if (!entry.olderPending && this.connected()) {
+      entry.olderPending = true;
+      void (async () => {
+        try {
+          const hub = await this.client();
+          const tasks = hub ? await hub.tasks({ channel, limit: OLDER_LIMIT }) : [];
+          entry.older = new Map(tasks.map((task) => [task.id, task.status]));
+        } catch {
+          // Unknown: the post keeps its full card. Not asked again until the page reloads.
+          entry.older = new Map();
+        } finally {
+          entry.olderPending = false;
+          this.notify();
+        }
+      })();
+    }
+    return undefined;
   }
 
   /** The task whose thread starts at `root`, if its channel's board was read. */

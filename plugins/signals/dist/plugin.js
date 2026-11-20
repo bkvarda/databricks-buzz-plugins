@@ -1849,6 +1849,7 @@ var STATUS_GROUPS = [
   { status: "done", title: "Done" },
   { status: "dismissed", title: "Dismissed" }
 ];
+var postWeight = (status2) => status2 === "dismissed" ? "folded" : status2 === "done" ? "quiet" : "full";
 var ownersOf = (item) => item.people.filter((person) => person.on && person.role === "owner" && (person.kind === "agent" || person.kind === "person"));
 var removable = (item) => item.people.filter((person) => person.on && (person.kind === "agent" || person.kind === "person"));
 function assigneeOf(item) {
@@ -2773,6 +2774,7 @@ function taskPanel(ctx, live) {
 
 // plugins/signals/src/live-tasks.ts
 var STALE_MS = 3e4;
+var OLDER_LIMIT = 500;
 var LiveTasks = class {
   constructor(service) {
     this.service = service;
@@ -2816,6 +2818,32 @@ var LiveTasks = class {
   /** The task as the hub has it now, if its channel's board was read. */
   task(channel, id) {
     return this.board(channel).board?.tasks.find((item) => item.task.id === id);
+  }
+  /**
+   * The status of a task that isn't on its channel's board (it closed before
+   * the board's window), read once per channel; undefined until it's known,
+   * or when the hub doesn't have it.
+   */
+  olderStatus(channel, id) {
+    const entry = this.board(channel);
+    if (!entry.board || entry.board.tasks.some((item) => item.task.id === id)) return void 0;
+    if (entry.older) return entry.older.get(id);
+    if (!entry.olderPending && this.connected()) {
+      entry.olderPending = true;
+      void (async () => {
+        try {
+          const hub2 = await this.client();
+          const tasks = hub2 ? await hub2.tasks({ channel, limit: OLDER_LIMIT }) : [];
+          entry.older = new Map(tasks.map((task) => [task.id, task.status]));
+        } catch {
+          entry.older = /* @__PURE__ */ new Map();
+        } finally {
+          entry.olderPending = false;
+          this.notify();
+        }
+      })();
+    }
+    return void 0;
   }
   /** The task whose thread starts at `root`, if its channel's board was read. */
   byRoot(channel, root) {
@@ -2925,11 +2953,39 @@ function SourceLine(props) {
   const parts = [props.ticket ? `${sourceName(source.kind)} ${props.ticket}` : sourceName(source.kind), source.from, source.where && !/^https?:/.test(source.where) ? source.where : void 0, source.when && shortWhen(source.when)].filter(Boolean);
   return /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", style: { minWidth: 0, ...clamp(1) } }, /* @__PURE__ */ React.createElement("span", { title: parts.join(" \xB7 ") }, parts.join(" \xB7 ")));
 }
+function FoldedTask(props) {
+  const button = React.useRef(null);
+  React.useEffect(() => void (props.focus && button.current?.focus()), []);
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      ref: button,
+      type: "button",
+      onClick: props.onShow,
+      "aria-expanded": false,
+      title: `Task ${props.id} was dismissed: ${props.title}. Show its card.`,
+      style: { display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, margin: 0, padding: "2px 0", border: 0, borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--dbx-tertiary)", fontFamily: "inherit", fontSize: "0.75rem", lineHeight: "18px", textAlign: "left" }
+    },
+    /* @__PURE__ */ React.createElement(StatusIcon, { status: "dismissed", size: 11 }),
+    /* @__PURE__ */ React.createElement("span", { style: { flex: "none" } }, "Dismissed"),
+    /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { flex: "none" } }, "\xB7"),
+    /* @__PURE__ */ React.createElement("span", { style: { flex: "0 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, props.title),
+    /* @__PURE__ */ React.createElement("span", { style: { flex: "none", marginLeft: "auto", paddingLeft: 8, textDecoration: "underline dotted" } }, "Show")
+  ));
+}
 function TaskPostCard(props) {
   const { message, live } = props;
   const post = React.useMemo(() => parseTaskPost(message.content), [message.content]);
   const item = useLiveTask(live, message.channelId, { ...post && { id: post.id } });
   const [full, setFull] = React.useState(false);
+  const [unfolded, setUnfolded] = React.useState(false);
+  const moved = React.useRef(void 0);
+  const card = React.useRef(null);
+  React.useEffect(() => {
+    const want = moved.current;
+    moved.current = void 0;
+    if (unfolded && want === "fold") card.current?.querySelector('button[aria-label="Fold"]')?.focus();
+  }, [unfolded]);
   const latest = item?.activity?.text ?? "";
   const mentioned = React.useMemo(() => mentionedNpubs(`${message.content}
 ${latest}`).map(npubKey).filter((key) => Boolean(key)), [message.content, latest]);
@@ -2937,17 +2993,20 @@ ${latest}`).map(npubKey).filter((key) => Boolean(key)), [message.content, latest
   const profile = useProfiles(props.ctx, [...mentioned, ...assignee && (assignee.kind === "agent" || assignee.kind === "person") ? [assignee.key] : []]);
   if (!post) return null;
   const target = taskTarget(message.channelId, post.id);
-  const question = item ? item.task.question && !closed(item) ? item.task.question : void 0 : post.question;
   const options = item ? item.task.options ?? [] : post.options;
-  const status2 = item?.task.status;
+  const status2 = item?.task.status ?? live.olderStatus(message.channelId, post.id);
+  const weight = postWeight(status2);
+  const question = item ? item.task.question && !closed(item) ? item.task.question : void 0 : weight === "full" ? post.question : void 0;
+  const details = weight === "full" || weight === "folded" && unfolded;
   const source = post.source;
   const origin = postOrigin(source, item?.origin);
   const ticket = taskOrigin(post.title, origin).ref;
   const open = () => props.canOpen(target) && props.open(target) || props.openBoard(message.channelId);
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement("div", { className: "dbx-card", style: { padding: "10px 12px", borderRadius: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true, style: { minWidth: 0 } }, status2 ? /* @__PURE__ */ React.createElement(StatusIcon, { status: status2 }) : /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "Task ", post.id), status2 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: status2 === "waiting" ? "warning" : status2 === "done" ? "success" : "subtle", weight: 500 }, statusTitle(status2)), post.workstream && /* @__PURE__ */ React.createElement(Chip2, { title: item && item.task.workstream === post.workstream ? workstreamHint(item.task) : post.workstream }, post.workstream), post.initiative && /* @__PURE__ */ React.createElement(Chip2, null, post.initiative), post.mode && post.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip2, { title: MODE_TITLE[post.mode], ...post.mode === "auto" && { tone: "success" } }, post.mode)), assignee && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none", maxWidth: "40%" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, assignee.kind === "you" ? "Waiting on you" : assigneeName(assignee, profile)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { size: "md", weight: 600, style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: titleHint(post.title, origin) }, post.title)), /* @__PURE__ */ React.createElement(SourceLine, { source, ...ticket && { ticket } })), source?.quote && /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(3) } }, source.quote)), source && source.facts.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 } }, source.facts.map((fact) => /* @__PURE__ */ React.createElement(Text, { key: fact.label, size: "xs", tone: "subtle", style: { whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, fact.label), " ", fact.value))), question && /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, id: post.id, question, options, ...item && { item } }), item?.activity && !question && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, item.activity.kind === "agent_reply" ? "Agent" : "Latest", " \xB7 ", ago(item.activity.at * 1e3), " \xB7 "), (() => {
+  if (weight === "folded" && !unfolded) return /* @__PURE__ */ React.createElement(FoldedTask, { id: post.id, title: post.title, focus: moved.current === "show", onShow: () => (moved.current = "fold", setUnfolded(true)) });
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { minWidth: 0, maxWidth: 620 } }, /* @__PURE__ */ React.createElement("div", { ref: card, className: "dbx-card", style: { padding: "10px 12px", borderRadius: 8, minWidth: 0 } }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8, align: "center", justify: "space-between" }, /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true, style: { minWidth: 0 } }, status2 ? /* @__PURE__ */ React.createElement(StatusIcon, { status: status2 }) : /* @__PURE__ */ React.createElement("span", { "aria-hidden": true, style: { width: 13, height: 13, borderRadius: 999, border: "1.5px solid var(--dbx-border-strong)", flex: "none" } }), /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary", mono: true }, "Task ", post.id), status2 && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: status2 === "waiting" ? "warning" : status2 === "done" ? "success" : "subtle", weight: 500 }, statusTitle(status2)), post.workstream && /* @__PURE__ */ React.createElement(Chip2, { title: item && item.task.workstream === post.workstream ? workstreamHint(item.task) : post.workstream }, post.workstream), post.initiative && /* @__PURE__ */ React.createElement(Chip2, null, post.initiative), post.mode && post.mode !== "draft" && /* @__PURE__ */ React.createElement(Chip2, { title: MODE_TITLE[post.mode], ...post.mode === "auto" && { tone: "success" } }, post.mode)), assignee && /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", style: { flex: "none", maxWidth: "40%" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, assignee.kind === "you" ? "Waiting on you" : assigneeName(assignee, profile)), /* @__PURE__ */ React.createElement(AssigneeMark, { assignee, profile, size: 18 }))), /* @__PURE__ */ React.createElement(Stack, { gap: 2 }, /* @__PURE__ */ React.createElement(Text, { size: "md", weight: 600, style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { title: titleHint(post.title, origin) }, post.title)), /* @__PURE__ */ React.createElement(SourceLine, { source, ...ticket && { ticket } })), source?.quote && details && /* @__PURE__ */ React.createElement("div", { style: { borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 } }, /* @__PURE__ */ React.createElement(Text, { size: "sm", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(3) } }, source.quote)), source && source.facts.length > 0 && details && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 } }, source.facts.map((fact) => /* @__PURE__ */ React.createElement(Text, { key: fact.label, size: "xs", tone: "subtle", style: { whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, fact.label), " ", fact.value))), question && /* @__PURE__ */ React.createElement(Answer, { live, channel: message.channelId, id: post.id, question, options, ...item && { item } }), item?.activity && !question && /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", style: { overflowWrap: "anywhere", ...clamp(2) } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--dbx-tertiary)" } }, item.activity.kind === "agent_reply" ? "Agent" : "Latest", " \xB7 ", ago(item.activity.at * 1e3), " \xB7 "), (() => {
     const line2 = plainLine(item.activity.text, (npub) => profile(npubKey(npub) ?? "")?.name);
     return /* @__PURE__ */ React.createElement("span", { title: line2 }, line2);
-  })()), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "primary", onClick: open, title: "Its details, what's been made for it and its thread" }, "Open task"), source?.url && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => openExternal(source.url), title: source.url }, "View source \u2197"), /* @__PURE__ */ React.createElement("span", { style: { flex: "1 1 auto" } }), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setFull(!full), title: "The whole message, as agents read it" }, full ? "Hide full post" : "Full post")), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile }))));
+  })()), /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 6, align: "center", wrap: true }, /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: weight === "full" ? "primary" : "default", onClick: open, title: "Its details, what's been made for it and its thread" }, "Open task"), source?.url && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => openExternal(source.url), title: source.url }, "View source \u2197"), /* @__PURE__ */ React.createElement("span", { style: { flex: "1 1 auto" } }), weight === "folded" && /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", "aria-label": "Fold", onClick: () => (moved.current = "show", setUnfolded(false), setFull(false)), title: "Back to one line: it was dismissed, so there's nothing to do" }, "Fold"), /* @__PURE__ */ React.createElement(Button, { size: "sm", variant: "ghost", onClick: () => setFull(!full), title: "The whole message, as agents read it" }, full ? "Hide full post" : "Full post")), full && /* @__PURE__ */ React.createElement(FullPost, { ctx: props.ctx, content: message.content, profile }))));
 }
 var LINE_ICON = { update: "\u21BB", done: "\u2713", nudge: "\u23F1", answered: "\u21B3", status: "\u25CF", assigned: "\u{1F464}", asked: "\u2192" };
 function ThreadPostCard(props) {

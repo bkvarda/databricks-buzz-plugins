@@ -1,5 +1,7 @@
 // Cards for the hub's posts in a channel. A new task shows as a compact card:
 // where it's at, who has it, what it came from and the one thing to do next.
+// A done task drops the source's quote and details; a dismissed one folds to
+// one quiet line that opens the card again (see postWeight).
 // What the hub wrote for agents (their brief, the full source) is folded
 // under "Full post". In a task's thread, the hub's updates are one quiet line
 // each, and a question is a card you answer with one click. Agents still read
@@ -9,7 +11,7 @@ import { React } from "@dbx/core/react";
 import { describeError } from "@dbx/core/service";
 import { ago, Button, DbxRoot, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { Markdown } from "@dbx/core/ui/markdown";
-import { assigneeOf, postOrigin, STATUS_GROUPS, taskOrigin, titleHint, withMentionNames, workstreamHint } from "./board-view";
+import { assigneeOf, postOrigin, postWeight, STATUS_GROUPS, taskOrigin, titleHint, withMentionNames, workstreamHint } from "./board-view";
 import { AssigneeMark, assigneeName, npubKey, type Profile, StatusIcon, useProfiles } from "./board-panel";
 import type { BoardTask } from "./client";
 import type { LiveTasks } from "./live-tasks";
@@ -141,29 +143,77 @@ function SourceLine(props: { source: TaskPost["source"]; ticket?: string }) {
   );
 }
 
+/**
+ * A dismissed task, as one quiet line: what it was, and a way back to its
+ * card. Muted like the board's Dismissed group, so the channel's open work
+ * stands out.
+ */
+function FoldedTask(props: { id: number; title: string; onShow(): void; focus?: boolean }) {
+  const button = React.useRef<HTMLButtonElement>(null);
+  // Back from Fold: the keyboard stays where it was.
+  React.useEffect(() => void (props.focus && button.current?.focus()), []);
+  return (
+    <DbxRoot style={{ minWidth: 0, maxWidth: 620 }}>
+      <button
+        ref={button}
+        type="button"
+        onClick={props.onShow}
+        aria-expanded={false}
+        title={`Task ${props.id} was dismissed: ${props.title}. Show its card.`}
+        style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, margin: 0, padding: "2px 0", border: 0, borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--dbx-tertiary)", fontFamily: "inherit", fontSize: "0.75rem", lineHeight: "18px", textAlign: "left" }}
+      >
+        <StatusIcon status="dismissed" size={11} />
+        <span style={{ flex: "none" }}>Dismissed</span>
+        <span aria-hidden style={{ flex: "none" }}>·</span>
+        <span style={{ flex: "0 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{props.title}</span>
+        <span style={{ flex: "none", marginLeft: "auto", paddingLeft: 8, textDecoration: "underline dotted" }}>Show</span>
+      </button>
+    </DbxRoot>
+  );
+}
+
 /** A new task, as a card. */
 export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; message: PostMessage; openBoard(channel: string): void }) {
   const { message, live } = props;
   const post = React.useMemo(() => parseTaskPost(message.content), [message.content]);
   const item = useLiveTask(live, message.channelId, { ...(post && { id: post.id }) });
   const [full, setFull] = React.useState(false);
+  // A dismissed task's card, opened from its folded line.
+  const [unfolded, setUnfolded] = React.useState(false);
+  // Where the keyboard goes after Show (Fold) or Fold (back to Show); not on the first render.
+  const moved = React.useRef<"show" | "fold" | undefined>(undefined);
+  const card = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    // One move per Show or Fold: a later fold (a refresh that dismisses it again) leaves focus where it is.
+    // The folded line's own effect, which runs first, has already used "show".
+    const want = moved.current;
+    moved.current = undefined;
+    if (unfolded && want === "fold") card.current?.querySelector<HTMLButtonElement>('button[aria-label="Fold"]')?.focus();
+  }, [unfolded]);
   const latest = item?.activity?.text ?? "";
   const mentioned = React.useMemo(() => mentionedNpubs(`${message.content}\n${latest}`).map(npubKey).filter((key): key is string => Boolean(key)), [message.content, latest]);
   const assignee = item && assigneeOf(item);
   const profile = useProfiles(props.ctx, [...mentioned, ...(assignee && (assignee.kind === "agent" || assignee.kind === "person") ? [assignee.key] : [])]);
   if (!post) return null;
   const target = taskTarget(message.channelId, post.id);
-  const question = item ? (item.task.question && !closed(item) ? item.task.question : undefined) : post.question;
+
   const options = item ? (item.task.options ?? []) : post.options;
-  const status = item?.task.status;
+  // A task that closed before the board's window isn't on it: its status is looked up on its own.
+  const status = item?.task.status ?? live.olderStatus(message.channelId, post.id);
+  const weight = postWeight(status);
+  // A closed task asks nothing, even when its post did (and the board no longer has it).
+  const question = item ? (item.task.question && !closed(item) ? item.task.question : undefined) : weight === "full" ? post.question : undefined;
+  // Opened from its folded line, a dismissed task shows its whole card.
+  const details = weight === "full" || (weight === "folded" && unfolded);
   const source = post.source;
   // The source the task opened from, whose own title and key a short title or the rule's template may hide.
   const origin = postOrigin(source, item?.origin);
   const ticket = taskOrigin(post.title, origin).ref;
   const open = () => (props.canOpen(target) && props.open(target)) || props.openBoard(message.channelId);
+  if (weight === "folded" && !unfolded) return <FoldedTask id={post.id} title={post.title} focus={moved.current === "show"} onShow={() => ((moved.current = "fold"), setUnfolded(true))} />;
   return (
     <DbxRoot style={{ minWidth: 0, maxWidth: 620 }}>
-      <div className="dbx-card" style={{ padding: "10px 12px", borderRadius: 8, minWidth: 0 }}>
+      <div ref={card} className="dbx-card" style={{ padding: "10px 12px", borderRadius: 8, minWidth: 0 }}>
         <Stack gap={8}>
           <Stack direction="row" gap={8} align="center" justify="space-between">
             <Stack direction="row" gap={6} align="center" wrap style={{ minWidth: 0 }}>
@@ -187,12 +237,12 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
             </Text>
             <SourceLine source={source} {...(ticket && { ticket })} />
           </Stack>
-          {source?.quote && (
+          {source?.quote && details && (
             <div style={{ borderLeft: "2px solid var(--dbx-border-strong)", paddingLeft: 8 }}>
               <Text size="sm" tone="subtle" style={{ overflowWrap: "anywhere", ...clamp(3) }}>{source.quote}</Text>
             </div>
           )}
-          {source && source.facts.length > 0 && (
+          {source && source.facts.length > 0 && details && (
             <div style={{ display: "flex", flexWrap: "wrap", columnGap: 14, rowGap: 2 }}>
               {source.facts.map((fact) => (
                 <Text key={fact.label} size="xs" tone="subtle" style={{ whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -212,9 +262,11 @@ export function TaskPostCard(props: Opener & { ctx: Context; live: LiveTasks; me
             </Text>
           )}
           <Stack direction="row" gap={6} align="center" wrap>
-            <Button size="sm" variant="primary" onClick={open} title="Its details, what's been made for it and its thread">Open task</Button>
+            {/* A closed task has nothing to do, so opening it isn't the card's one action. */}
+            <Button size="sm" variant={weight === "full" ? "primary" : "default"} onClick={open} title="Its details, what's been made for it and its thread">Open task</Button>
             {source?.url && <Button size="sm" variant="ghost" onClick={() => openExternal(source.url!)} title={source.url}>View source ↗</Button>}
             <span style={{ flex: "1 1 auto" }} />
+            {weight === "folded" && <Button size="sm" variant="ghost" aria-label="Fold" onClick={() => ((moved.current = "show"), setUnfolded(false), setFull(false))} title="Back to one line: it was dismissed, so there's nothing to do">Fold</Button>}
             <Button size="sm" variant="ghost" onClick={() => setFull(!full)} title="The whole message, as agents read it">{full ? "Hide full post" : "Full post"}</Button>
           </Stack>
           {full && <FullPost ctx={props.ctx} content={message.content} profile={profile} />}
