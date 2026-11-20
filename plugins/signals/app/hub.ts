@@ -99,7 +99,7 @@ export type Onboarding = Readonly<{
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered", "/api/onboard"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered", "/api/onboard", "/api/retitle"] as const;
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
@@ -233,6 +233,18 @@ export class Hub {
         case "GET /api/config":
           // The rules as saved; accounts teams set up are under /api/accounts.
           return { json: { config: (await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, canEdit: this.isAdmin(user) } };
+        case "POST /api/retitle": {
+          // Titles and files open tasks again as their rules now would (see SignalsStore.retitle). A dry run unless dry_run is false.
+          if (!this.isAdmin(user)) return bad("Only the hub's admins can retitle tasks.", 403);
+          const input = await body();
+          if (input.dry_run !== undefined && typeof input.dry_run !== "boolean") return bad("dry_run is true or false.");
+          if (input.ids !== undefined && (!Array.isArray(input.ids) || !input.ids.every((id) => Number.isInteger(id) && id > 0) || input.ids.length > 500)) return bad("ids are at most 500 task ids.");
+          if (input.limit !== undefined && (!Number.isInteger(input.limit) || (input.limit as number) < 1)) return bad("limit is a positive number.");
+          const dryRun = input.dry_run !== false;
+          const result = await this.store.retitle(await this.config(), user, { dryRun, ...(input.ids !== undefined && { ids: input.ids as number[] }), ...(input.limit !== undefined && { limit: input.limit as number }) });
+          if (!dryRun) this.log(`${user} retitled ${result.changed.length} tasks`);
+          return { json: { dry_run: dryRun, ...result } };
+        }
         case "POST /api/config": {
           if (!this.isAdmin(user)) return bad("Only the hub's admins can change its rules.", 403);
           const input = await body();

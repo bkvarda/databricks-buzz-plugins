@@ -58,6 +58,10 @@ export type Task = Readonly<{
 }>;
 
 export type FiledBy = "rule" | "match" | "classifier";
+
+/** A task retitle titled or filed again (see SignalsStore.retitle): as it is now, and as it was. `applied`: written (false for a dry run). */
+export type RetitleChange = Readonly<{ id: number; title: string; was: string; rule: string; was_rule: string; workstream: string | null; was_workstream: string | null; mode: Mode; was_mode: Mode; source_title?: string; filed_by: FiledBy | null; applied: boolean }>;
+export type RetitleResult = Readonly<{ changed: RetitleChange[]; skipped: { id: number; reason: string }[]; unchanged: number }>;
 const FILED_BY: readonly FiledBy[] = ["rule", "match", "classifier"];
 
 /** A recurring series and what the team said about it. */
@@ -855,7 +859,12 @@ export class SignalsStore {
     // Another person's copy of it (the same mail in their mailbox) has a task: this group joins it.
     const copy = decision.same ? await this.copyTask(decision.same) : undefined;
     if (copy) {
-      await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [decision.group, copy.id, now()]);
+      // The group's link, or the task that claimed it first (a retitle moving its task to this group, say): its events go there.
+      const joined = await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING RETURNING 1`, [decision.group, copy.id, now()]);
+      if (!joined.rows[0]) {
+        const owned = await this.taskByGroup(decision.group, { link: false });
+        if (owned && owned.id !== copy.id) return { task: owned, opened: false, create: createFor(owned), rule };
+      }
       await this.activity(copy.id, "signals", "joined", `${owner}'s copy joined it (${event.source}).`);
       return { task: copy, opened: false, create: createFor(copy), rule };
     }
@@ -870,6 +879,8 @@ export class SignalsStore {
     }
     const placed = await this.placeNew(owner, event, recorded, decision, classifier, filtered);
     if (placed && decision.same) await this.copyOf(decision.same, placed.task.id);
+    // The group's task came first (another ingest's, or a retitle's move to it): this event updates it, as one found would.
+    if (placed && !placed.opened) return { ...placed, create: createFor(placed.task) };
     return placed;
   }
 
@@ -1147,7 +1158,7 @@ export class SignalsStore {
     const input = { rule: decision.rule.id, group: decision.group, title, source_title: sourceTitle(event, title), filed, title_event: recorded.id, origin_title: event.title ?? undefined, account: decision.account?.name, channel: decision.channel, workstream, mode, by: owner, at: toSeconds(event.occurred_at), latest };
     const open = async (task: Parameters<SignalsStore["openTask"]>[0]) => {
       const opened = await this.openTask(task);
-      return opened && { task: opened, opened: true, create: true, rule };
+      return opened && { task: opened.task, opened: opened.inserted, create: true, rule };
     };
     if (!decision.series) return open(input);
     const series = await this.seriesFor(decision.series);
@@ -1160,12 +1171,13 @@ export class SignalsStore {
     // A new (or undecided) series: this task asks the team, in ask mode so no agent starts on it yet.
     const asking = await this.openTask({ ...input, mode: "ask", series: decision.series });
     if (!asking) return undefined;
+    if (!asking.inserted) return { task: asking.task, opened: false, create: true, rule };
     await this.q(
       `INSERT INTO $S.series (key, rule_id, account, title, asked_task, mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (key) DO UPDATE SET asked_task = EXCLUDED.asked_task, title = EXCLUDED.title, mode = EXCLUDED.mode`,
-      [decision.series, decision.rule.id, decision.account?.name ?? null, title, asking.id, decision.mode, now()],
+      [decision.series, decision.rule.id, decision.account?.name ?? null, title, asking.task.id, decision.mode, now()],
     );
-    return { task: (await this.setQuestion(asking.id, SERIES_ASKER, { question: seriesQuestion(title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
+    return { task: (await this.setQuestion(asking.task.id, SERIES_ASKER, { question: seriesQuestion(title), options: SERIES_OPTIONS, by: SERIES_ASKER }))!, opened: true, create: true, rule };
   }
 
   /**
@@ -1173,21 +1185,23 @@ export class SignalsStore {
    * statement that opens it (the event's row locked to share, so a newer version being recorded waits for it, and one
    * recorded first fails the check): none is opened for a version a newer one has replaced.
    */
-  private async openTask(input: { rule: string; group: string; title: string; source_title?: string; filed?: { by: FiledBy; score?: number }; title_event?: number; origin_title?: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string; latest?: { event: number; version: number; revisions?: boolean } }): Promise<Task | undefined> {
+  private async openTask(input: { rule: string; group: string; title: string; source_title?: string; filed?: { by: FiledBy; score?: number }; title_event?: number; origin_title?: string; account?: string; channel?: string; workstream?: string; mode: Mode; by: string; at: number; series?: string; latest?: { event: number; version: number; revisions?: boolean } }): Promise<{ task: Task; inserted: boolean } | undefined> {
     const at = now();
     const found = await this.q(
       `INSERT INTO $S.tasks (rule_id, group_key, title, account, channel, workstream, mode, created_by, created_at, updated_at, last_event_at, series, source_title, filed_by, filed_score, title_event, origin_title)
        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $15, $16, $17::real, $18::bigint, $19
        WHERE $12::bigint IS NULL OR (EXISTS (SELECT 1 FROM $S.events WHERE id = $12::bigint AND versions = $13::integer FOR SHARE)
          AND (NOT $14::boolean OR ${LATEST_REVISION(12)}))
-       ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *`,
+       ON CONFLICT (group_key) DO UPDATE SET updated_at = $S.tasks.updated_at RETURNING *, (xmax = 0) AS inserted`,
       [input.rule, input.group, input.title, input.account ?? null, input.channel ?? null, input.workstream ?? null, input.mode, input.by, at, Number.isNaN(input.at) ? at : input.at, input.series ?? null, input.latest?.event ?? null, input.latest?.version ?? null, input.latest?.revisions ?? false,
         input.source_title ?? null, input.filed?.by ?? null, input.filed?.score ?? null, input.title_event ?? null, input.title_event === undefined ? null : input.origin_title ?? null],
     );
     if (!found.rows[0]) return undefined;
     const task = toTask(found.rows[0]);
-    await this.activity(task.id, "signals", "opened", openedText(input));
-    return task;
+    // (A task another statement opened for the group first, or a retitle moved to it: it's that task's, found, not opened here.)
+    const inserted = Boolean(found.rows[0].inserted);
+    if (inserted) await this.activity(task.id, "signals", "opened", openedText(input));
+    return { task, inserted };
   }
 
   /**
@@ -1479,6 +1493,118 @@ export class SignalsStore {
   }
 
   /**
+   * Titles and files open tasks again as their rules now would open them (see Hub's POST /api/retitle): for a rule, a category or
+   * a short title added after the task opened. Each task's event is the one it opened with (title_event; for a task opened before
+   * that was kept, its first event), as it reads now. The rule that would open a task for it now, the category its `when` or the
+   * categorizer picks, the team's mode for that, and the title (shortened by the titler when the rule asks; a task already shortened
+   * keeps its title when the titler fails now). A task someone filed under a workstream by hand keeps it (and its mode, unless it's
+   * one of the new rule's categories). One moved to another rule takes that rule's group for its event as its own (its old group
+   * linked to it), so the event's next version comes to it either way. Left alone: tasks asking about a series, fan-out candidates, action items, meeting notes rules, and a
+   * task whose new group another task already has. With `dryRun`, nothing is written: it says what would change. Each change is
+   * written only while the task still reads as it did (title, rule, group, workstream and mode)
+   * and its event is at the version read, and only once it holds the new group in group_links (where ingest's joins claim one
+   * too), with its activity, in one statement. A dry run's lookups link nothing.
+   */
+  async retitle(config: SignalsConfig, actor: string, options: Readonly<{ dryRun: boolean; ids?: readonly number[]; limit?: number }>): Promise<RetitleResult> {
+    const limit = Math.min(Math.max(Math.floor(options.limit ?? 200), 1), 500);
+    const found = await this.q(
+      `SELECT t.*, e.id AS ev_id, e.owner AS ev_owner, e.source AS ev_source, e.external_id AS ev_external_id, e.occurred_at AS ev_occurred_at, e.title AS ev_title,
+         e.url AS ev_url, e.actor AS ev_actor, e.account AS ev_account, e.payload AS ev_payload, e.group_key AS ev_group_key, e.versions AS ev_versions,
+         (t.workstream_by IS NOT NULL OR EXISTS (SELECT 1 FROM $S.activities a WHERE a.task_id = t.id AND a.kind = 'workstream')) AS by_hand
+       FROM $S.tasks t LEFT JOIN $S.events e ON e.id = COALESCE(t.title_event, (SELECT te.event_id FROM $S.task_events te WHERE te.task_id = t.id ORDER BY te.at, te.event_id LIMIT 1), t.latest_event)
+       WHERE t.status NOT IN ('done', 'dismissed') ${options.ids ? "AND t.id = ANY($1::bigint[])" : ""} ORDER BY t.id LIMIT ${limit}`,
+      options.ids ? [options.ids] : [],
+    );
+    const result: { changed: RetitleChange[]; skipped: { id: number; reason: string }[]; unchanged: number } = { changed: [], skipped: [], unchanged: 0 };
+    for (const row of found.rows) {
+      const task = toTask(row);
+      const skip = (reason: string) => void result.skipped.push({ id: task.id, reason });
+      const current = config.rules.find((rule) => rule.id === task.rule_id);
+      if (task.rule_id.includes("/")) { skip("an action item from a meeting's notes"); continue; }
+      if (task.series) { skip("part of a recurring series"); continue; }
+      if (current?.fan_out || task.verdict) { skip("a fan-out candidate"); continue; }
+      if (current?.meeting_task || current?.action_items) { skip("its rule takes a meeting's notes"); continue; }
+      if (row.ev_id === null || row.ev_id === undefined) { skip("it has no event"); continue; }
+      const event: EventInput = { ...toEvent({ source: row.ev_source, external_id: row.ev_external_id, occurred_at: row.ev_occurred_at, title: row.ev_title, url: row.ev_url, actor: row.ev_actor, account: row.ev_account, payload: row.ev_payload }), ...(row.ev_group_key ? { group_key: String(row.ev_group_key) } : {}) };
+      const decision = decide(config, event, { firstRun: false, owner: String(row.ev_owner) });
+      if (decision.kind === "none") { skip(`no rule opens a task for its event now (${decision.reason})`); continue; }
+      const rule = decision.rule;
+      if (rule.action !== "task") { skip(`rule ${rule.id} only updates tasks`); continue; }
+      if (rule.meeting_task || rule.action_items || rule.series) { skip(`rule ${rule.id} isn't one retitle moves tasks to`); continue; }
+      if (decision.group !== task.group_key) {
+        // (Looked up without linking anything: a dry run writes nothing, and the write below checks again.)
+        const other = await this.taskByGroup(decision.group, { link: false });
+        if (other && other.id !== task.id) { skip(`task ${other.id} already has rule ${rule.id}'s group for its event`); continue; }
+      }
+      const preferences = config.accounts?.find((one) => task.account && namesAccount(one, task.account.toLowerCase()))?.preferences;
+      let category = categoryByWhen(rule, event);
+      let filed: { by: FiledBy; score?: number } = { by: category ? "match" : "rule" };
+      if (!category) {
+        const picked = await this.category(event, rule);
+        if (picked) {
+          category = picked.category;
+          filed = { by: "classifier", ...(picked.score !== undefined && { score: picked.score }) };
+        }
+      }
+      const byHand = Boolean(row.by_hand);
+      const kept = byHand ? categoryNamed(rule, task.workstream) : undefined;
+      const workstream = byHand ? task.workstream : (category?.workstream.trim() ?? rule.workstream ?? null);
+      const mode: Mode = byHand ? (kept ? categoryModeFor(preferences, rule, kept.workstream) : task.mode) : categoryModeFor(preferences, rule, category?.workstream);
+      if (mode === "off") { skip(`the team turned ${workstream ?? rule.id} off`); continue; }
+      const short = rule.summarize_title && !category?.title ? await this.shortened(event) : undefined;
+      // (Shortened before, and the titler can't now: it keeps the short title it has.)
+      const keep = rule.summarize_title && !category?.title && !short && Boolean(task.source_title);
+      const title = keep ? task.title : taskTitle(rule, event, category, short);
+      const source_title = keep ? (task.source_title ?? undefined) : sourceTitle(event, title);
+      if (title === task.title && rule.id === task.rule_id && workstream === task.workstream && mode === task.mode) { result.unchanged++; continue; }
+      const change: RetitleChange = { id: task.id, title, was: task.title, rule: rule.id, was_rule: task.rule_id, workstream, was_workstream: task.workstream, mode, was_mode: task.mode,
+        ...(source_title && { source_title }), filed_by: byHand ? (task.filed_by ?? null) : filed.by, applied: false };
+      if (options.dryRun) { result.changed.push(change); continue; }
+      const moves = [rule.id !== task.rule_id && `rule ${task.rule_id} → ${rule.id}`, workstream !== task.workstream && `workstream ${task.workstream ?? "none"} → ${workstream ?? "none"}`, mode !== task.mode && `mode ${task.mode} → ${mode}`].filter(Boolean);
+      const text = `Retitled by ${actor}${title !== task.title ? `: was "${clip(task.title, 300)}"` : ""}${moves.length ? ` (${moves.join(", ")})` : ""}.`;
+      // Only while it reads as it did (a filing, a move or a retitle meanwhile is left as it is), and, for a task this read as not
+      // filed by hand, still isn't; and while its event is at the version read (a newer one, withdrawn say, is that version's to place).
+      // The new group is claimed first, as a link to it in group_links, the table every alias writer inserts into: the task row
+      // locked and checked, then its event's (in that order, as attach takes them), then the link inserted, or kept when it's this task's already. A link another task has (an ingest's
+      // `same_as` join, committed first or waiting to) fails the claim, and nothing else is written; one written after this commits
+      // finds this link and is left out. The task then takes the group as its own group_key too (unique: a task an ingest opened
+      // for it meanwhile fails the statement), its old group linked to it, and its activity, all in the same statement.
+      let written: { rows: Row[] };
+      try {
+        written = await this.q(
+          `WITH lk AS (SELECT t.id FROM $S.tasks t
+             WHERE t.id = $1 AND t.group_key = $20 AND t.title = $13 AND t.rule_id = $14 AND t.workstream IS NOT DISTINCT FROM $15::text AND t.mode = $16 AND t.status NOT IN ('done', 'dismissed')
+               AND ($7::boolean OR (t.workstream_by IS NULL AND NOT EXISTS (SELECT 1 FROM $S.activities WHERE task_id = $1 AND kind = 'workstream')))
+             FOR UPDATE OF t),
+           -- (The event's row locked only after the task's, joined to it, as attach locks them: the other order deadlocks with it.)
+           ev AS (SELECT lk.id FROM lk JOIN $S.events e ON e.id = $10::bigint AND e.versions = $21::integer FOR SHARE OF e),
+           claim AS (INSERT INTO $S.group_links (group_key, task_id, at)
+             SELECT $17, id, $12 FROM ev
+             ON CONFLICT (group_key) DO UPDATE SET at = $S.group_links.at WHERE $S.group_links.task_id = EXCLUDED.task_id
+             RETURNING task_id),
+           u AS (UPDATE $S.tasks SET title = $2, source_title = $3, rule_id = $4, workstream = $5, mode = $6,
+             filed_by = CASE WHEN $7::boolean THEN filed_by ELSE $8 END, filed_score = CASE WHEN $7::boolean THEN filed_score ELSE $9::real END,
+             origin_title = CASE WHEN title_event IS NULL THEN $11 ELSE origin_title END, title_event = COALESCE(title_event, $10::bigint), updated_at = $12, group_key = $17
+           WHERE id = $1 AND EXISTS (SELECT 1 FROM claim)
+           RETURNING *),
+           l AS (INSERT INTO $S.group_links (group_key, task_id, at) SELECT $20, id, $12 FROM u WHERE $20 <> $17 ON CONFLICT (group_key) DO NOTHING RETURNING 1),
+           a AS (INSERT INTO $S.activities (task_id, at, actor, kind, text) SELECT id, $12, $18, 'retitle', $19 FROM u RETURNING 1)
+           SELECT * FROM u`,
+          [task.id, title, source_title ?? null, rule.id, workstream, mode, byHand, filed.by, filed.score ?? null, Number(row.ev_id), event.title ?? null, now(),
+            task.title, task.rule_id, task.workstream, task.mode, decision.group, actor, text.slice(0, 4000), task.group_key, Number(row.ev_versions)],
+        );
+      } catch (error) {
+        if ((error as { code?: unknown }).code !== "23505") throw error;
+        skip(`another task took rule ${rule.id}'s group for its event while it was being retitled`);
+        continue;
+      }
+      if (written.rows[0]) result.changed.push({ ...change, applied: true });
+      else skip("it changed while it was being retitled");
+    }
+    return result;
+  }
+
+  /**
    * Adds an event to a task. One that isn't a team reply (`customer`) raises
    * the task's newest customer time; with `reopen`, a finished task opens
    * again unless a team reply decided on it came at or after the event (that
@@ -1575,12 +1701,12 @@ export class SignalsStore {
   }
 
   /** The task a group's events go to: the one it opened, or the one it joined as a copy of another person's. */
-  async taskByGroup(group: string): Promise<Task | undefined> {
+  async taskByGroup(group: string, options: Readonly<{ link?: boolean }> = {}): Promise<Task | undefined> {
     const found = await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [group]);
     if (found.rows[0]) return toTask(found.rows[0]);
     const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
     if (linked.rows[0]) return toTask(linked.rows[0]);
-    return this.legacySlackTask(group);
+    return this.legacySlackTask(group, options.link ?? true);
   }
 
   /**
@@ -1594,7 +1720,7 @@ export class SignalsStore {
    * every Slack message on it names this thread: a task that mixed threads
    * (two in one second), or has a message without a permalink, is left alone.
    */
-  private async legacySlackTask(group: string): Promise<Task | undefined> {
+  private async legacySlackTask(group: string, link = true): Promise<Task | undefined> {
     const key = /^(.*)\|([A-Z0-9]+):(\d{10})\.(\d{6})$/i.exec(group);
     if (!key) return undefined;
     const [, rule, channel, seconds, micros] = key as unknown as [string, string, string, string, string];
@@ -1618,6 +1744,8 @@ export class SignalsStore {
       if (threads.size === 1 && threads.has(thread)) found.push(task);
     }
     if (found.length !== 1) return undefined;
+    // (Without link: the task it would link, with nothing written.)
+    if (!link) return found[0];
     await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [group, found[0]!.id, now()]);
     const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
     return linked.rows[0] ? toTask(linked.rows[0]) : undefined;
