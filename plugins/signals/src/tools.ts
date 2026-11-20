@@ -2,7 +2,7 @@
 // They run as the owner (their Databricks sign-in), so the hub knows who acted.
 import { type AgentTool, numberArg, schema, stringArg } from "@dbx/core/host-types";
 import type { DatabricksService } from "@dbx/core/service";
-import { capitalized, MODES, playbookFor, TASK_STATUSES } from "../app/model";
+import { actionsFor, actionsText, capitalized, MODES, playbookFor, TASK_STATUSES } from "../app/model";
 import type { Task } from "../app/store";
 import { chosenHub, HubClient } from "./client";
 
@@ -121,6 +121,9 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           : names.length
             ? [`Playbooks: ${names.join(", ")}. Read the one for your task's workstream with workstream.`]
             : [];
+        // The workstream's default actions (Set up account): which to do when their triggers hold, and what happens otherwise.
+        const actions = workstream ? actionsFor(account.workstream_actions ?? {}, { rule_id: workstream, workstream }) : undefined;
+        const actionLines = actions ? [actionsText(actions)] : [];
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` · channel ${account.channel}` : ""}`,
           account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
@@ -134,6 +137,8 @@ export function signalsTools(service: DatabricksService): AgentTool[] {
           "",
           ...playbookText,
           ...(playbookText.length ? [""] : []),
+          ...actionLines,
+          ...(actionLines.length ? [""] : []),
           "Profile (what agents have learned; update it with signals_account_learn):",
           account.profile || "(empty)",
         ]

@@ -17,7 +17,7 @@ import { readFile } from "node:fs/promises";
 import { BuzzApp } from "../../agents/app/sdk";
 import { Lakebase } from "../../agents/app/index-store";
 import { splitMessage } from "../../agents/runner/buzz";
-import { chatTitler, jevCategorizer, jevClassifier, DEFAULT_CLASSIFIER_ENDPOINT, DEFAULT_TITLER_ENDPOINT } from "./classify";
+import { chatTitler, chatTriggerer, jevCategorizer, jevClassifier, DEFAULT_CLASSIFIER_ENDPOINT, DEFAULT_TITLER_ENDPOINT } from "./classify";
 import { Hub, HUB_PATHS, type Notifier, taskMessage } from "./hub";
 import { configProblems, type SignalsConfig } from "./model";
 import { schemaName, SignalsStore } from "./store";
@@ -88,10 +88,13 @@ async function prepare() {
     // Rules' summarize_title: short titles from a fast chat model (SIGNALS_TITLER names another endpoint, or "off").
     const titler = process.env.SIGNALS_TITLER?.trim() || DEFAULT_TITLER_ENDPOINT;
     if (titler !== "off") store.titler = chatTitler((path, init) => app.databricks.api(path, init), titler, log);
+    // Workstreams' default actions: which ticked triggers hold, from the same fast chat model unless SIGNALS_TRIGGERS names another ("off": a row's triggers are never checked, so its tasks go to agents as without one).
+    const triggers = process.env.SIGNALS_TRIGGERS?.trim() || DEFAULT_TITLER_ENDPOINT;
+    const triggerer = triggers === "off" ? undefined : chatTriggerer((path, init) => app.databricks.api(path, init), triggers, log);
     // Where people's poller jobs log in: this app's own database resource.
     const { LAKEBASE_ENDPOINT, PGHOST, PGDATABASE, PGPORT } = process.env;
     const lakebaseInfo = LAKEBASE_ENDPOINT && PGHOST && PGDATABASE ? { endpoint: LAKEBASE_ENDPOINT, host: PGHOST, database: PGDATABASE, ...(PGPORT && PGPORT !== "5432" && { port: Number(PGPORT) }) } : undefined;
-    hub = new Hub(store, notifier, { ...(lakebaseInfo && { lakebase: lakebaseInfo }), ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), ...(classifier && { classifier }), log });
+    hub = new Hub(store, notifier, { ...(lakebaseInfo && { lakebase: lakebaseInfo }), ...(admins.length && { admins }), ...(defaultConfig && { defaultConfig }), ...(classifier && { classifier }), ...(triggerer && { triggerer }), log });
     state.ready = true;
     state.setupError = undefined;
     state.stats = await store.stats();

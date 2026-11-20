@@ -1040,6 +1040,7 @@ function readWorkstreamActions(raw) {
       if (typeof id !== "string" || !ACTION_ID.test(id)) return `A ${name} action's id is 1-40 lowercase letters, digits and dashes.`;
       if (actions.some((other) => other.id === id)) return `${name} has the action ${id} twice.`;
       if (typeof label2 !== "string" || !label2.trim() || label2.trim().length > MAX_ACTION_LABEL) return `The ${name} action ${id} needs a label of 1-${MAX_ACTION_LABEL} characters.`;
+      if (label2.includes("\u2014")) return `The ${name} action ${id}'s label can't contain \u2014.`;
       if (always !== void 0 && always !== true && always !== false) return `The ${name} action ${id}: always is true or left out.`;
       if (trigger !== void 0 && typeof trigger !== "string") return `The ${name} action ${id}: trigger must be text.`;
       const text = typeof trigger === "string" ? trigger.trim() : "";
@@ -1052,6 +1053,25 @@ function readWorkstreamActions(raw) {
   }
   if (Object.keys(out).length > MAX_PLAYBOOKS) return `An account sets actions for at most ${MAX_PLAYBOOKS} workstreams.`;
   return out;
+}
+function actionsFor(rows, task) {
+  const entries = Object.entries(rows ?? {});
+  for (const wanted of [task.rule_id, task.workstream ?? void 0]) {
+    const lower = wanted?.trim().toLowerCase();
+    const found = lower && entries.find(([key]) => key.trim().toLowerCase() === lower);
+    if (found) return { key: found[0], row: found[1] };
+  }
+  return void 0;
+}
+function actionsText(found) {
+  const { key, row } = found;
+  const watch = row.watch.map((action) => `- ${action.label}: ${action.always ? "always" : action.trigger}`);
+  const otherwise = row.otherwise === "dismiss" ? "the task is dismissed" : "the task stays open, with no agent asked";
+  return [
+    `Default actions for ${key} (do each one whose trigger holds, under the mode; the hub says which it found):`,
+    ...watch.length ? watch : ["- none ticked"],
+    `Otherwise (none holds): ${otherwise}.`
+  ].join("\n");
 }
 var DEFAULT_WORKSTREAM_ACTIONS = [
   {
@@ -3498,6 +3518,8 @@ function signalsTools(service) {
         const names = Object.keys(account.playbooks ?? {});
         const playbook = workstream ? playbookFor(account.playbooks, { rule_id: workstream, workstream }) : void 0;
         const playbookText = workstream ? playbook ? [`Playbook for ${playbook.key} (how the team likes this done; follow it):`, playbook.text] : [`No playbook for ${workstream}${names.length ? ` (the team has playbooks for ${names.join(", ")})` : ""}.`] : names.length ? [`Playbooks: ${names.join(", ")}. Read the one for your task's workstream with workstream.`] : [];
+        const actions = workstream ? actionsFor(account.workstream_actions ?? {}, { rule_id: workstream, workstream }) : void 0;
+        const actionLines = actions ? [actionsText(actions)] : [];
         return [
           `Account: ${account.name}${account.aliases.length ? ` (also ${account.aliases.join(", ")})` : ""}${account.channel ? ` \xB7 channel ${account.channel}` : ""}`,
           account.domains.length ? `${capitalized(account.labels?.customer ?? "customer")} domains: ${account.domains.join(", ")}` : "",
@@ -3511,6 +3533,8 @@ function signalsTools(service) {
           "",
           ...playbookText,
           ...playbookText.length ? [""] : [],
+          ...actionLines,
+          ...actionLines.length ? [""] : [],
           "Profile (what agents have learned; update it with signals_account_learn):",
           account.profile || "(empty)"
         ].filter((part, index, all) => part !== "" || all[index - 1] !== "").join("\n");

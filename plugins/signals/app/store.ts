@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds, readWorkstreamActions, type WorkstreamActions } from "./model";
+import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds, readWorkstreamActions, type CheckResult, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, type WorkstreamActions } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -55,6 +55,8 @@ export type Task = Readonly<{
   /** How its workstream was chosen when it opened: its rule's, a category's `when` (match), or the classifier's pick (with its confidence). Null for tasks opened before this was kept. */
   filed_by?: FiledBy | null;
   filed_score?: number | null;
+  /** Its last default-actions check (see TriggerState), or null when it's had none. */
+  triggers?: TriggerState | null;
 }>;
 
 export type FiledBy = "rule" | "match" | "classifier";
@@ -167,7 +169,8 @@ export type IngestResult = Readonly<{
   created: Task[];
   /** Tasks an event of this post was added to. */
   /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
-  updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] };
+  /** `event`: the event version this update attached (default actions check each one, see Hub.checkUpdates). */
+  updated: { task: Task; event?: Readonly<{ id: number; version: number }>; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] };
     /** A meeting's follow-up whose checklist this event changed: the checklist now (null: the notes list no items now, so it was cleared). */
     checklist?: string | null;
     /** A meeting's notes that just moved its prep task to their rule (meeting_task): its agents are the new workstream's. The
@@ -190,8 +193,9 @@ const now = () => Math.floor(Date.now() / 1000);
 class RefileConflict extends Error {}
 
 /**
- * A replay (see RefileConflict) whose mark is gone: another post of the same version placed it, or a newer version was saved
- * (its own ingest places it). It stops, writing and reporting nothing more.
+ * A replay (see RefileConflict) whose mark is gone (another post of the same version placed it, or a newer version was saved,
+ * and its own ingest places it), or a post whose attachment another post of it claimed to report (see claimReport). It stops,
+ * writing and reporting nothing more.
  */
 class ReplayTaken extends Error {}
 
@@ -253,6 +257,11 @@ export class SignalsStore {
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS source_title text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS filed_by text`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS filed_score real`);
+    // Its last trigger check (default actions, see TriggerState): each action's result, the version checked, and whether its row's Otherwise dismissed it.
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS triggers jsonb`);
+    // Triggers that fired on an update and whose thread notice isn't delivered yet (see TriggerNotice): each saved with its decision, sent and deleted by the hub in order, retried by the sweep.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.trigger_notices (id bigserial PRIMARY KEY, task_id bigint NOT NULL, notice jsonb NOT NULL, at bigint NOT NULL, claim text, claimed_at bigint)`);
+    await this.q(`CREATE INDEX IF NOT EXISTS trigger_notices_task ON $S.trigger_notices (task_id, id)`);
     // The event that opened the task (its title came from it): the board's `origin`. Null for tasks opened before it was kept.
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS title_event bigint`);
     // That event's title as it opened the task: a later edit of the same event changes the event's row, not where the task came from.
@@ -371,6 +380,26 @@ export class SignalsStore {
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_status ON $S.tasks (status, last_event_at)`);
     await this.q(`CREATE INDEX IF NOT EXISTS tasks_account ON $S.tasks (account, status)`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.task_events (task_id bigint NOT NULL, event_id bigint NOT NULL, version int NOT NULL, at bigint NOT NULL, PRIMARY KEY (task_id, event_id, version))`);
+    // Each attachment's default-actions check (see PendingCheck), saved with it: `seq` orders a task's attachments (taken
+    // under its lock as each attaches), `trigger_pending` says it's still to be decided (rows from before these columns,
+    // and attachments that aren't updates, have none), `trigger_result` keeps its check done while earlier ones aren't,
+    // and `trigger_claimed_at` is when a post last took it to check. (Added without defaults on the rows already there.)
+    await this.q(`CREATE SEQUENCE IF NOT EXISTS $S.task_events_seq`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS seq bigint`);
+    await this.q(`ALTER TABLE $S.task_events ALTER COLUMN seq SET DEFAULT nextval('$S.task_events_seq')`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS trigger_pending boolean`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS trigger_result jsonb`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS trigger_claimed_at bigint`);
+    // Each attachment's report (see claimReport): `reopened`, whether its attach opened the task again, decided under the task's
+    // lock as it attached; `report_changes`, the watched fields' changes its ingest found before attaching it; `reported_at`, when
+    // a post of it took its update to report (rows already there count as reported).
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS reopened boolean`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS report_changes jsonb`);
+    await this.q(`ALTER TABLE $S.task_events ADD COLUMN IF NOT EXISTS reported_at bigint DEFAULT 0`);
+    await this.q(`ALTER TABLE $S.task_events ALTER COLUMN reported_at DROP DEFAULT`);
+    // (The attachments still to report, for a post again of their version: see unreported. Claimed as they're posted, so few.)
+    await this.q(`CREATE INDEX IF NOT EXISTS task_events_unreported ON $S.task_events (event_id, version) WHERE reported_at IS NULL AND report_changes IS NOT NULL`);
+    await this.q(`CREATE INDEX IF NOT EXISTS task_events_pending ON $S.task_events (task_id, seq) WHERE trigger_pending`);
     await this.q(`CREATE TABLE IF NOT EXISTS $S.activities (id bigserial PRIMARY KEY, task_id bigint NOT NULL, at bigint NOT NULL, actor text NOT NULL, kind text NOT NULL, text text NOT NULL)`);
     await this.q(`CREATE INDEX IF NOT EXISTS activities_task ON $S.activities (task_id, at)`);
     // What an activity is about, when it must be recorded once however often it's tried (a move's `changed`, see Hub.changed).
@@ -541,22 +570,26 @@ export class SignalsStore {
    * `items`, a new or changed version is marked as having action items to
    * write (items_pending) in the same statement, so the sweep finishes them
    * even when a later write of this post fails and the post is acknowledged.
+   * With `place`, a new or changed version is marked to be placed
+   * (place_pending) in the same statement, so a post that fails before
+   * placing it, even when no later write works, leaves the same event to be
+   * placed when it's posted again; placing it clears the mark.
    */
-  async record(owner: string, given: EventInput, items = false, firstRun = false, fan = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number; fanPending?: { version: number; firstRun: boolean }; placePending?: PlacePending }> {
+  async record(owner: string, given: EventInput, items = false, firstRun = false, fan = false, place = false): Promise<{ outcome: Exclude<Outcome, "skipped">; id: number; version: number; taskId: number | null; before?: EventInput; itemsPending?: number; fanPending?: { version: number; firstRun: boolean }; placePending?: PlacePending }> {
     const event = await this.keepDetails(owner, given);
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
     const micros = toMicros(event.occurred_at);
-    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun, fan];
+    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros), items, firstRun, fan, place];
     // xmax = 0 only for a row this statement inserted.
     const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean; items_pending: unknown; fan_pending: unknown; fan_first_run: unknown; place_pending: unknown }>(
       `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3),
        doc AS (INSERT INTO $S.revisions (source, group_key, latest_us) SELECT $2, $11, $13::bigint WHERE $14 AND $11::text IS NOT NULL AND $13::bigint IS NOT NULL
          ON CONFLICT (source, group_key) DO UPDATE SET latest_us = GREATEST($S.revisions.latest_us, excluded.latest_us) RETURNING 1)
-       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us, items_pending, placing_at, items_first_run, fan_pending, fan_first_run)
+       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us, items_pending, placing_at, items_first_run, fan_pending, fan_first_run, place_pending)
        VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint, CASE WHEN $14 THEN 1 END, CASE WHEN $14 THEN $6::bigint END, CASE WHEN $14 THEN $15::boolean END,
-         CASE WHEN $16 THEN 1 END, CASE WHEN $16 THEN $15::boolean END)
+         CASE WHEN $16 THEN 1 END, CASE WHEN $16 THEN $15::boolean END, CASE WHEN $17 THEN jsonb_build_object('version', 1, 'outcome', 'new', 'reopened', false) END)
        ON CONFLICT (owner, source, external_id) DO UPDATE SET
          last_seen = excluded.last_seen,
          content_hash = excluded.content_hash,
@@ -570,7 +603,10 @@ export class SignalsStore {
          items_first_run = CASE WHEN $14 AND $S.events.content_hash <> excluded.content_hash THEN excluded.items_first_run ELSE $S.events.items_first_run END,
          fan_pending = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $S.events.versions + 1 ELSE $S.events.fan_pending END,
          fan_first_run = CASE WHEN $16 AND $S.events.content_hash <> excluded.content_hash THEN $15::boolean ELSE $S.events.fan_first_run END,
-         place_pending = CASE WHEN $S.events.content_hash <> excluded.content_hash THEN NULL ELSE $S.events.place_pending END
+         -- (A new version's mark, with the event as it was before it, as the version's ingest has it: see PlacePending.)
+         place_pending = CASE WHEN $S.events.content_hash = excluded.content_hash THEN $S.events.place_pending
+           WHEN $17 THEN jsonb_build_object('version', $S.events.versions + 1, 'outcome', 'changed', 'reopened', false, 'before_row', jsonb_build_object('occurred_at', $S.events.occurred_at,
+             'title', $S.events.title, 'url', $S.events.url, 'actor', $S.events.actor, 'account', $S.events.account, 'payload', $S.events.payload)) END
        RETURNING id, versions, task_id, items_pending, fan_pending, fan_first_run, place_pending,
          (SELECT row_to_json(previous) FROM previous) AS before,
          NOT EXISTS (SELECT 1 FROM previous) AS inserted,
@@ -582,7 +618,9 @@ export class SignalsStore {
     const raw = typeof row.before === "string" ? (JSON.parse(row.before) as Row) : (row.before as Row | null);
     const before = raw ? toEvent({ ...raw, source: event.source, external_id: event.external_id }) : undefined;
     const pendingRaw = typeof row.place_pending === "string" ? (JSON.parse(row.place_pending) as PlacePending) : (row.place_pending as PlacePending | null | undefined);
-    const placePending = pendingRaw && pendingRaw.version === row.versions ? pendingRaw : undefined;
+    // (Marked as recorded: the version before it as saved then, an event as toEvent reads it.)
+    const { before_row: beforeRow, ...marked } = (pendingRaw ?? {}) as PlacePending & { before_row?: Row };
+    const placePending = pendingRaw && pendingRaw.version === row.versions ? { ...marked, ...(beforeRow && !marked.before && { before: toEvent({ ...beforeRow, source: event.source, external_id: event.external_id }) }) } : undefined;
     return { outcome: row.inserted ? "new" : row.changed ? "changed" : "same", id: Number(row.id), version: row.versions, taskId: num(row.task_id), ...(before && { before }), ...(num(row.items_pending) !== null && { itemsPending: num(row.items_pending)! }), ...(num(row.fan_pending) !== null && { fanPending: { version: num(row.fan_pending)!, firstRun: row.fan_first_run === true } }), ...(placePending && { placePending }) };
   }
 
@@ -627,6 +665,14 @@ export class SignalsStore {
       let pendingEvent: number | undefined;
       // A replay that took its mark (see placedNow): a failure after that puts the mark back, so a post again finishes it.
       let took = false;
+      // Being placed and not attached yet: a failure here marks the version to be placed again (place_pending), so a post
+      // again attaches it (with its default-actions check, see PendingCheck) rather than finding it seen and doing nothing.
+      let unattached = false;
+      // This version's mark, written as it was recorded: cleared once it's placed (a failure before that leaves it).
+      let marked = false;
+      // Claiming its attachment's report (see claimReport), or finding one to claim: a failure there leaves it unclaimed, and the
+      // post is asked for again.
+      let claiming = false;
       try {
         let state = consent.get(event.source);
         if (!state) consent.set(event.source, (state = await this.enabled(owner, event.source)));
@@ -640,9 +686,12 @@ export class SignalsStore {
         // placing it finds nothing to do and clears the marker).
         const fan = fanOut(config, event, { firstRun: state.firstRun, owner });
         // (So is one a rule with meeting_task may take: its placement, which may move a prep task, is finished the same way.)
-        const stored = await this.record(owner, event, config.rules.some((rule) => (rule.action_items || rule.meeting_task) && ruleApplies(config, rule, event, owner)), state.firstRun, Boolean(fan));
+        const items = config.rules.some((rule) => (rule.action_items || rule.meeting_task) && ruleApplies(config, rule, event, owner));
+        // (Marked to be placed as it's recorded, unless another mark finishes it: items_pending, fan_pending.)
+        const stored = await this.record(owner, event, items, state.firstRun, Boolean(fan), !items && !fan);
         counts[stored.outcome]++;
         saved = true;
+        marked = stored.outcome !== "same" && !items && !fan;
         if (stored.outcome !== "same" && stored.itemsPending !== undefined) {
           placing = stored.id;
           placingVersion = stored.version;
@@ -653,13 +702,21 @@ export class SignalsStore {
         const recorded = resume ? { ...stored, outcome: resume.outcome, ...(resume.before ? { before: resume.before } : {}) } : stored;
         pendingEvent = recorded.id;
         pending = { version: recorded.version, outcome: recorded.outcome, ...(recorded.before && { before: recorded.before }), reopened: Boolean(resume?.reopened) };
-        // A replay places and reports only while it holds the mark: the refile that moves the task takes it in the same statement
+        // A replay places only while it holds the mark: the refile that moves the task takes it in the same statement
         // (see refile's `owned`), or else this does, before its update is reported. One that finds it gone stops (ReplayTaken).
+        // (Which post reports the update, this ingest's or a replay's, is decided by claiming the attachment: see claimReport.)
         // (One that took it already checks again, before reporting, that its version is still the saved one: a newer version saved
         // meanwhile reports its own change, and this one's would come after it, older.)
         const owned = resume ? { event: recorded.id, version: recorded.version } : undefined;
         const placedNow = async () => {
-          if (!resume) return;
+          if (!resume) {
+            if (!marked) return;
+            // Its own mark, cleared while it's still this version's (a newer version saved meanwhile has its own). Whether this
+            // or a post again of it reports the update is decided by its attachment, not the mark (see claimReport).
+            await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2`, [recorded.id, recorded.version]);
+            marked = false;
+            return;
+          }
           const found = took
             ? await this.q(`SELECT 1 FROM $S.events WHERE id = $1 AND versions = $2`, [recorded.id, recorded.version])
             : await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2 RETURNING 1`, [recorded.id, recorded.version]);
@@ -677,7 +734,7 @@ export class SignalsStore {
           const decisions = pending.firstRun === state.firstRun ? fan.decisions : fanOut(config, event, { firstRun: pending.firstRun, owner })!.decisions;
           await this.fanOutPlace(owner, event, recorded, decisions, opened, (task) => {
             touched.set(task.id, task);
-            result.updated.push({ task, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }) });
+            result.updated.push({ task, event: { id: recorded.id, version: recorded.version }, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }) });
           });
           await this.q(`UPDATE $S.events SET fan_pending = NULL WHERE id = $1 AND fan_pending = $2`, [recorded.id, recorded.version]);
           continue;
@@ -696,9 +753,26 @@ export class SignalsStore {
               for (const id of resumed.opened) opened.add(id);
               if (resumed.checklist !== undefined || resumed.joined) result.updated.push({ task: resumed.task, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...resumedUpdate(resumed) });
             }
+          } else {
+            // Attached, and its update not reported: its claim failed (or a write between the two did) and nothing marks it to
+            // be placed again (a replay took the mark and putting it back failed too). The attachment is the record: reported now,
+            // once, from what was saved with it (see claimReport). A failure finding it, reading its task or claiming it leaves
+            // it unclaimed, and asks for the post again (see `claiming` in the catch).
+            claiming = true;
+            for (const id of await this.unreported(recorded.id, recorded.version)) {
+              const fresh = await this.task(id);
+              if (!fresh) continue;
+              const claim = await this.claimReport(id, recorded.id, recorded.version);
+              if (!claim) continue;
+              touched.set(fresh.id, fresh);
+              result.updated.push({ task: fresh, event: { id: recorded.id, version: recorded.version }, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(claim.reopened && { reopened: true }), ...(claim.changes?.length && { changes: claim.changes }) });
+            }
+            claiming = false;
           }
           continue;
         }
+        // (Notes with action items have their own mark, items_pending, that the sweep finishes: not this one too.)
+        unattached = recorded.itemsPending === undefined;
         const placed = await this.place(owner, event, recorded, config, state.firstRun, classifier, () => counts.filtered++);
         // An event can finish a task even when its rule no longer matches it (a resolved ticket).
         let finishedHere = false;
@@ -721,13 +795,13 @@ export class SignalsStore {
           if (done && done.task.id === placed?.task.id) finishedHere = true;
         }
         if (!placed || finishedHere) {
+          unattached = false;
           // Not placed (no task for it: filtered, a first run, a closed group) or finished here: no action items to write later either.
           if (recorded.itemsPending !== undefined) await this.q(`UPDATE $S.events SET items_pending = NULL WHERE id = $1 AND items_pending = $2`, [recorded.id, recorded.itemsPending]);
           await placedNow();
           continue;
         }
         let task = placed.task;
-        if (placed.opened) opened.add(task.id);
         // A finished task opens again for a new event, when attached (below): not for a message older than a team reply decided on it
         // (that reply answered it), and not for a late event that is itself past done, like a meeting's notes after it ended.
         // (A task this event just opened too: a team reply decided while it was being attached may have closed it already.)
@@ -761,7 +835,15 @@ export class SignalsStore {
         }
         // (Resumed: it may have opened the task again the first time; this attach finds it attached and open. And only while it's
         // the event's saved version: a newer one saved meanwhile is placed by its own ingest.)
-        const reopened = (await this.attachOnce(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen }, Boolean(resume))).reopened || Boolean(resume?.reopened);
+        // (Saved with the watched fields' changes found here, so whichever post reports it reports these: a post again of a new
+        // event finds it the task's latest event by then, and would compare it with itself.)
+        // (Not for a task it opens: that's posted as new, not reported as an update, so a post again has nothing to report from it.)
+        const attachment = await this.attachOnce(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen }, Boolean(resume), true, placed.opened ? undefined : changes);
+        const reopened = attachment.reopened || Boolean(resume?.reopened);
+        unattached = false;
+        // New work only once its event is attached: a task opened by an ingest that failed before that isn't posted (see
+        // unposted), and the post again that attaches it, its first event, posts it as new, with its opening check.
+        if (placed.opened || (resume && attachment.attached?.event_count === 1 && !attachment.attached.buzz_root)) opened.add(task.id);
         pending.reopened = reopened;
         // A meeting's notes: the account team's items get their own tasks, the rest a checklist on this one.
         let checklist: string | null | undefined;
@@ -794,23 +876,46 @@ export class SignalsStore {
         // with everything its update needs already read: a failure before it leaves the move for the sweep. Its mark stays
         // until the hub has posted the update (see IngestResult.updated's joined).
         const joined = placed.joined && (await this.claimJoin(recorded.id));
+        // (A replay takes its mark first, as it places only while it holds it.)
+        if (resume) await placedNow();
+        // Reported by the post that claims its attachment, once, whichever that is (this ingest or one posting it again at the
+        // same time), with what was saved as it attached: whether it opened the task again, and the watched fields' changes.
+        // A newer version saved meanwhile doesn't take it: its own attachment reports its own change. Claimed by another post:
+        // nothing to report here (ReplayTaken). A failed claim leaves it unclaimed, and asks for the post again (see `claiming`
+        // in the catch), which claims and reports it: placing it again while its mark stands, or else from the attachment
+        // (see unreported), so it doesn't rest on the mark being put back.
+        claiming = true;
+        const claim = await this.claimReport(fresh.id, recorded.id, recorded.version);
+        claiming = false;
+        // (The recording ingest's mark, cleared once the report is decided either way. Left standing when that fails: a post
+        // again then finds the attachment claimed and reports nothing.)
+        if (!resume) await placedNow().catch(() => {});
+        if (!claim) throw new ReplayTaken();
+        const reported = claim.reopened;
+        if (claim.changes) changes = claim.changes;
         if (placed.joined && !joined) changes = changes.slice(placed.joined.changes.length);
-        // (Its mark cleared before its update is reported: a failure clearing it reports nothing, and a post again places it again.)
-        await placedNow();
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }), ...(joined && { joined: joined.claim }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(recorded.version !== undefined && { event: { id: recorded.id, version: recorded.version } }), ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reported && { reopened: reported }), ...(changes.length && { changes }), ...(outgrown && { outgrown }), ...(checklist !== undefined && { checklist }), ...(joined && { joined: joined.claim }) });
       } catch (error) {
-        // A refile that lost every write to filings by hand: the version is marked to be placed again, and the post is asked for
-        // again (posted again, the same event takes that mark, above). Only while it's still the version saved: a newer one places itself.
+        // A refile that lost every write to filings by hand, or a write that failed before the version was attached: the version
+        // is marked to be placed again, and the post is asked for again (posted again, the same event takes that mark, above). Only while it's still the version saved: a newer one places itself.
         // A replay another post or a newer version took over: nothing to report.
         if (error instanceof ReplayTaken) continue;
         // (A replay, whatever failed, keeps its mark as saved, with whether it has reopened the task now: one that took it puts it
         // back, one that didn't writes it only while it's still there, so a replay another post finished meanwhile isn't marked again.)
         const mark = resume ? { ...resume, reopened: pending?.reopened ?? resume.reopened } : pending;
-        const again = (error instanceof RefileConflict || resume !== undefined) && saved && !fanning && mark !== undefined
+        // (A failed claim, for a version with its own mark: a meeting's notes, whose items_pending the sweep finishes, aren't marked.)
+        const placeAgain = error instanceof RefileConflict || resume !== undefined || unattached || (claiming && marked);
+        const again = placeAgain && saved && !fanning && mark !== undefined
           && (await this.q(`UPDATE $S.events SET place_pending = $3::jsonb WHERE id = $1 AND versions = $2 AND ${took ? "place_pending IS NULL" : resume ? "place_pending IS NOT NULL" : "true"} RETURNING 1`, [pendingEvent, mark.version, JSON.stringify(mark)]).then((found) => found.rows.length > 0, () => false));
-        result.errors.push({ index, error: (error as Error).message, ...((!saved || fanning || again) && { retry: true }) });
-        if (!saved || fanning || again) retried.add(event.source);
+        // (When that write fails too, the mark it was recorded with still stands: posted again, it's placed then.)
+        const kept = placeAgain && marked;
+        // A failure after it was attached: nothing to place again (its check is pending already), as before the mark.
+        if (!placeAgain && marked && pendingEvent !== undefined && pending) await this.q(`UPDATE $S.events SET place_pending = NULL WHERE id = $1 AND versions = $2 AND (place_pending->>'version')::int = $2`, [pendingEvent, pending.version]).catch(() => {});
+        // (A failed claim: its attachment is still unclaimed, so a post again reports it, whether or not its mark was put back.)
+        const retry = !saved || fanning || again || kept || claiming;
+        result.errors.push({ index, error: (error as Error).message, ...(retry && { retry: true }) });
+        if (retry) retried.add(event.source);
       } finally {
         // Done placing it (or failed to): the sweep may finish it now.
         // (Only its own lease: a newer version recorded since holds the lease for its own ingest, still placing it.)
@@ -822,7 +927,7 @@ export class SignalsStore {
     try {
       for (const id of opened) {
         const task = await this.task(id);
-        if (task && isOpen(task.status)) result.created.push(task);
+        if (task && isOpen(task.status) && !task.buzz_root) result.created.push(task);
       }
     } catch (error) {
       await this.releaseJoins(result.updated.flatMap((update) => (update.joined ? [update.joined] : []))).catch(() => {});
@@ -1042,7 +1147,7 @@ export class SignalsStore {
       }
       // Attached by this write (not already on it, from this ingest or one at the same time, and still the saved version):
       // reported here, once, as the write left it.
-      const fresh = (await this.attachOnce(task.id, recorded.id, recorded.version, occurred, undefined, true)).attached;
+      const fresh = (await this.attachOnce(task.id, recorded.id, recorded.version, occurred, undefined, true, true)).attached;
       if (fresh && isOpen(fresh.status) && !fresh.verdict && !opened.has(fresh.id)) updated(fresh);
     }
   }
@@ -1240,7 +1345,7 @@ export class SignalsStore {
         // (The move as saved: by the ingest a failed write cut short, or by place just now.)
         const join = placed.joined ?? (await this.pendingJoin(id));
         const reopen = join?.task === placed.task.id && join.reopen;
-        await this.attach(placed.task.id, id, Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        await this.attach(placed.task.id, id, Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen }, true);
         task = await this.task(placed.task.id);
         if (placed.opened && task) placedNow.push(task.id);
       }
@@ -1608,6 +1713,32 @@ export class SignalsStore {
     return result;
   }
 
+  /** The tasks this version was attached to, as an update (report_changes), whose report no post has claimed yet. */
+  private async unreported(event: number, version: number): Promise<number[]> {
+    const found = await this.q<{ task_id: unknown }>(
+      `SELECT task_id FROM $S.task_events WHERE event_id = $1 AND version = $2 AND reported_at IS NULL AND report_changes IS NOT NULL ORDER BY task_id`,
+      [event, version],
+    );
+    return found.rows.map((row) => Number(row.task_id));
+  }
+
+  /**
+   * Takes an attachment's update to report: once, by whichever post of the version claims it first. Gives what was saved
+   * with it as it attached (whether that attach opened the task again, and the watched fields' changes its ingest found, when
+   * it saved them), or undefined when another post claimed it already.
+   */
+  private async claimReport(task: number, event: number, version: number): Promise<{ reopened: boolean; changes?: FieldChange[] } | undefined> {
+    const found = await this.q<{ reopened: unknown; report_changes: unknown }>(
+      `UPDATE $S.task_events SET reported_at = $4 WHERE task_id = $1 AND event_id = $2 AND version = $3 AND reported_at IS NULL RETURNING reopened, report_changes`,
+      [task, event, version, now()],
+    );
+    const row = found.rows[0];
+    if (!row) return undefined;
+    // (pg gives jsonb as an object, PGlite may give text.)
+    const raw = typeof row.report_changes === "string" ? (JSON.parse(row.report_changes) as unknown) : row.report_changes;
+    return { reopened: row.reopened === true, ...(Array.isArray(raw) && { changes: raw as FieldChange[] }) };
+  }
+
   /**
    * Adds an event to a task. One that isn't a team reply (`customer`) raises
    * the task's newest customer time; with `reopen`, a finished task opens
@@ -1616,8 +1747,8 @@ export class SignalsStore {
    * so a reply decided at the same time either sees this event or is seen by
    * it. Returns whether it reopened the task.
    */
-  private async attach(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>): Promise<boolean> {
-    return (await this.attachOnce(task, event, version, at, customer)).reopened;
+  private async attach(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>, pending = false): Promise<boolean> {
+    return (await this.attachOnce(task, event, version, at, customer, false, pending)).reopened;
   }
 
   /**
@@ -1627,11 +1758,21 @@ export class SignalsStore {
    * saved, and its ingest places it). In one statement, so a read after it
    * failing can't lose what it did.
    */
-  private async attachOnce(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>, current = false): Promise<{ reopened: boolean; attached?: Task }> {
+  private async attachOnce(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>, current = false, pending = false, changes?: readonly FieldChange[]): Promise<{ reopened: boolean; attached?: Task }> {
     const micros = customer && !Number.isNaN(customer.micros) ? String(customer.micros) : null;
+    // `pre`: whether attaching it opens the task again, decided before the insert so the attachment is saved with it (see
+    // claimReport). Only for a customer's event, not a team reply's, after the task's last decided reply (`answered`: for a task
+    // closed before answered_us was kept, its decided replies as this statement sees them). And not a task its default actions'
+    // Otherwise dismissed: only a trigger that holds opens that again, see Hub.commitTriggers. (Kept short ahead of the insert,
+    // so the statement as pg_stat_activity shows it still names it.)
+    // `ins`, with `pending`: an update's version, its default-actions check saved with it, claimed by this post as it is (see PendingCheck).
     const found = await this.q<{ reopened: unknown; task: unknown }>(
-      `WITH lk AS (SELECT id, status, answered_us FROM $S.tasks WHERE id = $1 FOR UPDATE),
-       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk
+      `WITH lk AS (SELECT id, status, answered_us, triggers FROM $S.tasks WHERE id = $1 FOR UPDATE),
+       answered AS (SELECT COALESCE((SELECT answered_us FROM lk), (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
+         AND (r.closed_task = $1 OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = r.event_id)))) AS us),
+       pre AS (SELECT $7::boolean AND lk.status IN ('done', 'dismissed') AND $6::bigint IS NOT NULL AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)
+         AND NOT COALESCE(lk.status = 'dismissed' AND lk.triggers->>'dismissed' = 'true', false) AND $6::bigint > COALESCE((SELECT us FROM answered), -1) AS reopen FROM lk),
+       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at, trigger_pending, trigger_claimed_at, reopened, report_changes) SELECT $1, $2, $3, $5, $8::bigint IS NOT NULL, $8::bigint, COALESCE((SELECT reopen FROM pre), false), $9::jsonb FROM lk
          -- (With current: only while $3 is the event's saved version, so an edit being saved waits for this, or this sees it.
          -- Locked as ev below updates it, not FOR SHARE first: two of these on the event, for two tasks, would each hold a
          -- share lock and wait for the other's to update it, a deadlock.)
@@ -1639,14 +1780,7 @@ export class SignalsStore {
        ev AS (UPDATE $S.events SET task_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM ins) RETURNING 1),
        -- (Only while the event is saved: Forget's delete of it waits for this, or wins and this changes nothing on the task.)
        cust AS (SELECT $6::bigint AS us WHERE $6::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM ev) AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)),
-       -- (For a task closed before answered_us was kept: its decided replies as this statement sees them.)
-       answered AS (
-         SELECT COALESCE((SELECT answered_us FROM lk), (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
-           AND (r.closed_task = $1 OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = r.event_id)))) AS us),
-       dec AS (
-         SELECT $7::boolean AND lk.status IN ('done', 'dismissed') AND (SELECT us FROM cust) IS NOT NULL
-           AND (SELECT us FROM cust) > COALESCE((SELECT us FROM answered), -1) AS reopen
-         FROM lk WHERE EXISTS (SELECT 1 FROM ev)),
+       dec AS (SELECT reopen FROM pre WHERE EXISTS (SELECT 1 FROM ev)),
        t AS (
          -- The latest event is the newest by when it happened (one older that comes in late is kept in its history, not made latest).
          UPDATE $S.tasks SET event_count = event_count + 1,
@@ -1664,7 +1798,7 @@ export class SignalsStore {
          SELECT $1, $5, 'signals', 'status', 'open: Opened again: a new event came in.' FROM dec WHERE dec.reopen AND EXISTS (SELECT 1 FROM t)
          RETURNING 1)
        SELECT EXISTS (SELECT 1 FROM again) AS reopened, (SELECT row_to_json(t) FROM t) AS task`,
-      [task, event, version, Number.isNaN(at) ? now() : at, now(), micros, customer?.reopen ?? false],
+      [task, event, version, Number.isNaN(at) ? now() : at, now(), micros, customer?.reopen ?? false, pending ? now() : null, changes ? JSON.stringify(changes) : null],
     );
     // (pg gives row_to_json as an object, PGlite may give text.)
     const raw = found.rows[0]?.task;
@@ -1789,7 +1923,8 @@ export class SignalsStore {
 
   async setStatus(id: number, status: TaskStatus, actor: string, note?: string): Promise<Task | undefined> {
     if (!TASK_STATUSES.includes(status)) throw new Error(`status must be one of ${TASK_STATUSES.join(", ")}`);
-    const found = await this.q(`UPDATE $S.tasks SET status = $2, updated_at = $3 WHERE id = $1 RETURNING *`, [id, status, now()]);
+    // (A status set this way is someone's decision: a dismissal by the default actions' Otherwise isn't one any more.)
+    const found = await this.q(`UPDATE $S.tasks SET status = $2, updated_at = $3, triggers = triggers - 'dismissed' WHERE id = $1 RETURNING *`, [id, status, now()]);
     if (!found.rows[0]) return undefined;
     await this.activity(id, actor, "status", note ? `${status}: ${note}` : status);
     return toTask(found.rows[0]);
@@ -2000,10 +2135,243 @@ export class SignalsStore {
   }
 
   /** The task's latest event, as it was posted (occurred_at in Unix seconds). */
+  /** Whether any event is attached to the task (one opened by an ingest that failed before attaching it has none). */
+  async attached(task: number): Promise<boolean> {
+    return (await this.q(`SELECT 1 FROM $S.task_events WHERE task_id = $1 LIMIT 1`, [task])).rows.length > 0;
+  }
+
   async latestEvent(task: number): Promise<EventInput | undefined> {
     const found = await this.q(`SELECT e.* FROM $S.tasks t JOIN $S.events e ON e.id = t.latest_event WHERE t.id = $1`, [task]);
     const row = found.rows[0];
     return row ? toEvent(row) : undefined;
+  }
+
+  /**
+   * What a trigger check looks at: an event on the task (its latest when not
+   * given), with its id and saved version, and the task's last check as saved
+   * (`prior`, raw: saveTriggers saves only while it's still that).
+   */
+  async triggerSubject(task: number, event?: number): Promise<{ event: EventInput; id: number; version: number; prior: string | null } | undefined> {
+    const found = await this.q(
+      `SELECT e.*, t.triggers::text AS task_triggers FROM $S.tasks t JOIN $S.events e ON e.id = COALESCE($2::bigint, t.latest_event)
+       WHERE t.id = $1 AND EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = t.id AND te.event_id = e.id)`,
+      [task, event ?? null],
+    );
+    const row = found.rows[0];
+    return row ? { event: toEvent(row), id: Number(row.id), version: Number(row.versions), prior: typeof row.task_triggers === "string" ? row.task_triggers : null } : undefined;
+  }
+
+  /**
+   * Saves a trigger check's results (`state`) and, in the same statement,
+   * what follows from them: `dismiss` (its row's Otherwise, nothing held as
+   * it opened) marks it dismissed by the default actions; `reopen` (a trigger
+   * held on a task they dismissed) opens it again; `notice` (actions that
+   * fired on an update) is queued for its thread, on its own; `done` takes
+   * those events' attachments up to those versions off its pending checks.
+   * Only while the task's last check is still `prior` (so of two checks that
+   * read the same state, one saves), the event checked is on the task at the
+   * version checked (`latest`: and is its latest; `pending`: and that
+   * attachment is still pending), each of `also` (earlier events an opening
+   * checked) is too, and, for dismiss and reopen, the task is as the check
+   * found it. The task is locked before the events, as attaching an event
+   * does. Each check's activities are recorded once (by event, version and
+   * action), `also`'s too. Undefined when it didn't save.
+   */
+  async saveTriggers(
+    id: number,
+    checked: Readonly<{ event: number; version: number; latest?: boolean; pending?: boolean; prior: string | null }>,
+    state: TriggerState,
+    results: readonly TriggerResult[],
+    then?: Readonly<{
+      dismiss?: string;
+      reopen?: string;
+      notice?: TriggerNotice;
+      also?: readonly Readonly<{ event: number; version: number; results: readonly TriggerResult[] }>[];
+      done?: readonly Readonly<{ event: number; version: number }>[];
+    }>,
+  ): Promise<Task | undefined> {
+    const { dismissed: _, ...kept } = state;
+    const status = then?.dismiss !== undefined ? `, status = CASE WHEN t.status IN ('done', 'dismissed') THEN t.status ELSE 'dismissed' END` : then?.reopen !== undefined ? `, status = 'open'` : "";
+    // (A check that changes nothing keeps an Otherwise dismissal's mark, so a later trigger can still open it again.)
+    const mark = then?.dismiss !== undefined ? `jsonb_build_object('dismissed', true)` : then?.reopen !== undefined ? `'{}'::jsonb` : `CASE WHEN t.status = 'dismissed' AND t.triggers->>'dismissed' = 'true' THEN jsonb_build_object('dismissed', true) ELSE '{}'::jsonb END`;
+    const guard = then?.dismiss !== undefined ? ` AND status NOT IN ('done', 'dismissed')` : then?.reopen !== undefined ? ` AND status = 'dismissed' AND triggers->>'dismissed' = 'true'` : "";
+    const others = (then?.also ?? []).filter((one) => one.event !== checked.event);
+    const done = then?.done ?? [];
+    const found = await this.q(
+      `WITH lk AS (SELECT id FROM $S.tasks WHERE id = $1 AND triggers IS NOT DISTINCT FROM $7::jsonb${checked.latest ? " AND latest_event = $3" : ""}${guard} FOR UPDATE),
+       ev AS (SELECT versions FROM $S.events WHERE id = $3 AND EXISTS (SELECT 1 FROM lk) FOR SHARE),
+       -- (The other events the decision read: each still at the version it read, locked so an edit waits for this or fails it.)
+       evs AS (SELECT e.id FROM $S.events e JOIN unnest($8::bigint[], $9::int[]) AS c(id, version) ON c.id = e.id
+         WHERE e.versions = c.version AND EXISTS (SELECT 1 FROM lk) FOR SHARE OF e),
+       up AS (UPDATE $S.tasks t SET triggers = $2::jsonb || ${mark}, updated_at = $5${status}
+         FROM lk WHERE t.id = lk.id AND (SELECT versions FROM ev) = $4
+           AND EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = $3${checked.pending ? " AND te.version = $4 AND te.trigger_pending" : ""})
+           AND (SELECT count(*) FROM evs) = cardinality($8::bigint[])
+           AND NOT EXISTS (SELECT 1 FROM unnest($8::bigint[]) AS o(id) WHERE NOT EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = o.id))
+         RETURNING t.*),
+       nt AS (INSERT INTO $S.trigger_notices (task_id, notice, at) SELECT id, $6::jsonb, $5 FROM up WHERE $6::jsonb IS NOT NULL),
+       dn AS (UPDATE $S.task_events te SET trigger_pending = false FROM unnest($10::bigint[], $11::int[]) AS d(id, version)
+         WHERE te.task_id = $1 AND te.trigger_pending AND te.event_id = d.id AND te.version <= d.version AND EXISTS (SELECT 1 FROM up))
+       SELECT * FROM up`,
+      [
+        id,
+        JSON.stringify(kept),
+        checked.event,
+        checked.version,
+        now(),
+        then?.notice ? JSON.stringify(then.notice) : null,
+        checked.prior,
+        others.map((one) => one.event),
+        others.map((one) => one.version),
+        done.map((one) => one.event),
+        done.map((one) => one.version),
+      ],
+    );
+    if (!found.rows[0]) return undefined;
+    for (const one of [...(then?.also ?? []), { event: checked.event, version: checked.version, results }])
+      for (const result of one.results)
+        await this.activity(id, "hub", "trigger", `${result.label}: ${result.held ? "triggered" : "not triggered"}${result.why && result.why !== "always" ? ` (${result.why})` : ""}`, `${one.event}:${one.version}:${result.id}`);
+    if (then?.dismiss !== undefined) await this.activity(id, "hub", "status", `dismissed: ${then.dismiss}`, `otherwise:${checked.event}:${checked.version}`);
+    if (then?.reopen !== undefined) await this.activity(id, "hub", "status", `open: ${then.reopen}`, `reopen:${checked.event}:${checked.version}`);
+    return toTask(found.rows[0]);
+  }
+
+  /** A task with its trigger state as saved (`prior`, raw, for saveTriggers). */
+  async triggersOf(id: number): Promise<{ task: Task; prior: string | null } | undefined> {
+    const found = await this.q(`SELECT *, triggers::text AS raw_triggers FROM $S.tasks WHERE id = $1`, [id]);
+    const row = found.rows[0];
+    return row ? { task: toTask(row), prior: typeof row.raw_triggers === "string" ? row.raw_triggers : null } : undefined;
+  }
+
+  /** A task's pending checks (see PendingCheck), in the order they were attached. */
+  async pendingChecks(task: number): Promise<PendingCheck[]> {
+    const found = await this.q(
+      `SELECT event_id, version, seq, trigger_result, trigger_claimed_at FROM $S.task_events WHERE task_id = $1 AND trigger_pending ORDER BY seq, event_id, version LIMIT 200`,
+      [task],
+    );
+    return found.rows.map((row) => {
+      const result = readCheck(row.trigger_result);
+      return { event: Number(row.event_id), version: Number(row.version), seq: Number(row.seq ?? 0), claimed_at: num(row.trigger_claimed_at), ...(result && { result }) };
+    });
+  }
+
+  /**
+   * Takes a pending check to do now: while it's still pending with no
+   * result, and no one took it within `lease` seconds (a negative lease
+   * takes it whoever has it). Whether it did.
+   */
+  async claimCheck(task: number, check: Readonly<{ event: number; version: number }>, lease: number, at = now()): Promise<boolean> {
+    const found = await this.q(
+      `UPDATE $S.task_events SET trigger_claimed_at = $4 WHERE task_id = $1 AND event_id = $2 AND version = $3 AND trigger_pending AND trigger_result IS NULL
+         AND ($5::bigint < 0 OR COALESCE(trigger_claimed_at, 0) <= $4::bigint - $5::bigint) RETURNING 1`,
+      [task, check.event, check.version, at, lease],
+    );
+    return found.rows.length > 0;
+  }
+
+  /** Keeps a pending check's result for when the ones before it are decided (the first one kept stands). */
+  async storeCheck(task: number, result: CheckResult): Promise<void> {
+    await this.q(`UPDATE $S.task_events SET trigger_result = $4::jsonb WHERE task_id = $1 AND event_id = $2 AND version = $3 AND trigger_pending AND trigger_result IS NULL`, [
+      task,
+      result.event,
+      result.version,
+      JSON.stringify(result),
+    ]);
+  }
+
+  /** Gives pending checks a post took and couldn't finish to the next sweep (their claims cleared). */
+  async releaseChecks(task: number, checks: readonly Readonly<{ event: number; version: number }>[]): Promise<void> {
+    if (!checks.length) return;
+    await this.q(
+      `UPDATE $S.task_events te SET trigger_claimed_at = 0 FROM unnest($2::bigint[], $3::int[]) AS c(id, version)
+       WHERE te.task_id = $1 AND te.event_id = c.id AND te.version = c.version AND te.trigger_pending AND te.trigger_result IS NULL`,
+      [task, checks.map((one) => one.event), checks.map((one) => one.version)],
+    );
+  }
+
+  /**
+   * Takes checks off a task's pending ones undecided: these events' up to
+   * these versions (an event that moved on, the model couldn't answer, an
+   * opening that went on without them), or, with none given, all of them
+   * (no row applies now).
+   */
+  async dropChecks(task: number, checks?: readonly Readonly<{ event: number; version: number }>[]): Promise<void> {
+    if (!checks) await this.q(`UPDATE $S.task_events SET trigger_pending = false WHERE task_id = $1 AND trigger_pending`, [task]);
+    else if (checks.length)
+      await this.q(
+        `UPDATE $S.task_events te SET trigger_pending = false FROM unnest($2::bigint[], $3::int[]) AS c(id, version)
+         WHERE te.task_id = $1 AND te.trigger_pending AND te.event_id = c.id AND te.version <= c.version`,
+        [task, checks.map((one) => one.event), checks.map((one) => one.version)],
+      );
+  }
+
+  /**
+   * Posted tasks with pending checks the sweep can move on (a result to
+   * decide, or one no post took within CHECK_LEASE seconds), the one left
+   * longest first.
+   */
+  async pendingTriggers(limit = 20, at = now()): Promise<number[]> {
+    const found = await this.q(
+      `SELECT te.task_id FROM $S.task_events te JOIN $S.tasks t ON t.id = te.task_id
+       WHERE te.trigger_pending AND t.buzz_root IS NOT NULL AND (te.trigger_result IS NOT NULL OR COALESCE(te.trigger_claimed_at, 0) <= $1::bigint - ${CHECK_LEASE})
+       GROUP BY te.task_id ORDER BY MIN(COALESCE(te.trigger_claimed_at, 0)), te.task_id LIMIT ${limit}`,
+      [at],
+    );
+    return found.rows.map((row) => Number(row.task_id));
+  }
+
+  /**
+   * A task's events as they are now, in the order they came to it (by when
+   * each first did, then as each was attached): what its opening check goes through.
+   */
+  async taskEvents(task: number): Promise<{ event: EventInput; id: number; version: number }[]> {
+    const found = await this.q(
+      `SELECT e.* FROM $S.events e JOIN (SELECT event_id, MIN(at) AS first, MIN(seq) AS seq FROM $S.task_events WHERE task_id = $1 GROUP BY event_id) te ON te.event_id = e.id
+       ORDER BY te.first, te.seq NULLS FIRST, e.id LIMIT 200`,
+      [task],
+    );
+    return found.rows.map((row) => ({ event: toEvent(row), id: Number(row.id), version: Number(row.versions) }));
+  }
+
+  /**
+   * Takes a task's oldest undelivered trigger notice to send, while no other
+   * of its notices is being sent (a lease of NOTICE_LEASE seconds, so a sweep
+   * doesn't send one being sent, and they go out in order): the task, the
+   * notice and the claim to give doneNotice or failedNotice.
+   */
+  async claimNotice(task: number, at = now()): Promise<{ task: Task; notice: TriggerNotice; id: number; claim: string } | undefined> {
+    const claim = randomUUID();
+    const found = await this.q(
+      `UPDATE $S.trigger_notices n SET claim = $2, claimed_at = $3
+       WHERE n.id = (SELECT id FROM $S.trigger_notices WHERE task_id = $1 ORDER BY id LIMIT 1) AND COALESCE(n.claimed_at, 0) < $3::bigint - ${NOTICE_LEASE}
+         AND EXISTS (SELECT 1 FROM $S.tasks t WHERE t.id = n.task_id AND t.buzz_root IS NOT NULL) RETURNING n.id, n.notice`,
+      [task, claim, at],
+    );
+    const row = found.rows[0];
+    const notice = row && readNotice(row.notice);
+    const owner = notice && (await this.task(task));
+    if (row && !notice) await this.q(`DELETE FROM $S.trigger_notices WHERE id = $1`, [row.id]);
+    return row && notice && owner ? { task: owner, notice, id: Number(row.id), claim } : undefined;
+  }
+
+  /** A claimed notice was sent: deleted. */
+  async doneNotice(id: number, claim: string): Promise<void> {
+    await this.q(`DELETE FROM $S.trigger_notices WHERE id = $1 AND claim = $2`, [id, claim]);
+  }
+
+  /** A claimed notice couldn't be sent: left for the next sweep. */
+  async failedNotice(id: number, claim: string): Promise<void> {
+    await this.q(`UPDATE $S.trigger_notices SET claim = NULL, claimed_at = NULL WHERE id = $1 AND claim = $2`, [id, claim]);
+  }
+
+  /** Tasks with a trigger notice to send (none of theirs being sent now). */
+  async undeliveredNotices(limit = 20, at = now()): Promise<number[]> {
+    const found = await this.q(
+      `SELECT n.task_id FROM $S.trigger_notices n JOIN $S.tasks t ON t.id = n.task_id WHERE t.buzz_root IS NOT NULL
+       GROUP BY n.task_id HAVING MAX(COALESCE(n.claimed_at, 0)) < $1::bigint - ${NOTICE_LEASE} ORDER BY n.task_id LIMIT ${limit}`,
+      [at],
+    );
+    return found.rows.map((row) => Number(row.task_id));
   }
 
   /**
@@ -2033,9 +2401,14 @@ export class SignalsStore {
     await this.q(`UPDATE $S.tasks SET agent_reply = $2, updated_at = $3 WHERE id = $1`, [task, reply, now()]);
   }
 
-  /** Open tasks with a channel that aren't in Buzz yet (a post that failed, or a channel added later). */
+  /**
+   * Open tasks with a channel that aren't in Buzz yet (a post that failed, or a channel added later), and ones their default
+   * actions dismissed as they opened (posted folded). Only once an event is attached: an ingest that failed before attaching
+   * the event that opened one leaves it for the post again (see PlacePending), whose opening check decides how it's posted.
+   */
   async unposted(limit = 20): Promise<Task[]> {
-    const found = await this.q(`SELECT * FROM $S.tasks WHERE buzz_root IS NULL AND channel IS NOT NULL AND status NOT IN ('done', 'dismissed') ORDER BY id LIMIT ${limit}`);
+    const found = await this.q(`SELECT * FROM $S.tasks t WHERE buzz_root IS NULL AND channel IS NOT NULL AND (status NOT IN ('done', 'dismissed') OR (status = 'dismissed' AND triggers->>'dismissed' = 'true'))
+      AND EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = t.id) ORDER BY id LIMIT ${limit}`);
     return found.rows.map(toTask);
   }
 
@@ -2426,6 +2799,69 @@ function toTask(row: Row): Task {
     source_title: typeof row.source_title === "string" && row.source_title ? plainSlack(row.source_title) : null,
     filed_by: FILED_BY.includes(row.filed_by as FiledBy) ? (row.filed_by as FiledBy) : null,
     filed_score: num(row.filed_score),
+    triggers: readTriggerState(row.triggers),
+  };
+}
+
+/** A task's saved trigger state (tasks.triggers, parsed or as text), or null when it has none. */
+export function readTriggerState(value: unknown): TriggerState | null {
+  const read = typeof value === "string" ? JSON.parse(value) : value;
+  if (!read || typeof read !== "object" || Array.isArray(read)) return null;
+  const { held, event, version, seq, dismissed } = read as Record<string, unknown>;
+  const flags = held && typeof held === "object" && !Array.isArray(held) ? Object.fromEntries(Object.entries(held).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean")) : {};
+  return {
+    held: flags,
+    ...(typeof event === "number" && { event }),
+    ...(typeof version === "number" && { version }),
+    ...(typeof seq === "number" && { seq }),
+    ...(dismissed === true && { dismissed: true }),
+  };
+}
+
+function readResults(value: unknown): TriggerResult[] {
+  return Array.isArray(value)
+    ? value.flatMap((one) => {
+        const r = one as Record<string, unknown> | null;
+        return r && typeof r.id === "string" && typeof r.label === "string" && typeof r.held === "boolean" ? [{ id: r.id, label: r.label, held: r.held, why: typeof r.why === "string" ? r.why : "" }] : [];
+      })
+    : [];
+}
+
+/** A pending check's saved result (task_events.trigger_result), or undefined for none (or one that doesn't read). */
+function readCheck(value: unknown): CheckResult | undefined {
+  const r = (typeof value === "string" ? JSON.parse(value) : value) as Record<string, unknown> | null;
+  if (!r || typeof r !== "object" || typeof r.event !== "number" || typeof r.version !== "number" || !Array.isArray(r.results)) return undefined;
+  return {
+    event: r.event,
+    version: r.version,
+    results: readResults(r.results),
+    what: typeof r.what === "string" ? r.what : "a new event",
+    owner: typeof r.owner === "string" ? r.owner : "",
+    ...(typeof r.extra === "string" && r.extra && { extra: r.extra }),
+    ...(r.reopened === true && { reopened: true as const }),
+    ...(typeof r.source === "string" && r.source && { source: r.source }),
+  };
+}
+
+/** How long a pending check a post took is left to it before the sweep checks it (the post stopped, say). */
+export const CHECK_LEASE = 120;
+
+/** How long a claimed trigger notice is left to its sender before a sweep may send it. */
+const NOTICE_LEASE = 300;
+
+/** A trigger notice as saved, or undefined for one that doesn't read. */
+function readNotice(value: unknown): TriggerNotice | undefined {
+  const read = typeof value === "string" ? JSON.parse(value) : value;
+  if (!read || typeof read !== "object" || !Array.isArray((read as { fired?: unknown }).fired)) return undefined;
+  const { fired, what, extra, reopened, source } = read as Record<string, unknown>;
+  const results = readResults((fired as unknown[]).map((one) => ({ ...(one as object), held: true })));
+  if (!results.length) return undefined;
+  return {
+    fired: results,
+    what: typeof what === "string" ? what : "a new event",
+    ...(typeof extra === "string" && extra && { extra }),
+    ...(reopened === true && { reopened: true }),
+    ...(typeof source === "string" && source && { source }),
   };
 }
 

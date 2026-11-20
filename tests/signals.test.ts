@@ -1743,7 +1743,7 @@ describe("work someone on the team did themselves", () => {
       const db: Db = {
         query: async (text, values) => {
           // The team's reply is ingested and decided just before the customer's message is attached.
-          if (paused && text.includes(".task_events (task_id, event_id, version, at)") && values?.[1] === customerId) {
+          if (paused && text.includes(".task_events (task_id, event_id, version, at") && values?.[1] === customerId) {
             const run = paused;
             paused = undefined;
             await run();
