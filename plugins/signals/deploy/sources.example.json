@@ -34,6 +34,24 @@
       }
     },
     {
+      "name": "gmail.sent",
+      "service": "gmail",
+      "kind": "mcp",
+      "tool": "gmail_search",
+      "args": { "query": "in:sent after:{since_epoch}", "max_results": 50 },
+      "items": "items",
+      "lookback_hours": 24,
+      "map": {
+        "external_id": "id",
+        "title": "subject",
+        "actor": "from",
+        "group_key": "threadId",
+        "url": "https://mail.google.com/mail/u/0/#all/{threadId}",
+        "occurred_at": "date",
+        "payload": ["from", "to", "snippet", "labelIds"]
+      }
+    },
+    {
       "name": "google_drive",
       "kind": "mcp",
       "tool": "google_drive_list_recent",
@@ -51,6 +69,7 @@
     {
       "name": "slack",
       "kind": "mcp",
+      "service": "slack",
       "tool": "slack_search_public_and_private",
       "args": { "keywords": ["<@YOUR_SLACK_USER_ID>"], "filters": "", "natural_language_query": "", "after": "{since_epoch}", "limit": 20, "include_bots": false },
       "items": "results",
@@ -62,7 +81,35 @@
       "map": {
         "external_id": { "from": "permalink", "match": "\\((https://[^)?]+)" },
         "url": { "from": "permalink", "match": "\\((https://[^)]+)\\)" },
-        "group_key": { "from": "permalink", "match": "thread_ts=(\\d{10})|/p(\\d{10})" },
+        "group_key": { "from": "permalink", "match": ["/archives/([A-Z0-9]+)/p\\d+\\?(?:[^)\\s]*&)?thread_ts=(\\d+)\\.(\\d+)", "/archives/([A-Z0-9]+)/p(\\d{10})(\\d{6})"], "replace": "\\1:\\2.\\3" },
+        "title": { "from": "text", "match": "^\\s*([^\\n]{1,140})" },
+        "actor": { "from": "from", "match": "<([^>\\s]+@[^>\\s]+)>" },
+        "occurred_at": "message_ts",
+        "payload": {
+          "channel": { "from": "channel", "match": "^(.*?)\\s*\\(ID:" },
+          "channel_id": { "from": "channel", "match": "\\(ID: ([A-Z0-9]+)\\)" },
+          "from": { "from": "from", "match": "^(.*?)\\s*\\(ID:" },
+          "text": "text",
+          "context_before": "context_before"
+        }
+      }
+    },
+    {
+      "name": "slack.sent",
+      "kind": "mcp",
+      "service": "slack",
+      "tool": "slack_search_public_and_private",
+      "args": { "keywords": [], "filters": "from:<@YOUR_SLACK_USER_ID>", "natural_language_query": "", "after": "{since_epoch}", "limit": 20, "include_bots": false },
+      "items": "results",
+      "sections": {
+        "split": "^### Result \\d+ of \\d+\\s*$",
+        "keys": ["Channel", "Participants", "From", "Time", "Message_ts", "Reply count", "Permalink", "Text", "Context before", "Context after"]
+      },
+      "lookback_hours": 24,
+      "map": {
+        "external_id": { "from": "permalink", "match": "\\((https://[^)?]+)" },
+        "url": { "from": "permalink", "match": "\\((https://[^)]+)\\)" },
+        "group_key": { "from": "permalink", "match": ["/archives/([A-Z0-9]+)/p\\d+\\?(?:[^)\\s]*&)?thread_ts=(\\d+)\\.(\\d+)", "/archives/([A-Z0-9]+)/p(\\d{10})(\\d{6})"], "replace": "\\1:\\2.\\3" },
         "title": { "from": "text", "match": "^\\s*([^\\n]{1,140})" },
         "actor": { "from": "from", "match": "<([^>\\s]+@[^>\\s]+)>" },
         "occurred_at": "message_ts",

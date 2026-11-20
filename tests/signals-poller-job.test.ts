@@ -39,10 +39,13 @@ describe("a person's poller job", () => {
     expect(without.lakebase).toEqual(lakebase);
     expect(without.sources.every((source: { kind: string }) => source.kind === "mcp")).toBe(true);
     expect(without.sources.map((source: { name: string }) => source.name)).not.toContain("slack");
+    expect(without.sources.map((source: { name: string }) => source.name)).not.toContain("slack.sent");
     expect(without.sources.map((source: { name: string }) => source.name)).not.toContain("table.support_cases");
     const withSlack = personalSources(onboarding, "U0123");
     expect(withSlack).toContain("<@U0123>");
     expect(withSlack).not.toContain("YOUR_SLACK_USER_ID");
+    const sent = JSON.parse(withSlack).sources.find((source: { name: string }) => source.name === "slack.sent");
+    expect(sent.args.filters).toBe("from:<@U0123>");
   });
 
   it("runs poller.py from the person's folder with the full config path, every 15 minutes on serverless", () => {

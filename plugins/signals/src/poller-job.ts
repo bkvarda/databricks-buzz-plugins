@@ -11,17 +11,19 @@ export const POLLER_SCHEDULE = "0 0/15 * * * ?";
 export const pollerJobName = (user: string) => `Signals poller (${user})`;
 
 type Source = Record<string, unknown> & { name: string; kind: string };
+const isSlack = (source: Source) => source.name === "slack" || source.name.startsWith("slack.");
 
 /**
  * A person's sources.json: the example's personal (`mcp`) sources and the
- * hub's `lakebase`. Slack needs their Slack user id; without one it's left out.
+ * hub's `lakebase`. Slack (`slack`, and `slack.sent` for their own messages)
+ * needs their Slack user id; without one it's left out.
  */
 export function personalSources(onboarding: Onboarding, slackUserId?: string, example = EXAMPLE_SOURCES): string {
   const parsed = JSON.parse(example) as { sources: Source[] };
   const slack = slackUserId?.trim();
   const sources = parsed.sources
-    .filter((source) => source.kind === "mcp" && (source.name !== "slack" || slack))
-    .map((source) => (source.name === "slack" && slack ? (JSON.parse(JSON.stringify(source).replaceAll("YOUR_SLACK_USER_ID", slack)) as Source) : source));
+    .filter((source) => source.kind === "mcp" && (!isSlack(source) || slack))
+    .map((source) => (isSlack(source) && slack ? (JSON.parse(JSON.stringify(source).replaceAll("YOUR_SLACK_USER_ID", slack)) as Source) : source));
   return `${JSON.stringify({ lakebase: onboarding.lakebase, sources }, null, 2)}\n`;
 }
 

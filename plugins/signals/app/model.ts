@@ -63,6 +63,24 @@ export function toSeconds(value: string | number | undefined): number {
   return Number.isNaN(ms) ? Number.NaN : Math.floor(ms / 1000);
 }
 
+/**
+ * The same moment as `toSeconds`, in whole microseconds, keeping what a
+ * decimal string carries exactly (Slack's `1795001030.900000`) rather than
+ * through a float. NaN when it can't be read.
+ */
+export function toMicros(value: string | number | undefined): number {
+  if (value === undefined) return Date.now() * 1000;
+  if (typeof value === "number") return value > 1e12 ? Math.floor(value) * 1000 : Math.round(value * 1e6);
+  const decimal = /^(\d+)(?:\.(\d+))?$/.exec(value);
+  if (decimal) {
+    const whole = Number(decimal[1]);
+    if (whole > 1e12) return Math.floor(Number(value)) * 1000;
+    return whole * 1_000_000 + Number((decimal[2] ?? "").slice(0, 6).padEnd(6, "0"));
+  }
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? Number.NaN : ms * 1000;
+}
+
 /** JSON with sorted keys, so the same content always hashes the same. */
 export function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
@@ -232,6 +250,10 @@ export function classifyQuestions(classify: Classify): Record<string, { type: "n
  *   calendar `{dateTime}` / `{date}`), like a meeting's `payload.end`; done
  *   once it has passed by `grace_hours` (default 0). Checked by the sweep.
  * - `idle_days`: nothing new on the task (no event, no activity) for this many days. Checked by the sweep.
+ * - `by_owner`: someone on the team did the work: an event of the task's group
+ *   whose `actor` is the person whose source sent it (their reply in the
+ *   thread, mail they sent). Checked as each event comes in. They become the
+ *   task's owner, and agents on it are taken off.
  *
  * Tasks still asking the team about a recurring series are left open.
  */
@@ -240,6 +262,7 @@ export type DoneWhen = Readonly<{
   after?: string;
   grace_hours?: number;
   idle_days?: number;
+  by_owner?: boolean;
   /** What the thread is told; `{field}` takes an event field. A default says why. */
   note?: string;
 }>;
@@ -274,10 +297,12 @@ export type SourceInfo = Readonly<{
 
 export const DEFAULT_SOURCES: readonly SourceInfo[] = [
   { name: "gmail", label: "Gmail", service: "gmail", description: "Mail in your inbox." },
+  { name: "gmail.sent", label: "Gmail (sent)", service: "gmail", description: "Mail you sent, so a reply you send in a task's thread closes it." },
   { name: "google_calendar", label: "Google Calendar", service: "google_calendar", description: "Your meetings in the next week." },
   { name: "google_drive", label: "Google Drive", service: "google_drive", description: "Docs changed recently." },
   { name: "jira", label: "Jira", service: "atlassian", description: "Issues you're assigned, reported or watching." },
   { name: "slack", label: "Slack", service: "slack", description: "Messages that mention you." },
+  { name: "slack.sent", label: "Slack (sent)", service: "slack", description: "Messages you sent, so a reply you send in a task's thread closes it." },
 ];
 
 export type SignalsConfig = Readonly<{
@@ -423,10 +448,11 @@ export function configProblems(raw: unknown): string[] {
 }
 
 function doneWhenProblems(raw: unknown, where: string): string[] {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [`${where} is an object with when, after or idle_days`];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [`${where} is an object with when, after, idle_days or by_owner`];
   const done = raw as Record<string, unknown>;
   const problems: string[] = [];
-  if (done.when === undefined && done.after === undefined && done.idle_days === undefined) problems.push(`${where} needs when, after or idle_days`);
+  if (done.when === undefined && done.after === undefined && done.idle_days === undefined && done.by_owner === undefined) problems.push(`${where} needs when, after, idle_days or by_owner`);
+  if (done.by_owner !== undefined && typeof done.by_owner !== "boolean") problems.push(`${where}.by_owner is true or false`);
   if (done.when !== undefined) {
     if (!done.when || typeof done.when !== "object" || Array.isArray(done.when)) problems.push(`${where}.when is an object`);
     else
@@ -492,6 +518,31 @@ export function finishes(config: SignalsConfig, event: EventInput): { rule: Rule
   return config.rules.flatMap((rule) =>
     rule.action === "task" && rule.done_when?.when && Object.keys(rule.done_when.when).length && sourceMatches(rule.sources, event.source) && matches(rule.done_when.when, event) ? [{ rule, group: groupKey(rule, event) }] : [],
   );
+}
+
+/**
+ * The tasks an event shows someone on the team handled: for each rule with
+ * `done_when.by_owner` (and whose sources it's from), when the event's actor
+ * is `owner`, the person whose source sent it, that rule's group for it. The
+ * rule itself needn't match (it may skip your own messages).
+ */
+export function handledBy(config: SignalsConfig, event: EventInput, owner: string | undefined): { rule: Rule; group: string }[] {
+  if (!owner || emailOf(event.actor) !== owner.toLowerCase()) return [];
+  return config.rules.flatMap((rule) => (rule.action === "task" && rule.done_when?.by_owner && sourceMatches(rule.sources, event.source) ? [{ rule, group: groupKey(rule, event) }] : []));
+}
+
+/**
+ * A Slack thread's key, `C123:1795000000.123456` (its channel and root
+ * message's full ts), from a message's permalink: a reply's carries the root
+ * as `thread_ts=`, a root's is its own `/p…`. As the example Slack sources key
+ * threads. Undefined for anything else.
+ */
+export function slackThreadKey(permalink: string | null | undefined): string | undefined {
+  if (!permalink) return undefined;
+  const reply = /\/archives\/([A-Z0-9]+)\/p\d+\?(?:[^\s)#]*&)?thread_ts=(\d+)\.(\d+)/i.exec(permalink);
+  if (reply) return `${reply[1]}:${reply[2]}.${reply[3]}`;
+  const root = /\/archives\/([A-Z0-9]+)\/p(\d{10})(\d{6})(?![\d])/i.exec(permalink);
+  return root ? `${root[1]}:${root[2]}.${root[3]}` : undefined;
 }
 
 /** A rule's done_when with the config's done_idle_days filled in. */

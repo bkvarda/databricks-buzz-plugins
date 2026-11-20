@@ -113,6 +113,60 @@ class Extract(unittest.TestCase):
         self.assertIsNone(poller.extract(None, "b"))
 
 
+class ExampleSources(unittest.TestCase):
+    """The example sources.json, on items shaped like the real tools' output."""
+
+    def setUp(self):
+        import json, os
+        with open(os.path.join(os.path.dirname(__file__), "sources.example.json")) as file:
+            self.sources = {source["name"]: source for source in json.load(file)["sources"]}
+
+    def slack_events(self, name, permalinks):
+        results = "".join(
+            f"### Result {i + 1} of {len(permalinks)}\nChannel: #ext-{i} (ID: {channel})\nFrom: Ann <ann@globex.io> (ID: U1)\nMessage_ts: {ts}\nPermalink: [link]({link})\nText: hi\n\n---\n"
+            for i, (channel, ts, link) in enumerate(permalinks)
+        )
+        ws = FakeWorkspace([], mcp={"slack": {"results": results}})
+        events, _ = poller.poll_source(ws, self.sources[name], None, None, NOW)
+        return ws, events
+
+    def test_slack_sources_use_the_slack_service(self):
+        for name in ("slack", "slack.sent"):
+            ws, events = self.slack_events(name, [("C1", "1795000000.123456", "https://x.slack.com/archives/C1/p1795000000123456")])
+            self.assertEqual(ws.calls[0][1], "slack")
+            self.assertEqual(len(events), 1)
+
+    def test_slack_thread_key_is_the_channel_and_the_full_root_ts(self):
+        for name in ("slack", "slack.sent"):
+            _, events = self.slack_events(name, [
+                # A thread's root, and a reply in it (Slack's reply permalinks carry the root as thread_ts, after cid).
+                ("C1", "1795000000.123456", "https://x.slack.com/archives/C1/p1795000000123456"),
+                ("C1", "1795000300.654321", "https://x.slack.com/archives/C1/p1795000300654321?thread_ts=1795000000.123456&cid=C1"),
+                ("C1", "1795000301.000001", "https://x.slack.com/archives/C1/p1795000301000001?cid=C1&thread_ts=1795000000.123456"),
+                # Another channel's root in the same second, and another root in the same second of C1.
+                ("C2", "1795000000.999999", "https://x.slack.com/archives/C2/p1795000000999999"),
+                ("C1", "1795000000.000001", "https://x.slack.com/archives/C1/p1795000000000001"),
+            ])
+            keys = [event["group_key"] for event in events]
+            self.assertEqual(keys, ["C1:1795000000.123456", "C1:1795000000.123456", "C1:1795000000.123456", "C2:1795000000.999999", "C1:1795000000.000001"])
+            # The external id is still the message's own permalink, without the query.
+            self.assertEqual(events[1]["external_id"], "https://x.slack.com/archives/C1/p1795000300654321")
+
+    def test_sent_mail_is_its_own_source(self):
+        self.assertEqual(self.sources["gmail"]["args"]["query"], "in:inbox after:{since_epoch}")
+        self.assertNotIn("sent", self.sources["gmail"]["args"]["query"])
+        self.assertEqual(self.sources["gmail.sent"]["args"]["query"], "in:sent after:{since_epoch}")
+        ws = FakeWorkspace([], mcp={"gmail": {"items": [{"id": "m1", "threadId": "t1", "from": "me@x.com", "subject": "Re: hi"}]}})
+        events, _ = poller.poll_source(ws, self.sources["gmail.sent"], None, None, NOW)
+        self.assertEqual(ws.calls[0][1], "gmail")
+        self.assertEqual(events[0]["group_key"], "t1")
+
+    def test_match_lists_and_replace(self):
+        self.assertEqual(poller.extract("a-1 b-2", ["z(\\d)", "b-(\\d)"]), "2")
+        self.assertEqual(poller.extract("a-1 b-2", r"a-(\d) b-(\d)", r"\2/\1"), "2/1")
+        self.assertIsNone(poller.extract("abc", ["x", "y"]))
+
+
 class FakeCursor:
     def __init__(self, db):
         self.db = db

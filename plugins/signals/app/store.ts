@@ -9,7 +9,7 @@
 //   ticket update share one task), with its Buzz thread once posted.
 // - task_events, activities, artifacts: what led to a task and what was done.
 import { createHash } from "node:crypto";
-import { type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
+import { slackThreadKey, toMicros, type AccountIds, type AccountRecord, type Decision, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -67,6 +67,25 @@ export type Series = Readonly<{
 /** Someone on a task. `assigned_at`: when a person (or an agent) made them its owner, as against an agent asked to help. */
 export type TaskPerson = Readonly<{ kind: "agent" | "person"; key: string; label?: string; at: number; replied_at?: number; asked_at?: number; assigned_at?: number }>;
 
+/** A task someone on the team handled: who, their reply, the agents taken off it, and `owner` when a person other than them still owns it. */
+export type Handled = { task: Task; by: string; title?: string; url?: string; agents: string[]; owner?: string };
+
+/** A reply someone on the team sent in a group's thread, as recorded. */
+/**
+ * An event row's time in microseconds: `occurred_us`, or for a row saved
+ * before it, its Slack permalink's own ts (`/p1795001030900000`, the message's,
+ * not `thread_ts=`, which is the root's) when that's in the same second, or
+ * else its second.
+ */
+const EVENT_MICROS = `COALESCE(e.occurred_us,
+  CASE WHEN (e.source = 'slack' OR e.source LIKE 'slack.%') AND substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{16})') IS NOT NULL
+        AND substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{10})[0-9]{6}')::bigint = e.occurred_at
+       THEN substring(e.url from '/archives/[A-Za-z0-9]+/p([0-9]{16})')::bigint END,
+  e.occurred_at * 1000000)`;
+
+/** `at` in seconds; `micros` the same moment in microseconds (Slack's ts keeps them), for ordering it against the customer's messages. */
+export type Reply = Readonly<{ group: string; event: number; owner: string; source: string; title: string | null; url: string | null; at: number; micros?: number }>;
+
 export type Outcome = "new" | "changed" | "same" | "skipped";
 /** A rule's classifier: the probability (0 to 1) that the event needs a task, or undefined when it can't tell. */
 export type Classifier = (event: EventInput, classify: import("./model").Classify) => Promise<number | undefined>;
@@ -89,9 +108,11 @@ export type IngestResult = Readonly<{
   created: Task[];
   /** Tasks an event of this post was added to. */
   /** `changes`: watched fields this event changed. `outgrown`: the task's own rule no longer applies to the event and no other `task` rule of its group took it over, with the watched fields' values now. */
-  updated: { task: Task; title?: string; url?: string; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
+  updated: { task: Task; title?: string; url?: string; reopened?: boolean; changes?: FieldChange[]; outgrown?: { rule: string; values: { field: string; value: string }[] } }[];
   /** Tasks an event of this post finished (its rule's done_when.when), and why. */
   finished: { task: Task; reason: string }[];
+  /** Tasks someone on the team handled themselves (done_when.by_owner): who, the event that shows it, and the agents taken off. */
+  handled: Handled[];
   firstRun: boolean;
 }>;
 
@@ -137,6 +158,10 @@ export class SignalsStore {
       created_at bigint NOT NULL, updated_at bigint NOT NULL, last_event_at bigint NOT NULL, event_count int NOT NULL DEFAULT 0,
       latest_event bigint, buzz_root text, nudged_at bigint)`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS initiative text`);
+    // The newest customer message on the task, and the newest team reply decided on it (both microseconds): on the row,
+    // so a closure and a customer message decided at once see each other (each waits for the other's row lock, then rereads them).
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS customer_us bigint`);
+    await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS answered_us bigint`);
     await this.q(`ALTER TABLE $S.tasks ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'draft'`);
     // Account channels as their teams set them up (Set up account): names, domains, preferences, what agents learned.
     await this.q(`CREATE TABLE IF NOT EXISTS $S.accounts (
@@ -182,6 +207,16 @@ export class SignalsStore {
     // Owners someone chose (assigned_at), and who was taken off (removed_at): kept, so nothing puts them back but assigning them again.
     await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS assigned_at bigint`);
     await this.q(`ALTER TABLE $S.task_people ADD COLUMN IF NOT EXISTS removed_at bigint`);
+    // Replies someone on the team sent in a group's thread (done_when.by_owner), kept until they're decided:
+    // applied_at once checked against the task (closed_task when they closed it). One with no task yet waits for the task to open.
+    await this.q(`CREATE TABLE IF NOT EXISTS $S.replies (
+      group_key text NOT NULL, event_id bigint NOT NULL, owner text NOT NULL, source text NOT NULL, title text, url text,
+      at bigint NOT NULL, seen_at bigint NOT NULL, applied_at bigint, closed_task bigint, PRIMARY KEY (group_key, event_id))`);
+    await this.q(`CREATE INDEX IF NOT EXISTS replies_event ON $S.replies (event_id) WHERE applied_at IS NULL`);
+    // When it happened in microseconds, for ordering a team reply against a customer's message in the same second (Slack's ts).
+    // Rows from before it have none: their second stands in (occurred_at * 1e6).
+    await this.q(`ALTER TABLE $S.events ADD COLUMN IF NOT EXISTS occurred_us bigint`);
+    await this.q(`ALTER TABLE $S.replies ADD COLUMN IF NOT EXISTS at_us bigint`);
     await this.setupInbox();
   }
 
@@ -282,7 +317,19 @@ export class SignalsStore {
          enabled_at = CASE WHEN excluded.enabled AND NOT $S.sources.enabled THEN excluded.enabled_at ELSE $S.sources.enabled_at END`,
       [owner, source, enabled, scope === undefined ? null : JSON.stringify(scope), enabled ? now() : null],
     );
-    if (!enabled && forget) await this.q(`DELETE FROM $S.events WHERE owner = $1 AND source = $2`, [owner, source]);
+    if (!enabled && forget) {
+      // Events first, then their replies, decided or not: a forgotten reply mustn't close (or keep closed) anything.
+      // A reply is saved only while its event is there (recordReply), so one saved during this is caught by the second delete.
+      // (An event being attached holds its row: the delete waits for it, then returns the task it went to.)
+      const events = await this.q<{ task: unknown }>(
+        `WITH del AS (DELETE FROM $S.events WHERE owner = $1 AND source = $2 RETURNING id, task_id)
+         SELECT task_id AS task FROM del WHERE task_id IS NOT NULL UNION SELECT te.task_id FROM $S.task_events te WHERE te.event_id IN (SELECT id FROM del)`,
+        [owner, source],
+      );
+      const replies = await this.q<{ task: unknown }>(`DELETE FROM $S.replies WHERE owner = lower($1) AND source = $2 RETURNING closed_task AS task`, [owner, source]);
+      const tasks = [...new Set([...events.rows, ...replies.rows].map((row) => row.task).filter((task) => task !== null && task !== undefined).map(String))];
+      if (tasks.length) await this.retime(tasks);
+    }
   }
 
   async enabled(owner: string, source: string): Promise<{ enabled: boolean; firstRun: boolean }> {
@@ -307,18 +354,19 @@ export class SignalsStore {
     const hash = contentHash(event);
     const at = now();
     const occurred = toSeconds(event.occurred_at);
-    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null];
+    const micros = toMicros(event.occurred_at);
+    const values = [owner, event.source, event.external_id, hash, occurred, at, event.title ?? null, event.url ?? null, event.actor ?? null, event.account ?? null, event.group_key ?? null, event.payload ? JSON.stringify(event.payload) : null, Number.isNaN(micros) ? null : String(micros)];
     // xmax = 0 only for a row this statement inserted.
     const found = await this.q<{ id: unknown; versions: number; task_id: unknown; before: unknown; inserted: boolean; changed: boolean }>(
       `WITH previous AS (SELECT content_hash, occurred_at, title, url, actor, account, payload FROM $S.events WHERE owner = $1 AND source = $2 AND external_id = $3)
-       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12)
+       INSERT INTO $S.events (owner, source, external_id, content_hash, occurred_at, first_seen, last_seen, changed_at, title, url, actor, account, group_key, payload, occurred_us)
+       VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $13::bigint)
        ON CONFLICT (owner, source, external_id) DO UPDATE SET
          last_seen = excluded.last_seen,
          content_hash = excluded.content_hash,
          versions = $S.events.versions + CASE WHEN $S.events.content_hash = excluded.content_hash THEN 0 ELSE 1 END,
          changed_at = CASE WHEN $S.events.content_hash = excluded.content_hash THEN $S.events.changed_at ELSE excluded.changed_at END,
-         occurred_at = excluded.occurred_at, title = excluded.title, url = excluded.url, actor = excluded.actor,
+         occurred_at = excluded.occurred_at, occurred_us = excluded.occurred_us, title = excluded.title, url = excluded.url, actor = excluded.actor,
          account = excluded.account, group_key = excluded.group_key, payload = excluded.payload
        RETURNING id, versions, task_id,
          (SELECT row_to_json(previous) FROM previous) AS before,
@@ -339,7 +387,7 @@ export class SignalsStore {
    * are skipped (that's the opt-in). Returns what changed, for Buzz.
    */
   async ingest(owner: string, events: readonly EventInput[], config: SignalsConfig, classifier?: Classifier): Promise<IngestResult> {
-    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], firstRun: false };
+    const result: IngestResult = { received: events.length, new: 0, changed: 0, same: 0, skipped: 0, filtered: 0, errors: [], created: [], updated: [], finished: [], handled: [], firstRun: false };
     const counts = result as { -readonly [K in keyof IngestResult]: IngestResult[K] };
     const consent = new Map<string, { enabled: boolean; firstRun: boolean }>();
     const touched = new Map<number, Task>();
@@ -355,27 +403,43 @@ export class SignalsStore {
         if (state.firstRun) counts.firstRun = true;
         const recorded = await this.record(owner, event);
         counts[recorded.outcome]++;
-        if (recorded.outcome === "same") continue;
+        const replies = handledBy(config, event, owner);
+        if (recorded.outcome === "same") {
+          // Seen before, but a closure it started may not have finished (a write failed): finish it.
+          if (replies.length) {
+            for (const { group } of replies) await this.recordReply(group, recorded.id, owner, event, true);
+            for (const reply of await this.pendingReplies({ event: recorded.id })) await this.applyReply(reply, result);
+          }
+          continue;
+        }
         const placed = await this.place(owner, event, recorded, config, state.firstRun, classifier, () => counts.filtered++);
         // An event can finish a task even when its rule no longer matches it (a resolved ticket).
         let finishedHere = false;
         for (const { rule, group } of finishes(config, event)) {
           const task = placed?.task.group_key === group ? placed.task : await this.taskByGroup(group);
           if (!task || !isOpen(task.status) || (task.series && task.asked_by === SERIES_ASKER)) continue;
-          await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
+          await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), replies.length ? undefined : { micros: toMicros(event.occurred_at), reopen: false });
           const reason = doneReason(rule.done_when, event, { at: now(), sweep: false })!;
           const done = await this.finish(task.id, reason);
           if (task.id === placed?.task.id) finishedHere = true;
           // A task its own first event finishes (a ticket already resolved) is never posted.
           if (done && !(placed?.opened && task.id === placed.task.id)) result.finished.push({ task: done, reason });
         }
+        // Someone on the team did the work themselves (their reply in the thread): done, theirs, and its agents off it.
+        // (Recorded first, so a reply that comes before the customer's message, or a closure a failed write cut short, is still decided.)
+        for (const { group } of replies) {
+          const reply = await this.recordReply(group, recorded.id, owner, event);
+          if (!reply) continue;
+          const done = await this.applyReply(reply, result);
+          if (done && done.task.id === placed?.task.id) finishedHere = true;
+        }
         if (!placed || finishedHere) continue;
         let task = placed.task;
         if (placed.opened) opened.add(task.id);
-        else if (!isOpen(task.status) && placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true })) {
-          // (A finished task stays done when a late event for it is itself past done, like a meeting's notes after it ended.)
-          await this.setStatus(task.id, "open", "signals", "Opened again: a new event came in.");
-        }
+        // A finished task opens again for a new event, when attached (below): not for a message older than a team reply decided on it
+        // (that reply answered it), and not for a late event that is itself past done, like a meeting's notes after it ended.
+        // (A task this event just opened too: a team reply decided while it was being attached may have closed it already.)
+        const reopen = placed.create && recorded.outcome === "new" && !doneReason(doneWhenOf(config, placed.rule), event, { at: now(), sweep: true });
         // What the watched fields were: this event's last version, or else the task's latest event (another event of its group).
         let changes: FieldChange[] = [];
         let outgrown: { rule: string; values: { field: string; value: string }[] } | undefined;
@@ -390,15 +454,28 @@ export class SignalsStore {
           if (changes.length && own && task.rule_id !== placed.rule.id && !ruleApplies(config, own, event, owner))
             outgrown = { rule: own.id, values: [...new Set(watched)].map((path) => ({ field: path.replace(/^payload\./, ""), value: watchedValue(event, path) })) };
         }
-        await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at));
+        const reopened = await this.attach(task.id, recorded.id, recorded.version, toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen });
+        if (placed.opened) {
+          // Someone on the team already replied in its thread (their reply came in first): done, and never posted.
+          let closed = false;
+          for (const reply of await this.pendingReplies({ group: task.group_key })) if (await this.applyReply(reply)) closed = true;
+          if (closed) {
+            opened.delete(task.id);
+            continue;
+          }
+        }
         const fresh = (await this.task(task.id))!;
         touched.set(fresh.id, fresh);
-        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
+        if (!opened.has(fresh.id)) result.updated.push({ task: fresh, ...(event.title && { title: event.title }), ...(event.url && { url: event.url }), ...(reopened && { reopened }), ...(changes.length && { changes }), ...(outgrown && { outgrown }) });
       } catch (error) {
         result.errors.push({ index, error: (error as Error).message });
       }
     }
-    for (const id of opened) result.created.push(touched.get(id) ?? (await this.task(id))!);
+    // As they are now: a later event of this post (a team reply) may have closed one it opened. Those aren't new work.
+    for (const id of opened) {
+      const task = await this.task(id);
+      if (task && isOpen(task.status)) result.created.push(task);
+    }
     const by = new Map<string, number>();
     for (const event of events) by.set(event.source, (by.get(event.source) ?? 0) + 1);
     for (const [source, count] of by)
@@ -498,17 +575,123 @@ export class SignalsStore {
     return found.rows[0] ? toTask(found.rows[0]) : task;
   }
 
-  private async attach(task: number, event: number, version: number, at: number): Promise<void> {
-    const inserted = await this.q(`INSERT INTO $S.task_events (task_id, event_id, version, at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING task_id`, [task, event, version, now()]);
-    if (!inserted.rows.length) return;
-    await this.q(`UPDATE $S.events SET task_id = $1 WHERE id = $2`, [task, event]);
-    await this.q(`UPDATE $S.tasks SET event_count = event_count + 1, latest_event = $2, last_event_at = GREATEST(last_event_at, $3), updated_at = $4 WHERE id = $1`, [task, event, Number.isNaN(at) ? now() : at, now()]);
+  /**
+   * Adds an event to a task. One that isn't a team reply (`customer`) raises
+   * the task's newest customer time; with `reopen`, a finished task opens
+   * again unless a team reply decided on it came at or after the event (that
+   * reply answered it). All in one statement that locks the task row first,
+   * so a reply decided at the same time either sees this event or is seen by
+   * it. Returns whether it reopened the task.
+   */
+  private async attach(task: number, event: number, version: number, at: number, customer?: Readonly<{ micros: number; reopen: boolean }>): Promise<boolean> {
+    const micros = customer && !Number.isNaN(customer.micros) ? String(customer.micros) : null;
+    const found = await this.q<{ reopened: unknown }>(
+      `WITH lk AS (SELECT id, status, answered_us FROM $S.tasks WHERE id = $1 FOR UPDATE),
+       ins AS (INSERT INTO $S.task_events (task_id, event_id, version, at) SELECT $1, $2, $3, $5 FROM lk WHERE EXISTS (SELECT 1 FROM $S.events WHERE id = $2) ON CONFLICT DO NOTHING RETURNING task_id),
+       ev AS (UPDATE $S.events SET task_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM ins) RETURNING 1),
+       -- (Only while the event is saved: Forget's delete of it waits for this, or wins and this changes nothing on the task.)
+       cust AS (SELECT $6::bigint AS us WHERE $6::bigint IS NOT NULL AND EXISTS (SELECT 1 FROM ev) AND NOT EXISTS (SELECT 1 FROM $S.replies WHERE event_id = $2)),
+       -- (For a task closed before answered_us was kept: its decided replies as this statement sees them.)
+       answered AS (
+         SELECT COALESCE((SELECT answered_us FROM lk), (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
+           AND (r.closed_task = $1 OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = $1 AND te.event_id = r.event_id)))) AS us),
+       dec AS (
+         SELECT $7::boolean AND lk.status IN ('done', 'dismissed') AND (SELECT us FROM cust) IS NOT NULL
+           AND (SELECT us FROM cust) > COALESCE((SELECT us FROM answered), -1) AS reopen
+         FROM lk WHERE EXISTS (SELECT 1 FROM ev)),
+       t AS (
+         UPDATE $S.tasks SET event_count = event_count + 1, latest_event = $2, last_event_at = GREATEST(last_event_at, $4), updated_at = $5,
+           customer_us = GREATEST(customer_us, (SELECT us FROM cust)),
+           status = CASE WHEN (SELECT reopen FROM dec) THEN 'open' ELSE status END
+         WHERE id = $1 AND EXISTS (SELECT 1 FROM dec)
+         RETURNING 1),
+       again AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text)
+         SELECT $1, $5, 'signals', 'status', 'open: Opened again: a new event came in.' FROM dec WHERE dec.reopen AND EXISTS (SELECT 1 FROM t)
+         RETURNING 1)
+       SELECT EXISTS (SELECT 1 FROM again) AS reopened, (SELECT count(*) FROM ev) AS n`,
+      [task, event, version, Number.isNaN(at) ? now() : at, now(), micros, customer?.reopen ?? false],
+    );
+    return Boolean(found.rows[0]?.reopened);
+  }
+
+  /**
+   * Works out tasks' newest customer message and newest decided team reply
+   * again from the rows left (after Forget deleted some). Attaching and
+   * deciding only ever raise them, under the task's row lock: when one of
+   * them raised a task's value while this waited for that lock (after this
+   * statement's snapshot), its value is kept too.
+   */
+  private async retime(tasks: readonly string[]): Promise<void> {
+    // Each try reads the rows left and writes only when the task's times are still what that read saw. Otherwise
+    // something changed them meanwhile (an attachment, a closure, another Forget), and it reads again: a value
+    // worked out from an older read never stands.
+    let left = [...tasks];
+    for (let attempt = 0; left.length && attempt < 50; attempt++) {
+      const done = await this.q<{ id: unknown }>(
+        `UPDATE $S.tasks t SET customer_us = s.customer, answered_us = s.answered
+         FROM (
+           SELECT x.id, x.customer_us AS customer_was, x.answered_us AS answered_was,
+             (SELECT max(${EVENT_MICROS}) FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+               WHERE te.task_id = x.id AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)) AS customer,
+             (SELECT max(COALESCE(r.at_us, r.at * 1000000)) FROM $S.replies r WHERE r.applied_at IS NOT NULL
+               AND (r.closed_task = x.id OR EXISTS (SELECT 1 FROM $S.task_events te WHERE te.task_id = x.id AND te.event_id = r.event_id))) AS answered
+           FROM $S.tasks x WHERE x.id = ANY($1::bigint[])) s
+         WHERE t.id = s.id AND t.customer_us IS NOT DISTINCT FROM s.customer_was AND t.answered_us IS NOT DISTINCT FROM s.answered_was
+         RETURNING t.id`,
+        [left],
+      );
+      const written = new Set(done.rows.map((row) => String(row.id)));
+      left = left.filter((id) => !written.has(id));
+    }
+    if (left.length) throw new Error(`couldn't work out the times of tasks ${left.join(", ")} again`);
   }
 
   /** The task a group's events go to: the one it opened, or the one it joined as a copy of another person's. */
   async taskByGroup(group: string): Promise<Task | undefined> {
     const found = await this.q(`SELECT * FROM $S.tasks WHERE group_key = $1`, [group]);
     if (found.rows[0]) return toTask(found.rows[0]);
+    const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
+    if (linked.rows[0]) return toTask(linked.rows[0]);
+    return this.legacySlackTask(group);
+  }
+
+  /**
+   * A Slack task from before threads were keyed by channel and full root ts:
+   * the old example source keyed one by a second, `rule|1795000050`, the root's
+   * or (for a task a reply opened) that reply's own. For a new key
+   * (`rule|C1:1795000000.123456`) it looks for old-keyed tasks of the rule
+   * holding a Slack message whose stored permalink names this thread, and
+   * links the new key to the one it finds, so a customer's message and a team
+   * reply in the thread both reach it. Only when there's exactly one, and
+   * every Slack message on it names this thread: a task that mixed threads
+   * (two in one second), or has a message without a permalink, is left alone.
+   */
+  private async legacySlackTask(group: string): Promise<Task | undefined> {
+    const key = /^(.*)\|([A-Z0-9]+):(\d{10})\.(\d{6})$/i.exec(group);
+    if (!key) return undefined;
+    const [, rule, channel, seconds, micros] = key as unknown as [string, string, string, string, string];
+    const thread = `${channel}:${seconds}.${micros}`;
+    const like = (text: string) => text.replace(/[\\%_]/g, (c) => `\\${c}`);
+    const candidates = await this.q(
+      `SELECT DISTINCT t.* FROM $S.events e JOIN $S.tasks t ON t.id = e.task_id
+       WHERE (e.source = 'slack' OR e.source LIKE 'slack.%') AND e.url LIKE $1
+         AND (e.url LIKE $2 OR e.url LIKE $3) AND t.group_key LIKE $4 AND t.group_key ~ '\\|[0-9]{10}$' LIMIT 5`,
+      [`%/archives/${like(channel)}/p%`, `%thread_ts=${seconds}.${micros}%`, `%/archives/${like(channel)}/p${seconds}${micros}%`, `${like(rule)}|%`],
+    );
+    const found: Task[] = [];
+    for (const row of candidates.rows) {
+      const task = toTask(row);
+      if (task.group_key.slice(0, task.group_key.lastIndexOf("|")) !== rule) continue;
+      const messages = await this.q<{ url: unknown }>(
+        `SELECT DISTINCT e.url FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id WHERE te.task_id = $1 AND (e.source = 'slack' OR e.source LIKE 'slack.%')`,
+        [task.id],
+      );
+      const threads = new Set(messages.rows.map((message) => slackThreadKey(typeof message.url === "string" ? message.url : undefined) ?? ""));
+      if (threads.size === 1 && threads.has(thread)) found.push(task);
+    }
+    if (found.length !== 1) return undefined;
+    await this.q(`INSERT INTO $S.group_links (group_key, task_id, at) VALUES ($1, $2, $3) ON CONFLICT (group_key) DO NOTHING`, [group, found[0]!.id, now()]);
     const linked = await this.q(`SELECT t.* FROM $S.group_links l JOIN $S.tasks t ON t.id = l.task_id WHERE l.group_key = $1`, [group]);
     return linked.rows[0] ? toTask(linked.rows[0]) : undefined;
   }
@@ -811,6 +994,115 @@ export class SignalsStore {
     return out;
   }
 
+  /**
+   * Records a reply someone on the team sent in a group's thread (once; it
+   * waits there until it's decided), only while its event is still saved:
+   * undefined when Forget deleted it meanwhile.
+   */
+  private async recordReply(group: string, event: number, owner: string, input: EventInput, keep = false): Promise<Reply | undefined> {
+    const title = input.title ? plainSlack(input.title).replace(/\s+/g, " ").trim().slice(0, 200) : null;
+    const occurred = toSeconds(input.occurred_at);
+    const at = Number.isNaN(occurred) ? now() : occurred;
+    const precise = toMicros(input.occurred_at);
+    const micros = Number.isNaN(precise) ? at * 1_000_000 : precise;
+    // (The event's key-share lock holds Forget's delete of it until this commits; then Forget's delete of replies sees this row.)
+    const saved = await this.q<{ kept: unknown }>(
+      `WITH ev AS (SELECT id FROM $S.events WHERE id = $2 FOR KEY SHARE),
+       ins AS (
+         INSERT INTO $S.replies (group_key, event_id, owner, source, title, url, at, seen_at, at_us)
+         SELECT $1, ev.id, $3, $4, $5, $6, $7, $8, $9::bigint FROM ev
+         ON CONFLICT (group_key, event_id) DO ${keep ? "NOTHING" : "UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url, at = EXCLUDED.at, at_us = EXCLUDED.at_us"} RETURNING 1)
+       SELECT EXISTS (SELECT 1 FROM ev) AS kept, (SELECT count(*) FROM ins) AS n`,
+      [group, event, owner.toLowerCase(), input.source, title, input.url ?? null, at, now(), String(micros)],
+    );
+    if (!saved.rows[0]?.kept) return undefined;
+    return { group, event, owner: owner.toLowerCase(), source: input.source, title, url: input.url ?? null, at, micros };
+  }
+
+  /** Replies not decided yet: one event's, or one group's. */
+  private async pendingReplies(where: { event: number } | { group: string }): Promise<Reply[]> {
+    const found = "event" in where
+      ? await this.q(`SELECT * FROM $S.replies WHERE event_id = $1 AND applied_at IS NULL ORDER BY at`, [where.event])
+      : await this.q(`SELECT * FROM $S.replies WHERE group_key = $1 AND applied_at IS NULL ORDER BY at`, [where.group]);
+    return found.rows.map((row) => ({ group: String(row.group_key), event: Number(row.event_id), owner: String(row.owner), source: String(row.source), title: (row.title as string | null) ?? null, url: (row.url as string | null) ?? null, at: Number(row.at), micros: row.at_us === null || row.at_us === undefined ? Number(row.at) * 1_000_000 : Number(row.at_us) }));
+  }
+
+  /** Decides a recorded reply against its group's task, if it has one yet (adding the closure to `result`). */
+  private async applyReply(reply: Reply, result?: IngestResult): Promise<Handled | undefined> {
+    const task = await this.taskByGroup(reply.group);
+    if (!task) return undefined;
+    await this.attach(task.id, reply.event, 1, reply.at);
+    const done = await this.handled(task.id, reply);
+    if (done && result) result.handled.push(done);
+    return done;
+  }
+
+  /**
+   * Marks a task done because someone on the team did the work, as their
+   * reply shows, when it's open and the reply is no older than the customer's
+   * latest message on it: records what they did, makes them its owner unless
+   * a person still owns it, and takes its agents off it. All in one statement,
+   * so it all happens or none does, and only the call that closes it gets a
+   * result (and tells the agents to stop). The reply is marked decided either way.
+   */
+  async handled(id: number, reply: Reply): Promise<Handled | undefined> {
+    const at = now();
+    const what = `${reply.owner} handled it themselves (${reply.source})${reply.title ? `: ${reply.title}` : ""}${reply.url ? ` ${reply.url}` : ""}`.slice(0, 4000);
+    // The reply's row lock comes first, and for update: a second decision of the same reply waits for this one, then finds the task done,
+    // instead of both holding a share lock and deadlocking at `mark`. Forget's delete waits too, or wins and this closes nothing.
+    const found = await this.q<{ task: unknown; agents: unknown; owners: unknown }>(
+      // (Its event too: Forget deletes events before replies, so a reply whose event is gone is one being forgotten.)
+      `WITH kept AS (SELECT 1 FROM $S.replies r JOIN $S.events e ON e.id = r.event_id WHERE r.group_key = $2 AND r.event_id = $5 FOR NO KEY UPDATE OF r FOR KEY SHARE OF e),
+       -- Then the task row, for update (only once the reply is held, so two decisions take the locks in the same order). A customer
+       -- message being attached holds it too: this waits for it and reads its customer_us, or it waits for this and reads answered_us.
+       lk AS (SELECT id, status, series, asked_by, customer_us FROM $S.tasks WHERE id = $1 AND EXISTS (SELECT 1 FROM kept) FOR UPDATE),
+       -- (For events attached before customer_us was kept.)
+       latest AS (
+         SELECT max(${EVENT_MICROS}) AS at FROM $S.task_events te JOIN $S.events e ON e.id = te.event_id
+         WHERE te.task_id = $1 AND NOT EXISTS (SELECT 1 FROM $S.replies r WHERE r.event_id = e.id)),
+       dec AS (
+         SELECT lk.status NOT IN ('done', 'dismissed') AND NOT (lk.series IS NOT NULL AND lk.asked_by IS NOT DISTINCT FROM $9::text)
+           AND $4::bigint >= COALESCE(GREATEST(lk.customer_us, (SELECT at FROM latest)), 0) AS close
+         FROM lk),
+       -- (Only while the reply is still saved: Forget deletes it, and a closure it was about to make with it. Its time is kept either way:
+       -- a later customer message older than it doesn't reopen the task.)
+       upd AS (
+         UPDATE $S.tasks SET answered_us = GREATEST(answered_us, $4::bigint),
+           status = CASE WHEN (SELECT close FROM dec) THEN 'done' ELSE status END,
+           question = CASE WHEN (SELECT close FROM dec) THEN NULL ELSE question END,
+           options = CASE WHEN (SELECT close FROM dec) THEN NULL ELSE options END,
+           asked_by = CASE WHEN (SELECT close FROM dec) THEN NULL ELSE asked_by END,
+           updated_at = CASE WHEN (SELECT close FROM dec) THEN $3 ELSE updated_at END
+         WHERE id = $1 AND EXISTS (SELECT 1 FROM dec)
+         RETURNING *),
+       t AS (SELECT upd.* FROM upd, dec WHERE dec.close),
+       -- (Never undone: a second delivery of the same reply that finds the task already done keeps the first one's closure.)
+       mark AS (UPDATE $S.replies SET applied_at = COALESCE(applied_at, $3), closed_task = COALESCE((SELECT id FROM t), closed_task) WHERE group_key = $2 AND event_id = $5 RETURNING 1),
+       owners AS (SELECT key FROM $S.task_people WHERE task_id = $1 AND kind = 'person' AND assigned_at IS NOT NULL AND removed_at IS NULL AND key <> $6),
+       agents AS (
+         UPDATE $S.task_people SET removed_at = $3, assigned_at = NULL
+         WHERE task_id = $1 AND kind = 'agent' AND removed_at IS NULL AND EXISTS (SELECT 1 FROM t) RETURNING key),
+       responder AS (
+         INSERT INTO $S.task_people (task_id, kind, key, at, assigned_at)
+         SELECT $1, 'person', $6, $3, $3 WHERE EXISTS (SELECT 1 FROM t) AND NOT EXISTS (SELECT 1 FROM owners)
+         ON CONFLICT (task_id, kind, key) DO UPDATE SET removed_at = NULL, assigned_at = COALESCE($S.task_people.assigned_at, EXCLUDED.assigned_at)
+         RETURNING key),
+       acts AS (
+         INSERT INTO $S.activities (task_id, at, actor, kind, text)
+         SELECT $1, $3, $6, v.kind, v.text FROM t, (VALUES (1, 'handled', $7::text), (2, 'status', $8::text)) AS v(n, kind, text) ORDER BY v.n RETURNING 1),
+       art AS (INSERT INTO $S.artifacts (task_id, at, actor, kind, url, title) SELECT $1, $3, $6, 'reply', $10::text, $11::text FROM t WHERE $10::text IS NOT NULL RETURNING 1)
+       SELECT (SELECT row_to_json(t) FROM t) AS task, ARRAY(SELECT key FROM agents ORDER BY key) AS agents, ARRAY(SELECT key FROM owners ORDER BY key) AS owners,
+         (SELECT count(*) FROM mark) + (SELECT count(*) FROM responder) + (SELECT count(*) FROM acts) + (SELECT count(*) FROM art) AS writes`,
+      [id, reply.group, at, String(reply.micros ?? reply.at * 1_000_000), reply.event, reply.owner, what, `done: handled by ${reply.owner}`, SERIES_ASKER, reply.url, `${reply.owner}'s reply`],
+    );
+    const row = found.rows[0];
+    const raw = typeof row?.task === "string" ? (JSON.parse(row.task) as Row) : (row?.task as Row | null | undefined);
+    if (!raw) return undefined;
+    const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : typeof value === "string" ? value.replace(/^\{|\}$/g, "").split(",").filter(Boolean) : []);
+    const owners = list(row!.owners);
+    return { task: toTask(raw), by: reply.owner, ...(reply.title && { title: reply.title }), ...(reply.url && { url: reply.url }), agents: list(row!.agents), ...(owners[0] && { owner: owners[0] }) };
+  }
+
   /** Marks a task done by its rule (not a person), clearing any question; undefined if it's gone. */
   async finish(id: number, reason: string): Promise<Task | undefined> {
     await this.q(`UPDATE $S.tasks SET question = NULL, options = NULL, asked_by = NULL WHERE id = $1`, [id]);
@@ -862,7 +1154,7 @@ export class SignalsStore {
       const event = toEvent(row);
       const placed = await this.place(String(row.owner), event, { id: Number(row.id) }, config, false);
       if (!placed) continue;
-      await this.attach(placed.task.id, Number(row.id), Number(row.versions), toSeconds(event.occurred_at));
+      await this.attach(placed.task.id, Number(row.id), Number(row.versions), toSeconds(event.occurred_at), { micros: toMicros(event.occurred_at), reopen: false });
       if (placed.opened) opened.push((await this.task(placed.task.id))!);
     }
     return opened;

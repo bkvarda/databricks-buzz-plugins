@@ -25,8 +25,8 @@
 //                                         the `lakebase` settings and arguments for your sources.json and job
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
-import type { Classifier, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, idsByKind, readIds, plainSlack, type EventInput, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, withAccounts } from "./model";
+import type { Classifier, Handled, IngestResult, SignalsStore, Task, TaskPerson } from "./store";
 import { decode, npubEncode } from "nostr-tools/nip19";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -105,6 +105,8 @@ export class Hub {
   private publishedIds?: string;
   /** The last failure to post a task in each channel, until a post there works. */
   private readonly postFailures = new Map<string, string>();
+  /** Tasks being posted now, so overlapping posts of one task send one Buzz thread. */
+  private readonly posting = new Map<number, Promise<void>>();
 
   constructor(
     readonly store: SignalsStore,
@@ -316,11 +318,33 @@ export class Hub {
   private async announce(result: IngestResult) {
     if (!this.notifier) return;
     for (const task of result.created) await this.post(task);
+    // A task never posted (a reply closed it before it was) that a customer message opened again: post it now.
+    for (const id of new Set(result.updated.filter((update) => update.reopened && !update.task.buzz_root).map((update) => update.task.id))) {
+      const task = await this.store.task(id);
+      if (task) await this.post(task);
+    }
     const seen = new Set<number>();
     for (const { task, reason } of result.finished) {
       if (!task.buzz_root || seen.has(task.id)) continue;
       seen.add(task.id);
       await this.notifier.updated(task, doneMessage(reason)).catch((error: Error) => this.log(`couldn't post that task ${task.id} is done: ${error.message}`));
+    }
+    // One notice per task, for its last closure in this post (the reply that answered the newest customer message),
+    // taking off every agent any of its closures removed.
+    const closures = new Map<number, Handled>();
+    for (const done of result.handled) {
+      const before = closures.get(done.task.id);
+      closures.set(done.task.id, { ...done, agents: [...new Set([...(before?.agents ?? []), ...done.agents])] });
+    }
+    for (const { task, by, title, url, agents, owner } of closures.values()) {
+      if (!task.buzz_root || seen.has(task.id)) continue;
+      seen.add(task.id);
+      // A newer customer message later in the same post opened it again: one message says both, and no "Done".
+      const now = await this.store.task(task.id);
+      // The customer message that opened it again (not a delayed older one in the same post).
+      const later = now && isOpen(now.status) ? [...result.updated].reverse().find((update) => update.task.id === task.id && update.reopened) : undefined;
+      const text = now && isOpen(now.status) ? handledThenReopened(by, title, url, agents, owner, later && { title: later.title && plainSlack(later.title), url: later.url }) : handledMessage(by, title, url, agents, owner);
+      await this.notifier.updated(now ?? task, text, agents).catch((error: Error) => this.log(`couldn't post that task ${task.id} was handled: ${error.message}`));
     }
     for (const update of result.updated) {
       if (!update.task.buzz_root || seen.has(update.task.id)) continue;
@@ -374,8 +398,21 @@ export class Hub {
     await this.notifier!.updated(task, changedMessage(task, update, changes, agents, account && briefing(account, labels, playbookTask), outgrown, event && eventDetails(event, account?.domains ?? [], labels)), agents);
   }
 
-  private async post(task: Task) {
-    if (!this.notifier || !task.channel || task.buzz_root) return;
+  /**
+   * Posts a task once: a call for a task already being posted leaves it to that post (without waiting on the
+   * relay), and the task is read again first, so one posted (or closed) since isn't posted again.
+   */
+  private post(task: Task): Promise<void> {
+    if (this.posting.has(task.id)) return Promise.resolve();
+    const run = this.publish(task).finally(() => this.posting.delete(task.id));
+    this.posting.set(task.id, run);
+    return run;
+  }
+
+  private async publish(given: Task) {
+    if (!this.notifier || !given.channel || given.buzz_root) return;
+    const task = await this.store.task(given.id);
+    if (!task || !task.channel || task.buzz_root || !isOpen(task.status)) return;
     try {
       // The account's agents are asked to work on it, unless the team said ask (they wait for a person) or off.
       const account = task.account && (task.mode === "auto" || task.mode === "draft") ? await this.store.account({ name: task.account }) : undefined;
@@ -894,6 +931,35 @@ const REPEAT_MS = 12 * 60 * 60 * 1000;
 
 /** What a task's thread is told when its rule finishes it. */
 export const doneMessage = (reason: string) => `✅ Done: ${reason}. (Set its status on the Tasks board if it isn't.)`;
+
+/** What a task's thread is told when someone on the team did the work themselves; its agents (taken off it) are told to stop. */
+export function handledMessage(by: string, title?: string, url?: string, agents: readonly string[] = [], owner?: string): string {
+  const what = url ? `[${title ?? "their reply"}](${url})` : title ? `"${title}"` : "";
+  const whose = owner && owner !== by ? `It stays with **${owner}**` : "It's theirs now";
+  return [
+    `✅ Done: **${by}** handled this${what ? `: ${what}` : ""}. ${whose}; a new message from the customer opens it again.`,
+    agents.length ? `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you're off this task: stop working on it, and don't post more here unless someone asks you.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Someone on the team handled a task, and a newer message from the customer
+ * (in the same post) opened it again: it's still theirs, and the agents taken
+ * off it stay off (as when the message comes later), with nothing saying it's done.
+ */
+export function handledThenReopened(by: string, title?: string, url?: string, agents: readonly string[] = [], owner?: string, next?: Readonly<{ title?: string; url?: string }>): string {
+  const what = url ? `[${title ?? "their reply"}](${url})` : title ? `"${title}"` : "";
+  const message = next?.url ? `[${next.title ?? "a new message"}](${next.url})` : next?.title ? `"${next.title}"` : "a new message";
+  const who = owner && owner !== by ? owner : by;
+  return [
+    `↩️ **${by}** replied${what ? `: ${what}` : ""}, then the customer wrote again: ${message}. It's open, with **${who}**.`,
+    agents.length ? `${agents.map((key) => `nostr:${npub(key)}`).join(" ")} you're off this task: **${who}** has it. Don't post more here unless someone asks you.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
 
 /** A task as its Buzz message shows it. */
 /** An account as the API gives it: with its preferences read, so the UI and agents see what took. */
