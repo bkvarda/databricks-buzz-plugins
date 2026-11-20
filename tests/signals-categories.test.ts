@@ -168,7 +168,7 @@ describe("rule categories", () => {
     expect((await store.detail(after.refile!.id))!.activities.map((one) => one.text)).toContain("Now under rule resolved_work: a new event matched it. That rule has no capacity request category, so it's under no workstream now, in draft mode.");
   });
 
-  it("keeps a filing by hand that a refile overlaps, before its history is saved or after the task was read", async () => {
+  it("keeps a filing by hand that a refile overlaps, before its history is saved or after the task was read, in the new rule's mode for it", async () => {
     const rules = [
       { ...ESCALATIONS, group: "es", when: { "payload.status": ["Incoming"] }, watch: ["payload.status"] },
       { id: "case_follow", group: "es", group_by: "external_id", action: "task", sources: ["jira"], workstream: "case follow-up", when: { "payload.status": ["Investigating"] }, watch: ["payload.status"] },
@@ -190,9 +190,9 @@ describe("rule categories", () => {
       reached();
       return release;
     });
-    await post(ticket("early", "Please increase TPM for our endpoint", { status: "Incoming" }), ticket("late", "Please increase TPM for our endpoint", { status: "Incoming" }));
+    await post(...["early", "late", "other"].map((id) => ticket(id, "Please increase TPM for our endpoint", { status: "Incoming" })));
     const byKey = async (): Promise<Record<string, Awaited<ReturnType<SignalsStore["tasks"]>>[number]>> => Object.fromEntries((await store.tasks({})).map((task) => [task.group_key.split("|").pop(), task]));
-    const { early, late } = await byKey();
+    const { early, late, other } = await byKey();
     // The filing has saved its workstream, but not yet its history, when the ticket moves to a rule with a workstream of its own.
     const beforeHistory = holdNext((sql, values) => sql.includes("activities") && values?.[2] === "bob@x.com" && values?.[3] === "workstream");
     const filing = store.file(early!.id, "bob@x.com", { workstream: "manual review" });
@@ -209,6 +209,14 @@ describe("rule categories", () => {
     beforeWrite.release();
     expect((await refiled).errors).toEqual([]);
     expect(await store.task(late!.id)).toMatchObject({ rule_id: "es_later", workstream: "manual review", mode: "auto" });
+    // Filed under another of the new rule's categories meanwhile: it takes the team's mode for that one there (es_later: draft).
+    const beforeOther = holdNext((sql) => sql.includes("SET rule_id = $2"));
+    const moving = post(ticket("other", "Please increase TPM for our endpoint", { status: "Waiting" }));
+    await beforeOther.at;
+    await store.file(other!.id, "bob@x.com", { workstream: "incident" });
+    beforeOther.release();
+    expect((await moving).errors).toEqual([]);
+    expect(await store.task(other!.id)).toMatchObject({ rule_id: "es_later", workstream: "incident", mode: "draft" });
   });
 
   it("opens a closed task again only while the team still works on its own category", async () => {
