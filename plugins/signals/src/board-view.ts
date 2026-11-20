@@ -1,7 +1,7 @@
 // What the tasks board shows, apart from how it draws it: each task's
 // assignee, the filters, and the list and swimlane views' groups.
 import type { BoardPerson, BoardTask, FilteredEvent } from "./client";
-import { parseTaskPost, parseThreadPost, type TaskPost, type ThreadPost } from "./posts";
+import { parseTaskPost, parseThreadPost, sourceName, type TaskPost, type ThreadPost } from "./posts";
 
 /** The views of the board: rows grouped by status, a column per status, or the events the classifier held back. */
 export const VIEWS = ["list", "swimlanes", "filtered"] as const;
@@ -66,7 +66,7 @@ export function memberChoices(members: readonly string[], boardAgents: readonly 
 /** The board's filters; an empty one keeps every task. */
 export type BoardFilters = Readonly<{ status?: string; workstream?: string; assignee?: string; mode?: string; search?: string }>;
 
-/** The tasks the filters keep, in the board's order. Search matches the id, title, workstream, initiative, source and its title, any case. */
+/** The tasks the filters keep, in the board's order. Search matches the id, title, workstream, initiative, the latest source and its title, and the source it opened from (its title and id), any case. */
 export function filterTasks(tasks: readonly BoardTask[], filters: BoardFilters): BoardTask[] {
   const words = (filters.search ?? "").toLowerCase().split(/\s+/).filter(Boolean);
   return tasks.filter((item) => {
@@ -76,9 +76,79 @@ export function filterTasks(tasks: readonly BoardTask[], filters: BoardFilters):
     if (filters.mode && task.mode !== filters.mode) return false;
     if (filters.assignee && assigneeValue(assigneeOf(item)) !== filters.assignee) return false;
     if (!words.length) return true;
-    const haystack = [`#${task.id}`, task.title, task.workstream, task.initiative, item.source?.source, item.source?.title].filter(Boolean).join(" ").toLowerCase();
+    const haystack = [`#${task.id}`, task.title, task.workstream, task.initiative, item.source?.source, item.source?.title, item.origin?.title, item.origin?.external_id, taskOrigin(task.title, item.origin).ref].filter(Boolean).join(" ").toLowerCase();
     return words.every((word) => haystack.includes(word));
   });
+}
+
+const squash = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
+const TICKET = /^[A-Z][A-Z0-9]+-\d+$/;
+
+/** The source a task opened from, as far as a card knows it. */
+export type Origin = Readonly<{ source: string; external_id?: string; title?: string; url?: string }>;
+
+/**
+ * What a task's title no longer says about the source it opened from: that
+ * source's own title, when a short title or a rule's template replaced it
+ * ("Capacity request: Gemini 4 Carbon…" for "ES-2376026 For customer: …"),
+ * and its ticket key, from a Jira link (`/browse/ES-2376026`) or an id that is
+ * one. Each is left out when the title already has it, as "Prep: {title}"
+ * does; a key only as a whole word.
+ */
+export function taskOrigin(title: string, origin: Origin | undefined): { original?: string; ref?: string } {
+  if (!origin) return {};
+  const own = origin.title?.replace(/\s+/g, " ").trim();
+  const original = own && !squash(title).includes(squash(own)) ? own : undefined;
+  const linked = origin.url && /\/browse\/([A-Z][A-Z0-9]+-\d+)(?:[/?#]|$)/.exec(origin.url)?.[1];
+  const ref = linked || (origin.external_id && TICKET.test(origin.external_id) ? origin.external_id : undefined);
+  const said = ref && title.split(/[^A-Za-z0-9-]+/).includes(ref);
+  return { ...(original && { original }), ...(ref && !said && { ref }) };
+}
+
+/** A task title's tooltip: the title, and its source's own title when that says something else. */
+/** For the full view, under the task's title: the source it opened from, when a short title or template hides that source's title and the latest event (shown below it) isn't that same source, title and link. */
+export function openingTitle(item: Readonly<{ task: Readonly<{ title: string }>; source?: Readonly<{ source: string; title?: string; url?: string }>; origin?: Origin | null }>): { source: string; title: string; url?: string } | undefined {
+  const origin = item.origin ?? undefined;
+  const { original } = taskOrigin(item.task.title, origin);
+  if (!original || !origin) return undefined;
+  const latest = item.source;
+  // Only the same event (same source, title and link) already says it: another ticket with the same summary has its own link.
+  if (latest && latest.source === origin.source && (latest.url ?? "") === (origin.url ?? "") && latest.title && squash(latest.title) === squash(original)) return undefined;
+  return { source: origin.source, title: original, ...(origin.url && { url: origin.url }) };
+}
+
+/** How the hub filed a task under its workstream, for the workstream's hover: by a category's `when` match, or the classifier's pick. Nothing when the rule alone filed it, or for tasks filed before this was kept. */
+export function filedHint(task: Readonly<{ filed_by?: string | null; filed_score?: number | null }>): string | undefined {
+  if (task.filed_by === "match") return "Matched a category rule";
+  if (task.filed_by !== "classifier") return undefined;
+  const score = typeof task.filed_score === "number" && Number.isFinite(task.filed_score) ? ` (${Math.round(Math.min(1, Math.max(0, task.filed_score)) * 100)}%)` : "";
+  return `Picked by the classifier${score}`;
+}
+
+/** The workstream chip's hover: its full name (the chip may cut it short), then how it was filed, when known. */
+export function workstreamHint(task: Readonly<{ workstream?: string | null; filed_by?: string | null; filed_score?: number | null }>): string | undefined {
+  if (!task.workstream) return undefined;
+  const filed = filedHint(task);
+  return filed ? `${task.workstream}\n${filed}` : task.workstream;
+}
+
+export function titleHint(title: string, origin: Origin | undefined): string {
+  const { original } = taskOrigin(title, origin);
+  return original && origin ? `${title}\nFrom ${sourceName(origin.source)}: ${original}` : title;
+}
+
+/**
+ * The source a task post's card describes: the post's own (the event the task
+ * opened from), with what the live task adds about it (its id, and its title
+ * until the hub writes a `Title:` line). The live one counts only when it's the
+ * same source: same kind, and the same link when both have one.
+ */
+export function postOrigin(source: Readonly<{ kind: string; url?: string; title?: string }> | undefined, live: Origin | undefined): Origin | undefined {
+  if (!source) return undefined;
+  const same = live && live.source === source.kind && (!source.url || !live.url || live.url === source.url) ? live : undefined;
+  const title = source.title ?? same?.title;
+  const url = source.url ?? same?.url;
+  return { source: source.kind, ...(same?.external_id && { external_id: same.external_id }), ...(title && { title }), ...(url && { url }) };
 }
 
 /** The workstream filter's value for tasks without one. */
@@ -175,9 +245,10 @@ export function replyText(text: string, mentions: readonly { npub: string }[]): 
  * The task's details for its view's sidebar, as label and value pairs:
  * dates in the viewer's own time, with the exact UTC time as `title`. A
  * meeting's last event is when it starts, so a time ahead reads "Starts".
- * Status isn't here: the sidebar sets it.
+ * Status isn't here: the sidebar sets it. `note` is a quiet line under
+ * the value: how the workstream was picked, when the hub says.
  */
-export function taskFacts(item: BoardTask, now = Date.now() / 1000): { label: string; value: string; title?: string }[] {
+export function taskFacts(item: BoardTask, now = Date.now() / 1000): { label: string; value: string; title?: string; note?: string }[] {
   const { task } = item;
   const utc = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
   const local = (seconds: number) => {
@@ -188,7 +259,7 @@ export function taskFacts(item: BoardTask, now = Date.now() / 1000): { label: st
   const ahead = task.last_event_at > now;
   return [
     { label: "Mode", value: MODE_NAMES[task.mode]?.name ?? task.mode, ...(MODE_NAMES[task.mode] && { title: MODE_NAMES[task.mode]!.title }) },
-    ...(task.workstream ? [{ label: "Workstream", value: task.workstream }] : []),
+    ...(task.workstream ? [{ label: "Workstream", value: task.workstream, ...(filedHint(task) && { note: filedHint(task)! }) }] : []),
     ...(task.initiative ? [{ label: "Initiative", value: task.initiative }] : []),
     ...(task.account ? [{ label: "Account", value: task.account }] : []),
     { label: "Opened", value: local(task.created_at), title: utc(task.created_at) },

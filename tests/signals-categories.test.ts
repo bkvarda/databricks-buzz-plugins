@@ -27,7 +27,7 @@ describe("rule categories", () => {
     expect(bad([{ workstream: NO_CATEGORY, about: "x" }])).toEqual([expect.stringMatching(/can't be/)]);
     expect(bad([{ workstream: "a", when: { title: "(" } }])).toEqual([expect.stringMatching(/valid regular expression/)]);
     expect(bad([{ workstream: "a", when: {} }])).toEqual([expect.stringMatching(/when is an object of conditions/)]);
-    expect(bad([{ workstream: "a", about: "x", color: "red" }])).toEqual([expect.stringMatching(/is \{workstream, when\?, about\?\}/)]);
+    expect(bad([{ workstream: "a", about: "x", color: "red" }])).toEqual([expect.stringMatching(/is \{workstream, when\?, about\?, title\?\}/)]);
     expect(bad([{ workstream: "a", about: "x" }], { action: "update", group: "g" })).toContainEqual(expect.stringMatching(/categories needs action task/));
     expect(bad([{ workstream: "a", about: "x" }], { fan_out: "accounts", group_by: undefined })).toContainEqual(expect.stringMatching(/fan_out .* takes no categories/));
   });
@@ -416,7 +416,7 @@ describe("rule categories", () => {
   it("asks the endpoint a choice question, and reads its answer", async () => {
     const calls: { path: string; body: unknown }[] = [];
     const categorize = jevCategorizer(async (path, init) => (calls.push({ path, body: init.body }), { answers: { category: { type: "choice", choice: "capacity request", confidence: 0.99 } } }));
-    expect(await categorize({ source: "jira", external_id: "1", title: "More TPM" }, { "capacity request": "Raise a limit", [NO_CATEGORY]: "None" })).toBe("capacity request");
+    expect(await categorize({ source: "jira", external_id: "1", title: "More TPM" }, { "capacity request": "Raise a limit", [NO_CATEGORY]: "None" })).toEqual({ choice: "capacity request", score: 0.99 });
     expect(calls[0]).toMatchObject({ path: "/serving-endpoints/databricks-openjev-qwen35-4b/invocations", body: { state: { title: "More TPM" }, questions: { category: { type: "choice", criteria: { "capacity request": "Raise a limit" } } } } });
     expect(answerChoice({ answers: { category: { choice: "" } } })).toBeUndefined();
     const lines: string[] = [];

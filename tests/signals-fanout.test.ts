@@ -66,7 +66,7 @@ describe("fan-out rules", () => {
   };
 
   it("opens a candidate per opted-in account, and an announcement posted again keeps every verdict", async () => {
-    const { store, call, posted, updates, candidates, verdict } = await setup("signals_fanout");
+    const { store, hub, call, posted, updates, candidates, verdict } = await setup("signals_fanout");
     await call("/api/events", { events: [announcement("PrPr recruiting.")] });
     let list = await candidates();
     // Globex and Umbrella (Initech turned this work off; Hooli and Stark never opted in), each once.
@@ -76,6 +76,10 @@ describe("fan-out rules", () => {
     ]);
     expect(posted.sort()).toEqual(list.map((t) => t.id).sort());
     const [globex, umbrella] = list as [typeof list[0], typeof list[0]];
+    // The board shows each candidate's source and origin: the announcement, held through task_events (its own task_id is null).
+    const row = (await hub.board("globex")).tasks.find((r) => r.task.id === globex.id)!;
+    expect(row.source).toMatchObject({ source: "slack", title: "Format unification preview" });
+    expect(row.origin).toEqual({ source: "slack", external_id: "C1:1795129827.636059", title: "Format unification preview" });
 
     // Globex is disqualified (done), Umbrella qualified.
     expect((await verdict(globex.id, "disqualified", "Not on a supported cloud.")).status ?? 200).toBe(200);

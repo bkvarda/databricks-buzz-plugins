@@ -11,12 +11,13 @@
 // app.yaml: a `postgres` resource, LAKEBASE_ENDPOINT (valueFrom: postgres) and,
 // for posting to Buzz, BUZZ_IDENTITY_SECRET. Optional: SIGNALS_ADMINS (emails
 // that may change the rules), SIGNALS_CONFIG (the starting rules, as JSON),
-// SIGNALS_CLASSIFIER (the serving endpoint for rules' `classify`; "off" turns it off).
+// SIGNALS_CLASSIFIER (the serving endpoint for rules' `classify`; "off" turns it off),
+// SIGNALS_TITLER (the chat endpoint for rules' `summarize_title`; "off" turns it off).
 import { readFile } from "node:fs/promises";
 import { BuzzApp } from "../../agents/app/sdk";
 import { Lakebase } from "../../agents/app/index-store";
 import { splitMessage } from "../../agents/runner/buzz";
-import { jevCategorizer, jevClassifier, DEFAULT_CLASSIFIER_ENDPOINT } from "./classify";
+import { chatTitler, jevCategorizer, jevClassifier, DEFAULT_CLASSIFIER_ENDPOINT, DEFAULT_TITLER_ENDPOINT } from "./classify";
 import { Hub, HUB_PATHS, type Notifier, taskMessage } from "./hub";
 import { configProblems, type SignalsConfig } from "./model";
 import { schemaName, SignalsStore } from "./store";
@@ -84,6 +85,9 @@ async function prepare() {
     const classifier = endpoint === "off" ? undefined : jevClassifier((path, init) => app.databricks.api(path, init), endpoint, log);
     // Rules' categories without a matching `when` are picked by the same model (see Rule.categories).
     if (endpoint !== "off") store.categorizer = jevCategorizer((path, init) => app.databricks.api(path, init), endpoint, log);
+    // Rules' summarize_title: short titles from a fast chat model (SIGNALS_TITLER names another endpoint, or "off").
+    const titler = process.env.SIGNALS_TITLER?.trim() || DEFAULT_TITLER_ENDPOINT;
+    if (titler !== "off") store.titler = chatTitler((path, init) => app.databricks.api(path, init), titler, log);
     // Where people's poller jobs log in: this app's own database resource.
     const { LAKEBASE_ENDPOINT, PGHOST, PGDATABASE, PGPORT } = process.env;
     const lakebaseInfo = LAKEBASE_ENDPOINT && PGHOST && PGDATABASE ? { endpoint: LAKEBASE_ENDPOINT, host: PGHOST, database: PGDATABASE, ...(PGPORT && PGPORT !== "5432" && { port: Number(PGPORT) }) } : undefined;

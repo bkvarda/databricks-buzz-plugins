@@ -18,7 +18,7 @@ import { ago, Button, CopyButton, DbxRoot, Disclosure, Notice, Spinner, Stack, T
 import { Markdown } from "@dbx/core/ui/markdown";
 import { decode, npubEncode } from "nostr-tools/nip19";
 import { TASK_STATUSES } from "../app/model";
-import { type ActivityEntry, type ActivityLine, type Assignee, assigneeOf, type Member, memberChoices, MODE_NAMES, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskActivity, taskFacts, threadComments, withMentionNames } from "./board-view";
+import { type ActivityEntry, type ActivityLine, type Assignee, assigneeOf, type Member, memberChoices, MODE_NAMES, ownersOf, removable, type BoardFilters, type BoardView, byStatus, cardAssets, type Comment, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, NONE, readView, replyMentions, replyText, STATUS_GROUPS, taskActivity, openingTitle, taskFacts, taskOrigin, threadComments, titleHint, withMentionNames, workstreamHint } from "./board-view";
 import { type BoardPerson, type BoardTask, chosenHub, type FilteredEvent, HubClient } from "./client";
 import type { LiveTasks } from "./live-tasks";
 import { plainLine, readTaskTarget, sourceName } from "./posts";
@@ -392,7 +392,7 @@ function TaskBody(props: { hub: HubClient; item: BoardTask; steer(item: BoardTas
     <Stack gap={8} style={{ paddingTop: 8 }}>
       {item.task.question && !closed && <ProvideInput hub={props.hub} task={item} onDone={props.onChange} />}
       {props.assigning && <Owners hub={props.hub} item={item} {...props.assigning} onChange={props.onChange} compact />}
-      {item.source?.title && <Text size="xs" tone="subtle">From {item.source.source}: {item.source.url ? <a className="dbx-link" href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
+      {item.source?.title && <Text size="xs" tone="subtle">From {sourceName(item.source.source)}: {item.source.url ? <a className="dbx-link" href={item.source.url} onClick={link(item.source.url)}>{item.source.title}</a> : item.source.title}</Text>}
       {item.activity && <Text size="xs" tone="subtle">{item.activity.kind === "agent_reply" ? "Agent: " : ""}{shorten(plainLine(item.activity.text, (npub) => props.assigning?.profile(npubKey(npub) ?? "")?.name), 280)} <span style={{ color: "var(--dbx-tertiary)" }}>· {ago(item.activity.at * 1000)}</span></Text>}
       {assets.length > 0 && (
         <Stack direction="row" gap={6} wrap>
@@ -440,16 +440,23 @@ function AssignButton(props: { assignee: Assignee; profile(key: string): Profile
   );
 }
 
+/** Where a task came from, beside its title: the ticket key of the source it opened from, when its title left it out (Jira ES-2376026), or else its latest source. */
+function SourceMark(props: { source: NonNullable<BoardTask["source"]>; origin?: BoardTask["origin"]; title: string }) {
+  const { ref } = taskOrigin(props.title, props.origin);
+  const label = ref && props.origin ? `${sourceName(props.origin.source)} ${ref}` : sourceName(props.source.source);
+  return <Text size="xs" tone="tertiary" mono={Boolean(ref)}><span title={label} style={{ whiteSpace: "nowrap" }}>{ref ?? label}</span></Text>;
+}
+
 /** The labels a task shows beside its title: workstream, initiative, mode, source and the links made for it. */
 function Meta(props: { item: BoardTask }) {
   const { item } = props;
   const assets = cardAssets(item);
   return (
     <>
-      {item.task.workstream && <Chip>{item.task.workstream}</Chip>}
+      {item.task.workstream && <Chip title={workstreamHint(item.task)}>{item.task.workstream}</Chip>}
       {item.task.initiative && <Chip tone="brand">{item.task.initiative}</Chip>}
       {item.task.mode !== "draft" && <Chip tone={item.task.mode === "auto" ? "success" : undefined} title="How agents handle it">{item.task.mode}</Chip>}
-      {item.source && <Text size="xs" tone="tertiary">{item.source.source}</Text>}
+      {item.source && <SourceMark source={item.source} {...(item.origin && { origin: item.origin })} title={item.task.title} />}
       {assets.slice(0, 3).map((artifact) => (
         <a className="dbx-link" key={`${artifact.at}:${artifact.url}`} href={artifact.url} onClick={link(artifact.url)} title={artifact.title ?? artifact.url} style={{ fontSize: "0.75rem", textDecoration: "none" }}>{ASSET_ICON[artifact.kind] ?? "🔗"}</a>
       ))}
@@ -469,7 +476,7 @@ function TaskRow(props: TaskProps) {
       <div {...rowKeys(props.toggle)} aria-expanded={props.open} className="signals-row" style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", cursor: "pointer", minWidth: 0 }}>
         <Text size="xs" tone="tertiary" mono style={{ flex: "none", width: 34 }}>#{item.task.id}</Text>
         <StatusIcon status={item.task.status} />
-        <Text size="sm" weight={500} style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.task.title}</Text>
+        <Text size="sm" weight={500} style={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><span title={titleHint(item.task.title, item.origin)}>{item.task.title}</span></Text>
         <span style={{ display: "flex", gap: 6, alignItems: "center", flex: "none", maxWidth: "45%", overflow: "hidden" }}><Meta item={item} /></span>
         <Text size="xs" tone="tertiary" style={{ flex: "none", width: 52, textAlign: "right" }}>{ago(item.task.last_event_at * 1000)}</Text>
         <AssignButton assignee={assignee} profile={props.profile} open={props.open} toggle={props.toggle} />
@@ -496,7 +503,7 @@ function TaskCard(props: TaskProps) {
           </Stack>
           <Stack direction="row" gap={6} align="flex-start">
             <span style={{ paddingTop: 2 }}><StatusIcon status={item.task.status} /></span>
-            <Text size="sm" weight={500}>{item.task.title}</Text>
+            <Text size="sm" weight={500} style={{ minWidth: 0, overflowWrap: "anywhere" }}><span title={titleHint(item.task.title, item.origin)}>{item.task.title}</span></Text>
           </Stack>
           <Stack direction="row" gap={6} wrap align="center"><Meta item={item} /></Stack>
         </Stack>
@@ -891,6 +898,8 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
     seen.current = count;
   }, [count, thread.status]);
   const source = item.source;
+  const ticket = taskOrigin(item.task.title, item.origin).ref;
+  const opening = openingTitle(item);
   const sourceLine = [source && sourceName(source.source), opened?.source?.from && shortEmails(opened.source.from)].filter(Boolean).join(" · ");
   const quote = opened?.source?.quote;
   const sourceFacts = opened?.source?.facts ?? [];
@@ -904,7 +913,7 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
           {facts.map((fact) => (
             <React.Fragment key={fact.label}>
               <span style={{ color: "var(--dbx-tertiary)", whiteSpace: "nowrap" }}>{fact.label}</span>
-              <span title={fact.title} style={{ minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" }}>{fact.value}</span>
+              <span title={fact.title} style={{ minWidth: 0, overflowWrap: "anywhere", color: "var(--dbx-ink)" }}>{fact.value}{fact.note && <span style={{ display: "block", color: "var(--dbx-tertiary)" }}>{fact.note}</span>}</span>
             </React.Fragment>
           ))}
         </div>
@@ -947,13 +956,20 @@ function TaskView(props: { ctx: Context; hub: HubClient; item: BoardTask; channe
           <Stack direction="row" gap={8} align="center">
             {props.back && <Button size="sm" variant="ghost" onClick={props.back}>← Board</Button>}
             <Text size="xs" tone="tertiary" mono>Task {item.task.id}</Text>
-            {item.task.workstream && <Chip>{item.task.workstream}</Chip>}
+            {ticket && <Text size="xs" tone="tertiary" mono>{ticket}</Text>}
+            {item.task.workstream && <Chip title={workstreamHint(item.task)}>{item.task.workstream}</Chip>}
             {item.task.mode !== "draft" && <Chip tone={item.task.mode === "auto" ? "success" : undefined} title={MODE_NAMES[item.task.mode]?.title}>{item.task.mode}</Chip>}
           </Stack>
           <Stack direction="row" gap={8} align="flex-start">
             <span style={{ paddingTop: 5 }}><StatusIcon status={item.task.status} size={15} /></span>
             <Text as="h2" size="xl" weight={600} style={{ overflowWrap: "anywhere", margin: 0 }}>{item.task.title}</Text>
           </Stack>
+          {opening && (
+            <Text size="sm" tone="subtle" style={{ overflowWrap: "anywhere" }}>
+              <span style={{ color: "var(--dbx-tertiary)" }}>Opened from {sourceName(opening.source)}: </span>
+              {opening.url ? <a className="dbx-link" href={opening.url} onClick={link(opening.url)} title={opening.url}>{opening.title}</a> : opening.title}
+            </Text>
+          )}
           {source && (
             <Text size="xs" tone="subtle" style={{ overflowWrap: "anywhere" }}>
               {sourceLine}
