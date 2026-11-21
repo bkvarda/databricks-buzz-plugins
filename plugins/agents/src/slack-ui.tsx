@@ -10,6 +10,8 @@ import { cachedList } from "./ui";
 import { groupName, isPrivateKind, KIND_LABEL, parseListing, parseProfile, SLACK_TOOLS, type SlackConversation, type SlackKind, type SlackListing } from "./slack";
 
 const MAX_PAGES = 10;
+/** Listed one kind at a time, so a long list of one kind (group DMs, say) can't crowd out the others. */
+const LISTS = ["public_channel,private_channel", "im", "mpim"] as const;
 const SHOWN = 150;
 
 export type SlackDirectory = Readonly<{ conversations: readonly SlackListing[]; handle?: string; partial: boolean }>;
@@ -21,21 +23,27 @@ async function callSlack(service: DatabricksService, tool: string, args: Readonl
   return text;
 }
 
-/** Every conversation the owner is in (up to MAX_PAGES pages), and their handle, for naming group DMs. */
+/** Every conversation the owner is in (channels, then DMs, then group DMs; up to MAX_PAGES pages of each), and their handle, for naming group DMs. */
 export async function loadDirectory(service: DatabricksService, call = callSlack): Promise<SlackDirectory> {
-  const profile = parseProfile(await call(service, "slack_read_user_profile", { response_format: "concise" }));
-  const conversations: SlackListing[] = [];
-  let cursor: string | undefined;
-  let pages = 0;
-  do {
-    const page = parseListing(
-      await call(service, "slack_list_user_channels", { types: "public_channel,private_channel,im,mpim", exclude_archived: true, limit: 200, ...(cursor && { cursor }) }),
-    );
-    conversations.push(...page.conversations);
-    cursor = page.cursor;
-  } while (cursor && ++pages < MAX_PAGES);
-  const named = conversations.map((conversation) => (conversation.kind === "mpim" ? { ...conversation, name: groupName(conversation.name, profile?.handle) } : conversation));
-  return { conversations: named, ...(profile && { handle: profile.handle }), partial: Boolean(cursor) };
+  const list = async (types: string) => {
+    const conversations: SlackListing[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = parseListing(await call(service, "slack_list_user_channels", { types, exclude_archived: true, limit: 200, ...(cursor && { cursor }) }));
+      conversations.push(...page.conversations);
+      cursor = page.cursor;
+    } while (cursor && ++pages < MAX_PAGES);
+    return { conversations, partial: Boolean(cursor) };
+  };
+  const [profileText, ...lists] = await Promise.all([call(service, "slack_read_user_profile", { response_format: "concise" }), ...LISTS.map(list)]);
+  const profile = parseProfile(profileText);
+  const seen = new Set<string>();
+  const named = lists
+    .flatMap((listed) => listed.conversations)
+    .filter((conversation) => !seen.has(conversation.id) && Boolean(seen.add(conversation.id)))
+    .map((conversation) => (conversation.kind === "mpim" ? { ...conversation, name: groupName(conversation.name, profile?.handle) } : conversation));
+  return { conversations: named, ...(profile && { handle: profile.handle }), partial: lists.some((listed) => listed.partial) };
 }
 
 const FILTERS: readonly { id: "all" | "channels" | SlackKind; label: string }[] = [
@@ -121,7 +129,7 @@ export function SlackConversationsField(props: {
       >
         <Stack direction="row" gap={8}>
           <input className="dbx-input" style={{ flex: 1 }} placeholder="Search your Slack" value={query} disabled={props.disabled} onChange={(event) => setQuery(event.target.value)} />
-          <select className="dbx-select" value={filter} disabled={props.disabled} onChange={(event) => setFilter(event.target.value as typeof filter)}>
+          <select className="dbx-select" style={{ width: "auto", flex: "none" }} value={filter} disabled={props.disabled} onChange={(event) => setFilter(event.target.value as typeof filter)}>
             {FILTERS.map((choice) => (
               <option key={choice.id} value={choice.id}>
                 {choice.label}

@@ -62,20 +62,34 @@ describe("Slack's answers", () => {
     expect(around("1795209600.000000")).toEqual({ oldest: "1795209599.999999", latest: "1795209600.000001" });
   });
 
-  it("reads every page of the owner's conversations for the Settings tab", async () => {
+  it("reads every page of the owner's conversations for the Settings tab, one kind at a time", async () => {
     const calls: Record<string, unknown>[] = [];
-    const pages = [
-      '### #a\n- **ID:** C0AAAAAAA\n- **Type:** Public Channel\n\nPagination: More results available. Use cursor: "two"\n',
-      "### Group DM\n- **ID:** C0BBBBBBB\n- **Type:** Group DM\n- **Members:** Group messaging with: @jane.doe, @brandon.kvarda\n",
-    ];
+    const group = (n: number) => `### Group DM\n- **ID:** G${String(n).padStart(9, "0")}\n- **Type:** Group DM\n- **Members:** Group messaging with: @jane.doe, @brandon.kvarda\n`;
+    // Group DMs fill far more than the page limit, as they do for someone in many of them.
+    const lists: Record<string, (cursor?: string) => string> = {
+      "public_channel,private_channel": (cursor) =>
+        cursor ? "### #b\n- **ID:** C0BBBBBBB\n- **Type:** Private Channel\n" : '### #a\n- **ID:** C0AAAAAAA\n- **Type:** Public Channel\n\nPagination: More results available. Use cursor: "two"\n',
+      im: () => "### DM with Ryan Zapanta\n- **ID:** D03919ZRGP4\n- **Type:** Direct Message\n- **User ID:** U039LFJM4BS\n",
+      mpim: (cursor) => `${group(Number(cursor ?? 0))}\nPagination: More results available. Use cursor: "${Number(cursor ?? 0) + 1}"\n`,
+    };
     const directory = await loadDirectory({} as DatabricksService, async (_service, tool, args) => {
       if (tool === "slack_read_user_profile") return JSON.stringify({ result: "brandon.kvarda (Brandon Kvarda)\n" });
       calls.push({ ...args });
-      return JSON.stringify({ result: pages[calls.length - 1] });
+      return JSON.stringify({ result: lists[args.types as string]!(args.cursor as string | undefined) });
     });
-    expect(calls.map((c) => c.cursor)).toEqual([undefined, "two"]);
-    expect(calls[0]).toMatchObject({ types: "public_channel,private_channel,im,mpim", exclude_archived: true, limit: 200 });
-    expect(directory).toEqual({ conversations: [{ id: "C0AAAAAAA", name: "a", kind: "public" }, { id: "C0BBBBBBB", name: "jane.doe", kind: "mpim" }], handle: "brandon.kvarda", partial: false });
+    for (const call of calls) expect(call).toMatchObject({ exclude_archived: true, limit: 200 });
+    expect(calls.filter((c) => c.types === "public_channel,private_channel").map((c) => c.cursor)).toEqual([undefined, "two"]);
+    expect(calls.filter((c) => c.types === "mpim")).toHaveLength(10);
+    expect(directory.partial).toBe(true);
+    // Channels and DMs are all there, ahead of the group DMs, even though group DMs ran past the limit.
+    expect(directory.conversations.slice(0, 4)).toEqual([
+      { id: "C0AAAAAAA", name: "a", kind: "public" },
+      { id: "C0BBBBBBB", name: "b", kind: "private" },
+      { id: "D03919ZRGP4", name: "Ryan Zapanta", kind: "im", user: "U039LFJM4BS" },
+      { id: "G000000000", name: "jane.doe", kind: "mpim" },
+    ]);
+    expect(directory.conversations).toHaveLength(13);
+    expect(directory.handle).toBe("brandon.kvarda");
   });
 
   it("names Buzz channels and labels them by Slack ID", () => {
