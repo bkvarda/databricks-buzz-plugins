@@ -6,13 +6,13 @@ import type { Context } from "@buzz/author";
 import type { DatabricksApp } from "@dbx/core/api/apps";
 import { bindReact, React } from "@dbx/core/react";
 import { type DatabricksService, describeError, useAsync, useConnection, usePreference } from "@dbx/core/service";
-import { attach, MissingCore, useLive } from "@dbx/core/suite";
+import { attach, Live, MissingCore, useLive } from "@dbx/core/suite";
 import { ago, Badge, Button, CodeView, DbxRoot, Notice, SectionHeader, Spinner, Stack, Text, openExternal } from "@dbx/core/ui/components";
 import { WorkspaceField } from "@dbx/core/ui/workspace";
 import { type FollowedService, followWorkspace } from "@dbx/core/workspace-choice";
 import type { SourceInfo } from "../app/model";
 import { chosenHub, HUB_PREFERENCE, HubClient, lakebaseSnippet, type Onboarding, type SignIn, signInPath, signInState, type SourceState } from "./client";
-import { ACCOUNT_INSTRUCTIONS, accountPanel } from "./account-panel";
+import { ACCOUNT_INSTRUCTIONS, accountPanel, type OwnAgentsView } from "./account-panel";
 import { BOARD_PAGE, boardPage, boardPanel, taskPanel, validBoardRoute } from "./board-panel";
 import { optionalService } from "@dbx/core/host-types";
 import { LiveTasks } from "./live-tasks";
@@ -312,7 +312,11 @@ export function apply(ctx: Context) {
   const live = attach(ctx, { id: "bkvarda.databricks-signals", name: "Signals" }, (scope, main) => {
     // "Same as Buzz" unless chosen in Settings; the card and tools follow it.
     const databricks = followWorkspace(main, WORKSPACE_PREF);
+    // The viewer's agents and teams, for Set up account's agent menus (absent on hosts without the service).
+    const ownAgents = new Live<OwnAgentsView>();
     scope.inject(["agents"], (agents: Context) => {
+      ownAgents.set(agents.agents as unknown as OwnAgentsView);
+      agents.effect(() => () => ownAgents.set(undefined));
       for (const tool of signalsTools(databricks)) agents.agents.addTool(tool);
       // Hosts without addInstructions still have the tools, whose descriptions say the same.
       (agents.agents as { addInstructions?(input: { id: string; text: string }): void }).addInstructions?.({ id: "accounts", text: ACCOUNT_INSTRUCTIONS });
@@ -324,7 +328,7 @@ export function apply(ctx: Context) {
       matches: () => false,
       channelMenu: { label: "Set up account", eligible: (channel) => !channel.readOnly && !channel.cached },
       channelPlacement: "side",
-      component: accountPanel(ctx, databricks),
+      component: accountPanel(ctx, databricks, ownAgents),
     });
     scope.panels.register({
       id: "board",

@@ -2,13 +2,14 @@
 import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { accountRule, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
+import { accountRule, actionItemKind, taskKinds, agentsFor, DEFAULT_SOURCES, slackThreadKey, configProblems, decide, doneReason, finishes, handledBy, plainSlack, timeOf, type EventInput, labelsOf, modeFor, parsePreferences, playbookFor, ruleFor, type SignalsConfig, validateEvent, withAccounts } from "../plugins/signals/app/model";
 import { agentKey, briefing, doneMessage, eventDetails, handledMessage, handledThenReopened, handOffReason, mergedChanges, reopenedMessage, Hub, HUB_PATHS, type Onboarding, linkKind, markedQuestion, readQuestion, replyLinks, taskMessage, whoIsOn, disclosureMessage } from "../plugins/signals/app/hub";
 import { npubEncode } from "nostr-tools/nip19";
 import { lakebaseSnippet, rpcSignIn } from "../plugins/signals/src/client";
 import { boardRoute, validBoardRoute } from "../plugins/signals/src/board-panel";
 import { assigneeOf, memberChoices, ownersOf, removable, byStatus, cardAssets, filterFiltered, filteredWhy, filterOptions, filterTasks, mentionedKeys, readView, replyMentions, replyText, taskActivity, taskFacts, threadComments, withMentionNames } from "../plugins/signals/src/board-view";
 import { contentHash, type Db, SignalsStore } from "../plugins/signals/app/store";
+import { newlyAssigned } from "../plugins/signals/src/agent-choices";
 import { answerScore, jevClassifier } from "../plugins/signals/app/classify";
 import { classifyQuestions, classifyState } from "../plugins/signals/app/model";
 
@@ -703,8 +704,14 @@ describe("account channels", () => {
     await store.setAgentReply(2, "someone-already");
     replies.length = 0;
 
+    // The form asks first which agents a save would hand tasks to (they join the channel before it saves); asking saves nothing.
+    expect((await call("/api/handoffs", { name: "Globex", agents: [genie] })).json).toEqual({ agents: [genie] });
+    expect(await call("/api/handoffs", { name: "Globex", agents: ["not-a-key"] })).toMatchObject({ status: 400 });
+    expect(replies).toHaveLength(0);
+    expect((await store.account({ name: "Globex" }))?.agents).toEqual([]);
     const saved = await call("/api/account", { name: "Globex", agents: [genie] });
     expect(saved.json).toMatchObject({ woken: [1] });
+    expect((await call("/api/handoffs", { name: "Globex", agents: [genie] })).json).toEqual({ agents: [] });
     expect(replies).toHaveLength(1);
     expect(replies[0]).toMatchObject({ task: 1, agents: [genie] });
     expect(replies[0]!.text).toMatch(/^nostr:npub1\S+ you've been added to this account's agents/);
@@ -736,6 +743,84 @@ describe("account channels", () => {
     const root = "d".repeat(63) + "1";
     expect(await hub.collect(async () => [{ id: "r1", pubkey: scout, content: "Draft", created_at: 2, tags: [["e", root, "", "reply"]] }])).toEqual({ recorded: 1 });
     expect((await store.task(1))?.status).toBe("in_progress");
+  });
+
+  it("says which agents a save needs in the channel: the ones its tasks and rules newly go to, not every way a list could apply", async () => {
+    const store = new SignalsStore(pglite(), "signals_handoff_preview");
+    await store.setup();
+    const replies: { task: number; agents: readonly string[] }[] = [];
+    const hub = new Hub(
+      store,
+      { opened: async (task) => "d".repeat(63) + task.id, updated: async (task, _text, agents = []) => void replies.push({ task: task.id, agents }) },
+      { defaultConfig: { version: 1, rules: [{ id: "jira-updates", sources: ["jira"], action: "task", workstream: "tickets", group_by: "external_id" }] } },
+    );
+    const call = (path: string, body: unknown) => hub.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify(body) });
+    const [genie, poker] = ["ab".repeat(32), "ef".repeat(32)];
+    await call("/api/account", { name: "Globex", channel: "globex", domains: ["globex.io"], preferences: "tickets: draft", agents: [poker], workstream_agents: { "jira-updates": [genie], tickets: [genie] } });
+    // With no ticket open yet, giving the rule to Poker still names Poker: a ticket can open before the save, which
+    // hands it to Poker then (Poker's preview race, r5). Dropping the redundant override doesn't.
+    expect((await call("/api/handoffs", { name: "Globex", agents: [poker], workstream_agents: { tickets: [genie], "jira-updates": [poker] } })).json).toEqual({ agents: [poker] });
+    expect((await call("/api/handoffs", { name: "Globex", agents: [poker], workstream_agents: { tickets: [genie] } })).json).toEqual({ agents: [] });
+    // Nor for the tasks a meeting's notes open for the team's action items, by their workstream or their rule id.
+    const notes = new Hub(store, { opened: async () => "e".repeat(64), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "meeting-notes", sources: ["google_drive"], action: "task", workstream: "meeting follow-up", group_by: "group_key", action_items: {} }] } });
+    // (Poker has Globex's other work, as the account's agent; Genie is new to them.)
+    const ask = async (workstream_agents: Record<string, string[]>) => (await notes.handle({ method: "POST", path: "/api/handoffs", query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify({ name: "Globex", agents: [poker], workstream_agents }) })).json;
+    expect(await ask({ "meeting action items": [genie] })).toEqual({ agents: [genie] });
+    expect(await ask({ "meeting-notes/action-item": [genie] })).toEqual({ agents: [genie] });
+    expect(await ask({ "meeting follow-up": [genie] })).toEqual({ agents: [genie] });
+    expect(await ask({ "meeting action items": [poker] })).toEqual({ agents: [] });
+    // Nor for an ignore rule's id: it opens nothing (Poker's jira-noise case, r7). Taking an obsolete override for it off
+    // leaves no task with Poker, the account's agent.
+    const ignoring = new Hub(store, { opened: async () => "f".repeat(64), updated: async () => {} }, { defaultConfig: { version: 1, rules: [{ id: "jira-noise", sources: ["jira"], action: "ignore", when: { title: "noise" } }, { id: "jira-updates", sources: ["jira"], action: "task", workstream: "tickets", group_by: "external_id" }] } });
+    const initech = (path: string, workstream_agents: Record<string, string[]>) => ignoring.handle({ method: "POST", path, query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify({ name: "Initech", channel: "initech", agents: [poker], workstream_agents }) });
+    await initech("/api/account", { "jira-noise": [genie], tickets: [genie] });
+    expect((await initech("/api/handoffs", { tickets: [genie] })).json).toEqual({ agents: [] });
+    expect((await initech("/api/handoffs", { tickets: [genie], "jira-updates": [poker] })).json).toEqual({ agents: [poker] });
+    expect((await initech("/api/handoffs", { "jira-noise": [genie] })).json).toEqual({ agents: [poker] });
+    // Nor does giving a workstream no rule files under (a misspelling, a rule since removed) an agent.
+    expect((await call("/api/handoffs", { name: "Globex", agents: [poker], workstream_agents: { "jira-updates": [genie], tickets: [genie], "old-rule": [poker] } })).json).toEqual({ agents: [] });
+    await call("/api/sources", { source: "jira", enabled: true });
+    await call("/api/events", { events: [{ source: "jira", external_id: "seed" }] });
+    await call("/api/events", { events: [{ source: "jira", external_id: "GLX-1", actor: "ann@globex.io", title: "Broken export" }] });
+    expect((await store.task(1))?.workstream).toBe("tickets");
+    replies.length = 0;
+
+    // Dropping the jira-updates override leaves the ticket with Genie, through tickets: nobody new, though a jira-updates
+    // task filed under no workstream would go to Poker, the account's agent (what the form guesses without the hub).
+    const redundant = { name: "Globex", agents: [poker], workstream_agents: { tickets: [genie] } };
+    expect((await call("/api/handoffs", redundant)).json).toEqual({ agents: [] });
+    expect(newlyAssigned({ agents: [poker], workstream_agents: { "jira-updates": [genie], tickets: [genie] } }, redundant)).toEqual([poker]);
+    expect((await call("/api/account", redundant)).json).not.toHaveProperty("woken");
+    // Giving the rule to Poker hands Poker the ticket, which the preview says first.
+    const override = { name: "Globex", agents: [poker], workstream_agents: { tickets: [genie], "jira-updates": [poker] } };
+    expect((await call("/api/handoffs", override)).json).toEqual({ agents: [poker] });
+    expect(replies).toHaveLength(0);
+    expect((await call("/api/account", override)).json).toMatchObject({ woken: [1] });
+    expect(replies).toEqual([{ task: 1, agents: [poker] }]);
+    // A hub with no Buzz identity hands nothing off, so it names nobody.
+    const quiet = new Hub(store, undefined, { defaultConfig: { version: 1, rules: [] } });
+    expect((await quiet.handle({ method: "POST", path: "/api/handoffs", query: new URLSearchParams(), user: "alice@x.com", body: async () => JSON.stringify({ ...override, workstream_agents: { tickets: [poker] } }) })).json).toEqual({ agents: [] });
+  });
+
+  it("lists every rule id and workstream the rules open tasks under", () => {
+    const rules = [
+      { id: "jira-updates", sources: ["jira"], action: "task", workstream: "tickets" },
+      { id: "mail", sources: ["gmail"], action: "task", categories: [{ workstream: "questions" }, { workstream: "pricing" }] },
+      { id: "meeting-notes", sources: ["google_drive"], action: "task", workstream: "meeting follow-up", action_items: {} },
+      { id: "notes-b", sources: ["google_drive"], action: "task", action_items: { workstream: "to-dos" } },
+      { id: "jira-noise", sources: ["jira"], action: "ignore", workstream: "tickets" },
+    ] as unknown as SignalsConfig["rules"];
+    expect(taskKinds({ rules })).toEqual([
+      { rule_id: "jira-updates", workstream: "tickets" },
+      { rule_id: "mail", workstream: null },
+      { rule_id: "mail", workstream: "questions" },
+      { rule_id: "mail", workstream: "pricing" },
+      { rule_id: "meeting-notes", workstream: "meeting follow-up" },
+      { rule_id: "meeting-notes/action-item", workstream: "meeting action items" },
+      { rule_id: "notes-b", workstream: null },
+      { rule_id: "notes-b/action-item", workstream: "to-dos" },
+    ]);
+    expect(actionItemKind({ id: "x", action_items: {} })).toEqual({ rule_id: "x/action-item", workstream: "meeting action items" });
   });
 
   it("assigns and unassigns owners: agents are asked or told to stop, and an agent taken off stays off", async () => {

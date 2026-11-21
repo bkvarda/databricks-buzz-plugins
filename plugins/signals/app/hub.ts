@@ -26,7 +26,7 @@
 //   GET  /api/config | POST /api/config   the rules (posting needs the app's CAN_MANAGE: see below)
 import { randomUUID } from "node:crypto";
 import { type Attendee, attendeesOf, realCustomers, twinOf } from "./attendees";
-import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts, readWorkstreamActions, type WorkstreamActions, actionsFor, actionsText, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, triggeredLines, type WorkstreamActionsRow } from "./model";
+import { type AccountRecord, isOpen, configProblems, type FieldChange, DEFAULT_CLASSIFY_MIN, accountNames, idsByKind, readIds, plainSlack, type EventInput, sourceTitle, capitalized, DEFAULT_SOURCES, labelsOf, partyFor, type ResolvedLabels, type Rule, EMPTY_CONFIG, MAX_EVENTS_PER_POST, MAX_PLAYBOOK, MAX_PLAYBOOKS, agentListFor, agentsFor, parsePreferences, taskKinds, playbookFor, workstreamsOf, SERIES_ASKER, seriesAnswer, type SignalsConfig, TASK_STATUSES, type TaskStatus, validDomain, validateEvent, type Verdict, VERDICTS, withAccounts, readWorkstreamActions, type WorkstreamActions, actionsFor, actionsText, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, triggeredLines, type WorkstreamActionsRow } from "./model";
 import { type Classifier, type Handled, type IngestResult, type JoinClaim, CHECK_LEASE, readTriggerState, type SignalsStore, type Task, type TaskPerson } from "./store";
 import type { Triggerer } from "./classify";
 import { DRAFT_FORMAT, disclosureCheck } from "./disclosure";
@@ -103,7 +103,41 @@ export type Onboarding = Readonly<{
 const bad = (error: string, status = 400): HubResponse => ({ status, json: { error } });
 
 /** Every path Hub.handle serves; the app routes exactly these to it. */
-export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered", "/api/onboard", "/api/retitle"] as const;
+export const HUB_PATHS = ["/api/info", "/api/sources", "/api/cursor", "/api/events", "/api/tasks", "/api/task", "/api/accounts", "/api/account", "/api/board", "/api/config", "/api/ids", "/api/filtered", "/api/onboard", "/api/retitle", "/api/handoffs"] as const;
+
+/**
+ * An account input's agents and workstreams' own agents (workstream or rule id → keys), as saveAccount keeps them:
+ * undefined when not given, or what's wrong with them.
+ */
+function readAssignment(input: Record<string, unknown>): { agents?: string[]; workstreamAgents?: Record<string, string[]> } | string {
+  let agents: string[] | undefined;
+  if (input.agents !== undefined) {
+    const items = (Array.isArray(input.agents) ? input.agents : typeof input.agents === "string" ? input.agents.split(/[,\n]/) : undefined)?.map((item) => String(item).trim()).filter(Boolean);
+    if (!items) return "agents is a list of names.";
+    agents = [...new Set(items)].slice(0, 10).map(agentKey);
+    if (agents.some((key) => !key)) return "agents are Buzz pubkeys (64 hex characters or an npub).";
+  }
+  let workstreamAgents: Record<string, string[]> | undefined;
+  if (input.workstream_agents !== undefined) {
+    const given = input.workstream_agents;
+    if (!given || typeof given !== "object" || Array.isArray(given)) return "workstream_agents maps a workstream (or rule id) to the agents that work on its tasks.";
+    workstreamAgents = {};
+    for (const [key, value] of Object.entries(given as Record<string, unknown>)) {
+      const name = key.trim();
+      if (!name || name.length > 80) return "A workstream is 1-80 characters.";
+      const items = Array.isArray(value) ? value.map(String) : typeof value === "string" ? value.split(/[,\s]+/) : undefined;
+      if (!items) return `The ${name} agents are a list of Buzz pubkeys.`;
+      const keys = [...new Set(items.map((item) => item.trim()).filter(Boolean).map(agentKey))];
+      if (keys.some((item) => !item)) return `The ${name} agents are Buzz pubkeys (64 hex characters or an npub).`;
+      if (keys.length > 10) return `A workstream has at most 10 agents.`;
+      if (Object.keys(workstreamAgents).some((other) => other.toLowerCase() === name.toLowerCase())) return `${name} is named twice.`;
+      // No agents is the same as none: its tasks go to the account's agents.
+      if (keys.length) workstreamAgents[name] = keys;
+    }
+    if (Object.keys(workstreamAgents).length > MAX_PLAYBOOKS) return `An account names agents for at most ${MAX_PLAYBOOKS} workstreams.`;
+  }
+  return { ...(agents && { agents }), ...(workstreamAgents && { workstreamAgents }) };
+}
 
 export class Hub {
   private cached?: { at: number; config: SignalsConfig };
@@ -234,6 +268,8 @@ export class Hub {
         }
         case "POST /api/account":
           return this.saveAccount(user, await body());
+        case "POST /api/handoffs":
+          return this.previewHandOffs(await body());
         case "GET /api/config":
           // The rules as saved; accounts teams set up are under /api/accounts.
           return { json: { config: (await this.store.config()) ?? this.options.defaultConfig ?? EMPTY_CONFIG, canEdit: this.isAdmin(user) } };
@@ -933,28 +969,9 @@ export class Hub {
     const aliases = list("aliases", 20);
     const ids = input.ids === undefined ? undefined : readIds(input.ids);
     if (typeof ids === "string") return bad(ids);
-    const agents = list("agents", 10)?.map(agentKey);
-    const notAgent = agents?.find((key) => !key);
-    if (notAgent !== undefined) return bad("agents are Buzz pubkeys (64 hex characters or an npub).");
-    let workstreamAgents: Record<string, string[]> | undefined;
-    if (input.workstream_agents !== undefined) {
-      const given = input.workstream_agents;
-      if (!given || typeof given !== "object" || Array.isArray(given)) return bad("workstream_agents maps a workstream (or rule id) to the agents that work on its tasks.");
-      workstreamAgents = {};
-      for (const [key, value] of Object.entries(given as Record<string, unknown>)) {
-        const name = key.trim();
-        if (!name || name.length > 80) return bad("A workstream is 1-80 characters.");
-        const items = Array.isArray(value) ? value.map(String) : typeof value === "string" ? value.split(/[,\s]+/) : undefined;
-        if (!items) return bad(`The ${name} agents are a list of Buzz pubkeys.`);
-        const keys = [...new Set(items.map((item) => item.trim()).filter(Boolean).map(agentKey))];
-        if (keys.some((item) => !item)) return bad(`The ${name} agents are Buzz pubkeys (64 hex characters or an npub).`);
-        if (keys.length > 10) return bad(`A workstream has at most 10 agents.`);
-        if (Object.keys(workstreamAgents).some((other) => other.toLowerCase() === name.toLowerCase())) return bad(`${name} is named twice.`);
-        // No agents is the same as none: its tasks go to the account's agents.
-        if (keys.length) workstreamAgents[name] = keys;
-      }
-      if (Object.keys(workstreamAgents).length > MAX_PLAYBOOKS) return bad(`An account names agents for at most ${MAX_PLAYBOOKS} workstreams.`);
-    }
+    const assigned = readAssignment(input);
+    if (typeof assigned === "string") return bad(assigned);
+    const { agents, workstreamAgents } = assigned;
     let workstreamActions: WorkstreamActions | undefined;
     if (input.workstream_actions !== undefined) {
       const read = readWorkstreamActions(input.workstream_actions);
@@ -1007,13 +1024,12 @@ export class Hub {
   }
 
   /**
-   * Asks agents just added to an account to work on its open tasks that no
-   * agent has worked yet (posted in its channel, auto or draft): a reply in
-   * each task's thread, mentioning them, with the account's briefing. Their
-   * first reply is recorded as for a new task (see collect).
+   * The open tasks of an account that a change to who works on what hands to agents, and the agents each is handed
+   * to: tasks posted in its channel (auto or draft) that no agent has worked yet, for agents newly on them. Agents
+   * someone took off a task, or already on it, aren't asked again, and a task someone gave owners stays theirs.
    */
-  private async handOff(account: AccountRecord, before: Pick<AccountRecord, "agents" | "workstream_agents">): Promise<number[]> {
-    if (!this.notifier || !account.channel) return [];
+  private async handOffs(account: Pick<AccountRecord, "name" | "channel" | "agents" | "workstream_agents">, before: Pick<AccountRecord, "agents" | "workstream_agents">) {
+    if (!account.channel) return [];
     // Each task's new agents: the ones for its workstream now that weren't before.
     const addedFor = (task: Task) => {
       const was = new Set(agentsFor(before, task));
@@ -1024,20 +1040,58 @@ export class Hub {
     const fellBack = (task: Task) => agentListFor(before, task).key !== undefined && agentListFor(account, task).key === undefined;
     const lower = account.name.toLowerCase();
     const tasks = (await this.store.untouched(HAND_OFF_DAYS, undefined, HAND_OFF_MAX)).filter((task) => task.account?.toLowerCase() === lower && task.channel === account.channel);
-    const woken: number[] = [];
-    const labels = labelsOf(await this.config());
     const ids = tasks.map((task) => task.id);
     const [gone, people] = await Promise.all([this.store.removed(ids), this.store.people(ids)]);
-    for (const task of tasks) {
+    return tasks.flatMap((task) => {
       // Not agents someone took off it, and not tasks someone gave owners: a person chose who has those.
       const on = people.get(task.id) ?? [];
       // Not agents already on it, either: they were asked before.
       const asked = addedFor(task).filter((key) => !gone.get(task.id)?.has(key) && !on.some((person) => person.kind === "agent" && person.key === key));
-      if (!asked.length || on.some((person) => person.assigned_at)) continue;
-      if (fellBack(task) && on.some((person) => person.kind === "agent")) continue;
+      if (!asked.length || on.some((person) => person.assigned_at)) return [];
+      if (fellBack(task) && on.some((person) => person.kind === "agent")) return [];
+      return [{ task, asked, why: handOffReason(agentListFor(account, task).key, fellBack(task)) }];
+    });
+  }
+
+  /**
+   * The agents a save of an account's agents has to have in its channel first, without saving: the ones it would ask
+   * to work on open tasks (handOffs), since this is the only save that asks them, and the ones it newly puts on any
+   * kind of task the rules open (taskKinds: a rule's workstream, a category's, its action items'), since a task can
+   * open meanwhile and be handed off by this save. Agents whose work doesn't change aren't named, even where a list was redundant.
+   */
+  private async previewHandOffs(input: Record<string, unknown>): Promise<HubResponse> {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!name || name.length > 200) return bad("Send {name} (1-200 characters).");
+    if (input.channel !== undefined && input.channel !== null && (typeof input.channel !== "string" || !/^[\w-]{1,100}$/.test(input.channel))) return bad("channel is a Buzz channel id.");
+    const assigned = readAssignment(input);
+    if (typeof assigned === "string") return bad(assigned);
+    if (!this.notifier) return { json: { agents: [] } };
+    const before = await this.store.account({ name });
+    const was = { agents: before?.agents ?? [], workstream_agents: before?.workstream_agents ?? {} };
+    const channel = input.channel === undefined ? (before?.channel ?? null) : (input.channel as string | null) || null;
+    const after = { name, channel, agents: assigned.agents ?? was.agents, workstream_agents: assigned.workstreamAgents ?? was.workstream_agents };
+    const plans = await this.handOffs(after, was);
+    const config = await this.config();
+    const gained = taskKinds(config).flatMap((kind) => {
+      const old = new Set(agentsFor(was, kind));
+      return agentsFor(after, kind).filter((key) => !old.has(key));
+    });
+    return { json: { agents: [...new Set([...plans.flatMap((plan) => plan.asked), ...gained])] } };
+  }
+
+  /**
+   * Asks agents just added to an account to work on its open tasks that no
+   * agent has worked yet (posted in its channel, auto or draft): a reply in
+   * each task's thread, mentioning them, with the account's briefing. Their
+   * first reply is recorded as for a new task (see collect).
+   */
+  private async handOff(account: AccountRecord, before: Pick<AccountRecord, "agents" | "workstream_agents">): Promise<number[]> {
+    if (!this.notifier) return [];
+    const woken: number[] = [];
+    const labels = labelsOf(await this.config());
+    for (const { task, asked, why } of await this.handOffs(account, before)) {
       try {
         const event = await this.store.latestEvent(task.id);
-        const why = handOffReason(agentListFor(account, task).key, fellBack(task));
         await this.notifier.updated(task, handOffMessage(task, asked, briefing(account, labels, task), event && eventDetails(event, account.domains, labels, task), why), asked);
         await this.store.addPeople(task.id, asked.map((key) => ({ kind: "agent", key })));
         await this.store.activity(task.id, "hub", "agents_asked", `Asked ${asked.map((key) => `nostr:${npub(key)}`).join(", ")} to work on it (added to ${account.name})`);
