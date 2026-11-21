@@ -6847,6 +6847,7 @@ function parseProfile(text) {
 
 // plugins/agents/src/slack-ui.tsx
 var MAX_PAGES = 10;
+var LISTS = ["public_channel,private_channel", "im", "mpim"];
 var SHOWN = 150;
 async function callSlack(service, tool, args) {
   const result = await new McpClient(await service.ready(), gatewayMcpPath(SLACK_TOOLS)).callTool(tool, args, { timeoutMs: 12e4 });
@@ -6855,19 +6856,22 @@ async function callSlack(service, tool, args) {
   return text;
 }
 async function loadDirectory(service, call = callSlack) {
-  const profile = parseProfile(await call(service, "slack_read_user_profile", { response_format: "concise" }));
-  const conversations = [];
-  let cursor;
-  let pages = 0;
-  do {
-    const page = parseListing(
-      await call(service, "slack_list_user_channels", { types: "public_channel,private_channel,im,mpim", exclude_archived: true, limit: 200, ...cursor && { cursor } })
-    );
-    conversations.push(...page.conversations);
-    cursor = page.cursor;
-  } while (cursor && ++pages < MAX_PAGES);
-  const named = conversations.map((conversation) => conversation.kind === "mpim" ? { ...conversation, name: groupName(conversation.name, profile?.handle) } : conversation);
-  return { conversations: named, ...profile && { handle: profile.handle }, partial: Boolean(cursor) };
+  const list = async (types) => {
+    const conversations = [];
+    let cursor;
+    let pages = 0;
+    do {
+      const page = parseListing(await call(service, "slack_list_user_channels", { types, exclude_archived: true, limit: 200, ...cursor && { cursor } }));
+      conversations.push(...page.conversations);
+      cursor = page.cursor;
+    } while (cursor && ++pages < MAX_PAGES);
+    return { conversations, partial: Boolean(cursor) };
+  };
+  const [profileText, ...lists2] = await Promise.all([call(service, "slack_read_user_profile", { response_format: "concise" }), ...LISTS.map(list)]);
+  const profile = parseProfile(profileText);
+  const seen = /* @__PURE__ */ new Set();
+  const named = lists2.flatMap((listed) => listed.conversations).filter((conversation) => !seen.has(conversation.id) && Boolean(seen.add(conversation.id))).map((conversation) => conversation.kind === "mpim" ? { ...conversation, name: groupName(conversation.name, profile?.handle) } : conversation);
+  return { conversations: named, ...profile && { handle: profile.handle }, partial: lists2.some((listed) => listed.partial) };
 }
 var FILTERS = [
   { id: "all", label: "Everything" },
@@ -6919,7 +6923,7 @@ function SlackConversationsField(props) {
       label: "Slack conversations",
       hint: "Each one you turn on gets a Buzz channel. Public Slack channels go to open Buzz channels that everyone who bridges them shares. Private channels, DMs and group DMs go to a private Buzz channel of your own, with only you in it; someone else in the conversation who bridges it gets their own. Anyone you add to yours reads the Slack conversation, so add only people who are in it on Slack."
     },
-    /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, placeholder: "Search your Slack", value: query, disabled: props.disabled, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", value: filter, disabled: props.disabled, onChange: (event) => setFilter(event.target.value) }, FILTERS.map((choice) => /* @__PURE__ */ React.createElement("option", { key: choice.id, value: choice.id }, choice.label))))
+    /* @__PURE__ */ React.createElement(Stack, { direction: "row", gap: 8 }, /* @__PURE__ */ React.createElement("input", { className: "dbx-input", style: { flex: 1 }, placeholder: "Search your Slack", value: query, disabled: props.disabled, onChange: (event) => setQuery(event.target.value) }), /* @__PURE__ */ React.createElement("select", { className: "dbx-select", style: { width: "auto", flex: "none" }, value: filter, disabled: props.disabled, onChange: (event) => setFilter(event.target.value) }, FILTERS.map((choice) => /* @__PURE__ */ React.createElement("option", { key: choice.id, value: choice.id }, choice.label))))
   ), directory.error && /* @__PURE__ */ React.createElement(Notice, { tone: "warning", title: "Couldn't read your Slack" }, describeError(directory.error), ". The bridge reads Slack through your own Slack sign-in in this Databricks workspace; sign in to Slack there (for example by using Slack in Genie), then reopen this tab."), /* @__PURE__ */ React.createElement("div", { style: { border: "1px solid var(--dbx-border)", borderRadius: 8, maxHeight: 420, overflow: "auto" } }, props.value.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 10px", background: "var(--dbx-surface-raised, transparent)" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", weight: 600 }, "Bridged \xB7 ", props.value.length)), props.value.map((conversation) => row(conversation, true))), /* @__PURE__ */ React.createElement("div", { style: { padding: "6px 10px" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "subtle", weight: 600 }, directory.loading && !directory.data ? "Reading your Slack\u2026" : `Your Slack \xB7 ${others.length}${directory.data?.partial ? "+" : ""}`)), directory.loading && !directory.data && /* @__PURE__ */ React.createElement("div", { style: { padding: 12 } }, /* @__PURE__ */ React.createElement(Spinner, { size: 12 })), others.slice(0, SHOWN).map((conversation) => row(conversation, false)), others.length > SHOWN && /* @__PURE__ */ React.createElement("div", { style: { padding: "8px 10px" } }, /* @__PURE__ */ React.createElement(Text, { size: "xs", tone: "tertiary" }, others.length - SHOWN, " more; search to find them."))));
 }
 
