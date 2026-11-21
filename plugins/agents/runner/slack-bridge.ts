@@ -4,47 +4,60 @@
 // Slack, as its owner (the Sandbox's Databricks sign-in, through Slack's MCP
 // server, so Slack shows them as its owner's own).
 //
-// Several people can bridge the same conversation (../src/slack.ts has the
-// conventions). Each bridge finds the conversation's Buzz channel by its label,
-// the oldest one first:
-//   - a public Slack channel's open Buzz channel, which it joins;
-//   - for a private channel, DM or group DM, a private Buzz channel it made, or
-//     one another bridge made and shared with it. It takes someone else's only
-//     once that channel holds a message it can read in Slack itself, so a
-//     channel nobody in the conversation made can't collect it;
-//   - otherwise it makes one, with its owner as an admin.
-// The bridge that made the channel posts at once; the others post a message
-// only when it's still missing two minutes later, so the channel keeps up
-// while that bridge's Sandbox is asleep. Every bridge checks for the message's
-// Slack link (its `r` tag) first. The bridge that made a private channel adds
-// the Slack bridges of the people its owner adds to it.
+// Several people can bridge the same public Slack channel (../src/slack.ts has
+// the conventions). Each bridge finds its Buzz channel by its label, the oldest
+// one first, and joins it, or makes one. The bridge that made it posts at once;
+// the others post a message only when it's still missing two minutes later,
+// taking turns, so the channel keeps up while that bridge's Sandbox is asleep.
+// Every bridge checks for the message's Slack link (its `r` tag) first.
+//
+// A private channel, DM or group DM always goes to a private Buzz channel this
+// bridge made, with its owner as an admin: whoever else is in the Buzz channel
+// is the owner's choice. A bridge never takes a private channel someone else
+// made, since nothing in Buzz shows who is in the Slack conversation. Each
+// person in a DM has their own, and what one of them writes from Buzz shows up
+// in the other's like any Slack message.
+//
+// Slack's tools answer in markdown and don't escape message text, so the
+// bridge reads each new message again on its own before posting it: a header
+// someone typed into a message is not a message.
 import { randomUUID } from "node:crypto";
 import type { EventTemplate, NostrEvent } from "nostr-tools/pure";
 import {
   BRIDGE_TAG,
   bridgedContent,
-  bridgedText,
   buzzChannelName,
   FOOTER,
+  around,
   hasFooter,
   isPrivateKind,
+  isTs,
   mrkdwn,
   norm,
   parseMessages,
+  parseOne,
   parseProfile,
   permalink,
   type SlackConversation,
   type SlackMessage,
   slackLabel,
   tsFromLink,
+  unfooter,
   unwrap,
 } from "../src/slack";
 import { attestedOwner, threadRoot } from "./buzz";
 
 export const HELPER_DELAY_MS = 2 * 60_000;
+/** How much longer each helper after the first waits, so helpers take turns. */
+export const HELPER_TURN_MS = 30_000;
 const RESOLVE_EVERY_MS = 10 * 60_000;
 const BACKFILL = 5;
+/** Messages read a pass: the latest, for thread replies; and, after a gap, the next ones since the last handled. */
+const RECENT = 50;
+const CATCH_UP = 100;
 const KEEP = 500;
+const TRIES = 3;
+const MAX_SEND = 4900;
 
 export type BridgeRelay = Readonly<{
   publish(template: EventTemplate): Promise<NostrEvent>;
@@ -62,6 +75,8 @@ export type ConversationState = {
   ownerIn?: boolean;
   /** People in the Buzz channel, agents aside. */
   people?: number;
+  /** A helper's turn among the channel's other bridges: it waits HELPER_TURN_MS more per turn. */
+  turn?: number;
   resolvedAt?: number;
   /** Messages up to this Slack ts are all handled. */
   last?: string;
@@ -70,7 +85,12 @@ export type ConversationState = {
   threads: Record<string, { latest?: string; seen: string[] }>;
   /** Slack ts → when a helper first saw it missing. */
   pending: Record<string, number>;
-  out?: { since: number; sent: Record<string, string | null> };
+  /** Slack ts → failed tries at posting it. */
+  failed?: Record<string, number>;
+  /** Listed ts that aren't messages (a header typed into a message). */
+  fake?: string[];
+  /** Buzz event → the Slack ts it was sent as; "" while it's being sent (never sent twice), null when it won't be. */
+  out?: { since: number; sent: Record<string, string | null>; tries?: Record<string, number> };
   error?: string;
 };
 export type BridgeState = { conversations: Record<string, ConversationState>; me?: { handle: string; name: string } };
@@ -109,6 +129,7 @@ const byAge = (a: Channel, b: Channel) => (a.createdAt ?? Infinity) - (b.created
 
 export class SlackBridge {
   private lastCreated = 0;
+  private bridgeKeys: Promise<Set<string>> | undefined;
   /** Messages posted to Buzz or sent to Slack so far, for the runner's "last activity". */
   moved = 0;
 
@@ -119,6 +140,8 @@ export class SlackBridge {
       /** The bridge agent's pubkey, and its owner's. */
       pubkey: string;
       owner: string;
+      /** The relay's own key, which signs channel metadata; when known, metadata signed by anyone else is ignored. */
+      relayPubkey?: string;
       conversations: readonly SlackConversation[];
       state: BridgeState;
       save(): void;
@@ -141,6 +164,7 @@ export class SlackBridge {
 
   /** One pass over every conversation. */
   async tick(): Promise<void> {
+    this.bridgeKeys = undefined;
     if (!this.state.me) {
       try {
         const me = parseProfile(await this.input.slack("slack_read_user_profile", { response_format: "concise" }));
@@ -198,31 +222,39 @@ export class SlackBridge {
   // ── The Buzz channel ──
 
   private async members(channel: string): Promise<Map<string, string>> {
-    const [event] = await this.input.relay.query([{ kinds: [39002], "#d": [channel], limit: 1 }]);
+    const [event] = await this.input.relay.query([{ kinds: [39002], "#d": [channel], ...this.byRelay(), limit: 1 }]);
     const roles = new Map<string, string>();
     for (const tag of event?.tags ?? []) if (tag[0] === "p" && tag[1]) roles.set(tag[1], tag[3] ?? "member");
     return roles;
   }
 
-  /** Finds, takes or makes the conversation's Buzz channel; every few minutes, or until it has one. */
+  private byRelay() {
+    return this.input.relayPubkey ? { authors: [this.input.relayPubkey] } : {};
+  }
+
+  /** The Slack bridges in the community (their owners' attestations checked), this one included; read once a pass. */
+  private bridges(): Promise<Set<string>> {
+    return (this.bridgeKeys ??= this.input.relay.query([{ kinds: [0], "#t": [BRIDGE_TAG], limit: 500 }]).then((profiles) => {
+      const keys = new Set([this.input.pubkey]);
+      for (const profile of profiles) if (attestedOwner(profile)) keys.add(profile.pubkey);
+      return keys;
+    }));
+  }
+
+  /** Finds or makes the conversation's Buzz channel; every few minutes, or until it has one. */
   private async resolve(conversation: SlackConversation, st: ConversationState) {
     if (st.buzz && this.now() - (st.resolvedAt ?? 0) < RESOLVE_EVERY_MS) return;
     const label = slackLabel(conversation.id);
     const secret = isPrivateKind(conversation.kind);
-    const found = (await this.input.relay.query([{ kinds: [39000], "#t": [label], limit: 50 }]))
+    const found = (await this.input.relay.query([{ kinds: [39000], "#t": [label], ...this.byRelay(), limit: 50 }]))
       .map(channelOf)
       .filter((channel): channel is Channel => Boolean(channel && channel.labels.includes(label) && channel.private === secret))
       .sort(byAge);
-    let chosen: Channel | undefined;
-    for (const channel of found) {
-      if (channel.creator === this.input.pubkey || !secret || (await this.proven(conversation, channel))) {
-        chosen = channel;
-        break;
-      }
-    }
+    // A private conversation's channel is always this bridge's own.
+    let chosen = found.find((channel) => !secret || channel.creator === this.input.pubkey);
     if (!chosen) {
       // Only for a conversation the owner can read in Slack (this throws otherwise).
-      await this.read(conversation);
+      await this.read(conversation, { limit: 1 });
       chosen = await this.create(conversation, label, secret);
     }
     if (st.buzz !== chosen.id) {
@@ -231,6 +263,8 @@ export class SlackBridge {
       st.posted = {};
       st.threads = {};
       st.pending = {};
+      delete st.failed;
+      delete st.fake;
       delete st.last;
       delete st.out;
       st.buzz = chosen.id;
@@ -242,76 +276,99 @@ export class SlackBridge {
       await this.publish(9021, "", [["h", chosen.id]]);
       roles = await this.members(chosen.id);
     }
-    if (st.primary && secret) await this.addBridges(chosen.id, roles);
+    // A channel made while the relay refused to add the owner gets them now.
+    if (st.primary && !roles.has(this.input.owner)) {
+      await this.publish(9000, "", [["h", chosen.id], ["p", this.input.owner, "", "admin"]]);
+      roles = await this.members(chosen.id);
+    }
     st.ownerIn = roles.has(this.input.owner);
     st.people = [...roles].filter(([pubkey, role]) => role !== "bot" && pubkey !== this.input.pubkey).length;
+    if (!st.primary) {
+      // Helpers take turns by key, the channel's maker aside.
+      const bridges = await this.bridges();
+      const helpers = [...roles.keys()].filter((pubkey) => pubkey !== chosen.creator && (pubkey === this.input.pubkey || bridges.has(pubkey))).sort();
+      st.turn = Math.max(0, helpers.indexOf(this.input.pubkey));
+    } else delete st.turn;
     st.resolvedAt = this.now();
-  }
-
-  /** Whether a private channel someone else's bridge made holds a message of this conversation that this bridge can read in Slack. */
-  private async proven(conversation: SlackConversation, channel: Channel): Promise<boolean> {
-    if (!channel.creator) return false;
-    const posts = await this.input.relay.query([{ kinds: [9], "#h": [channel.id], authors: [channel.creator], limit: 50 }]);
-    if (!posts.length) return false;
-    const slack = new Map(parseMessages(await this.read(conversation)).map((message) => [message.ts, norm(mrkdwn(message.text))]));
-    return posts.some((post) => {
-      const link = post.tags.find((tag) => tag[0] === "r")?.[1];
-      const ts = tsFromLink(link);
-      const text = ts ? slack.get(ts) : undefined;
-      return Boolean(link?.includes(`/archives/${conversation.id}/`) && text && text === norm(bridgedText(post.content)));
-    });
   }
 
   private async create(conversation: SlackConversation, label: string, secret: boolean): Promise<Channel> {
     const id = this.input.newId?.() ?? randomUUID();
     const name = buzzChannelName(conversation, this.state.me);
-    const about = secret ? `Bridged from Slack. Only people in the Slack conversation should be added here.` : `Bridged from the Slack channel #${conversation.name}.`;
+    const about = secret
+      ? `Bridged from Slack by its owner's Slack bridge. Everyone in this channel reads the Slack conversation: add only people who are in it on Slack.`
+      : `Bridged from the Slack channel #${conversation.name}.`;
     await this.publish(9007, "", [["h", id], ["name", name], ["visibility", secret ? "private" : "open"], ["channel_type", "stream"], ["about", about], ["t", label]]);
     await this.publish(9000, "", [["h", id], ["p", this.input.owner, "", "admin"]]);
     this.input.log(`${conversation.id}: made ${secret ? "private" : "open"} channel ${name} (${id})`);
     return { id, name, private: secret, creator: this.input.pubkey, createdAt: Math.floor(this.now() / 1000), labels: [label] };
   }
 
-  /** Adds the Slack bridges of the people in a private channel this bridge made (their owners' attestations checked). */
-  private async addBridges(channel: string, roles: Map<string, string>) {
-    const people = new Set([...roles].filter(([pubkey, role]) => role !== "bot" && pubkey !== this.input.owner && pubkey !== this.input.pubkey).map(([pubkey]) => pubkey));
-    if (!people.size) return;
-    for (const profile of await this.input.relay.query([{ kinds: [0], "#t": [BRIDGE_TAG], limit: 500 }])) {
-      const owner = attestedOwner(profile);
-      if (!owner || !people.has(owner) || roles.has(profile.pubkey) || profile.pubkey === this.input.pubkey) continue;
-      await this.publish(9000, "", [["h", channel], ["p", profile.pubkey, "", "member"]]);
-      roles.set(profile.pubkey, "bot");
-      this.input.log(`${channel}: added ${owner.slice(0, 8)}…'s Slack bridge`);
-    }
-  }
-
   // ── Slack → Buzz ──
 
-  private read(conversation: SlackConversation) {
-    return this.input.slack("slack_read_channel", { channel_id: conversation.id, limit: 50 });
+  private read(conversation: SlackConversation, args: Readonly<Record<string, unknown>> = { limit: RECENT }) {
+    return this.input.slack("slack_read_channel", { channel_id: conversation.id, ...args });
+  }
+
+  /** The message at ts, read on its own: undefined when Slack has none (a header typed into another message). */
+  private async verify(conversation: SlackConversation, ts: string, parent?: string): Promise<SlackMessage | undefined> {
+    const text = parent
+      ? await this.input.slack("slack_read_thread", { channel_id: conversation.id, message_ts: parent, ...around(ts), limit: 2 })
+      : await this.read(conversation, { ...around(ts), limit: 1 });
+    return parseOne(text, ts);
+  }
+
+  /** Listed ts worth checking: well formed, not from the future, and not already found to be fake. */
+  private plausible(st: ConversationState, ts: string) {
+    return isTs(ts) && Number(ts) <= this.now() / 1000 + 300 && !st.fake?.includes(ts);
+  }
+
+  private markFake(conversation: SlackConversation, st: ConversationState, ts: string) {
+    (st.fake ??= []).push(ts);
+    if (st.fake.length > KEEP) st.fake.splice(0, st.fake.length - KEEP);
+    this.input.log(`${conversation.id}: ${ts} isn't a Slack message (a header inside one?); skipped`);
   }
 
   private async inbound(conversation: SlackConversation, st: ConversationState) {
-    const messages = parseMessages(await this.read(conversation));
+    const listed = parseMessages(await this.read(conversation));
+    let recent = listed.filter((message) => this.plausible(st, message.ts));
     if (st.last === undefined) {
       // A new channel starts with the latest few, not the whole history.
-      st.last = messages.length > BACKFILL ? messages[messages.length - BACKFILL - 1]!.ts : "0";
+      st.last = recent.length > BACKFILL ? recent[recent.length - BACKFILL - 1]!.ts : "0";
+    }
+    // After a gap longer than one read, carry on from the last handled message.
+    let fresh = recent;
+    if (st.last !== "0" && listed.length >= RECENT && recent.length && Number(recent[0]!.ts) > Number(st.last)) {
+      fresh = parseMessages(await this.read(conversation, { oldest: st.last, limit: CATCH_UP })).filter((message) => this.plausible(st, message.ts));
+      recent = [];
     }
     const twins = this.twins(st.buzz!);
-    for (const message of messages) {
-      if (Number(message.ts) > Number(st.last) && !(message.ts in st.posted)) {
-        const id = await this.mirror(conversation, st, message, twins);
-        if (id !== undefined) {
-          st.posted[message.ts] = id;
-          delete st.pending[message.ts];
-          this.input.save();
-        }
+    const real = new Set<string>();
+    for (const listed of fresh) {
+      if (Number(listed.ts) <= Number(st.last) || listed.ts in st.posted) {
+        real.add(listed.ts);
+        continue;
       }
-      if (message.thread && st.posted[message.ts] !== undefined && st.threads[message.ts]?.latest !== message.thread.latest) await this.thread(conversation, st, message, twins);
+      const message = await this.verify(conversation, listed.ts);
+      if (!message) {
+        this.markFake(conversation, st, listed.ts);
+        continue;
+      }
+      real.add(message.ts);
+      const id = await this.mirror(conversation, st, message, twins);
+      if (id !== undefined) {
+        st.posted[message.ts] = id;
+        delete st.pending[message.ts];
+        this.input.save();
+      }
+    }
+    // Thread replies, under the latest messages this bridge has in Buzz.
+    for (const message of recent) {
+      if (message.thread && real.has(message.ts) && st.posted[message.ts] !== undefined && st.threads[message.ts]?.latest !== message.thread.latest) await this.thread(conversation, st, message, twins);
     }
     // Handled up to the first message still waiting.
-    for (const message of messages) {
-      if (Number(message.ts) <= Number(st.last)) continue;
+    for (const message of fresh) {
+      if (Number(message.ts) <= Number(st.last) || !real.has(message.ts)) continue;
       if (!(message.ts in st.posted)) break;
       st.last = message.ts;
     }
@@ -328,16 +385,24 @@ export class SlackBridge {
     const root = st.posted[parent.ts];
     const replies = parseMessages(await this.input.slack("slack_read_thread", { channel_id: conversation.id, message_ts: parent.ts, limit: 200 }));
     let waiting = false;
-    for (const reply of replies) {
-      if (reply.ts === parent.ts || seen.seen.includes(reply.ts)) continue;
+    for (const listed of replies) {
+      if (listed.ts === parent.ts || seen.seen.includes(listed.ts) || !this.plausible(st, listed.ts)) continue;
       // Replies to a message from Buzz whose original wasn't found have nowhere to go.
-      const id = root ? await this.mirror(conversation, st, reply, twins, root) : "";
+      let id: string | undefined = "";
+      if (root) {
+        const reply = await this.verify(conversation, listed.ts, parent.ts);
+        if (!reply) {
+          this.markFake(conversation, st, listed.ts);
+          continue;
+        }
+        id = await this.mirror(conversation, st, reply, twins, root);
+      }
       if (id === undefined) {
         waiting = true;
         continue;
       }
-      seen.seen.push(reply.ts);
-      delete st.pending[reply.ts];
+      seen.seen.push(listed.ts);
+      delete st.pending[listed.ts];
       this.input.save();
     }
     if (seen.seen.length > KEEP) seen.seen.splice(0, seen.seen.length - KEEP);
@@ -353,74 +418,118 @@ export class SlackBridge {
         .then((events) => events.map((event) => ({ norm: norm(event.content), id: event.id }))));
   }
 
+  /** A bridge's post of a Slack message in this channel, by its link. */
+  private async postOf(st: ConversationState, link: string): Promise<NostrEvent | undefined> {
+    const bridges = await this.bridges();
+    const found = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], "#r": [link], limit: 20 }]);
+    return found.filter((event) => bridges.has(event.pubkey)).sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1))[0];
+  }
+
   /**
    * Posts a Slack message to Buzz unless it's there already. Resolves with its
-   * Buzz event, "" for a message from Buzz whose original isn't found, or
-   * undefined while a helper waits for the bridge that made the channel.
+   * Buzz event, "" when it won't be posted, or undefined while a helper waits
+   * its turn, or after a failure it will try again.
    */
   private async mirror(conversation: SlackConversation, st: ConversationState, message: SlackMessage, twins: () => Promise<readonly { norm: string; id: string }[]>, root?: string): Promise<string | undefined> {
+    // Sent from Buzz: linked to the original when it's in this channel; otherwise (someone else's Buzz) posted like any message.
     if (hasFooter(message.text)) {
       const text = norm(mrkdwn(message.text));
-      return (text && (await twins()).find((twin) => twin.norm === text)?.id) || "";
+      const twin = text ? (await twins()).find((found) => found.norm === text) : undefined;
+      if (twin) return twin.id;
     }
     if (!st.primary) {
       const first = (st.pending[message.ts] ??= this.now());
-      if (this.now() - first < (this.input.helperDelayMs ?? HELPER_DELAY_MS)) return undefined;
+      if (this.now() - first < (this.input.helperDelayMs ?? HELPER_DELAY_MS) + (st.turn ?? 0) * HELPER_TURN_MS) return undefined;
     }
     const link = permalink(conversation.id, message.ts);
-    const [there] = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], "#r": [link], limit: 1 }]);
+    const there = await this.postOf(st, link);
     if (there) return there.id;
     const tags = [["h", st.buzz!], ["r", link]];
     if (root) tags.push(["e", root, "", "reply"]);
-    const event = await this.publish(9, bridgedContent(message, link, Math.floor(this.now() / 1000)), tags);
-    this.moved++;
-    this.input.log(`${conversation.id}: posted ${message.ts}${root ? " (reply)" : ""}${st.primary ? "" : " as a helper"}`);
-    return event.id;
+    try {
+      const event = await this.publish(9, bridgedContent({ ...message, text: unfooter(message.text) }, link, Math.floor(this.now() / 1000)), tags);
+      this.moved++;
+      this.input.log(`${conversation.id}: posted ${message.ts}${root ? " (reply)" : ""}${st.primary ? "" : " as a helper"}`);
+      delete st.failed?.[message.ts];
+      return event.id;
+    } catch (error) {
+      // One message the relay won't take doesn't hold up the rest for long.
+      const failed = (st.failed ??= {});
+      failed[message.ts] = (failed[message.ts] ?? 0) + 1;
+      const why = String((error as Error).message ?? error).slice(0, 200);
+      if (failed[message.ts]! < TRIES) {
+        this.input.log(`${conversation.id}: couldn't post ${message.ts} (try ${failed[message.ts]}): ${why}`);
+        return undefined;
+      }
+      delete failed[message.ts];
+      this.input.log(`${conversation.id}: gave up posting ${message.ts}: ${why}`);
+      return "";
+    }
   }
 
   // ── Buzz → Slack ──
 
-  /** The Slack message a Buzz message stands for: one this bridge saw or sent, or another bridge's post of it. */
-  private async slackTs(st: ConversationState, event: string): Promise<string | undefined> {
+  /** The Slack message a Buzz message stands for: one this bridge saw or sent, or a bridge's post of one in this conversation. */
+  private async slackTs(conversation: SlackConversation, st: ConversationState, event: string): Promise<string | undefined> {
     for (const [ts, id] of Object.entries(st.posted)) if (id === event) return ts;
     const sent = st.out?.sent[event];
     if (sent) return sent;
     const [found] = await this.input.relay.query([{ ids: [event], limit: 1 }]);
-    return tsFromLink(found?.tags.find((tag) => tag[0] === "r")?.[1]);
+    if (!found || !(await this.bridges()).has(found.pubkey)) return undefined;
+    const link = found.tags.find((tag) => tag[0] === "r")?.[1];
+    return link?.includes(`/archives/${conversation.id}/`) ? tsFromLink(link) : undefined;
   }
 
   private async outbound(conversation: SlackConversation, st: ConversationState) {
     const out = (st.out ??= { since: Math.floor(this.now() / 1000), sent: {} });
+    const tries = (out.tries ??= {});
     const events = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], authors: [this.input.owner], since: out.since - 30, limit: 100 }]);
     let roles: Map<string, string> | undefined;
+    let retry = false;
     for (const event of events.sort((a, b) => a.created_at - b.created_at)) {
       if (event.id in out.sent || event.pubkey !== this.input.owner) continue;
       // Who's an agent now: read once a pass, and only when there's something to send.
       const known = (roles ??= await this.members(st.buzz!));
-      out.since = Math.max(out.since, event.created_at);
+      // Past a message that will be tried again, `since` stays put so it's read again.
+      if (!retry) out.since = Math.max(out.since, event.created_at);
       const text = event.content.trim();
       // "//" keeps a message in Buzz, and so does talking to an agent.
       const agents = event.tags.some((tag) => tag[0] === "p" && known.get(tag[1] ?? "") === "bot");
       const root = threadRoot(event);
-      const parent = root ? await this.slackTs(st, root) : undefined;
+      const parent = root ? await this.slackTs(conversation, st, root) : undefined;
       // A thread that started in Buzz stays there too.
       if (!text || text.startsWith("//") || agents || (root && !parent)) {
         out.sent[event.id] = null;
         continue;
       }
+      // Marked before it goes, so a restart mid-send never sends it twice.
+      out.sent[event.id] = "";
+      this.input.save();
+      const body = text.length > MAX_SEND ? `${text.slice(0, MAX_SEND)}… _(cut short: the rest is in Buzz)_` : text;
       try {
-        const reply = unwrap(await this.input.slack("slack_send_message", { channel_id: conversation.id, message: `${text.slice(0, 4900)}\n${FOOTER}`, ...(parent && { thread_ts: parent }) }));
+        const reply = unwrap(await this.input.slack("slack_send_message", { channel_id: conversation.id, message: `${body}\n${FOOTER}`, ...(parent && { thread_ts: parent }) }));
         const ts = String((reply.message_context as { message_ts?: string } | undefined)?.message_ts ?? "");
         out.sent[event.id] = ts || null;
+        delete tries[event.id];
         this.moved++;
         if (ts && parent) (st.threads[parent] ??= { seen: [] }).seen.push(ts);
         else if (ts) st.posted[ts] = event.id;
         this.input.log(`${conversation.id}: sent ${event.id.slice(0, 8)} to Slack${parent ? " (reply)" : ""}`);
       } catch (error) {
-        out.sent[event.id] = null;
         const why = String((error as Error).message ?? error).slice(0, 200);
-        this.input.log(`${conversation.id}: couldn't send ${event.id.slice(0, 8)}: ${why}`);
-        await this.publish(9, `⚠️ Couldn't send this to Slack: ${why}`, [["h", st.buzz!], ["e", root ?? event.id, "", "reply"]]).catch(() => {});
+        tries[event.id] = (tries[event.id] ?? 0) + 1;
+        if (tries[event.id]! < TRIES) {
+          // Slack said no, so nothing went out: try again next pass.
+          delete out.sent[event.id];
+          retry = true;
+          this.input.log(`${conversation.id}: couldn't send ${event.id.slice(0, 8)} (try ${tries[event.id]}): ${why}`);
+        } else {
+          out.sent[event.id] = null;
+          delete tries[event.id];
+          this.input.log(`${conversation.id}: gave up sending ${event.id.slice(0, 8)}: ${why}`);
+          // The reason stays in the log: the channel may be open to everyone.
+          await this.publish(9, `⚠️ Couldn't send this to Slack. Try again, or post it in Slack.`, [["h", st.buzz!], ["e", root ?? event.id, "", "reply"]]).catch(() => {});
+        }
       }
       this.input.save();
     }

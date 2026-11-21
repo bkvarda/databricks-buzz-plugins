@@ -110,7 +110,8 @@ function normalizeConversations(value: unknown): SlackConversation[] {
   return value.flatMap((item: Partial<SlackConversation>) => {
     if (!item || typeof item.id !== "string" || !/^[CDG][A-Z0-9]{4,}$/.test(item.id) || seen.has(item.id)) return [];
     seen.add(item.id);
-    const kind = SLACK_KINDS.includes(item.kind as SlackKind) ? (item.kind as SlackKind) : "public";
+    // Unknown is private: never an open Buzz channel for something that may not be public.
+    const kind = SLACK_KINDS.includes(item.kind as SlackKind) ? (item.kind as SlackKind) : "private";
     return [{ id: item.id, name: typeof item.name === "string" && item.name ? item.name.slice(0, 200) : item.id, kind }];
   });
 }
@@ -370,7 +371,15 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
     async update(pubkey: string, config: HostedConfig, signal?: AbortSignal) {
       const found = read(pubkey);
       if (!found) throw new Error("This agent is managed from another device.");
-      const record: HostedRecord = { ...found, config: { ...config, kind: found.config.kind, ...(found.config.profile ? { profile: found.config.profile } : {}) } };
+      const record: HostedRecord = {
+        ...found,
+        config: {
+          ...config,
+          kind: found.config.kind,
+          ...(found.config.profile ? { profile: found.config.profile } : {}),
+          ...(found.config.kind === "slack" && { slack: { conversations: normalizeConversations(config.slack?.conversations) } }),
+        },
+      };
       await deploy(service, record, { restart: true, publishProfile: false, ...(signal && { signal }) });
       await write(record);
     },

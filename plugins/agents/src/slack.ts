@@ -105,48 +105,76 @@ const HEAD =
   /=== Message from (?<n1>.*?) \((?<u1>\w+)\) at (?<w1>.*?) === ?\nMessage TS: (?<t1>\d+\.\d+)\n|From: (?<n2>.*?) \((?<u2>\w+)\)\nTime: (?<w2>.*?)\nMessage TS: (?<t2>\d+\.\d+)\n/g;
 const END = /\n(?:--- Reply \d+ of \d+ ---|=== THREAD REPLIES.*===|There are no more messages in this thread\.)/;
 
-/** Messages from `slack_read_channel` or `slack_read_thread` (markdown), oldest first. */
+function messageOf(groups: Record<string, string | undefined>, raw: string): SlackMessage {
+  let body = raw;
+  const end = END.exec(`\n${body}`);
+  if (end) body = end.index ? body.slice(0, Math.max(0, end.index - 1)) : "";
+  const name = (groups.n1 ?? groups.n2 ?? "").replace(/\s*<[^>]*>$/, "").trim();
+  let thread: SlackMessage["thread"];
+  const keep: string[] = [];
+  for (const line of body.replace(/\n+$/, "").split("\n")) {
+    const replies = /^Thread: (\d+) repl(?:y|ies) \(latest: (.*?)\)/.exec(line);
+    if (replies) {
+      thread = { count: Number(replies[1]), latest: replies[2]! };
+      continue;
+    }
+    if (/^Reactions: /.test(line)) continue;
+    const files = /^Files: (.*)$/.exec(line);
+    if (files) {
+      keep.push(
+        files[1]!
+          .split(/(?<=\)), /)
+          .map((file) => `📎 ${file.trim().replace(/ \(ID: [^,]*,.*?\)$/, "")}`)
+          .join("\n"),
+      );
+      continue;
+    }
+    keep.push(line);
+  }
+  const message = keep
+    .join("\n")
+    .trim()
+    .replace(/\n?\*Sent using\* <@\w+\|[^>]+>\s*$/, "")
+    .trim()
+    .replace(/ — use slack_read_thread or slack_read_channel to read it in context$/, "");
+  return { name, user: groups.u1 ?? groups.u2 ?? "", ts: groups.t1 ?? groups.t2 ?? "", when: groups.w1 ?? groups.w2 ?? "", text: message, ...(thread && { thread }) };
+}
+
+/**
+ * Messages from `slack_read_channel` or `slack_read_thread` (markdown), oldest
+ * first. Slack doesn't escape message text, so a message can hold text that
+ * looks like another message's header: these are only a listing, to be checked
+ * one by one with `parseOne` before anything is posted.
+ */
 export function parseMessages(text: string): SlackMessage[] {
   const md = String(unwrap(text).messages ?? "");
   const heads = [...md.matchAll(HEAD)];
-  const out: SlackMessage[] = [];
-  heads.forEach((head, i) => {
-    const groups = head.groups ?? {};
-    let body = md.slice(head.index! + head[0].length, i + 1 < heads.length ? heads[i + 1]!.index : md.length);
-    const end = END.exec(`\n${body}`);
-    if (end) body = end.index ? body.slice(0, Math.max(0, end.index - 1)) : "";
-    const name = (groups.n1 ?? groups.n2 ?? "").replace(/\s*<[^>]*>$/, "").trim();
-    let thread: SlackMessage["thread"];
-    const keep: string[] = [];
-    for (const line of body.replace(/\n+$/, "").split("\n")) {
-      const replies = /^Thread: (\d+) repl(?:y|ies) \(latest: (.*?)\)/.exec(line);
-      if (replies) {
-        thread = { count: Number(replies[1]), latest: replies[2]! };
-        continue;
-      }
-      if (/^Reactions: /.test(line)) continue;
-      const files = /^Files: (.*)$/.exec(line);
-      if (files) {
-        keep.push(
-          files[1]!
-            .split(/(?<=\)), /)
-            .map((file) => `📎 ${file.trim().replace(/ \(ID: [^,]*,.*?\)$/, "")}`)
-            .join("\n"),
-        );
-        continue;
-      }
-      keep.push(line);
-    }
-    const message = keep
-      .join("\n")
-      .trim()
-      .replace(/\n?\*Sent using\* <@\w+\|[^>]+>\s*$/, "")
-      .trim()
-      .replace(/ — use slack_read_thread or slack_read_channel to read it in context$/, "");
-    out.push({ name, user: groups.u1 ?? groups.u2 ?? "", ts: groups.t1 ?? groups.t2 ?? "", when: groups.w1 ?? groups.w2 ?? "", text: message, ...(thread && { thread }) });
-  });
-  return out.sort((a, b) => Number(a.ts) - Number(b.ts));
+  return heads
+    .map((head, i) => messageOf(head.groups ?? {}, md.slice(head.index! + head[0].length, i + 1 < heads.length ? heads[i + 1]!.index : md.length)))
+    .sort((a, b) => Number(a.ts) - Number(b.ts));
 }
+
+/**
+ * The one message with this ts, from a read of just the moments around it
+ * (`around`): its header is the first with that ts, and the rest of the answer
+ * is its text, headers it may contain included. Undefined when Slack has no such
+ * message, as for a header someone typed into a message.
+ */
+export function parseOne(text: string, ts: string): SlackMessage | undefined {
+  const md = String(unwrap(text).messages ?? "");
+  const head = [...md.matchAll(HEAD)].find((found) => (found.groups?.t1 ?? found.groups?.t2) === ts);
+  return head ? messageOf(head.groups ?? {}, md.slice(head.index! + head[0].length)) : undefined;
+}
+
+/** `oldest` and `latest` for a read of just the message at ts (Slack's bounds leave themselves out). */
+export function around(ts: string): { oldest: string; latest: string } {
+  const [seconds, micros = "0"] = ts.split(".");
+  const at = BigInt(seconds!) * 1_000_000n + BigInt(micros.padEnd(6, "0").slice(0, 6));
+  const format = (value: bigint) => `${value / 1_000_000n}.${String(value % 1_000_000n).padStart(6, "0")}`;
+  return { oldest: format(at - 1n), latest: format(at + 1n) };
+}
+
+export const isTs = (ts: string) => /^\d{10}\.\d{6}$/.test(ts);
 
 /** Slack mrkdwn as Buzz Markdown. */
 export function mrkdwn(text: string): string {

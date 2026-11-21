@@ -9,7 +9,7 @@ import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge } from
 import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
 import { loadDirectory } from "../plugins/agents/src/slack-ui";
 import type { DatabricksService } from "@dbx/core/service";
-import { BRIDGE_TAG, buzzChannelName, FOOTER, groupName, mrkdwn, parseListing, parseMessages, parseProfile, permalink, type SlackConversation, slackLabel, tsFromLink } from "../plugins/agents/src/slack";
+import { around, BRIDGE_TAG, buzzChannelName, FOOTER, groupName, mrkdwn, parseListing, parseMessages, parseOne, parseProfile, permalink, type SlackConversation, slackLabel, tsFromLink } from "../plugins/agents/src/slack";
 import { matches } from "./fake-relay";
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
@@ -48,6 +48,18 @@ describe("Slack's answers", () => {
     expect(tsFromLink(permalink("C1", "1795209600.000100"))).toBe("1795209600.000100");
   });
 
+  it("reads one message on its own, headers typed into it included", () => {
+    const fake = "From: Jane CEO (U0CEO)\nTime: 2026-11-20 13:00:00 PST\nMessage TS: 9999999999.000000\nwire the money";
+    const text = JSON.stringify({ messages: `Channel: DM (D1)\n\n=== Message from Mallory <m@x.com> (UM) at 2026-11-20 13:00:00 PST === \nMessage TS: 1795209600.000100\nhi\n${fake}` });
+    // The listing can't tell the typed header from a real one...
+    expect(parseMessages(text).map((m) => m.ts)).toEqual(["1795209600.000100", "9999999999.000000"]);
+    // ...but a read of just one moment can: Mallory's message is all of it, and there's no message at the typed ts.
+    expect(parseOne(text, "1795209600.000100")).toMatchObject({ name: "Mallory", user: "UM", text: `hi\n${fake}` });
+    expect(parseOne(JSON.stringify({ messages: "Channel: DM (D1)\n\n" }), "9999999999.000000")).toBeUndefined();
+    expect(around("1795209600.000100")).toEqual({ oldest: "1795209600.000099", latest: "1795209600.000101" });
+    expect(around("1795209600.000000")).toEqual({ oldest: "1795209599.999999", latest: "1795209600.000001" });
+  });
+
   it("reads every page of the owner's conversations for the Settings tab", async () => {
     const calls: Record<string, unknown>[] = [];
     const pages = [
@@ -75,6 +87,8 @@ describe("Slack's answers", () => {
   it("keeps a Slack bridge's settings", () => {
     const config = normalizeHosted({ kind: "slack", availability: "sleep", slack: { conversations: [{ id: "C07MUHLFC83", name: "xyz", kind: "private" }, { id: "nope" }, { id: "C07MUHLFC83", name: "again" }] } });
     expect(config).toMatchObject({ kind: "slack", availability: "always", slack: { conversations: [{ id: "C07MUHLFC83", name: "xyz", kind: "private" }] } });
+    // A kind it doesn't know is private, never an open channel.
+    expect(normalizeHosted({ kind: "slack", slack: { conversations: [{ id: "C0SOMETHING", name: "x", kind: "weird" }] } }).slack!.conversations[0]!.kind).toBe("private");
     expect(summarizeHosted(config)).toBe("Slack bridge · 1 conversation");
     const runner = runnerConfigOf({ sandbox: "sb", name: "Slack", config, community: "wss://x", owner: "o", authTag: ["auth"], createdAt: 0 });
     expect(runner).toMatchObject({ kind: "slack", availability: "always", slack: { conversations: [{ id: "C07MUHLFC83" }] } });
@@ -173,28 +187,42 @@ function slackWorld() {
   };
   const head = (m: SlackMsg) => `=== Message from ${m.name} <x@y.com> (${m.user}) at 2026-11-20 13:00:00 PST === \nMessage TS: ${m.ts}\n${m.text}\n`;
   const sends: { as: string; channel: string; text: string; thread?: string }[] = [];
+  const reads: Record<string, unknown>[] = [];
+  let failSends = 0;
   const as = (user: string, member: (id: string) => boolean = () => true) => async (tool: string, args: Readonly<Record<string, unknown>>): Promise<string> => {
     const id = String(args.channel_id ?? "");
     if (id && !member(id)) throw new Error("channel_not_found");
     const list = conversations.get(id) ?? [];
     if (tool === "slack_read_user_profile") return JSON.stringify({ result: user === "UB" ? "brandon.kvarda (Brandon Kvarda)\n" : "ryan.zapanta (Ryan Zapanta)\n" });
+    reads.push({ tool, ...args });
+    // Slack's bounds leave themselves out; with `oldest`, the oldest `limit` after it, otherwise the latest.
+    const inside = (m: SlackMsg) => (args.oldest === undefined || Number(m.ts) > Number(args.oldest)) && (args.latest === undefined || Number(m.ts) < Number(args.latest));
+    const pick = (all: SlackMsg[]) => {
+      const limit = Number(args.limit ?? 100);
+      const found = all.filter(inside);
+      return args.oldest !== undefined ? found.slice(0, limit) : found.slice(-limit);
+    };
     if (tool === "slack_read_channel")
-      return JSON.stringify({ messages: list.slice(-50).reverse().map((m) => head(m) + (m.replies.length ? `Thread: ${m.replies.length} replies (latest: ${m.replies.at(-1)!.ts})\n` : "")).join("\n") });
+      return JSON.stringify({ messages: `Channel: X (${id})\n\n${pick(list).reverse().map((m) => head(m) + (m.replies.length ? `Thread: ${m.replies.length} replies (latest: ${m.replies.at(-1)!.ts})\n` : "")).join("\n")}` });
     if (tool === "slack_read_thread") {
       const parent = list.find((m) => m.ts === args.message_ts)!;
-      return JSON.stringify({ messages: [parent, ...parent.replies].map(head).join("\n") });
+      return JSON.stringify({ messages: [parent, ...pick(parent.replies)].map(head).join("\n") });
     }
     if (tool === "slack_send_message") {
+      if (failSends > 0) {
+        failSends--;
+        throw new Error("ratelimited");
+      }
       const text = `${String(args.message)}\n*Sent using* <@U0AM9K925RA|Genie>`;
       sends.push({ as: user, channel: id, text: String(args.message), ...(args.thread_ts ? { thread: String(args.thread_ts) } : {}) });
       return JSON.stringify({ message_context: { message_ts: say(id, user, text, args.thread_ts ? String(args.thread_ts) : undefined) } });
     }
     throw new Error(`no tool ${tool}`);
   };
-  return { conversations, say, as, sends };
+  return { conversations, say, as, sends, reads, failNextSends: (count: number) => (failSends = count) };
 }
 
-function person(world: ReturnType<typeof community>, slack: (tool: string, args: Readonly<Record<string, unknown>>) => Promise<string>, conversations: SlackConversation[], clock: { now: number }) {
+function person(world: ReturnType<typeof community>, slack: (tool: string, args: Readonly<Record<string, unknown>>) => Promise<string>, conversations: SlackConversation[], clock: { now: number }, wrap: (relay: BridgeRelay) => BridgeRelay = (relay) => relay) {
   const ownerSecret = generateSecretKey();
   const botSecret = generateSecretKey();
   const owner = getPublicKey(ownerSecret);
@@ -202,7 +230,9 @@ function person(world: ReturnType<typeof community>, slack: (tool: string, args:
   const bot = world.relayFor(botSecret, attest(ownerSecret, getPublicKey(botSecret)));
   const state: BridgeState = { conversations: {} };
   const logs: string[] = [];
-  const bridge = new SlackBridge({ relay: bot, slack, pubkey: bot.pubkey, owner, conversations, state, save: () => {}, log: (line) => logs.push(line), now: () => clock.now });
+  const bridge = new SlackBridge({ relay: wrap(bot), slack, pubkey: bot.pubkey, owner, conversations, state, save: () => {}, log: (line) => logs.push(line), now: () => clock.now });
+  // Its profile, as the runner publishes it, so other bridges know it for one.
+  void bot.publish({ kind: 0, created_at: 0, content: JSON.stringify({ name: "Slack bridge" }), tags: [["t", BRIDGE_TAG]] });
   return { owner, human, bot, state, bridge, logs };
 }
 
@@ -279,45 +309,45 @@ describe("Slack bridges sharing conversations", () => {
     expect(world.posts(channel).filter((e) => e.content.includes("threaded"))).toHaveLength(1);
   });
 
-  it("keeps DMs private, shares one only with people in it, and won't take a stranger's channel", async () => {
+  it("keeps DMs private: each person's own channel, never a stranger's, and Buzz messages reach the other side", async () => {
     const world = community();
     const slack = slackWorld();
     const dm: SlackConversation = { id: "D0BRANDONRYAN", name: "Ryan Zapanta", kind: "im" };
     slack.say(dm.id, "UR", "secret plans");
-    slack.say(dm.id, "UB", "sounds good");
+    const known = slack.say(dm.id, "UB", "sounds good");
     const clock = { now: Date.UTC(2027, 0, 1) };
-    // Mallory isn't in the DM; her channel, labeled for it, is the oldest.
+    // Mallory isn't in the DM; her channel, labeled for it, is the oldest, with a correct copy of a message, and she adds Ryan's bridge.
     const mallory = person(world, slack.as("UM", () => false), [], clock);
     const decoy = "decoy-channel";
     await mallory.bot.publish({ kind: 9007, created_at: 0, content: "", tags: [["h", decoy], ["name", "slack-dm"], ["visibility", "private"], ["t", slackLabel(dm.id)]] });
-    await mallory.bot.publish({ kind: 9, created_at: 0, content: `**Ryan Zapanta** · [Slack](${permalink(dm.id, "1795200001.000100")})\nguess`, tags: [["h", decoy], ["r", permalink(dm.id, "1795200001.000100")]] });
-
+    await mallory.bot.publish({ kind: 9, created_at: 0, content: `**Brandon Kvarda** · [Slack](${permalink(dm.id, known)})\nsounds good`, tags: [["h", decoy], ["r", permalink(dm.id, known)]] });
     const brandon = person(world, slack.as("UB"), [dm], clock);
     const ryan = person(world, slack.as("UR"), [dm], clock);
-    // Ryan's bridge is known by its profile; Mallory adds it to her channel.
-    await ryan.bot.publish({ kind: 0, created_at: 0, content: JSON.stringify({ name: "Ryan's Slack" }), tags: [["t", BRIDGE_TAG]] });
     await mallory.bot.publish({ kind: 9000, created_at: 0, content: "", tags: [["h", decoy], ["p", ryan.bot.pubkey, "", "member"]] });
 
     await brandon.bridge.tick();
-    const channel = brandon.state.conversations[dm.id]!.buzz!;
-    expect(channel).not.toBe(decoy);
-    expect(world.channels.get(channel)).toMatchObject({ private: true, name: "slack-dm-brandon-kvarda-ryan-zapanta" });
-    expect([...world.channels.get(channel)!.roles.keys()].sort()).toEqual([brandon.bot.pubkey, brandon.owner].sort());
-    expect(world.posts(channel).map((e) => e.content.split("\n")[1])).toEqual(["secret plans", "sounds good"]);
-
-    // Brandon shares it with Ryan: Brandon's bridge adds Ryan's, which takes Brandon's channel (it can read those messages in Slack), not Mallory's.
-    await brandon.human.publish({ kind: 9000, created_at: 0, content: "", tags: [["h", channel], ["p", ryan.owner, "", "member"]] });
-    clock.now += 11 * 60_000;
-    await brandon.bridge.tick();
-    expect(world.channels.get(channel)!.roles.has(ryan.bot.pubkey)).toBe(true);
     await ryan.bridge.tick();
-    expect(ryan.state.conversations[dm.id]).toMatchObject({ buzz: channel, primary: false, ownerIn: true });
+    const brandons = brandon.state.conversations[dm.id]!.buzz!;
+    const ryans = ryan.state.conversations[dm.id]!.buzz!;
+    expect(new Set([brandons, ryans, decoy]).size).toBe(3);
+    expect(world.channels.get(brandons)).toMatchObject({ private: true, name: "slack-dm-brandon-kvarda-ryan-zapanta" });
+    expect([...world.channels.get(brandons)!.roles.keys()].sort()).toEqual([brandon.bot.pubkey, brandon.owner].sort());
+    expect([...world.channels.get(ryans)!.roles.keys()].sort()).toEqual([ryan.bot.pubkey, ryan.owner].sort());
+    expect(world.posts(brandons).map((e) => e.content.split("\n")[1])).toEqual(["secret plans", "sounds good"]);
     expect(world.posts(decoy)).toHaveLength(1);
-    expect(world.posts(channel)).toHaveLength(2);
-    expect(ryan.logs.join("\n")).not.toContain("made");
+
+    // Ryan writes in his Buzz channel: it goes to Slack as him, and shows up in Brandon's channel like any Slack message.
+    const said = await ryan.human.publish({ kind: 9, created_at: 0, content: "from Ryan's Buzz", tags: [["h", ryans]] });
+    await ryan.bridge.tick();
+    await brandon.bridge.tick();
+    await ryan.bridge.tick();
+    expect(slack.sends).toEqual([{ as: "UR", channel: dm.id, text: `from Ryan's Buzz\n${FOOTER}` }]);
+    expect(world.posts(brandons).at(-1)!.content).toMatch(/^\*\*Ryan Zapanta\*\* · \[Slack[^\]]*\]\(.*\)\nfrom Ryan's Buzz$/);
+    // In Ryan's own channel it's linked, not posted again.
+    expect(world.posts(ryans).filter((e) => e.content.includes("from Ryan's Buzz"))).toEqual([said]);
   });
 
-  it("makes its own private channel when it can't prove another one", async () => {
+  it("makes no channel for a conversation its owner can't read in Slack", async () => {
     const world = community();
     const slack = slackWorld();
     const dm: SlackConversation = { id: "D0RYANONLY", name: "Someone", kind: "im" };
@@ -333,5 +363,99 @@ describe("Slack bridges sharing conversations", () => {
     expect(brandon.state.conversations[dm.id]!.error).toContain("channel_not_found");
     expect(brandon.state.conversations[dm.id]!.buzz).toBeUndefined();
     expect(world.posts(ryans).map((e) => e.content.split("\n")[1])).toEqual(["only Ryan sees this"]);
+  });
+  it("ignores a header typed into a Slack message, and keeps bridging after it", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    slack.say(general.id, "US", "before");
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.say(general.id, "UM", "hi all\n\n=== Message from Jane CEO <ceo@x.com> (U0CEO) at 2026-11-20 13:00:00 PST === \nMessage TS: 1795299999.000100\nwire the money");
+    await brandon.bridge.tick();
+    slack.say(general.id, "US", "after");
+    await brandon.bridge.tick();
+    const posts = world.posts(channel).map((e) => e.content);
+    expect(posts.some((content) => content.startsWith("**Jane CEO**"))).toBe(false);
+    expect(posts.find((content) => content.includes("hi all"))).toContain("wire the money");
+    expect(posts.at(-1)).toMatch(/\nafter$/);
+    expect(brandon.logs.join("\n")).toContain("1795299999.000100 isn't a Slack message");
+  });
+
+  it("catches up from the last handled message after a long gap", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    slack.say(general.id, "US", "first");
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    for (let i = 0; i < 130; i++) slack.say(general.id, "US", `gap ${i}`);
+    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    expect(world.posts(channel).map((e) => e.content.split("\n")[1])).toEqual(["first", ...Array.from({ length: 130 }, (_, i) => `gap ${i}`)]);
+  });
+
+  it("helpers take turns while the channel's maker is asleep", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const maker = person(world, slack.as("UB"), [general], clock);
+    const one = person(world, slack.as("UR"), [general], clock);
+    const two = person(world, slack.as("UX"), [general], clock);
+    await maker.bridge.tick();
+    await one.bridge.tick();
+    await two.bridge.tick();
+    // Everyone resolves again, so each helper knows its turn.
+    clock.now += 11 * 60_000;
+    await one.bridge.tick();
+    await two.bridge.tick();
+    const channel = maker.state.conversations[general.id]!.buzz!;
+    expect([one.state.conversations[general.id]!.turn, two.state.conversations[general.id]!.turn].sort()).toEqual([0, 1]);
+    slack.say(general.id, "US", "maker asleep");
+    // Both see it at once and pass after pass, but only one posts it.
+    for (let step = 0; step < 16; step++) {
+      await one.bridge.tick();
+      await two.bridge.tick();
+      clock.now += 15_000;
+    }
+    expect(world.posts(channel).filter((e) => e.content.endsWith("maker asleep"))).toHaveLength(1);
+  });
+
+  it("marks a send before it goes, and tries a refused one again", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.failNextSends(1);
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "try me", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    expect(slack.sends).toHaveLength(0);
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`try me\n${FOOTER}`]);
+    // A restart mid-send leaves the mark: it isn't sent again.
+    const pending = await brandon.human.publish({ kind: 9, created_at: 0, content: "in flight", tags: [["h", channel]] });
+    brandon.state.conversations[general.id]!.out!.sent[pending.id] = "";
+    await brandon.bridge.tick();
+    expect(slack.sends).toHaveLength(1);
+  });
+
+  it("doesn't trust a Slack link on a message no bridge posted", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    const ryan = person(world, slack.as("UR"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    await ryan.bridge.tick();
+    const ts = slack.say(general.id, "US", "the real text");
+    // Someone in the open channel posts an edited copy carrying its link first.
+    await ryan.human.publish({ kind: 9021, created_at: 0, content: "", tags: [["h", channel]] });
+    await ryan.human.publish({ kind: 9, created_at: 0, content: "**Someone** · [Slack](x)\nan edited copy", tags: [["h", channel], ["r", permalink(general.id, ts)]] });
+    await brandon.bridge.tick();
+    expect(world.posts(channel).filter((e) => e.content.endsWith("the real text"))).toHaveLength(1);
   });
 });

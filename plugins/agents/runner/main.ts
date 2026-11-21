@@ -43,6 +43,20 @@ const TURN_TIMEOUT_MS = 30 * 60_000;
 const PROFILE_ABOUT = "A Databricks agent in its own Databricks Sandbox.";
 const SLACK_ABOUT = "Bridges Slack conversations into Buzz, from its own Databricks Sandbox.";
 const SLACK_POLL_MS = 15_000;
+/** Slack's rate limits are the owner's, shared with their other Slack tools: slower with many conversations, and after failures. */
+const slackPollMs = (conversations: number, failures: number) => Math.min(5 * 60_000, Math.max(SLACK_POLL_MS, conversations * 3_000) * 2 ** Math.min(failures, 4));
+
+/** The relay's own key (NIP-11 `self`), which signs channel metadata; undefined when it can't be read. */
+async function relayKey(url: string): Promise<string | undefined> {
+  try {
+    const response = await fetch(url.replace(/^ws/, "http"), { headers: { accept: "application/nostr+json", "user-agent": "buzz-slack-bridge/1" }, signal: AbortSignal.timeout(10_000) });
+    const info = (await response.json()) as { self?: unknown; pubkey?: unknown };
+    const key = typeof info.self === "string" ? info.self : typeof info.pubkey === "string" ? info.pubkey : undefined;
+    return key && /^[0-9a-f]{64}$/.test(key) ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** The agent's profile; a Slack bridge's carries the tag other bridges find it by. */
 const profileOf = (config: RunnerConfig) =>
@@ -238,11 +252,14 @@ async function serveSlack(config: RunnerConfig, secret: Uint8Array) {
     if (result.isError) throw new Error(text.slice(0, 300) || `${tool} failed`);
     return text;
   };
+  const relayPubkey = await relayKey(config.relay);
+  if (!relayPubkey) log("couldn't read the relay's key: channel metadata isn't checked against it");
   const bridge = new SlackBridge({
     relay,
     slack,
     pubkey,
     owner: config.owner,
+    ...(relayPubkey && { relayPubkey }),
     conversations: config.slack?.conversations ?? [],
     state: bridgeState,
     save: () => writeJson(paths.slack, bridgeState),
@@ -267,13 +284,18 @@ async function serveSlack(config: RunnerConfig, secret: Uint8Array) {
   };
   let stopping = false;
   let moved = 0;
+  let failures = 0;
   const pass = async () => {
     await publishProfile();
     try {
       await bridge.tick();
       lastError = undefined;
+      // A pass where every conversation failed counts as a failure, for backing off.
+      const statuses = bridge.status();
+      failures = statuses.length && statuses.every((conversation) => conversation.error) ? failures + 1 : 0;
     } catch (error) {
       lastError = (error as Error).message ?? String(error);
+      failures++;
       log(`pass failed: ${lastError}`);
     }
     // Activity is a message moved, so Buzz can find a quiet moment to give the Sandbox a fresh day.
@@ -282,12 +304,14 @@ async function serveSlack(config: RunnerConfig, secret: Uint8Array) {
       lastActivity = Date.now();
     }
     status();
-    if (!stopping) setTimeout(() => void pass(), SLACK_POLL_MS);
+    if (!stopping) setTimeout(() => void pass(), slackPollMs(config.slack?.conversations.length ?? 0, failures));
   };
   status();
   void pass();
   process.on("SIGTERM", () => {
     stopping = true;
+    // A send in flight is already marked, so it won't go twice after the restart.
+    writeJson(paths.slack, bridgeState);
     relay.close();
     process.exit(0);
   });

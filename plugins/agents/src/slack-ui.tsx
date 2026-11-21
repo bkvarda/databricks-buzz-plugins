@@ -49,7 +49,7 @@ function where(conversation: SlackConversation, status: ConversationStatus | und
   if (!saved) return isPrivateKind(conversation.kind) ? "Save to bridge it into a private Buzz channel." : "Save to bridge it into an open Buzz channel.";
   if (!status?.buzz) return status?.error ? `Not bridged yet: ${status.error}` : "Waiting for the bridge to pick it up.";
   const name = `#${status.buzzName ?? status.buzz}`;
-  const role = status.primary ? "your bridge posts there" : "another bridge posts there first; yours fills in and sends your messages";
+  const role = status.primary ? "your bridge posts there" : "another bridge posts there first; yours fills in when it's asleep and sends your messages";
   const people = status.people && status.people > 1 ? ` · ${status.people} people` : "";
   const join = status.ownerIn === false ? " · you haven't joined it in Buzz yet" : "";
   return `${name} · ${role}${people}${join}${status.error ? ` · last error: ${status.error}` : ""}`;
@@ -117,7 +117,7 @@ export function SlackConversationsField(props: {
     <Stack gap={10}>
       <Field
         label="Slack conversations"
-        hint="Each one you turn on gets a Buzz channel. Public Slack channels go to open Buzz channels that everyone who bridges them shares; private channels, DMs and group DMs go to private Buzz channels with only you in them. Add someone who's also in it on Slack to share it; their bridge joins once they turn it on."
+        hint="Each one you turn on gets a Buzz channel. Public Slack channels go to open Buzz channels that everyone who bridges them shares. Private channels, DMs and group DMs go to a private Buzz channel of your own, with only you in it; someone else in the conversation who bridges it gets their own. Anyone you add to yours reads the Slack conversation, so add only people who are in it on Slack."
       >
         <Stack direction="row" gap={8}>
           <input className="dbx-input" style={{ flex: 1 }} placeholder="Search your Slack" value={query} disabled={props.disabled} onChange={(event) => setQuery(event.target.value)} />
