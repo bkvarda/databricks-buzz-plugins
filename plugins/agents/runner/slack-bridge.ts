@@ -498,8 +498,8 @@ export class SlackBridge {
    * can make a key and call it a bridge, so another bridge's post counts only
    * with the message's text; this bridge's own, and those of the bridge that
    * made the channel, count as they are, so an edit in Slack isn't posted twice.
-   * When another bridge's post has other text, the message goes as a reply to
-   * it, marked edited, rather than as a second copy.
+   * When another bridge's post has other text (an edit in Slack since, or a
+   * forged copy), the message is posted too, marked as differing from it.
    */
   private async postOf(st: ConversationState, link: string, message: SlackMessage): Promise<{ there?: NostrEvent; other?: NostrEvent }> {
     const bridges = await this.bridges();
@@ -544,10 +544,10 @@ export class SlackBridge {
     const { there, other } = await this.postOf(st, link, message);
     if (there) return there.id;
     const tags = [["h", st.buzz!], ["r", link]];
-    const under = root ?? other?.id;
-    if (under) tags.push(["e", under, "", "reply"]);
+    if (root) tags.push(["e", root, "", "reply"]);
+    // Next to the other copy, never under it: which one is real can't be told from here.
     let content = bridgedContent({ ...message, text: unfooter(message.text) }, link, Math.floor(this.now() / 1000));
-    if (other) content = content.replace("\n", " · ✏️ edited in Slack\n");
+    if (other) content = content.replace("\n", " · differs from an earlier copy\n");
     try {
       const event = await this.publish(9, content, tags);
       this.moved++;

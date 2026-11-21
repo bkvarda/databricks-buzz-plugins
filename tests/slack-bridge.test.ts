@@ -723,7 +723,7 @@ describe("Slack bridges, third review", () => {
     expect(world.posts(channel).filter((e) => e.content.endsWith("\nblip"))).toHaveLength(1);
   });
 
-  it("posts an edit of a message another helper posted as a reply to it, not as a second copy", async () => {
+  it("posts a message edited since another helper posted it next to that copy, marked as differing", async () => {
     const world = community();
     const slack = slackWorld();
     const clock = { now: Date.UTC(2027, 0, 1) };
@@ -751,8 +751,9 @@ describe("Slack bridges, third review", () => {
     await maker.bridge.tick();
     const copies = world.posts(channel).filter((e) => e.tags.some((t) => t[0] === "r" && t[1] === permalink(general.id, ts)));
     const top = copies.filter((e) => !e.tags.some((t) => t[0] === "e"));
-    expect(top.map((e) => e.pubkey)).toEqual([first.bot.pubkey]);
-    expect(copies.filter((e) => e.content.includes("edited in Slack") && e.content.endsWith("\nhello"))).toHaveLength(1);
+    // The maker trusts the helpers' copies by text only, and the second copy matches: three bridges, two copies, none nested.
+    expect(top.map((e) => e.pubkey)).toEqual([first.bot.pubkey, second.bot.pubkey]);
+    expect(top[1]!.content).toMatch(/differs from an earlier copy\nhello$/);
   });
 
   it("doesn't post a long message that timed out back to Buzz, or send it again", async () => {
