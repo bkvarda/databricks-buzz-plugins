@@ -4,8 +4,9 @@
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { type EventTemplate, finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
-import { describe, expect, it } from "vitest";
-import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge, SlackToolError, UNSURE_MS } from "../plugins/agents/runner/slack-bridge";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HttpRelay } from "../plugins/agents/runner/http";
+import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge, SlackToolError, STUCK_MS, UNSURE_MS } from "../plugins/agents/runner/slack-bridge";
 import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
 import { loadDirectory } from "../plugins/agents/src/slack-ui";
 import type { DatabricksService } from "@dbx/core/service";
@@ -45,6 +46,7 @@ describe("Slack's answers", () => {
     expect(mrkdwn(messages[0]!.text)).toBe("see **this** [link](https://x.com)\n📎 a.png\n📎 b.pdf");
     expect(messages[1]!.text).toBe(`oh yeah i forgot.\n${FOOTER}`);
     expect(parseProfile(JSON.stringify({ result: "brandon.kvarda (Brandon Kvarda)\nDatabricks\n" }))).toEqual({ handle: "brandon.kvarda", name: "Brandon Kvarda" });
+    expect(parseProfile(JSON.stringify({ result: "User ID: U029YEWF7V2\nUsername: brandon.kvarda\nDisplay Name: Brandon Kvarda\nReal Name: Brandon Kvarda\nPronouns: \nTitle: Solutions Architect\n" }))).toEqual({ handle: "brandon.kvarda", name: "Brandon Kvarda", user: "U029YEWF7V2" });
     expect(tsFromLink(permalink("C1", "1795209600.000100"))).toBe("1795209600.000100");
   });
 
@@ -201,7 +203,11 @@ function slackWorld() {
     const id = String(args.channel_id ?? "");
     if (id && !member(id)) throw new Error("channel_not_found");
     const list = conversations.get(id) ?? [];
-    if (tool === "slack_read_user_profile") return JSON.stringify({ result: user === "UB" ? "brandon.kvarda (Brandon Kvarda)\n" : "ryan.zapanta (Ryan Zapanta)\n" });
+    // The detailed answer, as Slack gives it without `response_format`.
+    if (tool === "slack_read_user_profile") {
+      const [handle, name] = user === "UB" ? ["brandon.kvarda", "Brandon Kvarda"] : user === "UR" ? ["ryan.zapanta", "Ryan Zapanta"] : ["someone", "Someone"];
+      return JSON.stringify({ result: `User ID: ${user}\nUsername: ${handle}\nDisplay Name: ${name}\nReal Name: ${name}\nTitle: \nBot: No\n` });
+    }
     reads.push({ tool, ...args });
     // Slack's bounds leave themselves out; with `oldest`, the oldest `limit` after it, otherwise the latest.
     const inside = (m: SlackMsg) => (args.oldest === undefined || Number(m.ts) > Number(args.oldest)) && (args.latest === undefined || Number(m.ts) < Number(args.latest));
@@ -597,5 +603,115 @@ describe("Slack bridges sharing conversations", () => {
     await bridge.tick();
     expect(state.conversations[dm.id]!.buzz).toBeDefined();
     expect(state.conversations[dm.id]!.error).toBeUndefined();
+  });
+});
+
+describe("Slack bridges, third review", () => {
+  const general: SlackConversation = { id: "C0GENERAL1", name: "general", kind: "public" };
+
+  it("doesn't post a Slack message again when it's edited before a helper's turn", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const maker = person(world, slack.as("UB"), [general], clock);
+    const helper = person(world, slack.as("UR"), [general], clock);
+    await maker.bridge.tick();
+    await helper.bridge.tick();
+    const channel = maker.state.conversations[general.id]!.buzz!;
+    const ts = slack.say(general.id, "US", "helo");
+    await maker.bridge.tick();
+    await helper.bridge.tick();
+    slack.conversations.get(general.id)!.find((m) => m.ts === ts)!.text = "hello";
+    clock.now += HELPER_DELAY_MS + 1000;
+    await helper.bridge.tick();
+    expect(world.posts(channel).filter((e) => e.tags.some((t) => t[0] === "r" && t[1] === permalink(general.id, ts))).map((e) => e.pubkey)).toEqual([maker.bot.pubkey]);
+  });
+
+  it("finds a timed-out thread reply in Slack instead of sending it again, when its parent is old", async () => {
+    const world = community();
+    const slack = slackWorld();
+    // Slack's clock and the bridge's agree here, so the bridge can read Slack around when it sent.
+    const clock = { now: 1_795_200_000_000 };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.say(general.id, "US", "an old one");
+    await brandon.bridge.tick();
+    for (let i = 0; i < 60; i++) slack.say(general.id, "US", `later ${i}`);
+    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    const parent = world.posts(channel).find((e) => e.content.endsWith("\nan old one"))!;
+    slack.timeOutNextSends("after");
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "late reply", tags: [["h", channel], ["e", parent.id, "", "reply"]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    clock.now += UNSURE_MS + 1000;
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`late reply\n${FOOTER}`]);
+    expect(brandon.logs.join("\n")).toContain("did reach Slack");
+  });
+
+  it("doesn't match a Slack message to a Buzz-only member's message with the same text", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const dm: SlackConversation = { id: "D0BRANDONRYAN", name: "Ryan Zapanta", kind: "im" };
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [dm], clock);
+    const ryan = person(world, slack.as("UR"), [dm], clock);
+    slack.say(dm.id, "UR", "hi");
+    await brandon.bridge.tick();
+    await ryan.bridge.tick();
+    const brandons = brandon.state.conversations[dm.id]!.buzz!;
+    const ryans = ryan.state.conversations[dm.id]!.buzz!;
+    // Brandon adds Alice to his Buzz channel; what she writes there stays in Buzz.
+    const alice = world.relayFor(generateSecretKey());
+    await brandon.human.publish({ kind: 9000, created_at: 0, content: "", tags: [["h", brandons], ["p", alice.pubkey, "", "member"]] });
+    const hers = await alice.publish({ kind: 9, created_at: 0, content: "ok", tags: [["h", brandons]] });
+    await ryan.human.publish({ kind: 9, created_at: 0, content: "ok", tags: [["h", ryans]] });
+    await ryan.bridge.tick();
+    await brandon.bridge.tick();
+    expect(Object.values(brandon.state.conversations[dm.id]!.posted)).not.toContain(hers.id);
+    expect(world.posts(brandons).filter((e) => /^\*\*Ryan Zapanta\*\*.*\nok$/s.test(e.content))).toHaveLength(1);
+  });
+
+  it("sends the owner's messages while a Slack message can't be posted, and gives that one up after an hour", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.say(general.id, "US", "stuck");
+    world.failNextPosts(1000);
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "still goes", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`still goes\n${FOOTER}`]);
+    expect(brandon.logs.join("\n")).not.toContain("gave up posting");
+    clock.now += STUCK_MS + 1000;
+    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    expect(brandon.logs.join("\n")).toContain("gave up posting");
+  });
+});
+
+describe("The community over HTTP", () => {
+  const answer = (status: number, body: unknown) => async () => new Response(JSON.stringify(body), { status });
+  const relayWith = (respond: () => Promise<Response>) => {
+    vi.stubGlobal("fetch", respond);
+    return new HttpRelay("wss://relay.example", generateSecretKey(), ["auth", "x", "", "y"], () => {});
+  };
+  const failure = (relay: HttpRelay) => relay.publish({ kind: 9, created_at: 1, content: "", tags: [] }).then(() => ({}) as Record<string, unknown>, (error: Record<string, unknown>) => error);
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("tells a refusal from no answer, whatever the status", async () => {
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "invalid: bad tag" })))).refused).toBe(true);
+    expect((await failure(relayWith(answer(400, { accepted: false, message: "invalid: bad tag" })))).refused).toBe(true);
+    expect((await failure(relayWith(answer(403, { accepted: false, message: "restricted: not a member" })))).refused).toBe(true);
+    expect((await failure(relayWith(answer(413, { error: "too large" })))).refused).toBe(true);
+    expect((await failure(relayWith(answer(429, { accepted: false, message: "rate-limited: retry in 5s" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "rate-limited: slow down" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(401, { error: "unauthorized" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(503, { accepted: false, message: "error: try later" })))).refused).toBeUndefined();
+    // A duplicate is already there.
+    expect(await failure(relayWith(answer(409, { accepted: false, message: "duplicate: have it" })))).toEqual({});
   });
 });

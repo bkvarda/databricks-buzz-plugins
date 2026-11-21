@@ -75,9 +75,20 @@ export function groupName(name: string, ownHandle?: string): string {
   return others.length ? others.join(", ") : name;
 }
 
-/** The owner's handle and name, from `slack_read_user_profile`'s concise answer: "jane.doe (Jane Doe)". */
-export function parseProfile(text: string): { handle: string; name: string } | undefined {
-  const line = String(unwrap(text).result ?? "").split("\n", 1)[0]!.trim();
+/**
+ * The owner's handle and name, from `slack_read_user_profile`: its detailed
+ * answer ("User ID: U1\nUsername: jane.doe\nDisplay Name: Jane Doe", which also
+ * has their Slack ID) or its concise one ("jane.doe (Jane Doe)").
+ */
+export function parseProfile(text: string): { handle: string; name: string; user?: string } | undefined {
+  const result = String(unwrap(text).result ?? "");
+  const field = (name: string) => new RegExp(`^${name}:[ \\t]*(.*)$`, "m").exec(result)?.[1]?.trim() || undefined;
+  const username = field("Username");
+  if (username) {
+    const user = field("User ID");
+    return { handle: username, name: field("Display Name") ?? field("Real Name") ?? username, ...(user && /^[UW]\w+$/.test(user) && { user }) };
+  }
+  const line = result.split("\n", 1)[0]!.trim();
   const found = /^(\S+) \((.+)\)$/.exec(line);
   return found ? { handle: found[1]!, name: found[2]! } : line ? { handle: line, name: line } : undefined;
 }
