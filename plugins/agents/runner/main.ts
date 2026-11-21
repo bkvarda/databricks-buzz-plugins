@@ -34,10 +34,40 @@ import { sandboxService } from "./databricks";
 import { runLocalTurn } from "./harness";
 import { Typing } from "./typing";
 import { HttpRelay } from "./http";
-import { ensureDirs, paths, readConfig, readSecretKey, readState, type RunnerConfig, sandboxStartedAt, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
+import { ensureDirs, paths, readConfig, readJsonFile, readSecretKey, readState, type RunnerConfig, sandboxStartedAt, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
+import { gatewayMcpPath, McpClient, resultText } from "@dbx/core/api/mcp";
+import { BRIDGE_TAG, SLACK_TOOLS } from "../src/slack";
+import { type BridgeState, SlackBridge, SlackToolError } from "./slack-bridge";
 
 const TURN_TIMEOUT_MS = 30 * 60_000;
 const PROFILE_ABOUT = "A Databricks agent in its own Databricks Sandbox.";
+const SLACK_ABOUT = "Bridges Slack conversations into Buzz, from its own Databricks Sandbox.";
+const SLACK_POLL_MS = 15_000;
+/** Slack's rate limits are the owner's, shared with their other Slack tools: slower with many conversations, and after failures. */
+const slackPollMs = (conversations: number, failures: number) => Math.min(5 * 60_000, Math.max(SLACK_POLL_MS, conversations * 3_000) * 2 ** Math.min(failures, 4));
+
+/** The relay's own key (NIP-11 `self`), which signs channel metadata; undefined when it can't be read. */
+async function relayKey(url: string): Promise<string | undefined> {
+  try {
+    const response = await fetch(url.replace(/^ws/, "http"), { headers: { accept: "application/nostr+json", "user-agent": "buzz-slack-bridge/1" }, signal: AbortSignal.timeout(10_000) });
+    // Not `pubkey`: that's the admin's contact key.
+    const info = (await response.json()) as { self?: unknown };
+    const key = typeof info.self === "string" ? info.self : undefined;
+    return key && /^[0-9a-f]{64}$/.test(key) ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The agent's profile; a Slack bridge's carries the tag other bridges find it by. */
+const profileOf = (config: RunnerConfig) =>
+  profileTemplate({
+    name: config.name,
+    ...(config.picture && { picture: config.picture }),
+    about: config.kind === "slack" ? SLACK_ABOUT : PROFILE_ABOUT,
+    authTag: config.authTag,
+    ...(config.kind === "slack" && { tags: [["t", BRIDGE_TAG]] }),
+  });
 
 function log(line: string) {
   try {
@@ -76,7 +106,9 @@ const omnigentAgentOf = (config: RunnerConfig) => config.omnigentAgent || DEFAUL
 
 /** What answers for this agent, for its log. */
 const engineLabel = (config: RunnerConfig) =>
-  config.kind === "genie" ? "Genie" : config.kind === "omnigent" ? `Omnigent · ${config.omnigentLabel ?? omnigentAgentLabel(omnigentAgentOf(config))}` : harnessLabel(config.harness);
+  config.kind === "slack"
+    ? "Slack bridge"
+    : config.kind === "genie" ? "Genie" : config.kind === "omnigent" ? `Omnigent · ${config.omnigentLabel ?? omnigentAgentLabel(omnigentAgentOf(config))}` : harnessLabel(config.harness);
 
 /** For an Omnigent agent, in place of the Sandbox note: where it runs, and what happens to its last message. */
 const OMNIGENT_NOTE = [
@@ -199,12 +231,105 @@ async function omnigentAnswer(
 /** Marks a conversation's running Omnigent turn, so `interrupt` can stop it. */
 const omnigentTurnPath = (conversation: string) => `${turnPidPath(conversation)}.omnigent`;
 
+/**
+ * A Slack bridge (./slack-bridge.ts): a pass over its conversations every few
+ * seconds, as its owner in Slack. It takes no requests.
+ */
+async function serveSlack(config: RunnerConfig, secret: Uint8Array) {
+  const pubkey = getPublicKey(secret);
+  const startedAt = Date.now();
+  let lastActivity = Date.now();
+  let lastError: string | undefined;
+  log(`starting as ${pubkey.slice(0, 12)}… (Slack bridge, ${config.slack?.conversations.length ?? 0} conversations)`);
+  const relay = connect(config, secret);
+  const state = readState();
+  const saved = readJsonFile<Partial<BridgeState>>(paths.slack, {});
+  const bridgeState: BridgeState = { conversations: {}, ...saved };
+  // Slack's MCP server, as the owner: the Sandbox's own Databricks sign-in.
+  const slackTools = new McpClient(await sandboxService(config.workspaceId).ready(), gatewayMcpPath(SLACK_TOOLS));
+  const slack = async (tool: string, args: Readonly<Record<string, unknown>>) => {
+    const result = await slackTools.callTool(tool, args, { timeoutMs: 120_000 });
+    const text = resultText(result);
+    if (result.isError) throw new SlackToolError(text.slice(0, 300) || `${tool} failed`);
+    return text;
+  };
+  let keyMissing = false;
+  const bridge = new SlackBridge({
+    relay,
+    slack,
+    pubkey,
+    owner: config.owner,
+    // Read again each pass until it's known; private conversations wait for it.
+    relayKey: async () => {
+      const key = await relayKey(config.relay);
+      if (!key && !keyMissing) log("couldn't read the relay's key: private conversations wait for it");
+      keyMissing = !key;
+      return key;
+    },
+    conversations: config.slack?.conversations ?? [],
+    state: bridgeState,
+    save: () => writeJson(paths.slack, bridgeState),
+    log,
+  });
+  const status = () =>
+    writeJson(
+      paths.status,
+      { pid: process.pid, pubkey, connected: relay.ready, active: 0, startedAt: new Date(startedAt).toISOString(), lastActivity: new Date(lastActivity).toISOString(), slack: bridge.status(), ...(lastError && { lastError }) },
+      0o644,
+    );
+  const profileKey = JSON.stringify([config.name, config.picture ?? "", "slack"]);
+  const publishProfile = async () => {
+    if (state.profile === profileKey) return;
+    try {
+      await relay.publish(profileOf(config));
+      state.profile = profileKey;
+      writeState(state);
+    } catch (error) {
+      log(`profile not published yet: ${(error as Error).message}`);
+    }
+  };
+  let stopping = false;
+  let moved = 0;
+  let failures = 0;
+  const pass = async () => {
+    await publishProfile();
+    try {
+      await bridge.tick();
+      lastError = undefined;
+      // A pass where every conversation failed counts as a failure, for backing off.
+      const statuses = bridge.status();
+      failures = statuses.length && statuses.every((conversation) => conversation.error) ? failures + 1 : 0;
+    } catch (error) {
+      lastError = (error as Error).message ?? String(error);
+      failures++;
+      log(`pass failed: ${lastError}`);
+    }
+    // Activity is a message moved, so Buzz can find a quiet moment to give the Sandbox a fresh day.
+    if (bridge.moved !== moved) {
+      moved = bridge.moved;
+      lastActivity = Date.now();
+    }
+    status();
+    if (!stopping) setTimeout(() => void pass(), slackPollMs(config.slack?.conversations.length ?? 0, failures));
+  };
+  status();
+  void pass();
+  process.on("SIGTERM", () => {
+    stopping = true;
+    // A send in flight is already marked, so it won't go twice after the restart.
+    writeJson(paths.slack, bridgeState);
+    relay.close();
+    process.exit(0);
+  });
+}
+
 async function serve() {
   ensureDirs();
   const config = need(readConfig(), "config.json");
   const secret = need(readSecretKey(), "agent key");
   const pubkey = getPublicKey(secret);
   writeFileSync(paths.pid, String(process.pid));
+  if (config.kind === "slack") return serveSlack(config, secret);
   const state = readState();
   const handled = new Set(state.handled);
   const outsiderNotes = new OutsiderNotes();
@@ -386,7 +511,7 @@ async function serve() {
   const publishProfile = async () => {
     if (state.profile === profileKey) return;
     try {
-      await relay.publish(profileTemplate({ name: config.name, ...(config.picture && { picture: config.picture }), about: PROFILE_ABOUT, authTag: config.authTag }));
+      await relay.publish(profileOf(config));
       state.profile = profileKey;
       save();
       log("published the profile");
@@ -454,7 +579,7 @@ async function main() {
     case "profile": {
       const config = need(readConfig(), "config.json");
       const relay = connect(config, need(readSecretKey(), "agent key"));
-      await relay.publish(profileTemplate({ name: config.name, ...(config.picture && { picture: config.picture }), about: PROFILE_ABOUT, authTag: config.authTag }));
+      await relay.publish(profileOf(config));
       const state = readState();
       writeState({ ...state, profile: JSON.stringify([config.name, config.picture ?? ""]) });
       console.log("published");
@@ -509,6 +634,7 @@ async function main() {
       // Answers one question without the relay, to check Genie or the harness from inside the Sandbox.
       const config = need(readConfig(), "config.json");
       const question = args.join(" ") || "Say hello in one short sentence.";
+      if (config.kind === "slack") return console.log("A Slack bridge takes no questions.");
       if (config.kind === "genie") return console.log((await genieAnswer(config, question, undefined, AbortSignal.timeout(TURN_TIMEOUT_MS))).text);
       if (config.kind === "omnigent") {
         const result = await omnigentAnswer(config, { title: `Buzz · ${config.name} · diagnostic`, prompt: question, preamble: systemPrompt(config, "diagnostic"), signal: AbortSignal.timeout(TURN_TIMEOUT_MS) });

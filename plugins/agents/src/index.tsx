@@ -8,6 +8,7 @@
 //                        App (./app-type), as its own service principal.
 import type { Context } from "@buzz/author";
 import { bindReact, React } from "@dbx/core/react";
+import { optionalService } from "@dbx/core/host-types";
 import { attach, MissingCore, useLive } from "@dbx/core/suite";
 import { DbxRoot, Notice, Stack, Text } from "@dbx/core/ui/components";
 import { registerAppType } from "./app-type";
@@ -16,6 +17,14 @@ import { registerTypes } from "./types";
 
 export const inject = ["react", "agents", "settingsCards"];
 
+/** Opens a Buzz channel in this community, when the host lets plugins navigate. */
+function openChannel(ctx: Context, channelId: string) {
+  const relay = optionalService<{ snapshot(): { viewer?: string; origin?: string } }>(ctx, "relay")?.snapshot();
+  const navigation = optionalService<{ open(target: unknown): Promise<unknown> }>(ctx, "navigation");
+  if (!relay?.viewer || !relay.origin || !navigation) return;
+  void navigation.open({ version: 1, kind: "conversation", scope: { viewer: relay.viewer, communityOrigin: relay.origin }, channelId, context: "channel" });
+}
+
 export function apply(ctx: Context) {
   bindReact(ctx.react);
   const live = attach(ctx, { id: "bkvarda.databricks-agents", name: "Databricks Agents" }, (scope, databricks) => {
@@ -23,7 +32,7 @@ export function apply(ctx: Context) {
     const kit = scope.agents.harness;
     if (!kit) return { kit: false };
     registerTypes(scope.agents, kit, databricks);
-    const stop = registerHostedType(scope.agents, databricks);
+    const stop = registerHostedType(scope.agents, databricks, { openChannel: (channel) => openChannel(ctx, channel) });
     scope.effect(() => stop);
     const stopRefresh = registerAppType(scope.agents, databricks);
     scope.effect(() => stopRefresh);
@@ -54,7 +63,7 @@ export function apply(ctx: Context) {
               ],
               [
                 "Databricks (hosted)",
-                "Runs in your Databricks workspace, in its own Sandbox, so it can answer with Buzz closed. Genie, Claude Code, Codex or Pi in each harness's guarded mode, or an Omnigent agent. Always on, or asleep while Buzz is closed. It can't use Buzz's own tools.",
+                "Runs in your Databricks workspace, in its own Sandbox, so it can answer with Buzz closed. Genie, Claude Code, Codex or Pi in each harness's guarded mode, an Omnigent agent, or a Slack bridge that brings your Slack channels and DMs into Buzz. Always on, or asleep while Buzz is closed. It can't use Buzz's own tools.",
               ],
               [
                 "Databricks App",

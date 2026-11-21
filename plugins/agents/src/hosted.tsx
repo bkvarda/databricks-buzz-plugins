@@ -24,7 +24,10 @@ import { type ActivityLine, type ActivityTurn, turnsFromLines } from "./activity
 import { type ActivityTabProps, ActivityView } from "./activity-ui";
 import { HARNESS_MODEL, HARNESSES, harnessAccepts, harnessLabel, harnessModel, permissionsHint, type RemoteHarness, shellQuote, WORK_DIR } from "./remote";
 import { GENIE_ONE_CHOICE, normalizeChoices, type ToolChoice, workspaceIdOf } from "./capabilities";
-import { GenieKindIcon, OmnigentKindIcon, SandboxKindIcon } from "./icons";
+import { GenieKindIcon, OmnigentKindIcon, SandboxKindIcon, SlackKindIcon } from "./icons";
+import type { ConversationStatus } from "../runner/slack-bridge";
+import type { SlackConversation, SlackKind } from "./slack";
+import { SlackConversationsField } from "./slack-ui";
 import { DEFAULT_OMNIGENT_AGENT, Omnigent, omnigentAgentLabel } from "./omnigent";
 import { normalizeSkills, resolveSkills, type SkillsChoice, skillCatalogFor } from "./skills";
 import { installSkills } from "./skills-sandbox";
@@ -44,7 +47,7 @@ const QUIET_MINUTES = 10;
 /** Databricks stops a Sandbox this long after each start. */
 const SANDBOX_DAY_HOURS = 24;
 
-export type HostedKind = "genie" | "sandbox" | "omnigent";
+export type HostedKind = "genie" | "sandbox" | "omnigent" | "slack";
 export type Availability = "always" | "sleep";
 
 export type HostedConfig = {
@@ -55,6 +58,8 @@ export type HostedConfig = {
   genie?: { space: string; label: string };
   /** The Omnigent agent (its name, e.g. "claude-native-ui") an Omnigent agent runs as. */
   omnigent?: { agent: string; label: string };
+  /** A Slack bridge's Slack conversations. */
+  slack?: { conversations: SlackConversation[] };
   harness: RemoteHarness;
   model: string;
   /** A Sandbox agent's Databricks tools (Genie One, Genie agents, MCP servers), as the local type's. */
@@ -72,7 +77,7 @@ export function normalizeHosted(value: unknown): HostedConfig {
   const config = (value ?? {}) as Partial<HostedConfig>;
   const harness = HARNESS_CHOICES.some((choice) => choice.id === config.harness) ? (config.harness as RemoteHarness) : "claude";
   const genie = config.genie && typeof config.genie.space === "string" && config.genie.space ? { space: config.genie.space, label: String(config.genie.label || config.genie.space) } : undefined;
-  const kind: HostedKind = config.kind === "sandbox" || config.kind === "omnigent" ? config.kind : "genie";
+  const kind: HostedKind = config.kind === "sandbox" || config.kind === "omnigent" || config.kind === "slack" ? config.kind : "genie";
   const omnigent =
     kind === "omnigent"
       ? config.omnigent && typeof config.omnigent.agent === "string" && config.omnigent.agent
@@ -86,16 +91,36 @@ export function normalizeHosted(value: unknown): HostedConfig {
     // Genie One unless the owner chose otherwise (an empty list is a choice).
     tools: Array.isArray(config.tools) ? normalizeChoices(config.tools) : [GENIE_ONE_CHOICE],
     skills: normalizeSkills(config.skills),
-    availability: config.availability === "always" ? "always" : "sleep",
+    // A bridge is always on: Slack doesn't wait for Buzz to open.
+    availability: config.availability === "always" || kind === "slack" ? "always" : "sleep",
     scope: config.scope === "channel" ? "channel" : "thread",
     instructions: typeof config.instructions === "string" ? config.instructions : "",
     ...(typeof config.profile === "string" && config.profile && { profile: config.profile }),
     ...(genie && { genie }),
     ...(omnigent && { omnigent }),
+    ...(kind === "slack" && { slack: { conversations: normalizeConversations(config.slack?.conversations) } }),
   };
 }
 
+const SLACK_KINDS: readonly SlackKind[] = ["public", "private", "im", "mpim"];
+
+function normalizeConversations(value: unknown): SlackConversation[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.flatMap((item: Partial<SlackConversation>) => {
+    if (!item || typeof item.id !== "string" || !/^[CDG][A-Z0-9]{4,}$/.test(item.id) || seen.has(item.id)) return [];
+    seen.add(item.id);
+    // Unknown is private: never an open Buzz channel for something that may not be public.
+    const kind = SLACK_KINDS.includes(item.kind as SlackKind) ? (item.kind as SlackKind) : "private";
+    return [{ id: item.id, name: typeof item.name === "string" && item.name ? item.name.slice(0, 200) : item.id, kind }];
+  });
+}
+
 export function summarizeHosted(config: HostedConfig): string {
+  if (config.kind === "slack") {
+    const count = config.slack?.conversations.length ?? 0;
+    return ["Slack bridge", count === 1 ? "1 conversation" : `${count} conversations`, ...(config.profile ? [config.profile] : [])].join(" · ");
+  }
   const what =
     config.kind === "genie"
       ? config.genie
@@ -160,6 +185,7 @@ export function runnerConfigOf(record: HostedRecord, host?: string, workspaceId?
     ...(host && { workspaceHost: host }),
     ...(workspaceId && { workspaceId }),
     ...(config.kind === "sandbox" && config.tools.length && { tools: config.tools }),
+    ...(config.kind === "slack" && { slack: { conversations: config.slack?.conversations ?? [] } }),
   };
 }
 
@@ -185,7 +211,7 @@ async function runner(sandboxes: Sandboxes, sandbox: string, args: string, signa
 }
 
 /** What `runner.mjs status` reports. `bootedAt` is when the Sandbox started. */
-export type RunnerStatus = Readonly<{ running?: boolean; connected?: boolean; active?: number; lastError?: string; lastActivity?: string; bootedAt?: string }>;
+export type RunnerStatus = Readonly<{ running?: boolean; connected?: boolean; active?: number; lastError?: string; lastActivity?: string; bootedAt?: string; slack?: readonly ConversationStatus[] }>;
 
 /**
  * Whether an always-on agent's Sandbox should restart now: it has run for
@@ -345,7 +371,15 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
     async update(pubkey: string, config: HostedConfig, signal?: AbortSignal) {
       const found = read(pubkey);
       if (!found) throw new Error("This agent is managed from another device.");
-      const record: HostedRecord = { ...found, config: { ...config, kind: found.config.kind, ...(found.config.profile ? { profile: found.config.profile } : {}) } };
+      const record: HostedRecord = {
+        ...found,
+        config: {
+          ...config,
+          kind: found.config.kind,
+          ...(found.config.profile ? { profile: found.config.profile } : {}),
+          ...(found.config.kind === "slack" && { slack: { conversations: normalizeConversations(config.slack?.conversations) } }),
+        },
+      };
       await deploy(service, record, { restart: true, publishProfile: false, ...(signal && { signal }) });
       await write(record);
     },
@@ -465,6 +499,14 @@ const KIND_CHOICES: readonly { id: HostedKind; label: string; short: string; Ico
     detail:
       "An Omnigent agent (Claude Code, Codex, Pi, Polly…) on a Sandbox that Omnigent runs. Each conversation is an Omnigent session in this workspace, which you can open and continue in Omnigent.",
   },
+  {
+    id: "slack",
+    label: "Slack bridge",
+    short: "Your Slack channels and DMs, in Buzz",
+    Icon: SlackKindIcon,
+    detail:
+      "Brings the Slack channels, DMs and group DMs you choose into Buzz channels, and sends what you write in those channels to Slack as you. It reads Slack with your own Slack sign-in in this workspace. After you create it, choose the conversations in its Settings tab.",
+  },
 ];
 
 const AVAILABILITY_HINT: Record<Availability, string> = {
@@ -568,7 +610,11 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
             }}
           />
         )}
-        {config.kind === "omnigent" ? (
+        {config.kind === "slack" ? (
+          <Text tone="subtle" size="sm">
+            Choose a workspace where you use Slack in Databricks (Genie's Slack tools, for example): the bridge reads and sends with that sign-in. It's always on, and Buzz restarts its Sandbox each day.
+          </Text>
+        ) : config.kind === "omnigent" ? (
           <OmnigentField
             service={workspace}
             {...(config.omnigent && { value: config.omnigent })}
@@ -616,24 +662,28 @@ export function HostedForm(props: FormProps & { service: DatabricksService; lock
             <SkillsField service={props.service} {...(config.profile && { profile: config.profile })} value={config.skills} {...disabled} onChange={(skills) => onChange({ ...config, skills })} />
           </>
         )}
-        <Field label="Availability" hint={AVAILABILITY_HINT[config.availability]}>
-          <select className="dbx-select" {...disabled} value={config.availability} onChange={(event) => onChange({ ...config, availability: event.target.value as Availability })}>
-            <option value="sleep">Sleep when Buzz is closed</option>
-            <option value="always">Always on</option>
-          </select>
-        </Field>
-        <Field label="Conversation" hint="Thread: each thread is its own conversation. Channel: one conversation for the whole channel.">
-          <select className="dbx-select" {...disabled} value={config.scope} onChange={(event) => onChange({ ...config, scope: event.target.value as HostedConfig["scope"] })}>
-            <option value="thread">One per thread</option>
-            <option value="channel">One per channel</option>
-          </select>
-        </Field>
-        {config.kind !== "genie" && (
-          <Field label="Instructions" hint="Optional. Who it is, what it should focus on, how to answer.">
-            <textarea className="dbx-textarea" rows={5} {...disabled} value={config.instructions} onChange={(event) => onChange({ ...config, instructions: event.target.value })} />
-          </Field>
+        {config.kind !== "slack" && (
+          <>
+            <Field label="Availability" hint={AVAILABILITY_HINT[config.availability]}>
+              <select className="dbx-select" {...disabled} value={config.availability} onChange={(event) => onChange({ ...config, availability: event.target.value as Availability })}>
+                <option value="sleep">Sleep when Buzz is closed</option>
+                <option value="always">Always on</option>
+              </select>
+            </Field>
+            <Field label="Conversation" hint="Thread: each thread is its own conversation. Channel: one conversation for the whole channel.">
+              <select className="dbx-select" {...disabled} value={config.scope} onChange={(event) => onChange({ ...config, scope: event.target.value as HostedConfig["scope"] })}>
+                <option value="thread">One per thread</option>
+                <option value="channel">One per channel</option>
+              </select>
+            </Field>
+            {config.kind !== "genie" && (
+              <Field label="Instructions" hint="Optional. Who it is, what it should focus on, how to answer.">
+                <textarea className="dbx-textarea" rows={5} {...disabled} value={config.instructions} onChange={(event) => onChange({ ...config, instructions: event.target.value })} />
+              </Field>
+            )}
+          </>
         )}
-        {!props.locked && (
+        {!props.locked && config.kind !== "slack" && (
           <Text tone="tertiary" size="xs">
             Only your own messages reach it. Its Sandbox belongs to you in Databricks; removing the agent deletes it.
           </Text>
@@ -654,7 +704,7 @@ const STATE_LABEL: Record<string, string> = {
 const stateLabel = (state: string | undefined, availability: Availability) =>
   state === "SANDBOX_STATE_STOPPED" ? (availability === "sleep" ? "Asleep" : "Stopped") : (STATE_LABEL[state ?? ""] ?? state ?? "Unknown");
 
-export function HostedSettings(props: { service: DatabricksService; provider: HostedProvider; pubkey: string }) {
+export function HostedSettings(props: { service: DatabricksService; provider: HostedProvider; pubkey: string; openChannel?(channel: string): void }) {
   const [nonce, setNonce] = React.useState(0);
   const status = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce]);
   const record = props.provider.read(props.pubkey);
@@ -710,7 +760,19 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
                 : `Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts. Buzz starts it again within a few minutes, or now with Wake now.`
               : `Sandbox ${record.sandbox}.`}
         </Notice>
-        <HostedForm service={props.service} config={draft} onChange={setDraft} {...(busy && { disabled: true })} locked />
+        {draft.kind === "slack" ? (
+          <SlackConversationsField
+            service={workspaceOf(props.service, record.config.profile)}
+            value={draft.slack?.conversations ?? []}
+            saved={record.config.slack?.conversations ?? []}
+            {...(runnerState?.slack && { status: runnerState.slack })}
+            {...(props.openChannel && { openChannel: props.openChannel })}
+            {...(busy && { disabled: true })}
+            onChange={(conversations) => setDraft({ ...draft, slack: { conversations } })}
+          />
+        ) : (
+          <HostedForm service={props.service} config={draft} onChange={setDraft} {...(busy && { disabled: true })} locked />
+        )}
         {error && <Notice tone="danger">{error}</Notice>}
         <Stack direction="row" gap={8} justify="flex-end">
           <Button variant="ghost" disabled={!dirty || Boolean(busy)} onClick={() => setDraft(record.config)}>
@@ -784,14 +846,14 @@ function HostedActivity(props: ActivityTabProps & { provider: HostedProvider }) 
 
 // ── The type ──
 
-export function registerHostedType(agents: Agents, service: DatabricksService): () => void {
+export function registerHostedType(agents: Agents, service: DatabricksService, host: Readonly<{ openChannel?(channel: string): void }> = {}): () => void {
   const provider = hostedProvider(agents, service);
   const icon = databricksIcon() as unknown as AgentType["icon"];
   const type = {
     id: HOSTED_TYPE_ID,
     icon,
     title: "Databricks",
-    description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, Claude Code, Codex or Pi in its own Sandbox, or an Omnigent agent. No Buzz tools.",
+    description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, Claude Code, Codex or Pi in its own Sandbox, an Omnigent agent, or a Slack bridge. No Buzz tools.",
     defaults: () => ({ config: normalizeHosted({}) }),
     summary: (agent: { config: unknown; pubkey?: string }) => summarizeHosted(provider.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config)),
     Create: (props: { config: unknown; onChange(config: unknown): void; disabled: boolean }) => (
@@ -802,7 +864,9 @@ export function registerHostedType(agents: Agents, service: DatabricksService): 
         id: "settings",
         title: "Settings",
         role: "settings" as const,
-        component: (props: { agent: { pubkey: string } }) => <HostedSettings service={service} provider={provider} pubkey={props.agent.pubkey} />,
+        component: (props: { agent: { pubkey: string } }) => (
+          <HostedSettings service={service} provider={provider} pubkey={props.agent.pubkey} {...(host.openChannel && { openChannel: host.openChannel })} />
+        ),
       },
       {
         id: "activity",

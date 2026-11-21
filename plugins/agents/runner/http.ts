@@ -9,6 +9,20 @@ export type Filter = Readonly<Record<string, unknown>>;
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
+/** NIP-01 reasons about the agent or the relay rather than the event. */
+const SYSTEMIC = /^(rate-limited|error|restricted|blocked|auth-required):/;
+
+/** The NIP-01 reason in a relay's error body (`{"accepted":false,"message":"invalid: …"}`), or "". */
+function reasonOf(text: string): string {
+  try {
+    const body = JSON.parse(text) as { message?: unknown; error?: unknown };
+    const reason = typeof body.message === "string" ? body.message : typeof body.error === "string" ? body.error : "";
+    return reason.trim();
+  } catch {
+    return "";
+  }
+}
+
 export class HttpRelay {
   readonly base: string;
   /** True once a request has gone through; false after one fails. */
@@ -45,7 +59,12 @@ export class HttpRelay {
     const text = await response.text();
     if (!response.ok) {
       this.ready = false;
-      throw Object.assign(new Error(`${response.status} ${text.slice(0, 300)}`.trim()), { status: response.status });
+      // A refusal of this one event can come with an error status: "invalid:" or "pow:", or a bad request or one too large.
+      // Anything about the agent (not a member, blocked, not signed in), a timeout, a rate limit or a server error isn't: it's retried in order.
+      const reason = reasonOf(text);
+      const status = response.status;
+      const refused = /^(invalid|pow):/.test(reason) || ((status === 400 || status === 413) && !SYSTEMIC.test(reason));
+      throw Object.assign(new Error(`${status} ${(reason || text).slice(0, 300)}`.trim()), { status, reason, ...(refused && { refused: true }) });
     }
     this.ready = true;
     return JSON.parse(text);
@@ -57,8 +76,17 @@ export class HttpRelay {
     if (tags.some((tag) => tag[0] === "h")) tags.push(["ms", String(Date.now() % 1000)]);
     tags.push([...this.authTag]);
     const event = this.sign({ ...template, tags });
-    const reply = (await this.post("/events", JSON.stringify(event))) as { accepted?: boolean; message?: string };
-    if (!reply.accepted && !reply.message?.startsWith("duplicate")) throw new Error(reply.message || "The community refused the event.");
+    let reply: { accepted?: boolean; message?: string };
+    try {
+      reply = (await this.post("/events", JSON.stringify(event))) as typeof reply;
+    } catch (error) {
+      if (String((error as { reason?: unknown }).reason ?? "").startsWith("duplicate")) return event;
+      throw error;
+    }
+    if (!reply.accepted && !reply.message?.startsWith("duplicate")) {
+      const transient = SYSTEMIC.test(reply.message ?? "");
+      throw Object.assign(new Error(reply.message || "The community refused the event."), { ...(!transient && { refused: true }) });
+    }
     return event;
   }
 
