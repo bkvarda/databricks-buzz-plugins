@@ -1224,7 +1224,9 @@ export function actionsText(found: Readonly<{ key: string; row: WorkstreamAction
 
 /** The lines a post or update gives the actions a check found holding (just now, for an update): `**Triggered:** <label> — <why>` (labels never contain —), or just the label for an always action. */
 export function triggeredLines(results: readonly TriggerResult[]): string {
-  return results.map((result) => `**Triggered:** ${result.label}${result.why && result.why !== "always" ? ` — ${result.why}` : ""}`).join("\n");
+  // One line each, whatever line breaks a label or a check's reason has (the cards read a line per action).
+  const line = (text: string) => text.replace(/\s+/g, " ").trim();
+  return results.map((result) => `**Triggered:** ${line(result.label)}${result.why && result.why !== "always" ? ` — ${line(result.why)}` : ""}`).join("\n");
 }
 
 /** A catalog action: as stored, and whether setup ticks it to start with. */

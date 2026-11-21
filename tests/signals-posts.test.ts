@@ -2,8 +2,8 @@
 // parser against the hub's own message builders and posts as they look live.
 import { describe, expect, it } from "vitest";
 import { npubEncode } from "nostr-tools/nip19";
-import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, taskMessage, triggeredMessage } from "../plugins/signals/app/hub";
-import { triggeredLines } from "../plugins/signals/app/model";
+import { answerMessage, changedMessage, doneMessage, eventDetails, questionMessage, TASK_REPLY, taskMessage, triggeredMessage } from "../plugins/signals/app/hub";
+import { readWorkstreamActions, triggeredLines } from "../plugins/signals/app/model";
 import type { Task } from "../plugins/signals/app/store";
 import { ago } from "../packages/core/src/ui/components";
 import { filedHint, filterTasks, openingTitle, postOrigin, postWeight, taskFacts, taskOrigin, titleHint, workstreamHint } from "../plugins/signals/src/board-view";
@@ -62,6 +62,83 @@ describe("task posts", () => {
     expect(post.source?.quote).toBe("@Brandon Kvarda curious question, where did Block perform benchmarking; as we did not even launch the model");
     expect(post.source?.facts).toEqual([]);
     expect(post.asksAgents).toBe(true);
+  });
+
+  // Poker's opening-source repros (buzz-factory, 2026-11-20): what a task's default actions found, and a follow-up's
+  // checklist, came after its source, and the source's Details ran on to take them into the email's quote.
+  describe("a source's quote and what's around it", () => {
+    const opened = task({ id: 98, title: "Pricing question", workstream: "questions", rule_id: "gmail-reply" });
+    const snippet = "What does serverless cost?\n\nCould we get an annual estimate?";
+    const source = eventDetails({ source: "gmail", external_id: "review-email", payload: { snippet } });
+    const fired = triggeredLines([
+      { id: "price", label: "Pricing question", held: true, why: "The email asks for an annual estimate." },
+      { id: "esc", label: "Escalate", held: true, why: "always" },
+    ]);
+    const tracked = "No default action for questions is triggered, so it's tracked with no agent asked.";
+    const notes = { triggered: fired, tracked, dismissed: "No default action for questions is triggered, so it's dismissed. It opens again if one is." };
+    const checklist = "**Action items from the notes for this follow-up** (not the account team's own tasks):\n- [ ] Send the estimate (the customer's)\nThe account team's items have their own tasks:\n- Task 99: Draft the plan";
+    const slack = (text: string) => eventDetails({ source: "slack", external_id: "s", payload: { text } });
+
+    it("reads the quote whole and what the default actions found, for each outcome", () => {
+      expect(parseTaskPost(taskMessage(opened, { source }))?.source?.quote).toBe(snippet);
+      for (const [outcome, note] of Object.entries(notes)) {
+        const text = taskMessage(opened, { source, note });
+        // What they found comes first, then the source, right before the reply line.
+        expect(text.indexOf(note), outcome).toBeLessThan(text.indexOf("**Source**"));
+        const post = parseTaskPost(text)!;
+        expect(post.source?.quote, outcome).toBe(snippet);
+        expect(post.triggered, outcome).toEqual(outcome === "triggered" ? [{ label: "Pricing question", why: "The email asks for an annual estimate." }, { label: "Escalate" }] : []);
+        expect(post.untriggered, outcome).toBe(outcome === "triggered" ? undefined : outcome);
+      }
+      const followUp = task({ id: 100, title: "QBR follow-up", workstream: "meeting follow-up", rule_id: "meeting-notes", checklist } as Partial<Task>);
+      for (const note of [undefined, tracked, fired]) expect(parseTaskPost(taskMessage(followUp, { source, ...(note && { note }) }))?.source?.quote).toBe(snippet);
+      // With no source: what they found still reads.
+      expect(parseTaskPost(taskMessage(opened, { note: tracked }))).toMatchObject({ untriggered: "tracked" });
+    });
+
+    it("keeps a source's own text that looks like the hub's, and reads only the hub's lines as what was found", () => {
+      const pasted = "Here is the note from yesterday.\n\n" + tracked;
+      expect(taskMessage(opened, { source: slack(pasted) })).not.toBe(taskMessage(opened, { source: slack("Here is the note from yesterday."), note: tracked }));
+      const alone = parseTaskPost(taskMessage(opened, { source: slack(pasted) }))!;
+      expect(alone.source?.quote).toBe(pasted);
+      expect(alone.untriggered).toBeUndefined();
+      const quotedList = "Hi\n\nThe account team's items have their own tasks:\n- Task 99: Draft the plan";
+      expect(parseTaskPost(taskMessage(opened, { source: slack(quotedList), note: tracked }))).toMatchObject({ source: { quote: quotedList }, untriggered: "tracked" });
+      expect(parseTaskPost(taskMessage(opened, { source: slack("**Triggered:** Escalate — no") }))).toMatchObject({ source: { quote: "**Triggered:** Escalate — no" }, triggered: [] });
+      // A source with a post's own reply line in it (a pasted post) keeps it and what follows; it reads the same.
+      const footer = "Here is the note.\n\n" + TASK_REPLY + "\n\nPlease send details.";
+      const pastedPost = parseTaskPost(taskMessage(opened, { source: slack(footer), note: tracked, agents: [AGENT] }))!;
+      expect(pastedPost.source?.quote?.replace(/\u00a0/g, " ")).toBe(footer);
+      expect(pastedPost).toMatchObject({ untriggered: "tracked", asksAgents: true });
+      const legacyFooter = "Here is the note.\n\nReply in this thread to work on it. Agents can update it with the signals_task tools.\n\nThanks";
+      expect(parseTaskPost(taskMessage(opened, { source: slack(legacyFooter) }))?.source?.quote).toBe(legacyFooter);
+    });
+
+    it("keeps a Triggered line on one line, whatever a label or a reason had in it", () => {
+      // A label saved with a line break still reads (a hub that refused it would drop the row it's in).
+      expect(readWorkstreamActions({ questions: { watch: [{ id: "price", label: "Pricing\nquestion", always: true }], otherwise: "track" } })).toMatchObject({ questions: { watch: [{ label: "Pricing\nquestion" }] } });
+      const note = triggeredLines([{ id: "price", label: "Pricing\nquestion", held: true, why: "It asks\n\nfor a price." }]);
+      expect(note).toBe("**Triggered:** Pricing question — It asks for a price.");
+      expect(parseTaskPost(taskMessage(opened, { source, note }))).toMatchObject({ source: { quote: snippet }, triggered: [{ label: "Pricing question", why: "It asks for a price." }] });
+    });
+
+    it("reads older posts, with the source first, as well as their text allows", () => {
+      const older = (source: string, ...after: string[]) =>
+        ["📌 **Task 98: Pricing question**", "Workstream: questions · Rule: gmail-reply", "Mode: draft", "", source, "", ...after.flatMap((part) => [part, ""]), "Reply in this thread to work on it. Agents can update it with the signals_task tools."].join("\n");
+      for (const [outcome, note] of Object.entries(notes)) {
+        const post = parseTaskPost(older(source, note))!;
+        expect(post.source?.quote, outcome).toBe(snippet);
+        expect(post.untriggered, outcome).toBe(outcome === "triggered" ? undefined : outcome);
+      }
+      expect(parseTaskPost(older(source, checklist, tracked))?.source?.quote).toBe(snippet);
+      expect(parseTaskPost(older(source, "The account team's items have their own tasks:\n- Task 99: Draft the plan"))?.source?.quote).toBe(snippet);
+      expect(parseTaskPost(older(source))?.source?.quote).toBe(snippet);
+      // A quote whose last paragraph only looks like a checklist heading stays whole.
+      const lookalike = slack("Hi\n\nThe account team's items have their own tasks: none");
+      expect(parseTaskPost(older(lookalike, tracked))?.source?.quote).toBe("Hi\n\nThe account team's items have their own tasks: none");
+      // Where an older post's source ended in the hub's own words, nothing tells them apart: that paragraph is read as the hub's.
+      expect(parseTaskPost(older(slack("Here is the note.\n\n" + tracked)))?.source?.quote).toBe("Here is the note.");
+    });
   });
 
   it("isn't fooled by other messages", () => {

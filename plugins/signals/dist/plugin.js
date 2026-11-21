@@ -1688,6 +1688,7 @@ function encodeBytes(prefix, bytes) {
 // plugins/signals/src/posts.ts
 var TASK_LINE = /^📌 \*\*Task (\d+): (.+)\*\*\s*$/u;
 var REPLY_HERE = "Reply in this thread to work on it.";
+var SOURCE_LAST_REPLY = "Reply in this thread to work on it. Agents update it with the signals_task tools.";
 var NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
 var NAMED = /(?:nostr|agent|person):(npub1[02-9ac-hj-np-z]{58})/g;
 var OPTIONS = /^Options: (.+)$/;
@@ -1703,6 +1704,25 @@ var triggeredIn = (lines) => lines.flatMap((line2) => {
 function untriggeredNote(post, now) {
   if (!post.untriggered || post.triggered.length) return void 0;
   return now?.status === "dismissed" && now.byDefaults ? "dismissed" : "opening";
+}
+var CHECKLIST_HEADS = ["**Action items from the notes for this follow-up** (not the account team's own tasks):", "The account team's items have their own tasks:"];
+var isChecklist = (block) => CHECKLIST_HEADS.includes(block[0]) && block.length > 1 && block.every((line2) => CHECKLIST_HEADS.includes(line2) || line2.startsWith("- "));
+function sourceEnd(lines, start, end) {
+  let at = end;
+  const blank = () => {
+    while (at > start + 1 && !lines[at - 1].trim()) at--;
+  };
+  const paragraph = () => {
+    let from2 = at;
+    while (from2 > start + 1 && lines[from2 - 1].trim()) from2--;
+    return from2;
+  };
+  blank();
+  let from = paragraph();
+  const block = lines.slice(from, at).map((line2) => line2.trim());
+  if (block.length && (block.every((line2) => TRIGGERED.test(line2)) || block.length === 1 && UNTRIGGERED.test(block[0]))) at = from, blank(), from = paragraph();
+  if (from < at && isChecklist(lines.slice(from, at).map((line2) => line2.trim()))) at = from, blank();
+  return at;
 }
 var isTaskPost = (content) => TASK_LINE.test(content.split("\n", 1)[0] ?? "") && content.includes(REPLY_HERE);
 var splitOptions = (text) => text.split(" / ").map((item) => item.trim()).filter(Boolean);
@@ -1736,12 +1756,15 @@ function parseTaskPost(content) {
     }
   }
   const start = lines.findIndex((line2) => line2.startsWith("**Source**"));
-  const end = lines.findIndex((line2) => line2.startsWith(REPLY_HERE));
+  const last = lines.findIndex((line2) => line2.trim() === SOURCE_LAST_REPLY);
+  const end = last >= 0 ? last : lines.findIndex((line2) => line2.startsWith(REPLY_HERE));
   const title = head[2].trim();
-  const read = start >= 0 ? parseSource(lines.slice(start, end > start ? end : void 0)) : void 0;
+  const sourceLast = last >= 0;
+  const until = end > start ? end : lines.length;
+  const read = start >= 0 ? parseSource(lines.slice(start, sourceLast ? until : sourceEnd(lines, start, until))) : void 0;
   const source = read && { ...read, facts: read.facts.filter((fact) => !title.toLowerCase().includes(fact.value.toLowerCase())) };
   const after = end >= 0 ? lines.slice(end + 1).join("\n") : "";
-  const middle = lines.slice(at, end >= 0 ? end : void 0);
+  const middle = lines.slice(at, sourceLast && start >= at ? start : end >= 0 ? end : void 0);
   const outcome = middle.map((line2) => UNTRIGGERED.exec(line2.trim())).find(Boolean);
   const untriggered = outcome ? outcome[1] ? "dismissed" : "tracked" : void 0;
   return {
