@@ -99,6 +99,10 @@ export class HubClient {
   saveAccount(input: AccountInput) {
     return this.call<{ account: AccountView; labels?: ResolvedLabels; workstreams?: string[]; warning?: string }>("POST", "/api/account", { body: input }).then((reply) => ({ ...reply.account, ...(reply.labels && { labels: reply.labels }), ...(reply.workstreams && { workstreams: reply.workstreams }), ...(reply.warning && { warning: reply.warning }) }));
   }
+  /** The agents saving these agents for an account would ask to work on its open tasks (the save's handoff), without saving. */
+  handOffs(input: Pick<AccountInput, "name" | "channel" | "agents" | "workstream_agents">, signal?: AbortSignal) {
+    return this.call<{ agents: string[] }>("POST", "/api/handoffs", { body: input, ...(signal && { signal }) }).then((reply) => reply.agents);
+  }
   deleteAccount(name: string) {
     return this.call<{ deleted: boolean }>("POST", "/api/account", { body: { name, delete: true } });
   }

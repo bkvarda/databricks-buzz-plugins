@@ -1344,6 +1344,24 @@ export function agentListFor(account: Pick<AccountRecord, "agents" | "workstream
 }
 
 /** The workstreams a config's rules file tasks under, in rule order. */
+/** The rule id and workstream of the tasks a rule's `action_items` opens, one per item the account team owns. */
+export function actionItemKind(rule: Pick<Rule, "id" | "action_items">): { rule_id: string; workstream: string } {
+  return { rule_id: `${rule.id}/action-item`, workstream: rule.action_items?.workstream ?? "meeting action items" };
+}
+
+/**
+ * Every rule id and workstream a task the rules open can have: each task rule's own workstream (or none), its
+ * categories', and the tasks its action_items open. (A person can move a task to another workstream once it's open.)
+ */
+export function taskKinds(config: Pick<SignalsConfig, "rules"> | undefined): { rule_id: string; workstream: string | null }[] {
+  // Only rules that open tasks: an ignore rule's id may still name tasks from before, which are open tasks if anything.
+  return (config?.rules ?? []).filter((rule) => rule.action === "task").flatMap((rule) => [
+    { rule_id: rule.id, workstream: rule.workstream ?? null },
+    ...(rule.categories ?? []).map((category) => ({ rule_id: rule.id, workstream: category.workstream })),
+    ...(rule.action_items ? [actionItemKind(rule)] : []),
+  ]);
+}
+
 export function workstreamsOf(config: SignalsConfig | undefined): string[] {
   return [...new Set((config?.rules ?? []).flatMap((rule) => [rule.workstream, ...(rule.categories ?? []).map((category) => category.workstream)]).map((name) => name?.trim()).filter((name): name is string => Boolean(name)))];
 }

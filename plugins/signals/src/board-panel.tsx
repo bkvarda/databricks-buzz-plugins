@@ -39,6 +39,7 @@ type RelaySession = {
   thread?: (channelId: string, messageId: string, options?: { exact?: boolean; priority?: "foreground" | "background" }) => ThreadReader;
   messages?: { reply?: (channelId: string, rootId: string, content: string, mentions?: readonly string[]) => string };
   channels?: { get?(channelId: string): { members?: readonly string[] } | undefined; resolve?(channelIds: readonly string[]): Promise<void>; subscribeList?(listener: () => void): () => void };
+  channelWrites?: { addAgents?(channelId: string, keys: readonly string[]): Promise<void> };
 };
 type RelayView = { snapshot(): { viewer?: string; origin?: string; session?: RelaySession; generation?: number; cached?: true; status?: string }; subscribe?(listener: () => void): () => void };
 
@@ -61,7 +62,7 @@ const readRelay = (relay: RelayView | undefined): RelaySnapshot => {
  * snapshot is read only when the relay says it changed, and kept when its
  * session, generation, viewer and origin are all the same.
  */
-function useRelay(ctx: Context): RelaySnapshot {
+export function useRelay(ctx: Context): RelaySnapshot {
   const relay = optionalService<RelayView>(ctx, "relay");
   const [held, setHeld] = React.useState<RelaySnapshot>(() => readRelay(relay));
   React.useEffect(() => {

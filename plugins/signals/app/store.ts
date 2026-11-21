@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { calendarEventId, itemKey, itemLine, parseNextSteps, peopleNamed, sideOf } from "./actions";
 import { attendeesOf, realCustomers } from "./attendees";
-import { KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds, readWorkstreamActions, type CheckResult, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, type WorkstreamActions } from "./model";
+import { actionItemKind, KEPT_DETAILS, slackThreadKey, toMicros, type AccountIds, type AccountRecord, atDomains, type Decision, categoryByWhen, categoryChoices, categoryModeFor, categoryNamed, type Category, shortTitle, sourceTitle, taskTitle, DEFAULT_CLASSIFY_MIN, contentKey, namesAccount, decide, fanOut, type Verdict, VERDICTS, doneReason, doneWhenOf, type EventInput, type FieldChange, fieldChanges, finishes, handledBy, isOpen, matches, modeFor, ruleApplies, watchedValue, type Mode, plainSlack, type Rule, SERIES_ASKER, SERIES_OPTIONS, type SeriesAnswer, seriesQuestion, type SignalsConfig, TASK_STATUSES, type TaskStatus, toSeconds, readWorkstreamActions, type CheckResult, type PendingCheck, type TriggerNotice, type TriggerResult, type TriggerState, type WorkstreamActions } from "./model";
 
 export type Row = Record<string, unknown>;
 /** The part of pg.Pool (and PGlite) the store uses. */
@@ -1472,8 +1472,7 @@ export class SignalsStore {
     const theirs = new Set(customers.map((a) => a.email!.toLowerCase()));
     const ours = listed.filter((a) => !theirs.has(a.email!.toLowerCase()) && (atOwn(a.email!) || (domains.length > 0 && atDomains(a.email!.toLowerCase(), domains))));
     const people = { ours, customers, account: account ? [account.name, ...(account.aliases ?? [])] : followUp.account ? [followUp.account] : [] };
-    const workstream = rule.action_items!.workstream ?? "meeting action items";
-    const ruleId = `${rule.id}/action-item`;
+    const { rule_id: ruleId, workstream } = actionItemKind(rule);
     const mode = modeFor(account?.preferences, { id: ruleId, workstream });
     const doc = event.group_key ?? event.external_id;
     const opened: number[] = [];
