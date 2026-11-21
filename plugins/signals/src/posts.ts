@@ -56,6 +56,9 @@ export type ThreadPost =
 
 const TASK_LINE = /^📌 \*\*Task (\d+): (.+)\*\*\s*$/u;
 const REPLY_HERE = "Reply in this thread to work on it.";
+// The reply line of posts that put the source last, right before it (hub.ts TASK_REPLY): everything between the
+// **Source** line and it is the source, and what the default actions found and the checklist come before it.
+const SOURCE_LAST_REPLY = "Reply in this thread to work on it. Agents update it with the signals_task tools.";
 const NPUB = /nostr:npub1[02-9ac-hj-np-z]{58}/g;
 /** A person named in a text: a nostr: mention, or the hub's agent:/person: actor. */
 const NAMED = /(?:nostr|agent|person):(npub1[02-9ac-hj-np-z]{58})/g;
@@ -90,6 +93,37 @@ export type UntriggeredNote = "dismissed" | "opening";
 export function untriggeredNote(post: Pick<TaskPost, "triggered" | "untriggered">, now?: Readonly<{ status: string; byDefaults: boolean }>): UntriggeredNote | undefined {
   if (!post.untriggered || post.triggered.length) return undefined;
   return now?.status === "dismissed" && now.byDefaults ? "dismissed" : "opening";
+}
+
+// A meeting follow-up's checklist (store.ts), which a task post has after its source: one or both of these headings,
+// each with its "- " items.
+const CHECKLIST_HEADS = ["**Action items from the notes for this follow-up** (not the account team's own tasks):", "The account team's items have their own tasks:"];
+const isChecklist = (block: readonly string[]) => CHECKLIST_HEADS.includes(block[0]!) && block.length > 1 && block.every((line) => CHECKLIST_HEADS.includes(line) || line.startsWith("- "));
+
+/**
+ * Where an older task post's source ends, before `end`. Those posts put the task's checklist and then what its default
+ * actions found (Triggered lines, or the no-action sentence) after the source, each as its own paragraph, and the
+ * source's Details run to its end. A quote can have paragraphs of its own, so those parts are taken off the end, each
+ * at most once and only in that order, rather than cutting at the first blank line. A source whose own text ends just
+ * like one of them reads the same, so it loses that paragraph: posts now put the source last instead.
+ */
+function sourceEnd(lines: readonly string[], start: number, end: number): number {
+  let at = end;
+  const blank = () => {
+    while (at > start + 1 && !lines[at - 1]!.trim()) at--;
+  };
+  // The last paragraph, from its first line to `at`.
+  const paragraph = () => {
+    let from = at;
+    while (from > start + 1 && lines[from - 1]!.trim()) from--;
+    return from;
+  };
+  blank();
+  let from = paragraph();
+  const block = lines.slice(from, at).map((line) => line.trim());
+  if (block.length && (block.every((line) => TRIGGERED.test(line)) || (block.length === 1 && UNTRIGGERED.test(block[0]!)))) (at = from), blank(), (from = paragraph());
+  if (from < at && isChecklist(lines.slice(from, at).map((line) => line.trim()))) (at = from), blank();
+  return at;
 }
 
 /** Whether a message is a task the hub posted: its first line and the line every task post has. */
@@ -128,14 +162,20 @@ export function parseTaskPost(content: string): TaskPost | undefined {
     }
   }
   const start = lines.findIndex((line) => line.startsWith("**Source**"));
-  const end = lines.findIndex((line) => line.startsWith(REPLY_HERE));
+  // The reply line: the whole line, in posts with the source last (the hub keeps the source from having it), else the
+  // first that starts like one.
+  const last = lines.findIndex((line) => line.trim() === SOURCE_LAST_REPLY);
+  const end = last >= 0 ? last : lines.findIndex((line) => line.startsWith(REPLY_HERE));
   const title = head[2]!.trim();
-  const read = start >= 0 ? parseSource(lines.slice(start, end > start ? end : undefined)) : undefined;
+  const sourceLast = last >= 0;
+  const until = end > start ? end : lines.length;
+  // Older posts have the source first: where it ends is a guess from the end (sourceEnd).
+  const read = start >= 0 ? parseSource(lines.slice(start, sourceLast ? until : sourceEnd(lines, start, until))) : undefined;
   // A fact the title already says (a meeting's summary, say) isn't repeated under it.
   const source = read && { ...read, facts: read.facts.filter((fact) => !title.toLowerCase().includes(fact.value.toLowerCase())) };
   const after = end >= 0 ? lines.slice(end + 1).join("\n") : "";
-  // What the default actions found sits after the source, before "Reply in this thread".
-  const middle = lines.slice(at, end >= 0 ? end : undefined);
+  // What the default actions found: before the source, or in older posts after it, before "Reply in this thread".
+  const middle = lines.slice(at, sourceLast && start >= at ? start : end >= 0 ? end : undefined);
   const outcome = middle.map((line) => UNTRIGGERED.exec(line.trim())).find(Boolean);
   const untriggered = outcome ? (outcome[1] ? "dismissed" : "tracked") : undefined;
   return {

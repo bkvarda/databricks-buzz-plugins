@@ -1954,18 +1954,25 @@ export function askMessage(task: Task, agents: readonly string[], user: string, 
     .join("\n");
 }
 
+/** A task post's reply line. Its wording marks posts with their source last, and no line of the source is it (posts.ts SOURCE_LAST_REPLY). */
+export const TASK_REPLY = "Reply in this thread to work on it. Agents update it with the signals_task tools.";
+
 export function taskMessage(task: Task, detail?: { agents?: readonly string[]; briefing?: string; source?: string; note?: string }): string {
   const asking = Boolean(detail?.agents?.length && (task.mode === "auto" || task.mode === "draft"));
+  // The source ends at the first line that is the reply line: one of its own that reads the same (a pasted post) gets a
+  // no-break space after "Reply", which looks the same and isn't that line.
+  const source = detail?.source?.split("\n").map((line) => (line.trim() === TASK_REPLY ? line.replace("Reply ", "Reply\u00a0") : line)).join("\n");
   const ask = asking ? `${detail!.agents!.map((key) => `nostr:${npub(key)}`).join(" ")} ${AGENT_ASK[task.mode as "auto" | "draft"]} ${AGENT_RECORD}` : "";
   return [
     `📌 **Task ${task.id}: ${task.title}**`,
     [task.account && `Account: ${task.account}`, task.workstream && `Workstream: ${task.workstream}`, task.initiative && `Initiative: ${task.initiative}`, `Rule: ${task.rule_id}`].filter(Boolean).join(" · "),
     MODE_TEXT[task.mode] ?? "",
     task.question ? `⏸️ **Needs input:** ${task.question}${task.options?.length ? `\nOptions: ${task.options.join(" / ")}` : ""}\nAnswer from the Tasks board (Provide input on its card).` : "",
-    detail?.source ? `\n${detail.source}\n` : "",
-    task.checklist ? `${task.checklist}\n` : "",
-    detail?.note ? `${detail.note}\n` : "",
-    `Reply in this thread to work on it. Agents can update it with the signals_task tools.`,
+    // What the default actions found and the checklist come before the source, which runs to the reply line: a
+    // source's text can look like either, so the card (posts.ts) reads them by place. The reply line's wording says
+    // a post is laid out this way (TASK_REPLY); posts before it had them after the source.
+    [detail?.note, task.checklist, source].some(Boolean) ? `\n${[detail?.note, task.checklist, source].filter(Boolean).join("\n\n")}\n` : "",
+    TASK_REPLY,
     ask,
     asking && detail?.briefing ? `\n${detail.briefing}` : "",
   ]
