@@ -9,6 +9,9 @@ export type Filter = Readonly<Record<string, unknown>>;
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
+/** NIP-01 reasons about the agent or the relay rather than the event. */
+const SYSTEMIC = /^(rate-limited|error|restricted|blocked|auth-required):/;
+
 /** The NIP-01 reason in a relay's error body (`{"accepted":false,"message":"invalid: …"}`), or "". */
 function reasonOf(text: string): string {
   try {
@@ -56,11 +59,11 @@ export class HttpRelay {
     const text = await response.text();
     if (!response.ok) {
       this.ready = false;
-      // A refusal of this one event can come with an error status: its NIP-01 prefix says so, and so does a 4xx about the request itself.
-      // A sign-in failure (401/403 with no reason), a timeout, a rate limit or a server error is about the relay, not the event.
+      // A refusal of this one event can come with an error status: "invalid:" or "pow:", or a bad request or one too large.
+      // Anything about the agent (not a member, blocked, not signed in), a timeout, a rate limit or a server error isn't: it's retried in order.
       const reason = reasonOf(text);
       const status = response.status;
-      const refused = /^(invalid|blocked|restricted|pow):/.test(reason) || (status >= 400 && status < 500 && ![401, 403, 408, 429].includes(status) && !/^(rate-limited|error|auth-required):/.test(reason));
+      const refused = /^(invalid|pow):/.test(reason) || ((status === 400 || status === 413) && !SYSTEMIC.test(reason));
       throw Object.assign(new Error(`${status} ${(reason || text).slice(0, 300)}`.trim()), { status, reason, ...(refused && { refused: true }) });
     }
     this.ready = true;
@@ -81,7 +84,7 @@ export class HttpRelay {
       throw error;
     }
     if (!reply.accepted && !reply.message?.startsWith("duplicate")) {
-      const transient = /^(rate-limited|error):/.test(reply.message ?? "");
+      const transient = SYSTEMIC.test(reply.message ?? "");
       throw Object.assign(new Error(reply.message || "The community refused the event."), { ...(!transient && { refused: true }) });
     }
     return event;

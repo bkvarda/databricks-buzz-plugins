@@ -6,7 +6,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { type EventTemplate, finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HttpRelay } from "../plugins/agents/runner/http";
-import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge, SlackToolError, STUCK_MS, UNSURE_MS } from "../plugins/agents/runner/slack-bridge";
+import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, HELPER_TURN_MS, SlackBridge, SlackToolError, STUCK_MS, UNSURE_LIMIT_MS, UNSURE_MS } from "../plugins/agents/runner/slack-bridge";
 import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
 import { loadDirectory } from "../plugins/agents/src/slack-ui";
 import type { DatabricksService } from "@dbx/core/service";
@@ -126,6 +126,7 @@ function community() {
   // The relay answers a refusal with accepted:false; an outage (a rate limit) isn't an answer.
   const refuse = (message: string) => Object.assign(new Error(message), { refused: true });
   let outages = 0;
+  let failing: ((event: NostrEvent) => boolean) | undefined;
   const relayFor = (secret: Uint8Array, authTag?: string[]): BridgeRelay & { pubkey: string } => {
     const pubkey = getPublicKey(secret);
     if (authTag) agents.add(pubkey);
@@ -136,6 +137,7 @@ function community() {
         const h = event.tags.find((tag) => tag[0] === "h")?.[1] ?? "";
         const channel = channels.get(h);
         const role = channel?.roles.get(pubkey);
+        if (event.kind === 9 && authTag && failing?.(event)) throw Object.assign(new Error("503 unavailable"), { status: 503 });
         if (event.kind === 9 && authTag && outages > 0) {
           outages--;
           throw Object.assign(new Error("429 rate limited"), { status: 429 });
@@ -175,7 +177,7 @@ function community() {
       },
     };
   };
-  return { events, channels, relayFor, failNextPosts: (count: number) => (outages = count), posts: (channel: string) => events.filter((e) => e.kind === 9 && e.tags.some((t) => t[0] === "h" && t[1] === channel)) };
+  return { events, channels, relayFor, failNextPosts: (count: number) => (outages = count), failPostsWhere: (when?: (event: NostrEvent) => boolean) => (failing = when), posts: (channel: string) => events.filter((e) => e.kind === 9 && e.tags.some((t) => t[0] === "h" && t[1] === channel)) };
 }
 
 // ── An in-memory Slack ──
@@ -674,7 +676,7 @@ describe("Slack bridges, third review", () => {
     expect(world.posts(brandons).filter((e) => /^\*\*Ryan Zapanta\*\*.*\nok$/s.test(e.content))).toHaveLength(1);
   });
 
-  it("sends the owner's messages while a Slack message can't be posted, and gives that one up after an hour", async () => {
+  it("sends the owner's messages while a Slack message can't be posted, and gives that one up after an hour of tries, with a note", async () => {
     const world = community();
     const slack = slackWorld();
     const clock = { now: Date.UTC(2027, 0, 1) };
@@ -682,14 +684,141 @@ describe("Slack bridges, third review", () => {
     await brandon.bridge.tick();
     const channel = brandon.state.conversations[general.id]!.buzz!;
     slack.say(general.id, "US", "stuck");
-    world.failNextPosts(1000);
+    world.failPostsWhere(() => true);
     await brandon.human.publish({ kind: 9, created_at: 0, content: "still goes", tags: [["h", channel]] });
     await brandon.bridge.tick();
     expect(slack.sends.map((send) => send.text)).toEqual([`still goes\n${FOOTER}`]);
+    // Nothing posts for over an hour, the note included: nothing is given up.
+    for (let pass = 0; pass < 20; pass++) {
+      clock.now += 4 * 60_000;
+      await brandon.bridge.tick();
+    }
     expect(brandon.logs.join("\n")).not.toContain("gave up posting");
-    clock.now += STUCK_MS + 1000;
-    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    // Only that message fails now: it's given up, with a note.
+    world.failPostsWhere((event) => event.content.endsWith("\nstuck"));
+    for (let pass = 0; pass < 3; pass++) {
+      clock.now += 60_000;
+      await brandon.bridge.tick();
+    }
     expect(brandon.logs.join("\n")).toContain("gave up posting");
+    expect(world.posts(channel).some((e) => e.content.startsWith("⚠️ A Slack message couldn't be bridged"))).toBe(true);
+  });
+
+  it("starts a message's hour again after a long gap between tries", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.say(general.id, "US", "blip");
+    world.failPostsWhere((event) => event.content.endsWith("\nblip"));
+    await brandon.bridge.tick();
+    // The Sandbox sleeps two hours, then a few more failures.
+    clock.now += 2 * STUCK_MS;
+    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    expect(brandon.logs.join("\n")).not.toContain("gave up posting");
+    world.failPostsWhere(undefined);
+    await brandon.bridge.tick();
+    expect(world.posts(channel).filter((e) => e.content.endsWith("\nblip"))).toHaveLength(1);
+  });
+
+  it("posts an edit of a message another helper posted as a reply to it, not as a second copy", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const maker = person(world, slack.as("UB"), [general], clock);
+    const one = person(world, slack.as("UR"), [general], clock);
+    const two = person(world, slack.as("UX"), [general], clock);
+    await maker.bridge.tick();
+    await one.bridge.tick();
+    await two.bridge.tick();
+    clock.now += 11 * 60_000;
+    await one.bridge.tick();
+    await two.bridge.tick();
+    const channel = maker.state.conversations[general.id]!.buzz!;
+    const first = one.state.conversations[general.id]!.turn === 0 ? one : two;
+    const second = first === one ? two : one;
+    // The maker is asleep: the first helper posts it, then it's edited in Slack before the second helper's turn.
+    const ts = slack.say(general.id, "US", "helo");
+    await first.bridge.tick();
+    await second.bridge.tick();
+    clock.now += HELPER_DELAY_MS + 1000;
+    await first.bridge.tick();
+    slack.conversations.get(general.id)!.find((m) => m.ts === ts)!.text = "hello";
+    clock.now += HELPER_TURN_MS + 1000;
+    await second.bridge.tick();
+    await maker.bridge.tick();
+    const copies = world.posts(channel).filter((e) => e.tags.some((t) => t[0] === "r" && t[1] === permalink(general.id, ts)));
+    const top = copies.filter((e) => !e.tags.some((t) => t[0] === "e"));
+    expect(top.map((e) => e.pubkey)).toEqual([first.bot.pubkey]);
+    expect(copies.filter((e) => e.content.includes("edited in Slack") && e.content.endsWith("\nhello"))).toHaveLength(1);
+  });
+
+  it("doesn't post a long message that timed out back to Buzz, or send it again", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: 1_795_200_000_000 };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    const long = Array.from({ length: 1200 }, (_, i) => `word${i}`).join(" ");
+    slack.timeOutNextSends("after");
+    const said = await brandon.human.publish({ kind: 9, created_at: 0, content: long, tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    clock.now += UNSURE_MS + 1000;
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends).toHaveLength(1);
+    expect(slack.sends[0]!.text).toContain("cut short");
+    expect(world.posts(channel).filter((e) => e.content.includes("word1199") || e.content.includes("word10 "))).toEqual([said]);
+  });
+
+  it("links a timed-out send that went while the owner's Slack ID can't be read", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const base = slack.as("UB");
+    const noProfile = (tool: string, args: Readonly<Record<string, unknown>>) => (tool === "slack_read_user_profile" ? Promise.reject(new Error("timed out")) : base(tool, args));
+    const brandon = person(world, noProfile, [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.timeOutNextSends("after");
+    const said = await brandon.human.publish({ kind: 9, created_at: 0, content: "went anyway", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    clock.now += UNSURE_MS + 1000;
+    await brandon.bridge.tick();
+    expect(slack.sends).toHaveLength(1);
+    expect(world.posts(channel).filter((e) => e.content.includes("went anyway") || e.content.startsWith("⚠️"))).toEqual([said]);
+  });
+
+  it("keeps sending when a timed-out send can't be checked, and gives that one up after a while", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: 1_795_200_000_000 };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    const parentTs = slack.say(general.id, "US", "a parent");
+    await brandon.bridge.tick();
+    const parent = world.posts(channel).find((e) => e.content.endsWith("\na parent"))!;
+    slack.timeOutNextSends("before");
+    const reply = await brandon.human.publish({ kind: 9, created_at: 0, content: "a reply", tags: [["h", channel], ["e", parent.id, "", "reply"]] });
+    await brandon.bridge.tick();
+    // The parent is deleted in Slack, so its thread can't be read.
+    const list = slack.conversations.get(general.id)!;
+    list.splice(list.findIndex((m) => m.ts === parentTs), 1);
+    clock.now += UNSURE_MS + 1000;
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "later one", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`later one\n${FOOTER}`]);
+    clock.now += UNSURE_LIMIT_MS;
+    await brandon.bridge.tick();
+    expect(world.posts(channel).filter((e) => e.content.startsWith("⚠️ This may not have reached Slack") && e.tags.some((t) => t[0] === "e" && t[1] === parent.id))).toHaveLength(1);
+    expect(brandon.state.conversations[general.id]!.out!.sent[reply.id]).toBeNull();
   });
 });
 
@@ -705,8 +834,14 @@ describe("The community over HTTP", () => {
   it("tells a refusal from no answer, whatever the status", async () => {
     expect((await failure(relayWith(answer(200, { accepted: false, message: "invalid: bad tag" })))).refused).toBe(true);
     expect((await failure(relayWith(answer(400, { accepted: false, message: "invalid: bad tag" })))).refused).toBe(true);
-    expect((await failure(relayWith(answer(403, { accepted: false, message: "restricted: not a member" })))).refused).toBe(true);
     expect((await failure(relayWith(answer(413, { error: "too large" })))).refused).toBe(true);
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "nope" })))).refused).toBe(true);
+    // About the agent, not the event: retried in order, nothing given up.
+    expect((await failure(relayWith(answer(403, { accepted: false, message: "restricted: not a member" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "restricted: not a member" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "blocked: you are banned" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(200, { accepted: false, message: "auth-required: sign in" })))).refused).toBeUndefined();
+    expect((await failure(relayWith(answer(404, { error: "not found" })))).refused).toBeUndefined();
     expect((await failure(relayWith(answer(429, { accepted: false, message: "rate-limited: retry in 5s" })))).refused).toBeUndefined();
     expect((await failure(relayWith(answer(200, { accepted: false, message: "rate-limited: slow down" })))).refused).toBeUndefined();
     expect((await failure(relayWith(answer(401, { error: "unauthorized" })))).refused).toBeUndefined();

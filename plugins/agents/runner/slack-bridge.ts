@@ -62,8 +62,14 @@ const TRIES = 3;
 const MAX_SEND = 4900;
 /** How long a send that timed out waits to show up in Slack before it's sent again. */
 export const UNSURE_MS = 2 * 60_000;
-/** How long a Slack message the community won't answer for is tried before it counts as refused. */
+/** How long a Slack message the community won't answer for is tried, while the bridge runs, before it counts as refused. */
 export const STUCK_MS = 60 * 60_000;
+/** A gap between tries longer than this (the Sandbox asleep) starts that hour again; the poll backs off to 5 minutes at most. */
+const STUCK_GAP_MS = 10 * 60_000;
+/** How long a send that timed out can't be checked in Slack before it's given up with a note. */
+export const UNSURE_LIMIT_MS = 30 * 60_000;
+/** How often the owner's Slack profile is read again while their Slack ID isn't known. */
+const PROFILE_EVERY_MS = 60_000;
 
 export type BridgeRelay = Readonly<{
   publish(template: EventTemplate): Promise<NostrEvent>;
@@ -105,8 +111,8 @@ export type ConversationState = {
   pending: Record<string, number>;
   /** Slack ts → failed tries at posting it. */
   failed?: Record<string, number>;
-  /** Slack ts → when the community first didn't answer a post of it. */
-  stuck?: Record<string, number>;
+  /** Slack ts → when the community first and last didn't answer a post of it. */
+  stuck?: Record<string, { first: number; last: number }>;
   /** Who made the Buzz channel (from metadata the relay's key signs): its posts are trusted when a message is edited in Slack later. */
   creator?: string;
   /** Listed ts that aren't messages (a header typed into a message). */
@@ -206,7 +212,7 @@ export class SlackBridge {
     this.typed.clear();
     if (!this.key && this.input.relayKey) this.key = await this.input.relayKey().catch(() => undefined);
     // The detailed profile has the owner's Slack ID, which tells their own messages from others' with the same text.
-    if (!this.state.me?.user && this.now() - this.profileAt > RESOLVE_EVERY_MS) {
+    if (!this.state.me?.user && this.now() - this.profileAt >= PROFILE_EVERY_MS) {
       this.profileAt = this.now();
       try {
         const me = parseProfile(await this.input.slack("slack_read_user_profile", {}));
@@ -483,7 +489,8 @@ export class SlackBridge {
     return () =>
       (found ??= this.input.relay
         .query([{ kinds: [9], "#h": [channel], since: Math.floor(this.now() / 1000) - 6 * 3600, limit: 300 }])
-        .then((events) => events.map((event) => ({ norm: norm(event.content), id: event.id, pubkey: event.pubkey, kept: event.content.trim().startsWith("//") }))));
+        // As it went to Slack: a long one is cut short there.
+        .then((events) => events.map((event) => ({ norm: norm(bodyOf(event.content.trim())), id: event.id, pubkey: event.pubkey, kept: event.content.trim().startsWith("//") }))));
   }
 
   /**
@@ -491,15 +498,18 @@ export class SlackBridge {
    * can make a key and call it a bridge, so another bridge's post counts only
    * with the message's text; this bridge's own, and those of the bridge that
    * made the channel, count as they are, so an edit in Slack isn't posted twice.
+   * When another bridge's post has other text, the message goes as a reply to
+   * it, marked edited, rather than as a second copy.
    */
-  private async postOf(st: ConversationState, link: string, message: SlackMessage): Promise<NostrEvent | undefined> {
+  private async postOf(st: ConversationState, link: string, message: SlackMessage): Promise<{ there?: NostrEvent; other?: NostrEvent }> {
     const bridges = await this.bridges();
-    const found = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], "#r": [link], limit: 20 }]);
+    const found = (await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], "#r": [link], limit: 20 }]))
+      .filter((event) => bridges.has(event.pubkey) && event.content.startsWith(`**${message.name}** · `))
+      .sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1));
     const text = norm(mrkdwn(unfooter(message.text)) || "_(no text)_");
     const trusted = (pubkey: string) => pubkey === this.input.pubkey || pubkey === st.creator;
-    return found
-      .filter((event) => bridges.has(event.pubkey) && event.content.startsWith(`**${message.name}** · `) && (trusted(event.pubkey) || norm(bridgedText(event.content)) === text))
-      .sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1))[0];
+    // `other`: a post with the link but other text (edited in Slack since, or a forged copy).
+    return { there: found.find((event) => trusted(event.pubkey) || norm(bridgedText(event.content)) === text), other: found[0] };
   }
 
   /**
@@ -514,8 +524,8 @@ export class SlackBridge {
       const sent = st.out?.sent ?? {};
       const linked = new Set(Object.values(st.posted));
       const me = this.state.me?.user;
-      // The owner's own: one this bridge sent as this, or is still sending, when the Slack message is the owner's.
-      const own = (found: Twin) => found.pubkey === this.input.owner && (sent[found.id] === message.ts || (sent[found.id] === "" && Boolean(me) && message.user === me));
+      // The owner's own: one this bridge sent as this, or is still sending, when the Slack message is the owner's (any, while their Slack ID isn't known).
+      const own = (found: Twin) => found.pubkey === this.input.owner && (sent[found.id] === message.ts || (sent[found.id] === "" && (!me || message.user === me)));
       // Someone else's: only in a public channel, and only a person with a bridge of their own, not the owner (who sends through this one).
       const owners = isPrivateKind(conversation.kind) ? new Set<string>() : new Set((await this.bridges()).values());
       const theirs = (found: Twin) => found.pubkey !== this.input.owner && owners.has(found.pubkey) && message.user !== me;
@@ -526,24 +536,34 @@ export class SlackBridge {
         if (sent[twin.id] === "") sent[twin.id] = message.ts;
         return twin.id;
       }
+      // The owner's own while a send that timed out is being checked: that check decides what it is.
+      if (me && message.user === me && Object.keys(st.out?.unsure ?? {}).some((id) => sent[id] === "")) return undefined;
     }
     if (this.waiting(st, message)) return undefined;
     const link = permalink(conversation.id, message.ts);
-    const there = await this.postOf(st, link, message);
+    const { there, other } = await this.postOf(st, link, message);
     if (there) return there.id;
     const tags = [["h", st.buzz!], ["r", link]];
-    if (root) tags.push(["e", root, "", "reply"]);
+    const under = root ?? other?.id;
+    if (under) tags.push(["e", under, "", "reply"]);
+    let content = bridgedContent({ ...message, text: unfooter(message.text) }, link, Math.floor(this.now() / 1000));
+    if (other) content = content.replace("\n", " · ✏️ edited in Slack\n");
     try {
-      const event = await this.publish(9, bridgedContent({ ...message, text: unfooter(message.text) }, link, Math.floor(this.now() / 1000)), tags);
+      const event = await this.publish(9, content, tags);
       this.moved++;
       this.input.log(`${conversation.id}: posted ${message.ts}${root ? " (reply)" : ""}${st.primary ? "" : " as a helper"}`);
       delete st.failed?.[message.ts];
       delete st.stuck?.[message.ts];
       return event.id;
     } catch (error) {
-      // The relay didn't answer (a rate limit, a timeout): stop here, in order, and try again next pass; for an hour, then it counts as refused.
+      // Not a member any more: look for the channel again next pass.
+      if (/\brestricted:/.test(String((error as Error).message ?? error))) st.resolvedAt = 0;
+      // The relay didn't answer (a rate limit, a timeout): stop here, in order, and try again next pass; for an hour of tries, then it counts as refused.
       const stuck = (st.stuck ??= {});
-      if (!refused(error) && this.now() - (stuck[message.ts] ??= this.now()) < STUCK_MS) throw error;
+      const now = this.now();
+      const was = stuck[message.ts];
+      const entry = (stuck[message.ts] = was && now - was.last < STUCK_GAP_MS ? { first: was.first, last: now } : { first: now, last: now });
+      if (!refused(error) && now - entry.first < STUCK_MS) throw error;
       // One message the relay won't take doesn't hold up the rest for long.
       const failed = (st.failed ??= {});
       failed[message.ts] = (failed[message.ts] ?? 0) + 1;
@@ -552,10 +572,19 @@ export class SlackBridge {
         this.input.log(`${conversation.id}: couldn't post ${message.ts} (try ${failed[message.ts]}): ${why}`);
         return undefined;
       }
+      // Given up only once the note says so; while the note can't be posted either, it's tried again.
+      const noted = await this.publish(9, `⚠️ A Slack message couldn't be bridged: ${link}`, [["h", st.buzz!], ...(root ? [["e", root, "", "reply"]] : [])]).then(
+        () => true,
+        () => false,
+      );
+      if (!noted) {
+        failed[message.ts] = TRIES - 1;
+        this.input.log(`${conversation.id}: couldn't post ${message.ts}, nor a note about it: ${why}`);
+        return undefined;
+      }
       delete failed[message.ts];
       delete stuck[message.ts];
       this.input.log(`${conversation.id}: gave up posting ${message.ts}: ${why}`);
-      await this.publish(9, `⚠️ A Slack message couldn't be bridged: ${link}`, [["h", st.buzz!], ...(root ? [["e", root, "", "reply"]] : [])]).catch(() => {});
       return "";
     }
   }
@@ -574,14 +603,16 @@ export class SlackBridge {
   }
 
   /**
-   * After a send that timed out: the ts of its copy in Slack; "" when Slack has
-   * no message from the owner sent from Buzz since then; undefined when it
-   * can't tell (one is there, but its text doesn't match).
+   * After a send that timed out: the ts of its copy in Slack; "absent" when
+   * Slack has no message from the owner sent from Buzz since then; "unclear"
+   * when one is there but its text doesn't match; "retry" when it can't check
+   * yet (the owner's Slack ID isn't known).
    */
-  private async sentAs(conversation: SlackConversation, st: ConversationState, id: string, unsure: Unsure): Promise<string | undefined> {
+  private async sentAs(conversation: SlackConversation, st: ConversationState, id: string, unsure: Unsure): Promise<{ ts: string } | "absent" | "unclear" | "retry"> {
     const me = this.state.me?.user;
+    if (!me) return "retry";
     const [event] = await this.input.relay.query([{ ids: [id], limit: 1 }]);
-    if (!me || !event) return undefined;
+    if (!event) return "retry";
     // The send started before it timed out: from a few minutes before.
     const oldest = `${Math.floor(unsure.at / 1000) - 300}.000000`;
     const listing = unsure.parent
@@ -589,15 +620,15 @@ export class SlackBridge {
       : await this.read(conversation, { oldest, limit: CATCH_UP });
     const known = new Set<string>([...Object.values(st.out?.sent ?? {}).filter((ts): ts is string => Boolean(ts)), ...Object.keys(st.posted), ...(unsure.parent ? (st.threads[unsure.parent]?.seen ?? []) : [])]);
     const mine = parseMessages(listing).filter((message) => message.ts !== unsure.parent && message.user === me && hasFooter(message.text) && !known.has(message.ts));
-    if (!mine.length) return "";
+    if (!mine.length) return "absent";
     const body = norm(bodyOf(event.content.trim()));
     for (const listed of mine) {
       if (norm(mrkdwn(listed.text)) !== body) continue;
       // A header typed into a message isn't one.
       const message = await this.verify(conversation, listed.ts, unsure.parent);
-      if (message?.user === me && norm(mrkdwn(message.text)) === body) return message.ts;
+      if (message?.user === me && norm(mrkdwn(message.text)) === body) return { ts: message.ts };
     }
-    return undefined;
+    return "unclear";
   }
 
   private async outbound(conversation: SlackConversation, st: ConversationState) {
@@ -607,16 +638,24 @@ export class SlackBridge {
     for (const [id, unsure] of Object.entries(out.unsure ?? {})) {
       if (out.sent[id] === "" && this.now() - unsure.at < UNSURE_MS) continue;
       if (out.sent[id] === "") {
-        const found = await this.sentAs(conversation, st, id, unsure);
-        if (found === undefined) {
+        // One that can't be checked doesn't hold up the others; after a while it's given up.
+        let found = await this.sentAs(conversation, st, id, unsure).catch((error: unknown) => {
+          this.input.log(`${conversation.id}: couldn't check whether ${id.slice(0, 8)} reached Slack: ${String((error as Error).message ?? error).slice(0, 200)}`);
+          return "retry" as const;
+        });
+        if (found === "retry") {
+          if (this.now() - unsure.at < UNSURE_LIMIT_MS) continue;
+          found = "unclear";
+        }
+        if (found === "unclear") {
           out.sent[id] = null;
           this.input.log(`${conversation.id}: can't tell whether ${id.slice(0, 8)} reached Slack; not sending it again`);
           await this.publish(9, `⚠️ This may not have reached Slack. Check there, and post it again if it's missing.`, [["h", st.buzz!], ["e", unsure.root ?? id, "", "reply"]]).catch(() => {});
-        } else if (found) {
-          out.sent[id] = found;
-          if (unsure.parent) (st.threads[unsure.parent] ??= { seen: [] }).seen.push(found);
-          else st.posted[found] = id;
-          this.input.log(`${conversation.id}: ${id.slice(0, 8)} did reach Slack, as ${found}`);
+        } else if (found !== "absent") {
+          out.sent[id] = found.ts;
+          if (unsure.parent) (st.threads[unsure.parent] ??= { seen: [] }).seen.push(found.ts);
+          else st.posted[found.ts] = id;
+          this.input.log(`${conversation.id}: ${id.slice(0, 8)} did reach Slack, as ${found.ts}`);
         } else {
           delete out.sent[id];
           out.since = Math.min(out.since, unsure.created);
