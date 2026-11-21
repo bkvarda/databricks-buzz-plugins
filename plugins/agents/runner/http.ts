@@ -58,7 +58,7 @@ export class HttpRelay {
     tags.push([...this.authTag]);
     const event = this.sign({ ...template, tags });
     const reply = (await this.post("/events", JSON.stringify(event))) as { accepted?: boolean; message?: string };
-    if (!reply.accepted && !reply.message?.startsWith("duplicate")) throw new Error(reply.message || "The community refused the event.");
+    if (!reply.accepted && !reply.message?.startsWith("duplicate")) throw Object.assign(new Error(reply.message || "The community refused the event."), { refused: true });
     return event;
   }
 

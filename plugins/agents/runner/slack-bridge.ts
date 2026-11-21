@@ -26,10 +26,12 @@ import type { EventTemplate, NostrEvent } from "nostr-tools/pure";
 import {
   BRIDGE_TAG,
   bridgedContent,
+  bridgedText,
   buzzChannelName,
   FOOTER,
   around,
   hasFooter,
+  headers,
   isPrivateKind,
   isTs,
   mrkdwn,
@@ -58,13 +60,25 @@ const CATCH_UP = 100;
 const KEEP = 500;
 const TRIES = 3;
 const MAX_SEND = 4900;
+/** How long a send that timed out waits to show up in Slack before it's sent again. */
+export const UNSURE_MS = 2 * 60_000;
 
 export type BridgeRelay = Readonly<{
   publish(template: EventTemplate): Promise<NostrEvent>;
   query(filters: readonly Readonly<Record<string, unknown>>[]): Promise<NostrEvent[]>;
 }>;
-/** Calls one of Slack's MCP tools as the owner; resolves with its text, rejects on a tool error. */
+/**
+ * Calls one of Slack's MCP tools as the owner; resolves with its text. Rejects
+ * with a SlackToolError when the tool answered with an error, so nothing
+ * happened, and with anything else (a timeout, a network failure) when it may
+ * have.
+ */
 export type SlackCall = (tool: string, args: Readonly<Record<string, unknown>>) => Promise<string>;
+export class SlackToolError extends Error {}
+/** The relay answered and refused the event (rather than failing to answer). */
+const refused = (error: unknown) => (error as { refused?: unknown } | undefined)?.refused === true;
+/** A Buzz message a Slack message may be the copy of; `kept` when "//" keeps it in Buzz. */
+type Twin = Readonly<{ norm: string; id: string; pubkey: string; kept: boolean }>;
 
 export type ConversationState = {
   buzz?: string;
@@ -90,7 +104,13 @@ export type ConversationState = {
   /** Listed ts that aren't messages (a header typed into a message). */
   fake?: string[];
   /** Buzz event → the Slack ts it was sent as; "" while it's being sent (never sent twice), null when it won't be. */
-  out?: { since: number; sent: Record<string, string | null>; tries?: Record<string, number> };
+  out?: {
+    since: number;
+    sent: Record<string, string | null>;
+    tries?: Record<string, number>;
+    /** Sends that timed out: when, and the Buzz message's time. Linked when they show up in Slack, otherwise sent again. */
+    unsure?: Record<string, { at: number; created: number }>;
+  };
   error?: string;
 };
 export type BridgeState = { conversations: Record<string, ConversationState>; me?: { handle: string; name: string } };
@@ -130,6 +150,9 @@ const byAge = (a: Channel, b: Channel) => (a.createdAt ?? Infinity) - (b.created
 export class SlackBridge {
   private lastCreated = 0;
   private bridgeKeys: Promise<Set<string>> | undefined;
+  private key: string | undefined;
+  /** Per pass: a thread's first message → how many headers are typed into its text. */
+  private typed = new Map<string, number>();
   /** Messages posted to Buzz or sent to Slack so far, for the runner's "last activity". */
   moved = 0;
 
@@ -142,6 +165,8 @@ export class SlackBridge {
       owner: string;
       /** The relay's own key, which signs channel metadata; when known, metadata signed by anyone else is ignored. */
       relayPubkey?: string;
+      /** Reads the relay's key, each pass until it's known; until then, private conversations get no channel. */
+      relayKey?: () => Promise<string | undefined>;
       conversations: readonly SlackConversation[];
       state: BridgeState;
       save(): void;
@@ -150,7 +175,9 @@ export class SlackBridge {
       helperDelayMs?: number;
       newId?: () => string;
     }>,
-  ) {}
+  ) {
+    this.key = input.relayPubkey;
+  }
 
   private get state() {
     return this.input.state;
@@ -165,6 +192,8 @@ export class SlackBridge {
   /** One pass over every conversation. */
   async tick(): Promise<void> {
     this.bridgeKeys = undefined;
+    this.typed.clear();
+    if (!this.key && this.input.relayKey) this.key = await this.input.relayKey().catch(() => undefined);
     if (!this.state.me) {
       try {
         const me = parseProfile(await this.input.slack("slack_read_user_profile", { response_format: "concise" }));
@@ -229,7 +258,7 @@ export class SlackBridge {
   }
 
   private byRelay() {
-    return this.input.relayPubkey ? { authors: [this.input.relayPubkey] } : {};
+    return this.key ? { authors: [this.key] } : {};
   }
 
   /** The Slack bridges in the community (their owners' attestations checked), this one included; read once a pass. */
@@ -246,6 +275,8 @@ export class SlackBridge {
     if (st.buzz && this.now() - (st.resolvedAt ?? 0) < RESOLVE_EVERY_MS) return;
     const label = slackLabel(conversation.id);
     const secret = isPrivateKind(conversation.kind);
+    // Whose channel it is comes from metadata only the relay's key can vouch for.
+    if (secret && !this.key && this.input.relayKey) throw new Error("couldn't read the community's key yet, to check this private conversation's channel");
     const found = (await this.input.relay.query([{ kinds: [39000], "#t": [label], ...this.byRelay(), limit: 50 }]))
       .map(channelOf)
       .filter((channel): channel is Channel => Boolean(channel && channel.labels.includes(label) && channel.private === secret))
@@ -312,10 +343,24 @@ export class SlackBridge {
 
   /** The message at ts, read on its own: undefined when Slack has none (a header typed into another message). */
   private async verify(conversation: SlackConversation, ts: string, parent?: string): Promise<SlackMessage | undefined> {
-    const text = parent
-      ? await this.input.slack("slack_read_thread", { channel_id: conversation.id, message_ts: parent, ...around(ts), limit: 2 })
-      : await this.read(conversation, { ...around(ts), limit: 1 });
-    return parseOne(text, ts);
+    if (!parent) return parseOne(await this.read(conversation, { ...around(ts), limit: 1 }), ts);
+    // A thread's answer starts with its first message, whose text can hold headers too: the reply's is the first after those.
+    let skip = this.typed.get(parent);
+    if (skip === undefined) {
+      const alone = await this.read(conversation, { ...around(parent), limit: 1 });
+      if (!parseOne(alone, parent)) return undefined;
+      skip = headers(alone) - 1;
+      this.typed.set(parent, skip);
+    }
+    return parseOne(await this.input.slack("slack_read_thread", { channel_id: conversation.id, message_ts: parent, ...around(ts), limit: 2 }), ts, skip + 1);
+  }
+
+  /** A helper waits its turn before checking a message it hasn't posted; true while it's waiting. */
+  private waiting(st: ConversationState, message: SlackMessage) {
+    // Its owner's own messages, back from Slack, are linked at once.
+    if (st.primary || hasFooter(message.text)) return false;
+    const first = (st.pending[message.ts] ??= this.now());
+    return this.now() - first < (this.input.helperDelayMs ?? HELPER_DELAY_MS) + (st.turn ?? 0) * HELPER_TURN_MS;
   }
 
   /** Listed ts worth checking: well formed, not from the future, and not already found to be fake. */
@@ -345,7 +390,7 @@ export class SlackBridge {
     const twins = this.twins(st.buzz!);
     const real = new Set<string>();
     for (const listed of fresh) {
-      if (Number(listed.ts) <= Number(st.last) || listed.ts in st.posted) {
+      if (Number(listed.ts) <= Number(st.last) || listed.ts in st.posted || this.waiting(st, listed)) {
         real.add(listed.ts);
         continue;
       }
@@ -380,7 +425,7 @@ export class SlackBridge {
     for (const [ts, at] of Object.entries(st.pending)) if (this.now() - at > 86_400_000) delete st.pending[ts];
   }
 
-  private async thread(conversation: SlackConversation, st: ConversationState, parent: SlackMessage, twins: () => Promise<readonly { norm: string; id: string }[]>) {
+  private async thread(conversation: SlackConversation, st: ConversationState, parent: SlackMessage, twins: () => Promise<readonly Twin[]>) {
     const seen = (st.threads[parent.ts] ??= { seen: [] });
     const root = st.posted[parent.ts];
     const replies = parseMessages(await this.input.slack("slack_read_thread", { channel_id: conversation.id, message_ts: parent.ts, limit: 200 }));
@@ -389,7 +434,8 @@ export class SlackBridge {
       if (listed.ts === parent.ts || seen.seen.includes(listed.ts) || !this.plausible(st, listed.ts)) continue;
       // Replies to a message from Buzz whose original wasn't found have nowhere to go.
       let id: string | undefined = "";
-      if (root) {
+      if (root && this.waiting(st, listed)) id = undefined;
+      else if (root) {
         const reply = await this.verify(conversation, listed.ts, parent.ts);
         if (!reply) {
           this.markFake(conversation, st, listed.ts);
@@ -411,18 +457,21 @@ export class SlackBridge {
 
   /** Recent Buzz messages in the channel, for finding where a message from Buzz came from; read once a pass. */
   private twins(channel: string) {
-    let found: Promise<{ norm: string; id: string }[]> | undefined;
+    let found: Promise<Twin[]> | undefined;
     return () =>
       (found ??= this.input.relay
         .query([{ kinds: [9], "#h": [channel], since: Math.floor(this.now() / 1000) - 6 * 3600, limit: 300 }])
-        .then((events) => events.map((event) => ({ norm: norm(event.content), id: event.id }))));
+        .then((events) => events.map((event) => ({ norm: norm(event.content), id: event.id, pubkey: event.pubkey, kept: event.content.trim().startsWith("//") }))));
   }
 
-  /** A bridge's post of a Slack message in this channel, by its link. */
-  private async postOf(st: ConversationState, link: string): Promise<NostrEvent | undefined> {
+  /** A bridge's post of this Slack message in this channel: by its link, and with its text (anyone can make a key and call it a bridge). */
+  private async postOf(st: ConversationState, link: string, message: SlackMessage): Promise<NostrEvent | undefined> {
     const bridges = await this.bridges();
     const found = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], "#r": [link], limit: 20 }]);
-    return found.filter((event) => bridges.has(event.pubkey)).sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1))[0];
+    const text = norm(mrkdwn(unfooter(message.text)) || "_(no text)_");
+    return found
+      .filter((event) => bridges.has(event.pubkey) && event.content.startsWith(`**${message.name}** · `) && norm(bridgedText(event.content)) === text)
+      .sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1))[0];
   }
 
   /**
@@ -430,19 +479,31 @@ export class SlackBridge {
    * Buzz event, "" when it won't be posted, or undefined while a helper waits
    * its turn, or after a failure it will try again.
    */
-  private async mirror(conversation: SlackConversation, st: ConversationState, message: SlackMessage, twins: () => Promise<readonly { norm: string; id: string }[]>, root?: string): Promise<string | undefined> {
+  private async mirror(conversation: SlackConversation, st: ConversationState, message: SlackMessage, twins: () => Promise<readonly Twin[]>, root?: string): Promise<string | undefined> {
     // Sent from Buzz: linked to the original when it's in this channel; otherwise (someone else's Buzz) posted like any message.
     if (hasFooter(message.text)) {
       const text = norm(mrkdwn(message.text));
-      const twin = text ? (await twins()).find((found) => found.norm === text) : undefined;
-      if (twin) return twin.id;
+      const sent = st.out?.sent ?? {};
+      const linked = new Set(Object.values(st.posted));
+      // Not one already linked or kept in Buzz; the owner's own only when this bridge is sending it, or sent it as this.
+      const twin = text
+        ? (await twins()).find(
+            (found) =>
+              found.norm === text &&
+              !found.kept &&
+              !linked.has(found.id) &&
+              (found.pubkey !== this.input.owner || sent[found.id] === "" || sent[found.id] === message.ts),
+          )
+        : undefined;
+      if (twin) {
+        // A send that timed out did go.
+        if (sent[twin.id] === "") sent[twin.id] = message.ts;
+        return twin.id;
+      }
     }
-    if (!st.primary) {
-      const first = (st.pending[message.ts] ??= this.now());
-      if (this.now() - first < (this.input.helperDelayMs ?? HELPER_DELAY_MS) + (st.turn ?? 0) * HELPER_TURN_MS) return undefined;
-    }
+    if (this.waiting(st, message)) return undefined;
     const link = permalink(conversation.id, message.ts);
-    const there = await this.postOf(st, link);
+    const there = await this.postOf(st, link, message);
     if (there) return there.id;
     const tags = [["h", st.buzz!], ["r", link]];
     if (root) tags.push(["e", root, "", "reply"]);
@@ -453,6 +514,8 @@ export class SlackBridge {
       delete st.failed?.[message.ts];
       return event.id;
     } catch (error) {
+      // The relay didn't answer (a rate limit, a timeout): stop here, in order, and try again next pass.
+      if (!refused(error)) throw error;
       // One message the relay won't take doesn't hold up the rest for long.
       const failed = (st.failed ??= {});
       failed[message.ts] = (failed[message.ts] ?? 0) + 1;
@@ -463,6 +526,7 @@ export class SlackBridge {
       }
       delete failed[message.ts];
       this.input.log(`${conversation.id}: gave up posting ${message.ts}: ${why}`);
+      await this.publish(9, `⚠️ A Slack message couldn't be bridged: ${link}`, [["h", st.buzz!], ...(root ? [["e", root, "", "reply"]] : [])]).catch(() => {});
       return "";
     }
   }
@@ -483,15 +547,23 @@ export class SlackBridge {
   private async outbound(conversation: SlackConversation, st: ConversationState) {
     const out = (st.out ??= { since: Math.floor(this.now() / 1000), sent: {} });
     const tries = (out.tries ??= {});
+    // A send that timed out and hasn't shown up in Slack goes again.
+    for (const [id, { at, created }] of Object.entries(out.unsure ?? {})) {
+      if (out.sent[id] === "" && this.now() - at < UNSURE_MS) continue;
+      delete out.unsure![id];
+      if (out.sent[id] !== "") continue;
+      delete out.sent[id];
+      out.since = Math.min(out.since, created);
+      this.input.log(`${conversation.id}: ${id.slice(0, 8)} didn't show up in Slack; sending it again`);
+    }
     const events = await this.input.relay.query([{ kinds: [9], "#h": [st.buzz!], authors: [this.input.owner], since: out.since - 30, limit: 100 }]);
     let roles: Map<string, string> | undefined;
-    let retry = false;
     for (const event of events.sort((a, b) => a.created_at - b.created_at)) {
       if (event.id in out.sent || event.pubkey !== this.input.owner) continue;
       // Who's an agent now: read once a pass, and only when there's something to send.
       const known = (roles ??= await this.members(st.buzz!));
-      // Past a message that will be tried again, `since` stays put so it's read again.
-      if (!retry) out.since = Math.max(out.since, event.created_at);
+      // A message that will be tried again ends the pass, and `since` (less 30 s) still reads it.
+      out.since = Math.max(out.since, event.created_at);
       const text = event.content.trim();
       // "//" keeps a message in Buzz, and so does talking to an agent.
       const agents = event.tags.some((tag) => tag[0] === "p" && known.get(tag[1] ?? "") === "bot");
@@ -518,11 +590,19 @@ export class SlackBridge {
       } catch (error) {
         const why = String((error as Error).message ?? error).slice(0, 200);
         tries[event.id] = (tries[event.id] ?? 0) + 1;
+        if (tries[event.id]! < TRIES && !(error instanceof SlackToolError)) {
+          // No answer (a timeout): it may have gone. The mark stays, the copy that comes back from Slack is linked to it, and otherwise it goes again.
+          (out.unsure ??= {})[event.id] = { at: this.now(), created: event.created_at };
+          this.input.log(`${conversation.id}: no answer sending ${event.id.slice(0, 8)} (try ${tries[event.id]}): ${why}`);
+          this.input.save();
+          break;
+        }
         if (tries[event.id]! < TRIES) {
-          // Slack said no, so nothing went out: try again next pass.
+          // Slack said no, so nothing went out: try again next pass, and send nothing after it before then.
           delete out.sent[event.id];
-          retry = true;
           this.input.log(`${conversation.id}: couldn't send ${event.id.slice(0, 8)} (try ${tries[event.id]}): ${why}`);
+          this.input.save();
+          break;
         } else {
           out.sent[event.id] = null;
           delete tries[event.id];

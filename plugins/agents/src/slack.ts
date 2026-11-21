@@ -156,15 +156,20 @@ export function parseMessages(text: string): SlackMessage[] {
 
 /**
  * The one message with this ts, from a read of just the moments around it
- * (`around`): its header is the first with that ts, and the rest of the answer
- * is its text, headers it may contain included. Undefined when Slack has no such
- * message, as for a header someone typed into a message.
+ * (`around`). Its header must be the answer's first, or, in a thread's answer,
+ * the first after the thread's first message and the `skip` headers typed
+ * into that message's text; the rest of the answer is its text, headers it may
+ * contain included. Undefined when Slack has no such message, as for a header
+ * someone typed into a message.
  */
-export function parseOne(text: string, ts: string): SlackMessage | undefined {
+export function parseOne(text: string, ts: string, skip = 0): SlackMessage | undefined {
   const md = String(unwrap(text).messages ?? "");
-  const head = [...md.matchAll(HEAD)].find((found) => (found.groups?.t1 ?? found.groups?.t2) === ts);
-  return head ? messageOf(head.groups ?? {}, md.slice(head.index! + head[0].length)) : undefined;
+  const head = [...md.matchAll(HEAD)][skip];
+  return head && (head.groups?.t1 ?? head.groups?.t2) === ts ? messageOf(head.groups ?? {}, md.slice(head.index! + head[0].length)) : undefined;
 }
+
+/** How many headers an answer holds: for a read of one message alone, one more than the headers typed into its text. */
+export const headers = (text: string) => [...String(unwrap(text).messages ?? "").matchAll(HEAD)].length;
 
 /** `oldest` and `latest` for a read of just the message at ts (Slack's bounds leave themselves out). */
 export function around(ts: string): { oldest: string; latest: string } {

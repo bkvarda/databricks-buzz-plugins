@@ -37,7 +37,7 @@ import { HttpRelay } from "./http";
 import { ensureDirs, paths, readConfig, readJsonFile, readSecretKey, readState, type RunnerConfig, sandboxStartedAt, saveSecretKey, turnPidPath, writeJson, writeState } from "./store";
 import { gatewayMcpPath, McpClient, resultText } from "@dbx/core/api/mcp";
 import { BRIDGE_TAG, SLACK_TOOLS } from "../src/slack";
-import { type BridgeState, SlackBridge } from "./slack-bridge";
+import { type BridgeState, SlackBridge, SlackToolError } from "./slack-bridge";
 
 const TURN_TIMEOUT_MS = 30 * 60_000;
 const PROFILE_ABOUT = "A Databricks agent in its own Databricks Sandbox.";
@@ -50,8 +50,9 @@ const slackPollMs = (conversations: number, failures: number) => Math.min(5 * 60
 async function relayKey(url: string): Promise<string | undefined> {
   try {
     const response = await fetch(url.replace(/^ws/, "http"), { headers: { accept: "application/nostr+json", "user-agent": "buzz-slack-bridge/1" }, signal: AbortSignal.timeout(10_000) });
-    const info = (await response.json()) as { self?: unknown; pubkey?: unknown };
-    const key = typeof info.self === "string" ? info.self : typeof info.pubkey === "string" ? info.pubkey : undefined;
+    // Not `pubkey`: that's the admin's contact key.
+    const info = (await response.json()) as { self?: unknown };
+    const key = typeof info.self === "string" ? info.self : undefined;
     return key && /^[0-9a-f]{64}$/.test(key) ? key : undefined;
   } catch {
     return undefined;
@@ -249,17 +250,22 @@ async function serveSlack(config: RunnerConfig, secret: Uint8Array) {
   const slack = async (tool: string, args: Readonly<Record<string, unknown>>) => {
     const result = await slackTools.callTool(tool, args, { timeoutMs: 120_000 });
     const text = resultText(result);
-    if (result.isError) throw new Error(text.slice(0, 300) || `${tool} failed`);
+    if (result.isError) throw new SlackToolError(text.slice(0, 300) || `${tool} failed`);
     return text;
   };
-  const relayPubkey = await relayKey(config.relay);
-  if (!relayPubkey) log("couldn't read the relay's key: channel metadata isn't checked against it");
+  let keyMissing = false;
   const bridge = new SlackBridge({
     relay,
     slack,
     pubkey,
     owner: config.owner,
-    ...(relayPubkey && { relayPubkey }),
+    // Read again each pass until it's known; private conversations wait for it.
+    relayKey: async () => {
+      const key = await relayKey(config.relay);
+      if (!key && !keyMissing) log("couldn't read the relay's key: private conversations wait for it");
+      keyMissing = !key;
+      return key;
+    },
     conversations: config.slack?.conversations ?? [],
     state: bridgeState,
     save: () => writeJson(paths.slack, bridgeState),

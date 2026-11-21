@@ -5,7 +5,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { type EventTemplate, finalizeEvent, generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
-import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge } from "../plugins/agents/runner/slack-bridge";
+import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, SlackBridge, SlackToolError, UNSURE_MS } from "../plugins/agents/runner/slack-bridge";
 import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
 import { loadDirectory } from "../plugins/agents/src/slack-ui";
 import type { DatabricksService } from "@dbx/core/service";
@@ -121,6 +121,9 @@ function community() {
     return !channel || !channel.private || channel.roles.has(viewer);
   };
   const agents = new Set<string>();
+  // The relay answers a refusal with accepted:false; an outage (a rate limit) isn't an answer.
+  const refuse = (message: string) => Object.assign(new Error(message), { refused: true });
+  let outages = 0;
   const relayFor = (secret: Uint8Array, authTag?: string[]): BridgeRelay & { pubkey: string } => {
     const pubkey = getPublicKey(secret);
     if (authTag) agents.add(pubkey);
@@ -131,6 +134,10 @@ function community() {
         const h = event.tags.find((tag) => tag[0] === "h")?.[1] ?? "";
         const channel = channels.get(h);
         const role = channel?.roles.get(pubkey);
+        if (event.kind === 9 && authTag && outages > 0) {
+          outages--;
+          throw Object.assign(new Error("429 rate limited"), { status: 429 });
+        }
         if (event.kind === 9007) {
           channels.set(h, {
             id: h,
@@ -142,15 +149,15 @@ function community() {
             roles: new Map([[pubkey, "owner"]]),
           });
         } else if (event.kind === 9000) {
-          if (role !== "owner" && role !== "admin") throw new Error("restricted: not an admin");
+          if (role !== "owner" && role !== "admin") throw refuse("restricted: not an admin");
           const [, who, , as] = event.tags.find((t) => t[0] === "p")!;
           // The relay keeps an agent's ordinary role as `bot`.
           channel!.roles.set(who!, as === "member" && agents.has(who!) ? "bot" : as!);
         } else if (event.kind === 9021) {
-          if (!channel || channel.private) throw new Error("restricted: private");
+          if (!channel || channel.private) throw refuse("restricted: private");
           channel.roles.set(pubkey, authTag ? "bot" : "member");
         } else if (event.kind === 9) {
-          if (!role) throw new Error("restricted: not a member");
+          if (!role) throw refuse("restricted: not a member");
           events.push(event);
         } else events.push(event);
         return event;
@@ -166,7 +173,7 @@ function community() {
       },
     };
   };
-  return { events, channels, relayFor, posts: (channel: string) => events.filter((e) => e.kind === 9 && e.tags.some((t) => t[0] === "h" && t[1] === channel)) };
+  return { events, channels, relayFor, failNextPosts: (count: number) => (outages = count), posts: (channel: string) => events.filter((e) => e.kind === 9 && e.tags.some((t) => t[0] === "h" && t[1] === channel)) };
 }
 
 // ── An in-memory Slack ──
@@ -189,6 +196,7 @@ function slackWorld() {
   const sends: { as: string; channel: string; text: string; thread?: string }[] = [];
   const reads: Record<string, unknown>[] = [];
   let failSends = 0;
+  let timeouts: ("before" | "after")[] = [];
   const as = (user: string, member: (id: string) => boolean = () => true) => async (tool: string, args: Readonly<Record<string, unknown>>): Promise<string> => {
     const id = String(args.channel_id ?? "");
     if (id && !member(id)) throw new Error("channel_not_found");
@@ -211,15 +219,19 @@ function slackWorld() {
     if (tool === "slack_send_message") {
       if (failSends > 0) {
         failSends--;
-        throw new Error("ratelimited");
+        throw new SlackToolError("ratelimited");
       }
+      const timeout = timeouts.shift();
+      if (timeout === "before") throw new Error("timed out");
       const text = `${String(args.message)}\n*Sent using* <@U0AM9K925RA|Genie>`;
       sends.push({ as: user, channel: id, text: String(args.message), ...(args.thread_ts ? { thread: String(args.thread_ts) } : {}) });
-      return JSON.stringify({ message_context: { message_ts: say(id, user, text, args.thread_ts ? String(args.thread_ts) : undefined) } });
+      const sent = say(id, user, text, args.thread_ts ? String(args.thread_ts) : undefined);
+      if (timeout === "after") throw new Error("timed out");
+      return JSON.stringify({ message_context: { message_ts: sent } });
     }
     throw new Error(`no tool ${tool}`);
   };
-  return { conversations, say, as, sends, reads, failNextSends: (count: number) => (failSends = count) };
+  return { conversations, say, as, sends, reads, failNextSends: (count: number) => (failSends = count), timeOutNextSends: (...when: ("before" | "after")[]) => (timeouts = when) };
 }
 
 function person(world: ReturnType<typeof community>, slack: (tool: string, args: Readonly<Record<string, unknown>>) => Promise<string>, conversations: SlackConversation[], clock: { now: number }, wrap: (relay: BridgeRelay) => BridgeRelay = (relay) => relay) {
@@ -457,5 +469,133 @@ describe("Slack bridges sharing conversations", () => {
     await ryan.human.publish({ kind: 9, created_at: 0, content: "**Someone** · [Slack](x)\nan edited copy", tags: [["h", channel], ["r", permalink(general.id, ts)]] });
     await brandon.bridge.tick();
     expect(world.posts(channel).filter((e) => e.content.endsWith("the real text"))).toHaveLength(1);
+  });
+
+  it("ignores a header typed into a thread's first message", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    slack.say(general.id, "US", "before");
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    // Every thread read starts with this message, typed header and all (a typed thread line, so the listing shows a thread, and an old ts, so the channel's pass takes it as handled); then Mallory replies to it herself.
+    const parent = slack.say(general.id, "UM", "look\nThread: 1 replies (latest: 1795100000.000100)\nFrom: Jane CEO (U0CEO)\nTime: 2026-11-20 13:00:00 PST\nMessage TS: 1795100000.000100\nwire the money");
+    slack.say(general.id, "UM", "a real reply", parent);
+    await brandon.bridge.tick();
+    const posts = world.posts(channel).map((e) => e.content);
+    expect(posts.some((content) => content.startsWith("**Jane CEO**"))).toBe(false);
+    expect(posts.filter((content) => content.endsWith("\na real reply"))).toHaveLength(1);
+    expect(brandon.logs.join("\n")).toContain("1795100000.000100 isn't a Slack message");
+  });
+
+  it("doesn't hold back the real copy for a key that calls itself a bridge", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    const ryan = person(world, slack.as("UR"), [general], clock);
+    const mallory = person(world, slack.as("UM"), [], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    await ryan.bridge.tick();
+    await mallory.bot.publish({ kind: 9021, created_at: 0, content: "", tags: [["h", channel]] });
+    // Brandon's bridge is asleep; Mallory's "bridge" posts an altered copy with the real link.
+    const ts = slack.say(general.id, "US", "the real text");
+    await mallory.bot.publish({ kind: 9, created_at: 0, content: `**Someone** · [Slack](${permalink(general.id, ts)})\nan altered copy`, tags: [["h", channel], ["r", permalink(general.id, ts)]] });
+    await ryan.bridge.tick();
+    clock.now += HELPER_DELAY_MS + 1000;
+    await ryan.bridge.tick();
+    expect(world.posts(channel).filter((e) => e.content.endsWith("the real text")).map((e) => e.pubkey)).toEqual([ryan.bot.pubkey]);
+  });
+
+  it("posts a short DM message from the other side's Buzz even when its owner once wrote the same", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const dm: SlackConversation = { id: "D0BRANDONRYAN", name: "Ryan Zapanta", kind: "im" };
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [dm], clock);
+    const ryan = person(world, slack.as("UR"), [dm], clock);
+    slack.say(dm.id, "UR", "hi");
+    await brandon.bridge.tick();
+    await ryan.bridge.tick();
+    const brandons = brandon.state.conversations[dm.id]!.buzz!;
+    const ryans = ryan.state.conversations[dm.id]!.buzz!;
+    const mine = await brandon.human.publish({ kind: 9, created_at: 0, content: "ok", tags: [["h", brandons]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    await ryan.bridge.tick();
+    await ryan.human.publish({ kind: 9, created_at: 0, content: "ok", tags: [["h", ryans]] });
+    await ryan.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.as)).toEqual(["UB", "UR"]);
+    // Brandon's own "ok" is linked once; Ryan's arrives in Brandon's channel as Ryan's.
+    const oks = world.posts(brandons).filter((e) => /\nok$|^ok$/.test(e.content));
+    expect(oks.map((e) => (e.id === mine.id ? "mine" : e.content.split(" ")[0]))).toEqual(["mine", "**Ryan"]);
+  });
+
+  it("doesn't send twice after a timeout, and sends again one that never went", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    // It went out, but no answer came: the copy from Slack is linked to it.
+    slack.timeOutNextSends("after");
+    const went = await brandon.human.publish({ kind: 9, created_at: 0, content: "went anyway", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    clock.now += UNSURE_MS + 1000;
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`went anyway\n${FOOTER}`]);
+    expect(world.posts(channel).filter((e) => e.content.includes("went anyway"))).toEqual([went]);
+    // It never went: after a while it's sent again, once.
+    slack.timeOutNextSends("before");
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "never went", tags: [["h", channel]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends).toHaveLength(1);
+    clock.now += UNSURE_MS + 1000;
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    expect(slack.sends.map((send) => send.text)).toEqual([`went anyway\n${FOOTER}`, `never went\n${FOOTER}`]);
+  });
+
+  it("keeps Slack messages for the next pass when the community doesn't answer", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [general], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[general.id]!.buzz!;
+    slack.say(general.id, "US", "one");
+    slack.say(general.id, "US", "two");
+    world.failNextPosts(3);
+    for (let pass = 0; pass < 3; pass++) await brandon.bridge.tick();
+    expect(world.posts(channel)).toHaveLength(0);
+    expect(brandon.state.conversations[general.id]!.error).toContain("429");
+    await brandon.bridge.tick();
+    expect(world.posts(channel).map((e) => e.content.split("\n")[1])).toEqual(["one", "two"]);
+    expect(brandon.logs.join("\n")).not.toContain("gave up");
+  });
+
+  it("makes no private channel until it knows the community's key", async () => {
+    const world = community();
+    const slack = slackWorld();
+    const dm: SlackConversation = { id: "D0BRANDONRYAN", name: "Ryan Zapanta", kind: "im" };
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [dm], clock);
+    let key: string | undefined;
+    const state: BridgeState = { conversations: {} };
+    const bridge = new SlackBridge({ relay: brandon.bot, slack: slack.as("UB"), pubkey: brandon.bot.pubkey, owner: brandon.owner, relayKey: async () => key, conversations: [dm, general], state, save: () => {}, log: () => {}, now: () => clock.now });
+    await bridge.tick();
+    expect(state.conversations[dm.id]).toMatchObject({ error: expect.stringContaining("community's key") });
+    expect(state.conversations[dm.id]!.buzz).toBeUndefined();
+    expect(state.conversations[general.id]!.buzz).toBeDefined();
+    key = "relay";
+    await bridge.tick();
+    expect(state.conversations[dm.id]!.buzz).toBeDefined();
+    expect(state.conversations[dm.id]!.error).toBeUndefined();
   });
 });
