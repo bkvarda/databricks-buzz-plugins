@@ -25,7 +25,7 @@ describe("manifests", () => {
   });
 
   it("covers every plugin in the suite", () => {
-    expect(plugins.sort()).toEqual(["agents", "databricks", "genie", "knowledge", "lakebase", "memory", "signals", "sql"]);
+    expect(plugins.sort()).toEqual(["agents", "databricks", "genie", "knowledge", "lakebase", "memory", "sql"]);
   });
 
   it.each(plugins)("%s uses only known keys and turns on update notices", (name) => {
