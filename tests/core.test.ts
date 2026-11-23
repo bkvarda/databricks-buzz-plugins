@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Host } from "@buzz/author";
 import { cliFailure, DatabricksCli, parseProfiles, parseToken, normalizeHost, isWorkspaceProfile, SignInRequiredError } from "@dbx/core/cli";
 import { Connection } from "@dbx/core/connection";
+import { createService } from "@dbx/core/provider";
 import { bodyAndTrailers, curlConfig, curlQuote, endMarker, splitHead } from "@dbx/core/curl";
 import { parseSse, SseParser } from "@dbx/core/sse";
 import { fromStatement, planChart, resultSet, toMarkdown } from "@dbx/core/result";
@@ -178,12 +179,20 @@ describe("a sign-in that expires while connected", () => {
         ? { status: 200, headers: {}, body: JSON.stringify({ userName: "me@example.com" }) }
         : { status: 200, headers: { "content-type": "application/json" }, body: "{}" },
     );
+    // The workspace's preferences (a plugin's own workspace choice is one) live in the browser's storage.
+    const saved = new Map<string, string>();
+    vi.stubGlobal("localStorage", { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => void saved.set(key, value), removeItem: (key: string) => void saved.delete(key) });
+    const service = createService(connection, () => {});
     await connection.useProfile("ws");
     expect(connection.snapshot()).toMatchObject({ status: "connected", user: { userName: "me@example.com" } });
+    service.preferences.set("signalsWorkspace", "lab");
     const client = connection.client()!;
     expired = true;
     await expect(client.get("/api/2.1/unity-catalog/model-services")).rejects.toThrow(/sign-in to ws\.cloud\.databricks\.com has expired/);
     expect(connection.snapshot()).toMatchObject({ status: "error", needsSignIn: true, profile: { name: "ws" } });
+    // Still this workspace's preferences while its sign-in has expired: a plugin's own workspace stays chosen.
+    expect(service.preferences.get("signalsWorkspace")).toBe("lab");
+    vi.unstubAllGlobals();
     await connection.reauthenticate();
     expect(calls.filter((call) => call.id === "cli-login").at(-1)?.args).toEqual(["--profile", "ws", "--host", "https://ws.cloud.databricks.com"]);
     expect(connection.snapshot()).toMatchObject({ status: "connected" });

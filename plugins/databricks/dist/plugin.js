@@ -1133,7 +1133,7 @@ var memoryStorage = () => {
 function createService(connection, openSettings, spawn) {
   const scope = () => {
     const snapshot = connection.snapshot();
-    return snapshot.status === "connected" ? snapshot.profile.host : "none";
+    return "profile" in snapshot ? snapshot.profile.host : "none";
   };
   const preferences = createPreferences(scope);
   const byProfile = /* @__PURE__ */ new Map();

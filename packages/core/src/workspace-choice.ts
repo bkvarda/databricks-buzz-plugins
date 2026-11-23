@@ -1,6 +1,8 @@
 // A plugin's own workspace choice. The person picks "Same as Buzz" (the
 // default) or another CLI profile; the choice is kept in the main
-// connection's preferences under `key`. The returned service forwards to the
+// connection's preferences under `key`, and holds while Buzz's own sign-in has
+// expired: tokens from one workspace, a plugin's hub or services in another.
+// The returned service forwards to the
 // chosen workspace, so code written against one service follows the choice:
 // it notifies its subscribers when the choice or that workspace changes, and
 // its preferences are the chosen workspace's own (per workspace, as always).
@@ -15,7 +17,14 @@ export type FollowedService = DatabricksService &
   }>;
 
 export function followWorkspace(main: DatabricksService, key: string): FollowedService {
-  const chosen = () => main.preferences.get<string>(key) || undefined;
+  // The choice as last read while Buzz's workspace was connected. When that connection drops (its sign-in expired, or it's
+  // signing in again), an older Databricks plugin hides its preferences; the plugin's own workspace stays chosen meanwhile.
+  let remembered = main.preferences.get<string>(key) || undefined;
+  const chosen = () => {
+    const value = main.preferences.get<string>(key) || undefined;
+    if (main.snapshot().status === "connected" || value !== undefined) remembered = value;
+    return remembered;
+  };
   const target = () => {
     const profile = chosen();
     return profile && main.forProfile ? main.forProfile(profile) : main;
@@ -75,6 +84,9 @@ export function followWorkspace(main: DatabricksService, key: string): FollowedS
     ...(main.forProfile && { forProfile: main.forProfile }),
     ...(main.addWorkspace && { addWorkspace: main.addWorkspace }),
     profile: chosen,
-    setProfile: (profile) => main.preferences.set(key, profile || undefined),
+    setProfile: (profile) => {
+      remembered = profile || undefined;
+      main.preferences.set(key, profile || undefined);
+    },
   };
 }

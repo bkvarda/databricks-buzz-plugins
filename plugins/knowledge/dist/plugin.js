@@ -905,7 +905,12 @@ var SkillCatalog = class {
 
 // packages/core/src/workspace-choice.ts
 function followWorkspace(main, key) {
-  const chosen = () => main.preferences.get(key) || void 0;
+  let remembered = main.preferences.get(key) || void 0;
+  const chosen = () => {
+    const value = main.preferences.get(key) || void 0;
+    if (main.snapshot().status === "connected" || value !== void 0) remembered = value;
+    return remembered;
+  };
   const target = () => {
     const profile = chosen();
     return profile && main.forProfile ? main.forProfile(profile) : main;
@@ -962,7 +967,10 @@ function followWorkspace(main, key) {
     ...main.forProfile && { forProfile: main.forProfile },
     ...main.addWorkspace && { addWorkspace: main.addWorkspace },
     profile: chosen,
-    setProfile: (profile) => main.preferences.set(key, profile || void 0)
+    setProfile: (profile) => {
+      remembered = profile || void 0;
+      main.preferences.set(key, profile || void 0);
+    }
   };
 }
 

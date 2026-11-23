@@ -107,3 +107,29 @@ describe("a plugin's own workspace", () => {
     expect(notified).toBe(2);
   });
 });
+
+describe("a plugin's own workspace while Buzz's sign-in has expired", () => {
+  it("keeps the chosen workspace when Buzz's workspace drops out, even when its preferences can't be read", () => {
+    const main = workspace("https://main.example");
+    const other = workspace("https://other.example");
+    let status = "connected";
+    // An older Databricks plugin: its preferences read empty while it isn't connected.
+    const mainService = {
+      ...main.service,
+      snapshot: () => (status === "connected" ? main.service.snapshot() : { status, profile: { host: "https://main.example", name: "main" }, profiles: [], message: "expired", needsSignIn: true }),
+      preferences: { ...main.service.preferences, get: (name: string) => (status === "connected" ? main.prefs.get(name) : undefined) },
+      forProfile: (profile: string) => (profile === "other" ? other.service : main.service),
+    } as unknown as DatabricksService;
+    main.prefs.set("signalsWorkspace", "other");
+    const followed = followWorkspace(mainService, "signalsWorkspace");
+    const host = () => (followed.snapshot() as { profile: { host: string } }).profile.host;
+    expect(host()).toBe("https://other.example");
+    status = "error";
+    expect(followed.profile()).toBe("other");
+    expect(followed.client()).toBe(other.service.client());
+    // Back on, the stored choice is the one again (here: Same as Buzz).
+    status = "connected";
+    main.prefs.delete("signalsWorkspace");
+    expect(followed.profile()).toBeUndefined();
+  });
+});

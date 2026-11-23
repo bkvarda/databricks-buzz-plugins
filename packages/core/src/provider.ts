@@ -27,9 +27,12 @@ export function createService(
   openSettings: () => void,
   spawn?: (storage: ConnectionStorage) => Connection,
 ): ProvidedService {
+  // Preferences belong to the workspace the connection names, whether its sign-in is live, being checked again, or has
+  // expired: a plugin's own workspace choice (see workspace-choice.ts) is kept here, and an expired sign-in to Buzz's
+  // workspace mustn't send that plugin back to Buzz's workspace.
   const scope = () => {
     const snapshot = connection.snapshot();
-    return snapshot.status === "connected" ? snapshot.profile.host : "none";
+    return "profile" in snapshot ? snapshot.profile.host : "none";
   };
   const preferences = createPreferences(scope);
   const byProfile = new Map<string, DatabricksService>();
