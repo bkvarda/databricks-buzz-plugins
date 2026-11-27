@@ -425,7 +425,10 @@ describe("Slack bridges sharing conversations", () => {
     await brandon.human.publish({ kind: 9, created_at: 0, content: "threaded", tags: [["h", channel], ["e", parent.id, "", "reply"]] });
     await brandon.human.publish({ kind: 9, created_at: 0, content: "// just Buzz", tags: [["h", channel]] });
     await brandon.human.publish({ kind: 9, created_at: 0, content: "@bot do it", tags: [["h", channel], ["p", ryan.bot.pubkey]] });
-    await brandon.human.publish({ kind: 9, created_at: 0, content: "a Buzz thread", tags: [["h", channel], ["e", said.id.replace(/./, "0"), "", "reply"]] });
+    // A reply under a Buzz message the bridge never saw: flip the first hex digit, so the id differs from said.id even when it starts with "0".
+    const missingParent = `${said.id[0] === "0" ? "1" : "0"}${said.id.slice(1)}`;
+    expect(world.posts(channel).some((e) => e.id === missingParent)).toBe(false);
+    await brandon.human.publish({ kind: 9, created_at: 0, content: "a Buzz thread", tags: [["h", channel], ["e", missingParent, "", "reply"]] });
     await brandon.bridge.tick();
     expect(slack.sends.slice(1)).toEqual([{ as: "UB", channel: general.id, text: `threaded\n${FOOTER}`, thread: tsFromLink(parent.tags.find((t) => t[0] === "r")![1]) }]);
     // Its own message, back from Slack in the thread, isn't posted again.
