@@ -7536,14 +7536,70 @@ async function deploy(service, record, options) {
   await runner(sandboxes, record.sandbox, "start", options.signal);
   return { client, sandboxes };
 }
+function needsSignIn(workspace, error) {
+  const snapshot = workspace.snapshot();
+  if (snapshot.status === "error" && snapshot.needsSignIn) return true;
+  if (snapshot.status === "signed-out") return true;
+  return error?.name === "SignInRequiredError";
+}
 function hostedProvider(agents, service) {
   const storage = agents.storage;
   const read = (pubkey) => parse2(storage.get(recordKey2(pubkey)));
   const write = (record) => storage.set(recordKey2(record.pubkey), JSON.stringify(record));
   const records = () => storage.keys().filter((key2) => key2.startsWith(RECORD_PREFIX2) && !key2.includes(":pending:")).map((key2) => parse2(storage.get(key2))).filter((record) => Boolean(record?.pubkey));
+  const problems = /* @__PURE__ */ new Map();
+  const listeners = /* @__PURE__ */ new Set();
+  const changed = () => {
+    for (const listener of [...listeners]) listener();
+  };
+  const noteWake = (pubkey, record, error) => {
+    const now = Date.now();
+    const previous = problems.get(pubkey);
+    problems.set(pubkey, { message: describeError(error), needsSignIn: needsSignIn(workspaceOf2(service, record.config.profile), error), since: previous?.since ?? now, at: now });
+    changed();
+  };
+  const clearWake = (pubkey) => {
+    if (problems.delete(pubkey)) changed();
+  };
+  async function wakeOnce(record, options) {
+    const { signal } = options;
+    const { client, sandboxes } = await sandboxOf(service, record, signal);
+    if (record.jobId) {
+      await dropKeeper(client, record.jobId, signal);
+      const { jobId: _old, ...rest } = record;
+      await write(rest);
+    }
+    await sandboxes.get(record.sandbox, signal).catch((error) => {
+      if (error.status === 404) throw new Error(`The agent's Sandbox ${record.sandbox} is gone; remove the agent and create it again.`);
+      throw error;
+    });
+    const node = `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)}`;
+    const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
+    const start = async () => {
+      await sandboxes.ensureRunning(record.sandbox, { ...signal && { signal } });
+      if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
+      await syncHostedSkills(service, record, sandboxes, signal);
+      const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...signal && { signal } });
+      if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
+      return JSON.parse((result.stdout ?? "").trim() || "{}");
+    };
+    const status3 = await start();
+    if (options.refresh === false || record.config.availability !== "always" || !shouldRefresh(status3)) return status3;
+    await runner(sandboxes, record.sandbox, "stop", signal);
+    await sandboxes.stop(record.sandbox);
+    await stopped(sandboxes, record.sandbox, signal);
+    return start();
+  }
   return {
     read,
     records,
+    /** Why Buzz's last wake of this agent failed, until one works. */
+    problem: (pubkey) => problems.get(pubkey),
+    /** Called when a wake problem appears, changes or clears. */
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     async provision(input) {
       const config = normalizeHosted(input.config);
       const pending = pendingKey2(input.community, input.name);
@@ -7629,38 +7685,20 @@ function hostedProvider(agents, service) {
      * sleeping one awake, and starts the runner if it isn't running. Then,
      * for an always-on agent, restarts a long-running Sandbox at a quiet
      * moment (`shouldRefresh`) unless `refresh` is false. Resolves with the
-     * runner's status.
+     * runner's status. A failure is kept as the agent's `problem` until a
+     * wake works.
      */
     async wake(pubkey, options = {}) {
-      const { signal } = options;
       const record = read(pubkey);
       if (!record) throw new Error("This agent is managed from another device.");
-      const { client, sandboxes } = await sandboxOf(service, record, signal);
-      if (record.jobId) {
-        await dropKeeper(client, record.jobId, signal);
-        const { jobId: _old, ...rest } = record;
-        await write(rest);
-      }
-      await sandboxes.get(record.sandbox, signal).catch((error) => {
-        if (error.status === 404) throw new Error(`The agent's Sandbox ${record.sandbox} is gone; remove the agent and create it again.`);
+      try {
+        const status3 = await wakeOnce(record, options);
+        clearWake(pubkey);
+        return status3;
+      } catch (error) {
+        if (!options.signal?.aborted) noteWake(pubkey, record, error);
         throw error;
-      });
-      const node = `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)}`;
-      const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
-      const start = async () => {
-        await sandboxes.ensureRunning(record.sandbox, { ...signal && { signal } });
-        if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
-        await syncHostedSkills(service, record, sandboxes, signal);
-        const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...signal && { signal } });
-        if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
-        return JSON.parse((result.stdout ?? "").trim() || "{}");
-      };
-      const status3 = await start();
-      if (options.refresh === false || record.config.availability !== "always" || !shouldRefresh(status3)) return status3;
-      await runner(sandboxes, record.sandbox, "stop", signal);
-      await sandboxes.stop(record.sandbox);
-      await stopped(sandboxes, record.sandbox, signal);
-      return start();
+      }
     },
     /** The agent's recent turns from its Sandbox's activity log, newest first; undefined while its Sandbox sleeps. */
     async activity(pubkey, signal) {
@@ -7868,6 +7906,9 @@ function HostedSettings(props) {
   const [draft, setDraft] = React.useState(record?.config);
   const [busy, setBusy] = React.useState();
   const [error, setError] = React.useState();
+  const problemOf = () => props.provider.problem(props.pubkey);
+  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
+  const workspace = React.useMemo(() => workspaceOf2(props.service, record?.config.profile), [props.service, record?.config.profile]);
   if (!record || !draft)
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "This agent was set up from another device, which manages its settings."));
   const run = (label, work) => {
@@ -7888,14 +7929,38 @@ function HostedSettings(props) {
   const runnerState = status3.data?.runner;
   const dirty = JSON.stringify(draft) !== JSON.stringify(record.config);
   const left = hoursLeft(runnerState?.bootedAt);
-  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, /* @__PURE__ */ React.createElement(
+  const checkError = !status3.data && status3.error ? status3.error : void 0;
+  const expired = problem?.needsSignIn || checkError !== void 0 && needsSignIn(workspace, checkError);
+  return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Stack, { gap: 16 }, (problem || expired) && /* @__PURE__ */ React.createElement(
+    Notice,
+    {
+      tone: "warning",
+      title: expired ? "Sign in again so Buzz can look after this agent" : "Buzz couldn't look after this agent",
+      action: expired && workspace.reauthenticate ? /* @__PURE__ */ React.createElement(
+        Button,
+        {
+          size: "sm",
+          variant: "brand",
+          disabled: Boolean(busy),
+          onClick: () => run("signin", async () => {
+            await workspace.reauthenticate();
+            await props.provider.wake(props.pubkey, { refresh: false });
+          })
+        },
+        busy === "signin" ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null,
+        "Sign in again"
+      ) : void 0
+    },
+    expired ? `Its Databricks sign-in${record.config.profile ? ` (${record.config.profile})` : ""} has expired, so Buzz has paused its automatic recovery: it won't restart the agent if it stops, or bring it a newer runner, until you sign in again. The agent keeps running in its Sandbox if it already is.` : `Buzz's last check on it failed: ${/[.!?]$/.test(problem.message) ? problem.message : `${problem.message}.`} It tries again every few minutes; until one works, it won't restart the agent if it stops, or bring it a newer runner.`,
+    problem ? ` Since ${new Date(problem.since).toLocaleString()}.` : ""
+  ), /* @__PURE__ */ React.createElement(
     Notice,
     {
       tone: state === "SANDBOX_STATE_RUNNING" && runnerState?.running === false ? "warning" : "info",
-      title: status3.loading && !status3.data ? "Checking\u2026" : stateLabel(state, record.config.availability),
+      title: status3.loading && !status3.data ? "Checking\u2026" : checkError ? "Couldn't check it" : stateLabel(state, record.config.availability),
       action: /* @__PURE__ */ React.createElement(Button, { size: "sm", disabled: Boolean(busy), onClick: () => run("wake", () => props.provider.wake(props.pubkey, { refresh: false })) }, busy === "wake" ? /* @__PURE__ */ React.createElement(Spinner, { size: 11 }) : null, state === "SANDBOX_STATE_RUNNING" ? "Check again" : "Wake now")
     },
-    state === "SANDBOX_STATE_RUNNING" ? runnerState?.running ? `${runnerState.connected ? "Connected to the community" : "Connecting"}${runnerState.active ? ` \xB7 working on ${runnerState.active}` : ""}${runnerState.lastError ? ` \xB7 last error: ${runnerState.lastError}` : ""}.${record.config.availability === "always" && left !== void 0 ? ` Databricks stops its Sandbox in about ${Math.max(1, Math.round(left))} h; your Buzz restarts it sooner, at a quiet moment.` : ""}` : "The Sandbox is up but the agent isn't running; Wake now starts it." : state === "SANDBOX_STATE_STOPPED" ? record.config.availability === "sleep" ? "It slept while Buzz was closed. Buzz wakes it within a few minutes, or now with Wake now." : `Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts. Buzz starts it again within a few minutes, or now with Wake now.` : `Sandbox ${record.sandbox}.`
+    state === "SANDBOX_STATE_RUNNING" ? runnerState?.running ? `${runnerState.connected ? "Connected to the community" : "Connecting"}${runnerState.active ? ` \xB7 working on ${runnerState.active}` : ""}${runnerState.lastError ? ` \xB7 last error: ${runnerState.lastError}` : ""}.${record.config.availability === "always" && left !== void 0 ? ` Databricks stops its Sandbox in about ${Math.max(1, Math.round(left))} h; your Buzz restarts it sooner, at a quiet moment.` : ""}` : "The Sandbox is up but the agent isn't running; Wake now starts it." : state === "SANDBOX_STATE_STOPPED" ? record.config.availability === "sleep" ? "It slept while Buzz was closed. Buzz wakes it within a few minutes, or now with Wake now." : `Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts. Buzz starts it again within a few minutes, or now with Wake now.` : checkError ? `${describeError(checkError)} (Sandbox ${record.sandbox}.)` : `Sandbox ${record.sandbox}.`
   ), draft.kind === "slack" ? /* @__PURE__ */ React.createElement(
     SlackConversationsField,
     {
@@ -7963,7 +8028,11 @@ function registerHostedType(agents, service, host = {}) {
     title: "Databricks",
     description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, Claude Code, Codex or Pi in its own Sandbox, an Omnigent agent, or a Slack bridge. No Buzz tools.",
     defaults: () => ({ config: normalizeHosted({}) }),
-    summary: (agent) => summarizeHosted(provider2.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config)),
+    summary: (agent) => {
+      const text = summarizeHosted(provider2.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config));
+      const problem = provider2.problem(agent.pubkey ?? "");
+      return problem ? `${text} \xB7 ${problem.needsSignIn ? "sign-in expired: Buzz can't restart it" : "Buzz couldn't check it"}` : text;
+    },
     Create: (props) => /* @__PURE__ */ React.createElement(HostedForm, { service, config: normalizeHosted(props.config), onChange: props.onChange, disabled: props.disabled }),
     tabs: [
       {
