@@ -112,8 +112,17 @@ export function buzzChannelName(conversation: SlackConversation, own?: { handle:
 
 export type SlackMessage = Readonly<{ name: string; user: string; ts: string; when: string; text: string; thread?: Readonly<{ count: number; latest: string }> }>;
 
-const HEAD =
-  /=== Message from (?<n1>.*?) \((?<u1>\w+)\) at (?<w1>.*?) === ?\nMessage TS: (?<t1>\d+\.\d+)\n|From: (?<n2>.*?) \((?<u2>\w+)\)\nTime: (?<w2>.*?)\nMessage TS: (?<t2>\d+\.\d+)\n/g;
+// The author's parentheses: the Slack user id, then, for someone from another
+// org in a Slack Connect channel, that org ("(U32HW4V0D, external: Block, Inc.)",
+// as Slack's reader gives every customer's message there). The suffix runs
+// (greedy, within the line) to the last ")" before the header's own delimiter,
+// so an org with parentheses or ") at " ("Globex (EMEA)", "School of Science
+// (SCS) at Example University") stays in it; any suffix after the id is allowed.
+const who = (n: number) => String.raw`\((?<u${n}>\w+)(?:, [^\n]*)?\)`;
+const HEAD = new RegExp(
+  String.raw`=== Message from (?<n1>.*?) ${who(1)} at (?<w1>.*?) === ?\nMessage TS: (?<t1>\d+\.\d+)\n|From: (?<n2>.*?) ${who(2)}\nTime: (?<w2>.*?)\nMessage TS: (?<t2>\d+\.\d+)\n`,
+  "g",
+);
 const END = /\n(?:--- Reply \d+ of \d+ ---|=== THREAD REPLIES.*===|There are no more messages in this thread\.)/;
 
 function messageOf(groups: Record<string, string | undefined>, raw: string): SlackMessage {
@@ -123,7 +132,13 @@ function messageOf(groups: Record<string, string | undefined>, raw: string): Sla
   const name = (groups.n1 ?? groups.n2 ?? "").replace(/\s*<[^>]*>$/, "").trim();
   let thread: SlackMessage["thread"];
   const keep: string[] = [];
-  for (const line of body.replace(/\n+$/, "").split("\n")) {
+  let lines = body.replace(/\n+$/, "").split("\n");
+  // Slack's reader now gives each message's text as a quote, every line "> …"
+  // (its Thread, Reactions and Files lines too): unquoted, so the text is the
+  // message's own and the reader's lines are read as before. A message that
+  // only quotes some lines keeps them.
+  if (lines.some((line) => line.trim()) && lines.every((line) => !line.trim() || line.startsWith(">"))) lines = lines.map((line) => line.replace(/^> ?/, ""));
+  for (const line of lines) {
     const replies = /^Thread: (\d+) repl(?:y|ies) \(latest: (.*?)\)/.exec(line);
     if (replies) {
       thread = { count: Number(replies[1]), latest: replies[2]! };

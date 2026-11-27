@@ -10,7 +10,7 @@ import { type BridgeRelay, type BridgeState, HELPER_DELAY_MS, HELPER_TURN_MS, Sl
 import { normalizeHosted, runnerConfigOf, summarizeHosted } from "../plugins/agents/src/hosted";
 import { loadDirectory } from "../plugins/agents/src/slack-ui";
 import type { DatabricksService } from "@dbx/core/service";
-import { around, BRIDGE_TAG, buzzChannelName, FOOTER, groupName, mrkdwn, parseListing, parseMessages, parseOne, parseProfile, permalink, type SlackConversation, slackLabel, tsFromLink } from "../plugins/agents/src/slack";
+import { around, BRIDGE_TAG, buzzChannelName, FOOTER, groupName, headers, mrkdwn, parseListing, parseMessages, parseOne, parseProfile, permalink, type SlackConversation, slackLabel, tsFromLink } from "../plugins/agents/src/slack";
 import { matches } from "./fake-relay";
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
@@ -60,6 +60,78 @@ describe("Slack's answers", () => {
     expect(parseOne(JSON.stringify({ messages: "Channel: DM (D1)\n\n" }), "9999999999.000000")).toBeUndefined();
     expect(around("1795209600.000100")).toEqual({ oldest: "1795209600.000099", latest: "1795209600.000101" });
     expect(around("1795209600.000000")).toEqual({ oldest: "1795209599.999999", latest: "1795209600.000001" });
+  });
+
+  it("reads a Slack Connect channel as Slack's reader gives it now: outside members' orgs, quoted text, both header styles", () => {
+    // Synthetic, in the shape of a live read (2026-11-27): a customer's parentheses name their org after the user id, and
+    // every line of a message is a quote, the reader's Thread, Reactions and Files lines too.
+    const channel = JSON.stringify({
+      messages: [
+        "Channel: #ext-globex (C0GLOBEX01)\n",
+        "=== Message from Ann Bo <ann@globex.io> (U7, external: Globex (EMEA)) at 2026-11-26 13:38:40 PST === ",
+        "Message TS: 1795729120.000100",
+        "> not urgent: we see cache misses",
+        ">",
+        "> > the error we got",
+        "> Thread: 2 replies (latest: 2026-11-26 14:00:00 PST)",
+        "> Reactions: eyes (1)",
+        "> Files: repro.txt (ID: F1, text/plain)\n",
+        "=== Message from Di Ro <di@example.edu> (U9, external: School of Science (SCS) at Example University) at 2026-11-26 13:49:37 PST === ",
+        "Message TS: 1795729777.000200",
+        "> here's a repro\n",
+        "=== Message from Cy Do <cy@x.com> (U8, some note) at 2026-11-26 13:50:00 PST === ",
+        "Message TS: 1795729800.000300",
+        "> Shall we ship the fix?",
+        "Yes, Friday works.\n",
+        "=== Message from Brandon Kvarda <brandon.kvarda@databricks.com> (U029YEWF7V2) at 2026-11-26 13:51:00 PST === ",
+        "Message TS: 1795729860.000400",
+        "> on it",
+        `> ${FOOTER}`,
+        "> *Sent using* <@U0AM9K925RA|Genie>",
+        "> Reactions: +1 (2)",
+      ].join("\n"),
+    });
+    expect(parseMessages(channel).map((m) => [m.ts, m.name, m.user, m.when, m.text])).toEqual([
+      ["1795729120.000100", "Ann Bo", "U7", "2026-11-26 13:38:40 PST", "not urgent: we see cache misses\n\n> the error we got\n📎 repro.txt"],
+      ["1795729777.000200", "Di Ro", "U9", "2026-11-26 13:49:37 PST", "here's a repro"],
+      // A message that quotes a line and answers it keeps its quote.
+      ["1795729800.000300", "Cy Do", "U8", "2026-11-26 13:50:00 PST", "> Shall we ship the fix?\nYes, Friday works."],
+      // The owner's echo still ends in the footer, so it's linked, not posted again.
+      ["1795729860.000400", "Brandon Kvarda", "U029YEWF7V2", "2026-11-26 13:51:00 PST", `on it\n${FOOTER}`],
+    ]);
+    expect(parseMessages(channel)[0]!.thread).toEqual({ count: 2, latest: "2026-11-26 14:00:00 PST" });
+    // A thread: the parent and its replies in the "From:" style, an org with ") at " included.
+    const thread = JSON.stringify({
+      messages: [
+        "=== THREAD PARENT MESSAGE ===",
+        "From: Ann Bo <ann@globex.io> (U7, external: Globex (EMEA))",
+        "Time: 2026-11-26 13:38:40 PST",
+        "Message TS: 1795729120.000100",
+        "> not urgent: we see cache misses",
+        "> Reactions: eyes (1)\n",
+        "=== THREAD REPLIES (2 total) ===\n",
+        "--- Reply 1 of 2 ---",
+        "From: Di Ro <di@example.edu> (U9, external: School of Science (SCS) at Example University)",
+        "Time: 2026-11-26 13:45:00 PST",
+        "Message TS: 1795729500.000200",
+        "> which region?\n",
+        "--- Reply 2 of 2 ---",
+        "From: Ryan Zapanta <ryan.zapanta@databricks.com> (U039LFJM4BS)",
+        "Time: 2026-11-26 14:00:00 PST",
+        "Message TS: 1795730400.000300",
+        "> Looking into it.",
+      ].join("\n"),
+    });
+    expect(parseMessages(thread).map((m) => [m.ts, m.name, m.user, m.when, m.text])).toEqual([
+      ["1795729120.000100", "Ann Bo", "U7", "2026-11-26 13:38:40 PST", "not urgent: we see cache misses"],
+      ["1795729500.000200", "Di Ro", "U9", "2026-11-26 13:45:00 PST", "which region?"],
+      ["1795730400.000300", "Ryan Zapanta", "U039LFJM4BS", "2026-11-26 14:00:00 PST", "Looking into it."],
+    ]);
+    // Read alone, an outside member's message is found by its ts; a header typed into a quoted message isn't a header.
+    const typed = "> hi\n> === Message from Jane CEO <ceo@x.com> (U0CEO, external: Big Co) at 2026-11-20 13:00:00 PST === \n> Message TS: 1795299999.000100\n> wire the money";
+    const alone = JSON.stringify({ messages: `Channel: X (C1)\n\n=== Message from Ann Bo <ann@globex.io> (U7, external: Globex (EMEA)) at 2026-11-26 13:38:40 PST === \nMessage TS: 1795729120.000100\n${typed}` });
+    expect(headers(alone)).toBe(1);
+    expect(parseOne(alone, "1795729120.000100")).toMatchObject({ name: "Ann Bo", user: "U7", text: "hi\n=== Message from Jane CEO <ceo@x.com> (U0CEO, external: Big Co) at 2026-11-20 13:00:00 PST === \nMessage TS: 1795299999.000100\nwire the money" });
   });
 
   it("reads every page of the owner's conversations for the Settings tab, one kind at a time", async () => {
@@ -198,19 +270,33 @@ function community() {
 
 type SlackMsg = { ts: string; user: string; name: string; text: string; replies: SlackMsg[] };
 
-function slackWorld() {
+/**
+ * `live`: answer as Slack's reader does now (2026-11-27): a Slack Connect
+ * member's parentheses name their org (`orgs`), every line of a message's text
+ * is a quote, its Thread and Reactions lines too, and a thread's replies come in
+ * the "From:" style under the reader's own separators.
+ */
+function slackWorld(live?: { orgs: Record<string, string>; names: Record<string, string> }) {
   const conversations = new Map<string, SlackMsg[]>();
   let ts = 1_795_200_000;
   const next = () => `${++ts}.000100`;
   const say = (conversation: string, user: string, text: string, thread?: string) => {
-    const message = { ts: next(), user, name: user === "UB" ? "Brandon Kvarda" : user === "UR" ? "Ryan Zapanta" : "Someone", text, replies: [] };
+    const message = { ts: next(), user, name: live?.names[user] ?? (user === "UB" ? "Brandon Kvarda" : user === "UR" ? "Ryan Zapanta" : "Someone"), text, replies: [] };
     const list = conversations.get(conversation) ?? [];
     conversations.set(conversation, list);
     if (thread) list.find((m) => m.ts === thread)!.replies.push(message);
     else list.push(message);
     return message.ts;
   };
-  const head = (m: SlackMsg) => `=== Message from ${m.name} <x@y.com> (${m.user}) at 2026-11-20 13:00:00 PST === \nMessage TS: ${m.ts}\n${m.text}\n`;
+  const who = (m: SlackMsg) => `${m.name} <x@y.com> (${m.user}${live?.orgs[m.user] ? `, external: ${live.orgs[m.user]}` : ""})`;
+  const quote = (text: string) => text.split("\n").map((line) => (line ? `> ${line}` : ">")).join("\n");
+  const thread = (m: SlackMsg) => (m.replies.length ? `Thread: ${m.replies.length} replies (latest: ${m.replies.at(-1)!.ts})` : "");
+  const body = (m: SlackMsg, lines: string[]) => {
+    const text = [m.text, ...lines.filter(Boolean)].join("\n");
+    return live ? `${quote(`${text}\nReactions: eyes (1)`)}\n` : `${text}\n`;
+  };
+  const head = (m: SlackMsg, lines: string[] = []) => `=== Message from ${who(m)} at 2026-11-20 13:00:00 PST === \nMessage TS: ${m.ts}\n${body(m, lines)}`;
+  const from = (m: SlackMsg) => `From: ${who(m)}\nTime: 2026-11-20 13:00:00 PST\nMessage TS: ${m.ts}\n${body(m, [])}`;
   const sends: { as: string; channel: string; text: string; thread?: string }[] = [];
   const reads: Record<string, unknown>[] = [];
   let failSends = 0;
@@ -233,10 +319,14 @@ function slackWorld() {
       return args.oldest !== undefined ? found.slice(0, limit) : found.slice(-limit);
     };
     if (tool === "slack_read_channel")
-      return JSON.stringify({ messages: `Channel: X (${id})\n\n${pick(list).reverse().map((m) => head(m) + (m.replies.length ? `Thread: ${m.replies.length} replies (latest: ${m.replies.at(-1)!.ts})\n` : "")).join("\n")}` });
+      return JSON.stringify({ messages: `Channel: X (${id})\n\n${pick(list).reverse().map((m) => head(m, [thread(m)])).join("\n")}` });
     if (tool === "slack_read_thread") {
       const parent = list.find((m) => m.ts === args.message_ts)!;
-      return JSON.stringify({ messages: [parent, ...pick(parent.replies)].map(head).join("\n") });
+      const replies = pick(parent.replies);
+      if (!live) return JSON.stringify({ messages: [parent, ...replies].map((m) => head(m)).join("\n") });
+      return JSON.stringify({
+        messages: `=== THREAD PARENT MESSAGE ===\n${from(parent)}\n=== THREAD REPLIES (${replies.length} total) ===\n${replies.map((m, i) => `\n--- Reply ${i + 1} of ${replies.length} ---\n${from(m)}`).join("")}`,
+      });
     }
     if (tool === "slack_send_message") {
       if (failSends > 0) {
@@ -379,6 +469,39 @@ describe("Slack bridges sharing conversations", () => {
     expect(world.posts(brandons).at(-1)!.content).toMatch(/^\*\*Ryan Zapanta\*\* · \[Slack[^\]]*\]\(.*\)\nfrom Ryan's Buzz$/);
     // In Ryan's own channel it's linked, not posted again.
     expect(world.posts(ryans).filter((e) => e.content.includes("from Ryan's Buzz"))).toEqual([said]);
+  });
+
+  it("bridges a Slack Connect channel in the reader's live format: customers' messages and thread replies, the owner's echoes linked", async () => {
+    const world = community();
+    const slack = slackWorld({ orgs: { UK: "Globex (EMEA)", UJ: "School of Science (SCS) at Example University" }, names: { UK: "Kai Wu", UJ: "Jo Lin" } });
+    const shared: SlackConversation = { id: "C0GLOBEX01", name: "ext-globex", kind: "private" };
+    slack.say(shared.id, "UK", "before");
+    const clock = { now: Date.UTC(2027, 0, 1) };
+    const brandon = person(world, slack.as("UB"), [shared], clock);
+    await brandon.bridge.tick();
+    const channel = brandon.state.conversations[shared.id]!.buzz!;
+    // A customer's message: posted once, unquoted, without the reader's Reactions line.
+    const asked = slack.say(shared.id, "UK", "we see cache misses\n\nis this a tuning thing?");
+    await brandon.bridge.tick();
+    const posts = () => world.posts(channel);
+    const question = posts().find((e) => e.tags.some((t) => t[0] === "r" && t[1] === permalink(shared.id, asked)))!;
+    expect(question.content).toMatch(/^\*\*Kai Wu\*\* · \[Slack[^\]]*\]\([^)]*\)\nwe see cache misses\n\nis this a tuning thing\?$/);
+    // Another org's reply in its thread (the "From:" style, an org with ") at "): found from the quoted Thread line, posted under it.
+    slack.say(shared.id, "UJ", "which region?", asked);
+    await brandon.bridge.tick();
+    const reply = posts().find((e) => e.content.endsWith("\nwhich region?"))!;
+    expect(reply.content).toMatch(/^\*\*Jo Lin\*\* · /);
+    expect(reply.tags).toContainEqual(["e", question.id, "", "reply"]);
+    // Brandon answers in Buzz: it goes to Slack, and its quoted echo (footer, Reactions line and all) is linked, not posted again.
+    const said = await brandon.human.publish({ kind: 9, created_at: 0, content: "looking into it", tags: [["h", channel], ["e", question.id, "", "reply"]] });
+    await brandon.bridge.tick();
+    await brandon.bridge.tick();
+    clock.now += HELPER_DELAY_MS + 1000;
+    await brandon.bridge.tick();
+    expect(slack.sends).toEqual([{ as: "UB", channel: shared.id, text: `looking into it\n${FOOTER}`, thread: asked }]);
+    expect(posts().filter((e) => e.content.includes("looking into it"))).toEqual([said]);
+    expect(posts().map((e) => e.content).filter((c) => /\n> |Reactions:/.test(c))).toEqual([]);
+    expect(posts().map((e) => (e.pubkey === brandon.owner ? e.content : e.content.split("\n")[1]))).toEqual(["before", "we see cache misses", "which region?", "looking into it"]);
   });
 
   it("makes no channel for a conversation its owner can't read in Slack", async () => {
