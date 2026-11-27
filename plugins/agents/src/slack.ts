@@ -113,7 +113,7 @@ export function buzzChannelName(conversation: SlackConversation, own?: { handle:
 export type SlackMessage = Readonly<{ name: string; user: string; ts: string; when: string; text: string; thread?: Readonly<{ count: number; latest: string }> }>;
 
 // The author's parentheses: the Slack user id, then, for someone from another
-// org in a Slack Connect channel, that org ("(U32HW4V0D, external: Block, Inc.)",
+// org in a Slack Connect channel, that org ("(U0EXAMPLE1, external: Example Co)",
 // as Slack's reader gives every customer's message there). The suffix runs
 // (greedy, within the line) to the last ")" before the header's own delimiter,
 // so an org with parentheses or ") at " ("Globex (EMEA)", "School of Science
