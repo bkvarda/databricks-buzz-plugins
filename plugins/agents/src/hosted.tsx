@@ -288,6 +288,28 @@ async function deploy(service: DatabricksService, record: HostedRecord, options:
 
 export type HostedProvider = ReturnType<typeof hostedProvider>;
 
+/**
+ * Why Buzz's last look after an agent (`wake`) failed, kept until a look
+ * works. While it's set, Buzz neither restarts the agent if it stops nor
+ * brings it a newer runner, so its Settings tab and summary say so.
+ */
+export type WakeProblem = Readonly<{
+  message: string;
+  /** The agent's Databricks sign-in has expired (or is missing): only the owner can fix it, by signing in again. */
+  needsSignIn: boolean;
+  /** When this run of failures began, and the latest one. */
+  since: number;
+  at: number;
+}>;
+
+/** Whether a failed wake needs the owner to sign in again, from the connection it used (structural: no instanceof across plugins). */
+function needsSignIn(workspace: Pick<DatabricksService, "snapshot">, error: unknown): boolean {
+  const snapshot = workspace.snapshot();
+  if (snapshot.status === "error" && snapshot.needsSignIn) return true;
+  if (snapshot.status === "signed-out") return true;
+  return (error as { name?: string } | undefined)?.name === "SignInRequiredError";
+}
+
 /** Provision, activate and the rest, against this device's records. */
 export function hostedProvider(agents: Pick<Agents, "storage">, service: DatabricksService) {
   const storage = agents.storage;
@@ -300,9 +322,65 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
       .map((key) => parse(storage.get(key)))
       .filter((record): record is HostedRecord => Boolean(record?.pubkey));
 
+  const problems = new Map<string, WakeProblem>();
+  const listeners = new Set<() => void>();
+  const changed = () => {
+    for (const listener of [...listeners]) listener();
+  };
+  const noteWake = (pubkey: string, record: HostedRecord, error: unknown) => {
+    const now = Date.now();
+    const previous = problems.get(pubkey);
+    problems.set(pubkey, { message: describeError(error), needsSignIn: needsSignIn(workspaceOf(service, record.config.profile), error), since: previous?.since ?? now, at: now });
+    changed();
+  };
+  const clearWake = (pubkey: string) => {
+    if (problems.delete(pubkey)) changed();
+  };
+
+  /** See `wake` below. */
+  async function wakeOnce(record: HostedRecord, options: Readonly<{ refresh?: boolean; signal?: AbortSignal }>): Promise<RunnerStatus | undefined> {
+    const { signal } = options;
+    const { client, sandboxes } = await sandboxOf(service, record, signal);
+    if (record.jobId) {
+      await dropKeeper(client, record.jobId, signal);
+      const { jobId: _old, ...rest } = record;
+      await write(rest);
+    }
+    await sandboxes.get(record.sandbox, signal).catch((error: unknown) => {
+      if ((error as { status?: number }).status === 404) throw new Error(`The agent's Sandbox ${record.sandbox} is gone; remove the agent and create it again.`);
+      throw error;
+    });
+    const node = `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)}`;
+    // The heartbeat a sleeping agent checks before it sleeps, the runner (if it isn't running) and its status, in one call.
+    const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
+    const start = async () => {
+      await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
+      // A newer plugin brings a newer runner: put it in place and restart the runner on it.
+      if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
+      await syncHostedSkills(service, record, sandboxes, signal);
+      const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...(signal && { signal }) });
+      if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
+      return JSON.parse((result.stdout ?? "").trim() || "{}") as RunnerStatus;
+    };
+    const status = await start();
+    if (options.refresh === false || record.config.availability !== "always" || !shouldRefresh(status)) return status;
+    // A fresh 24 hours: stop the runner cleanly, then the Sandbox, then start both again.
+    await runner(sandboxes, record.sandbox, "stop", signal);
+    await sandboxes.stop(record.sandbox);
+    await stopped(sandboxes, record.sandbox, signal);
+    return start();
+  }
+
   return {
     read,
     records,
+    /** Why Buzz's last wake of this agent failed, until one works. */
+    problem: (pubkey: string): WakeProblem | undefined => problems.get(pubkey),
+    /** Called when a wake problem appears, changes or clears. */
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     async provision(input: Readonly<{ name: string; picture?: string; community: string; config?: unknown; signal: AbortSignal }>) {
       const config = normalizeHosted(input.config);
       // A retried creation reuses its Sandbox, so it never makes two keys.
@@ -389,41 +467,21 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
      * sleeping one awake, and starts the runner if it isn't running. Then,
      * for an always-on agent, restarts a long-running Sandbox at a quiet
      * moment (`shouldRefresh`) unless `refresh` is false. Resolves with the
-     * runner's status.
+     * runner's status. A failure is kept as the agent's `problem` until a
+     * wake works.
      */
     async wake(pubkey: string, options: Readonly<{ refresh?: boolean; signal?: AbortSignal }> = {}): Promise<RunnerStatus | undefined> {
-      const { signal } = options;
       const record = read(pubkey);
       if (!record) throw new Error("This agent is managed from another device.");
-      const { client, sandboxes } = await sandboxOf(service, record, signal);
-      if (record.jobId) {
-        await dropKeeper(client, record.jobId, signal);
-        const { jobId: _old, ...rest } = record;
-        await write(rest);
-      }
-      await sandboxes.get(record.sandbox, signal).catch((error: unknown) => {
-        if ((error as { status?: number }).status === 404) throw new Error(`The agent's Sandbox ${record.sandbox} is gone; remove the agent and create it again.`);
+      try {
+        const status = await wakeOnce(record, options);
+        clearWake(pubkey);
+        return status;
+      } catch (error) {
+        // A wake someone called off (the Settings tab closed) says nothing about the agent.
+        if (!options.signal?.aborted) noteWake(pubkey, record, error);
         throw error;
-      });
-      const node = `node ${shellQuote(`${AGENT_DIR}/runner.mjs`)}`;
-      // The heartbeat a sleeping agent checks before it sleeps, the runner (if it isn't running) and its status, in one call.
-      const script = `${record.config.availability === "sleep" ? `touch ${shellQuote(`${AGENT_DIR}/awake`)} && ` : ""}${node} start >/dev/null && ${node} status`;
-      const start = async () => {
-        await sandboxes.ensureRunning(record.sandbox, { ...(signal && { signal }) });
-        // A newer plugin brings a newer runner: put it in place and restart the runner on it.
-        if (await uploadRunner(sandboxes, record.sandbox, signal)) await runner(sandboxes, record.sandbox, "stop", signal);
-        await syncHostedSkills(service, record, sandboxes, signal);
-        const result = await sandboxes.bash(record.sandbox, script, { timeoutSeconds: 60, ...(signal && { signal }) });
-        if (result.exit_code !== 0) throw new Error(`The agent's runner couldn't start: ${(result.stderr || result.stdout || `exit ${result.exit_code}`).trim().slice(-400)}`);
-        return JSON.parse((result.stdout ?? "").trim() || "{}") as RunnerStatus;
-      };
-      const status = await start();
-      if (options.refresh === false || record.config.availability !== "always" || !shouldRefresh(status)) return status;
-      // A fresh 24 hours: stop the runner cleanly, then the Sandbox, then start both again.
-      await runner(sandboxes, record.sandbox, "stop", signal);
-      await sandboxes.stop(record.sandbox);
-      await stopped(sandboxes, record.sandbox, signal);
-      return start();
+      }
     },
     /** The agent's recent turns from its Sandbox's activity log, newest first; undefined while its Sandbox sleeps. */
     async activity(pubkey: string, signal?: AbortSignal): Promise<ActivityTurn[] | undefined> {
@@ -460,7 +518,9 @@ export function hostedProvider(agents: Pick<Agents, "storage">, service: Databri
  * (`wake`): a stopped Sandbox starts again, a sleeping agent stays awake, and
  * an always-on agent gets a fresh 24 hours at a quiet moment. This is the
  * only thing that restarts a stopped agent; nothing runs on a schedule in
- * Databricks.
+ * Databricks. A failure isn't thrown here: `wake` keeps it as the agent's
+ * `problem`, which its Settings tab and summary show, so the owner knows
+ * Buzz has stopped looking after it (an expired sign-in, most often).
  */
 export function tendAgents(provider: HostedProvider): () => void {
   const busy = new Set<string>();
@@ -706,11 +766,15 @@ const stateLabel = (state: string | undefined, availability: Availability) =>
 
 export function HostedSettings(props: { service: DatabricksService; provider: HostedProvider; pubkey: string; openChannel?(channel: string): void }) {
   const [nonce, setNonce] = React.useState(0);
-  const status = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce]);
+  const problemOf = () => props.provider.problem(props.pubkey);
+  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
+  // Checked again when a background wake fails or recovers, so an open tab doesn't keep a stale "Couldn't check it".
+  const status = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce, Boolean(problem)]);
   const record = props.provider.read(props.pubkey);
   const [draft, setDraft] = React.useState(record?.config);
   const [busy, setBusy] = React.useState<string>();
   const [error, setError] = React.useState<string>();
+  const workspace = React.useMemo(() => workspaceOf(props.service, record?.config.profile), [props.service, record?.config.profile]);
   if (!record || !draft)
     return (
       <DbxRoot style={{ padding: "4px 0 24px" }}>
@@ -735,12 +799,43 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
   const runnerState = status.data?.runner;
   const dirty = JSON.stringify(draft) !== JSON.stringify(record.config);
   const left = hoursLeft(runnerState?.bootedAt);
+  // Checking it needs the same sign-in as waking it: an expired one fails both.
+  const checkError = !status.data && status.error ? status.error : undefined;
+  const expired = problem?.needsSignIn || (checkError !== undefined && needsSignIn(workspace, checkError));
   return (
     <DbxRoot style={{ padding: "4px 0 24px" }}>
       <Stack gap={16}>
+        {(problem || expired) && (
+          <Notice
+            tone="warning"
+            title={expired ? "Sign in again so Buzz can look after this agent" : "Buzz couldn't look after this agent"}
+            action={
+              expired && workspace.reauthenticate ? (
+                <Button
+                  size="sm"
+                  variant="brand"
+                  disabled={Boolean(busy)}
+                  onClick={() =>
+                    run("signin", async () => {
+                      await workspace.reauthenticate!();
+                      await props.provider.wake(props.pubkey, { refresh: false });
+                    })
+                  }
+                >
+                  {busy === "signin" ? <Spinner size={11} /> : null}Sign in again
+                </Button>
+              ) : undefined
+            }
+          >
+            {expired
+              ? `Its Databricks sign-in${record.config.profile ? ` (${record.config.profile})` : ""} has expired, so Buzz has paused its automatic recovery: it won't restart the agent if it stops, or bring it a newer runner, until you sign in again. The agent keeps running in its Sandbox if it already is.`
+              : `Buzz's last check on it failed: ${/[.!?]$/.test(problem!.message) ? problem!.message : `${problem!.message}.`} It tries again every few minutes; until one works, it won't restart the agent if it stops, or bring it a newer runner.`}
+            {problem ? ` Since ${new Date(problem.since).toLocaleString()}.` : ""}
+          </Notice>
+        )}
         <Notice
           tone={state === "SANDBOX_STATE_RUNNING" && runnerState?.running === false ? "warning" : "info"}
-          title={status.loading && !status.data ? "Checking…" : stateLabel(state, record.config.availability)}
+          title={status.loading && !status.data ? "Checking…" : checkError ? "Couldn't check it" : stateLabel(state, record.config.availability)}
           action={
             <Button size="sm" disabled={Boolean(busy)} onClick={() => run("wake", () => props.provider.wake(props.pubkey, { refresh: false }))}>
               {busy === "wake" ? <Spinner size={11} /> : null}
@@ -758,7 +853,9 @@ export function HostedSettings(props: { service: DatabricksService; provider: Ho
               ? record.config.availability === "sleep"
                 ? "It slept while Buzz was closed. Buzz wakes it within a few minutes, or now with Wake now."
                 : `Databricks stops a Sandbox ${SANDBOX_DAY_HOURS} hours after it starts. Buzz starts it again within a few minutes, or now with Wake now.`
-              : `Sandbox ${record.sandbox}.`}
+              : checkError
+                ? `${describeError(checkError)} (Sandbox ${record.sandbox}.)`
+                : `Sandbox ${record.sandbox}.`}
         </Notice>
         {draft.kind === "slack" ? (
           <SlackConversationsField
@@ -855,7 +952,11 @@ export function registerHostedType(agents: Agents, service: DatabricksService, h
     title: "Databricks",
     description: "Runs in your Databricks workspace, so it can answer with Buzz closed: Genie, Claude Code, Codex or Pi in its own Sandbox, an Omnigent agent, or a Slack bridge. No Buzz tools.",
     defaults: () => ({ config: normalizeHosted({}) }),
-    summary: (agent: { config: unknown; pubkey?: string }) => summarizeHosted(provider.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config)),
+    summary: (agent: { config: unknown; pubkey?: string }) => {
+      const text = summarizeHosted(provider.read(agent.pubkey ?? "")?.config ?? normalizeHosted(agent.config));
+      const problem = provider.problem(agent.pubkey ?? "");
+      return problem ? `${text} · ${problem.needsSignIn ? "sign-in expired: Buzz can't restart it" : "Buzz couldn't check it"}` : text;
+    },
     Create: (props: { config: unknown; onChange(config: unknown): void; disabled: boolean }) => (
       <HostedForm service={service} config={normalizeHosted(props.config)} onChange={props.onChange} disabled={props.disabled} />
     ),
