@@ -766,13 +766,14 @@ const stateLabel = (state: string | undefined, availability: Availability) =>
 
 export function HostedSettings(props: { service: DatabricksService; provider: HostedProvider; pubkey: string; openChannel?(channel: string): void }) {
   const [nonce, setNonce] = React.useState(0);
-  const status = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce]);
+  const problemOf = () => props.provider.problem(props.pubkey);
+  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
+  // Checked again when a background wake fails or recovers, so an open tab doesn't keep a stale "Couldn't check it".
+  const status = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce, Boolean(problem)]);
   const record = props.provider.read(props.pubkey);
   const [draft, setDraft] = React.useState(record?.config);
   const [busy, setBusy] = React.useState<string>();
   const [error, setError] = React.useState<string>();
-  const problemOf = () => props.provider.problem(props.pubkey);
-  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
   const workspace = React.useMemo(() => workspaceOf(props.service, record?.config.profile), [props.service, record?.config.profile]);
   if (!record || !draft)
     return (

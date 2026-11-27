@@ -1,7 +1,10 @@
+// @vitest-environment happy-dom
 // Hosted agents: when Buzz's background look after an agent (tendAgents →
 // wake) fails, the agent's status says so, an expired Databricks sign-in most
 // of all, since Buzz then stops restarting it; a wake that works clears it.
 import * as ReactModule from "react";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bindReact } from "@dbx/core/react";
@@ -36,6 +39,7 @@ vi.mock("../plugins/agents/src/slack-ui", () => ({ SlackConversationsField: () =
 const { HostedSettings, hostedProvider, normalizeHosted, tendAgents } = await import("../plugins/agents/src/hosted");
 
 bindReact(ReactModule as never);
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const PUBKEY = "a".repeat(64);
 const profile = { name: "gtm-ai-agent", host: "https://w.example" };
@@ -144,6 +148,40 @@ describe("a hosted agent's background wake", () => {
     expect(provider.problem(PUBKEY)).toBeUndefined();
     expect(sandbox.calls.some((command) => command.includes(" status"))).toBe(true);
     expect(settingsText(provider, connection.service)).not.toContain("Buzz can look after this agent");
+    stop();
+  });
+
+  it("an open Settings tab shows Running again once a background wake recovers from an expired sign-in", async () => {
+    const { provider, connection } = setup();
+    const stop = tendAgents(provider);
+    const element = document.createElement("div");
+    document.body.append(element);
+    const root = createRoot(element);
+    const text = () => (element.textContent ?? "").replace(/\s+/g, " ");
+    const flush = (ms = 0) => act(() => vi.advanceTimersByTimeAsync(ms));
+
+    // Opened while the sign-in is expired: its own check fails…
+    await act(async () => root.render(ReactModule.createElement(HostedSettings, { service: connection.service, provider, pubkey: PUBKEY })));
+    await flush();
+    expect(text()).toContain("Couldn't check it");
+    // …and so does the first background wake, which adds the warning.
+    await flush(30_000);
+    expect(text()).toContain("Sign in again so Buzz can look after this agent");
+    expect(text()).toContain("Couldn't check it");
+
+    // Signed in again outside this tab (Settings → Databricks); the next background wake works.
+    connection.state.signedIn = true;
+    await flush(4 * 60_000);
+    await flush();
+    expect(provider.problem(PUBKEY)).toBeUndefined();
+    expect(text()).not.toContain("Buzz can look after this agent");
+    expect(text()).not.toContain("Couldn't check it");
+    expect(text()).not.toContain("has expired");
+    expect(text()).toContain("Running");
+    expect(text()).toContain("Connected to the community");
+
+    await act(async () => root.unmount());
+    element.remove();
     stop();
   });
 

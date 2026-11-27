@@ -7901,13 +7901,13 @@ var STATE_LABEL = {
 var stateLabel = (state, availability) => state === "SANDBOX_STATE_STOPPED" ? availability === "sleep" ? "Asleep" : "Stopped" : STATE_LABEL[state ?? ""] ?? state ?? "Unknown";
 function HostedSettings(props) {
   const [nonce, setNonce] = React.useState(0);
-  const status3 = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce]);
+  const problemOf = () => props.provider.problem(props.pubkey);
+  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
+  const status3 = useAsync(() => props.provider.status(props.pubkey), [props.pubkey, nonce, Boolean(problem)]);
   const record = props.provider.read(props.pubkey);
   const [draft, setDraft] = React.useState(record?.config);
   const [busy, setBusy] = React.useState();
   const [error, setError] = React.useState();
-  const problemOf = () => props.provider.problem(props.pubkey);
-  const problem = React.useSyncExternalStore(props.provider.subscribe, problemOf, problemOf);
   const workspace = React.useMemo(() => workspaceOf2(props.service, record?.config.profile), [props.service, record?.config.profile]);
   if (!record || !draft)
     return /* @__PURE__ */ React.createElement(DbxRoot, { style: { padding: "4px 0 24px" } }, /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "This agent was set up from another device, which manages its settings."));
